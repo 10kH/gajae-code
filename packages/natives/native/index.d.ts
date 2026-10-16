@@ -1238,9 +1238,10 @@ export declare function exactReplacePath(sourcePath: string, destinationPath: st
  * single-link ownership; hard-linked or symlinked source/destination are
  * rejected) before anything is mutated. On Windows a pre-mutation
  * `STATUS_SHARING_VIOLATION` on the destination open is reported as a
- * distinct `sharing_violation` code with `windows_error_code` set -- exactly
- * as [`exact_replace_path`] already reports it -- and is always surfaced
- * before any rename, so it is never mistaken for a post-effect failure.
+ * distinct `sharing_violation` code, while `STATUS_ACCESS_DENIED` on a
+ * retained open or rename is reported as `access_denied`. Pre-mutation
+ * failures include the original `windows_error_code`; only known-safe rename
+ * operations retry transient access-denied or sharing-violation statuses.
  */
 export declare function exactReplaceRetained(sourcePath: string, destinationPath: string, backupName: string, expectedSource: NativeExactFileIdentity, expectedDestination: NativeExactFileIdentity): NativeExactUnlinkResult
 
@@ -1292,6 +1293,16 @@ export declare function exactUnlinkDirect(path: string, identity: NativeExactFil
  * that cannot be queued is left for the owning reconciliation pass.
  */
 export declare function exactUnlinkDirectDetached(path: string, identity: NativeExactFileIdentity): boolean
+
+/**
+ * Delete only the empty regular file opened by the caller's retained descriptor.
+ *
+ * This is used when a newly created staging file cannot be statted through the
+ * host API. Native code derives identity from the open descriptor and verifies
+ * the public entry still names that object before using the platform's exact
+ * unlink protocol.
+ */
+export declare function exactUnlinkOpenFile(path: string, callerFd: number, quarantineName: string): NativeExactUnlinkResult
 
 /**
  * Execute a brush shell command.
@@ -2579,6 +2590,7 @@ export declare function ptyTimeoutCount(): bigint
 
 /**
  * Rasterize bounded SVG/SVGZ bytes into a PNG without resolving local files.
+ *
  * DTD/entity declarations and SVG image elements are rejected rather than
  * allowing unbounded expansion or silently returning an incomplete preview.
  *

@@ -13,6 +13,7 @@ import type {
 import {
 	exactRestore,
 	exactUnlinkDirect,
+	exactUnlinkOpenFile,
 	openRecoveryFsRoot,
 	renameDirectoryNoReplacePathAsync,
 	renameNoReplacePathAsync,
@@ -198,6 +199,11 @@ export const FileLockTestHooks: {
 		infoPath: string,
 		capture: () => Promise<FileLockStagingFileIdentity>,
 	) => Promise<FileLockStagingFileIdentity>;
+	stagingInfoCleanup?: (
+		infoPath: string,
+		callerFd: number,
+		quarantineName: string,
+	) => NativeExactUnlinkResult | Promise<NativeExactUnlinkResult>;
 	beforeRemovalOwnerPublish?: (transitionPath: string) => void | Promise<void>;
 	cleanupPendingStaging?: (stagingPath: string) => Promise<void>;
 	stagingRootIdentity?: (stagingPath: string) => FileLockStagingRootIdentity | Promise<FileLockStagingRootIdentity>;
@@ -368,6 +374,29 @@ async function removePendingStaging(stagingPath: string, identity: FileLockStagi
 	if (cleanup) {
 		if (!(await hasPendingStagingRootIdentity(stagingPath, identity))) return;
 		await cleanup(stagingPath);
+		return;
+	}
+	if (!identity.infoFileIdentity && process.platform !== "win32") {
+		if (!(await hasPendingStagingRootIdentity(stagingPath, identity))) return;
+		const captured = nativeFileLockBindings().snapshotDirectoryTree(stagingPath);
+		const root = captured.snapshot?.entries.find(entry => entry.relativePath === "");
+		if (
+			!captured.ok ||
+			!captured.snapshot ||
+			captured.snapshot.entries.length !== 1 ||
+			captured.snapshot.rootDev !== identity.rootDev ||
+			captured.snapshot.rootIno !== identity.rootIno ||
+			root?.kind !== "directory" ||
+			root.dev !== identity.rootDev ||
+			root.ino !== identity.rootIno
+		)
+			throw Object.assign(
+				new Error("Staged file-lock root is not empty and its info identity is unavailable; refusing removal."),
+				{ code: captured.code ?? "identity_unavailable" },
+			);
+		// Unlike recursive removal, rmdir cannot consume an entry that appears after
+		// the empty-tree proof; it fails with ENOTEMPTY instead.
+		await fs.rmdir(stagingPath);
 		return;
 	}
 	if (process.platform === "win32") {
@@ -686,13 +715,21 @@ async function writeLockInfo(
 			// Without the handle's inode identity, retaining this empty info entry would
 			// make both immediate cleanup and the later orphan reaper fail closed.
 			try {
-				await fs.unlink(`${lockPath}/info`);
-			} catch (cleanupError) {
-				if (!isEnoent(cleanupError))
-					throw new AggregateError(
-						[error, cleanupError],
-						`Failed to remove staged file-lock info after identity capture failed at ${lockPath}.`,
+				const infoPath = `${lockPath}/info`;
+				const quarantineName = `${path.basename(infoPath)}.cleanup.${crypto.randomUUID()}`;
+				const cleanup = await (FileLockTestHooks.stagingInfoCleanup
+					? FileLockTestHooks.stagingInfoCleanup(infoPath, handle.fd, quarantineName)
+					: exactUnlinkOpenFile(infoPath, handle.fd, quarantineName));
+				if (!cleanup.ok && cleanup.code !== "not_found")
+					throw Object.assign(
+						new Error(`Identity-bound cleanup of staged file-lock info failed: ${cleanup.code ?? "unknown"}.`),
+						{ code: cleanup.code ?? "identity_unavailable" },
 					);
+			} catch (cleanupError) {
+				throw new AggregateError(
+					[error, cleanupError],
+					`Failed to remove staged file-lock info after identity capture failed at ${lockPath}.`,
+				);
 			}
 			throw error;
 		}

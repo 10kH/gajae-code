@@ -15,6 +15,7 @@ import {
 } from "@gajae-code/coding-agent/config/file-lock";
 import {
 	exactRemoveDirectoryTree,
+	exactUnlinkOpenFile,
 	type NativeDirectoryTreeSnapshot,
 	type NativeExactUnlinkResult,
 	type NativeNoReplaceResult,
@@ -61,6 +62,7 @@ afterEach(async () => {
 	FileLockTestHooks.cleanupPendingStaging = undefined;
 	FileLockTestHooks.afterStagingInfoWrite = undefined;
 	FileLockTestHooks.stagingInfoIdentity = undefined;
+	FileLockTestHooks.stagingInfoCleanup = undefined;
 	for (const { directory, forgetGrant } of tempDirs.splice(0)) {
 		try {
 			await fs.rm(directory, { recursive: true, force: true });
@@ -1194,6 +1196,37 @@ test("reaps an empty staging directory after info identity retries exhaust", asy
 	const release = await acquireFileLock(file, { retries: 1, retryDelayMs: 1 });
 	await release();
 	expect(await fs.readdir(root)).toEqual([]);
+});
+
+test("does not unlink a replacement staged info path when identity capture fails", async () => {
+	const { root, file } = await makeFixture();
+	let movedInfoPath: string | undefined;
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree,
+		exactRemoveDirectoryTree: exactRemoveStagingSnapshotForTest,
+	});
+	FileLockTestHooks.stagingInfoIdentity = async infoPath => {
+		movedInfoPath = `${infoPath}.moved`;
+		await fs.rename(infoPath, movedInfoPath);
+		await fs.writeFile(infoPath, "replacement info", { mode: 0o600 });
+		throw Object.assign(new Error("staging info identity denied"), { code: "EACCES" });
+	};
+	FileLockTestHooks.stagingInfoCleanup = (infoPath, callerFd, quarantineName) =>
+		exactUnlinkOpenFile(infoPath, callerFd, quarantineName);
+
+	try {
+		await expect(acquireFileLock(file, { retries: 1, retryDelayMs: 1 })).rejects.toBeInstanceOf(AggregateError);
+		if (!movedInfoPath) throw new Error("expected staging info path to be moved");
+		expect(await fs.readFile(movedInfoPath, "utf8")).toBe("");
+		expect(await fs.readFile(movedInfoPath.replace(/\.moved$/, ""), "utf8")).toBe("replacement info");
+	} finally {
+		FileLockTestHooks.nativeQuarantineBindings = undefined;
+		FileLockTestHooks.stagingInfoIdentity = undefined;
+		FileLockTestHooks.stagingInfoCleanup = undefined;
+	}
+	const pendingName = (await fs.readdir(root)).find(name => name.includes(".pending."));
+	if (!pendingName) throw new Error("expected unverified staging directory to remain for safe recovery");
+	expect(await fs.readFile(path.join(root, pendingName, "info"), "utf8")).toBe("replacement info");
 });
 
 test("aborts a transient publication retry before another publish attempt", async () => {

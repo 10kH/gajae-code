@@ -1788,6 +1788,25 @@ pub fn exact_unlink(path: String, identity: NativeExactFileIdentity) -> NativeEx
 	platform::exact_unlink(Path::new(&path), &identity)
 }
 
+/// Delete only the empty regular file opened by the caller's retained
+/// descriptor.
+///
+/// This is used when a newly created staging file cannot be statted through the
+/// host API. Native code derives identity from the open descriptor and verifies
+/// the public entry still names that object before using the platform's exact
+/// unlink protocol.
+#[napi]
+pub fn exact_unlink_open_file(
+	path: String,
+	caller_fd: i32,
+	quarantine_name: String,
+) -> NativeExactUnlinkResult {
+	if path.contains('\0') || quarantine_name.contains('\0') {
+		return NativeExactUnlinkResult::failure("invalid_request");
+	}
+	platform::exact_unlink_open_file(Path::new(&path), caller_fd, &quarantine_name)
+}
+
 /// Delete only the regular file that still has the supplied platform identity,
 /// without the exchange/quarantine protocol used by [`exact_unlink`].
 ///
@@ -2649,7 +2668,7 @@ pub(crate) mod platform {
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
 		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, digest_reader, io_code,
-		security_io_code, sha256,
+		security_io_code, sha256, validate_retained_backup_name,
 	};
 
 	/// Bound on EINTR restarts for the no-replace rename primitive. A signal
@@ -5435,6 +5454,59 @@ pub(crate) mod platform {
 		} else {
 			close_parent(NativeExactUnlinkResult::detached_failure("cleanup_pending", detached_path))
 		}
+	}
+
+	pub(super) fn exact_unlink_open_file(
+		path: &Path,
+		caller_fd: i32,
+		quarantine_name: &str,
+	) -> NativeExactUnlinkResult {
+		if caller_fd < 0 || validate_retained_backup_name(quarantine_name).is_none() {
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
+		// SAFETY: zero is valid initialized storage for fstat output; caller_fd is
+		// retained by the host FileHandle for the duration of this synchronous call.
+		let mut file_stat: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe { libc::fstat(caller_fd, &mut file_stat) } != 0 {
+			return NativeExactUnlinkResult::failure(security_code(&std::io::Error::last_os_error()));
+		}
+		if file_stat.st_mode & libc::S_IFMT != libc::S_IFREG
+			|| file_stat.st_size != 0
+			|| file_stat.st_nlink != 1
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		let (parent_fd, _) = match open_parent_no_follow(path) {
+			Ok(parent) => parent,
+			Err(result) => return *result,
+		};
+		// SAFETY: zero is valid initialized storage for fstat output.
+		let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+		let parent_stat_result = unsafe { libc::fstat(parent_fd, &mut parent_stat) };
+		// SAFETY: open_parent_no_follow returned ownership of this descriptor.
+		unsafe { libc::close(parent_fd) };
+		if parent_stat_result != 0 {
+			return NativeExactUnlinkResult::failure(security_code(&std::io::Error::last_os_error()));
+		}
+		let Ok(mtime_ns) = i64::try_from(stat_mtime_ns(&file_stat)) else {
+			return NativeExactUnlinkResult::failure("identity_unavailable");
+		};
+		let identity = ExactFileIdentity {
+			dev: file_stat.st_dev as u64,
+			ino: file_stat.st_ino as u64,
+			nlink: Some(file_stat.st_nlink as u64),
+			parent_dev: Some(parent_stat.st_dev as u64),
+			parent_ino: Some(parent_stat.st_ino as u64),
+			size: 0,
+			mtime_ns,
+			directory: false,
+			detach_only: false,
+			quarantine_name: Some(quarantine_name.to_owned()),
+			sha256: Some(sha256(&[])),
+			allow_hard_link: false,
+			require_hard_link: false,
+		};
+		exact_unlink_direct(path, &identity)
 	}
 
 	fn exact_unlink_at(
@@ -12831,6 +12903,78 @@ mod platform {
 		exact_unlink(path, identity)
 	}
 
+	pub(super) fn exact_unlink_open_file(
+		path: &Path,
+		caller_fd: i32,
+		_quarantine_name: &str,
+	) -> NativeExactUnlinkResult {
+		let caller = match retained_caller_handle(caller_fd) {
+			Ok(handle) => handle,
+			Err(result) => {
+				return NativeExactUnlinkResult::failure(
+					result.code.as_deref().unwrap_or("identity_unavailable"),
+				);
+			},
+		};
+		let attributes = match handle_attributes(caller.target) {
+			Ok(attributes) => attributes,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(caller.target, &mut information) } == 0 {
+			return NativeExactUnlinkResult::failure(last_error_code());
+		}
+		let size = (u64::from(information.nFileSizeHigh) << 32) | u64::from(information.nFileSizeLow);
+		if attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+			|| size != 0
+			|| information.nNumberOfLinks != 1
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		let path_handle = match open_exact_with_share(
+			path,
+			"file",
+			FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		) {
+			Ok(handle) => handle,
+			Err(result) => {
+				return NativeExactUnlinkResult::failure(
+					result.code.as_deref().unwrap_or("identity_unavailable"),
+				);
+			},
+		};
+		match same_file_identity(path_handle.target, caller.target) {
+			Ok(true) => {},
+			Ok(false) => return NativeExactUnlinkResult::failure("identity_mismatch"),
+			Err(result) => {
+				return NativeExactUnlinkResult::failure(
+					result.code.as_deref().unwrap_or("identity_unavailable"),
+				);
+			},
+		}
+		let attributes = match handle_attributes(path_handle.target) {
+			Ok(attributes) => attributes,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		let mut path_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(path_handle.target, &mut path_information) } == 0 {
+			return NativeExactUnlinkResult::failure(last_error_code());
+		}
+		let path_size = (u64::from(path_information.nFileSizeHigh) << 32)
+			| u64::from(path_information.nFileSizeLow);
+		if attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+			|| path_size != 0
+			|| path_information.nNumberOfLinks != 1
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		match delete_handle(path_handle.target) {
+			Ok(()) => NativeExactUnlinkResult::success(),
+			Err(code) => NativeExactUnlinkResult::failure(code),
+		}
+	}
+
 	pub(super) fn exact_restore(
 		detached_path: &Path,
 		original_path: &Path,
@@ -14423,6 +14567,9 @@ mod platform {
 		NativeExactUnlinkResult::failure("identity_unavailable")
 	}
 	pub(super) fn exact_unlink_direct(_: &Path, _: &ExactFileIdentity) -> NativeExactUnlinkResult {
+		NativeExactUnlinkResult::failure("identity_unavailable")
+	}
+	pub(super) fn exact_unlink_open_file(_: &Path, _: i32, _: &str) -> NativeExactUnlinkResult {
 		NativeExactUnlinkResult::failure("identity_unavailable")
 	}
 	pub(super) fn exact_restore(

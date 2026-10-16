@@ -6,5 +6,5 @@
 - Accept the distinct Windows `access_denied` code in managed-session security validation so ACL access refusals remain classified security errors.
 - Map Windows canonical workspace-identity `access_denied` results to `permission_denied` for scope resolution and candidate diagnostics.
 - Preserve candidate-invalid `permission_denied` diagnostics through lifecycle session-list validation.
-- Remove the staged info entry when identity-stat retries exhaust so Windows cleanup and orphan reaping can safely reclaim the empty stage.
+- Remove staged info entries after identity-stat retries exhaust only through a handle-derived identity, and refuse recursive cleanup when that identity is unavailable.
 - Defer transient Windows `access_denied` while detaching replacement receipts so a later managed-session mutation can retry cleanup.
