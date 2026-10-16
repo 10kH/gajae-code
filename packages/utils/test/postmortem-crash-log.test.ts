@@ -550,6 +550,24 @@ describe("recordFatalCrash", () => {
 		);
 	});
 
+	it("redacts Azure SharedAccessKey connection-string fields", () => {
+		const keys = [
+			"SharedAccessKey",
+			"sharedAccessKey",
+			"shared_access_key",
+			"shared-access-key",
+			"shared.access.key",
+		];
+		for (const key of keys) expect(isCredentialKey(key)).toBe(true);
+		expect(isCredentialKey("SharedAccessKeyName")).toBe(false);
+
+		const connectionString =
+			"Endpoint=sb://host/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=opaque-secret-123";
+		expect(redactCrashSecrets(connectionString)).toBe(
+			"Endpoint=sb://host/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=«redacted»",
+		);
+	});
+
 	it("redacts abbreviated password credential fields", () => {
 		for (const key of ["pwd", "dbPwd", "user_pwd"]) expect(isCredentialKey(key)).toBe(true);
 		expect(redactCrashSecrets("pwd=opaque-pwd dbPwd=opaque-db-pwd user_pwd=opaque-user-pwd")).toBe(

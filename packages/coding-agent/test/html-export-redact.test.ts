@@ -86,6 +86,7 @@ describe("session HTML export embed", () => {
 				content: [
 					"clone: https://alice:correct@horse@example.com/repo.git?keep=1",
 					"database: postgresql+asyncpg://alice:opaque-database-password@example.com/db",
+					"Endpoint=sb://host/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=opaque-servicebus-secret-123",
 					"password_confirmation=opaque-snake-confirmation passwordConfirmation=opaque-camel-confirmation",
 					'password="correct-horse-"battery-staple note=keep',
 					"password=opaque-secret status: failed",
@@ -108,6 +109,7 @@ describe("session HTML export embed", () => {
 			for (const secret of [
 				"correct@horse",
 				"opaque-database-password",
+				"opaque-servicebus-secret-123",
 				"correct,horse",
 				"correct;horse",
 				"opaque-snake-confirmation",
@@ -129,6 +131,9 @@ describe("session HTML export embed", () => {
 			expect(embedded).toContain("https://«redacted-url-credential»@example.com/repo.git?keep=1");
 			expect(embedded).toContain("postgresql+asyncpg://«redacted-url-credential»@example.com/db");
 			expect(exportedContent).toContain("password=«redacted»");
+			expect(exportedContent).toContain(
+				"Endpoint=sb://host/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=«redacted»",
+			);
 			expect(exportedContent).toContain("password_confirmation=«redacted» passwordConfirmation=«redacted»");
 			expect(exportedContent).toContain('password="«redacted»" note=keep');
 			expect(exportedContent).toContain("password=«redacted» status: failed");
@@ -184,6 +189,8 @@ describe("session HTML export embed", () => {
 							password: "abcdefgh1234",
 							password_confirmation: "opaque-nested-snake-confirmation",
 							passwordConfirmation: "opaque-nested-camel-confirmation",
+							SharedAccessKey: "opaque-nested-servicebus-key",
+							SharedAccessKeyName: "RootManageSharedAccessKey",
 							note: ORDINARY_SENTENCE,
 						},
 					},
@@ -196,9 +203,12 @@ describe("session HTML export embed", () => {
 			expect(embedded).not.toContain("abcdefgh1234");
 			expect(embedded).not.toContain("opaque-nested-snake-confirmation");
 			expect(embedded).not.toContain("opaque-nested-camel-confirmation");
+			expect(embedded).not.toContain("opaque-nested-servicebus-key");
 			expect(embedded).toContain("«redacted»");
 			expect(embedded).toContain('"password_confirmation":"«redacted»"');
 			expect(embedded).toContain('"passwordConfirmation":"«redacted»"');
+			expect(embedded).toContain('"SharedAccessKey":"«redacted»"');
+			expect(embedded).toContain('"SharedAccessKeyName":"RootManageSharedAccessKey"');
 			expect(embedded).toContain(ORDINARY_SENTENCE);
 		} finally {
 			await session?.close();
