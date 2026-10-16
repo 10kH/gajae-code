@@ -224,6 +224,7 @@ describe("session HTML export embed", () => {
 								OPENAI_API_KEY: "opaque-openai-api-key-value",
 								api_token: "opaque-api-token-value",
 								cookie: "opaque-cookie-value",
+								cookies: [{ name: "session", value: "opaque-cookie-jar-secret" }],
 							},
 							auth: "opaque-auth-value",
 							bearer: "opaque-bearer-field-value",
@@ -285,6 +286,7 @@ describe("session HTML export embed", () => {
 				"opaque-openai-api-key-value",
 				"opaque-api-token-value",
 				"opaque-cookie-value",
+				"opaque-cookie-jar-secret",
 				"opaque-auth-value",
 				"opaque-bearer-field-value",
 				"opaque-credentials-value",
@@ -328,6 +330,7 @@ describe("session HTML export embed", () => {
 				OPENAI_API_KEY: "«redacted»",
 				api_token: "«redacted»",
 				cookie: "«redacted»",
+				cookies: "«redacted»",
 			});
 			expect(args?.auth).toBe("«redacted»");
 			expect(args?.bearer).toBe("«redacted»");

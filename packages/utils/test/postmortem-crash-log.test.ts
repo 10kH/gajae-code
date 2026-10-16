@@ -237,6 +237,17 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain('metadata=["public"]');
 	});
 
+	it("redacts plural cookie containers and camelCase cookie fields", () => {
+		expect(isCredentialKey("cookies")).toBe(true);
+		expect(isCredentialKey("sessionCookies")).toBe(true);
+		const redacted = redactCrashSecrets(
+			'{"cookies":[{"name":"session","value":"opaque-cookie-jar-secret"}]} note=keep',
+		);
+		expect(redacted).not.toContain("opaque-cookie-jar-secret");
+		expect(redacted).toContain("«redacted»");
+		expect(redacted).toContain("note=keep");
+	});
+
 	it("redacts escaped-quoted containers across embedded closing delimiters", () => {
 		const serialized = String.raw`credentials={\"primary\":\"alpha}suffix\",\"secondary\":\"beta-secret\"} note=keep`;
 		const redacted = redactCrashSecrets(serialized);
