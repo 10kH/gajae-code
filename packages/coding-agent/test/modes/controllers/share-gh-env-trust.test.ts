@@ -70,6 +70,7 @@ const TRUST_KEYS = [
 	"BUNDLER_SETUP",
 	"GEM_HOME",
 	"GEM_PATH",
+	"RUBYGEMS_GEMDEPS",
 	"RUBYOPT",
 	"RUBYLIB",
 	"PERL5OPT",
@@ -142,6 +143,7 @@ interface GhSpawn {
 	BUNDLER_SETUP: string | null;
 	GEM_HOME: string | null;
 	GEM_PATH: string | null;
+	RUBYGEMS_GEMDEPS: string | null;
 	RUBYOPT: string | null;
 	RUBYLIB: string | null;
 	PERL5OPT: string | null;
@@ -252,6 +254,7 @@ await fsPromises.appendFile(
 		BUNDLER_SETUP: process.env.BUNDLER_SETUP ?? null,
 		GEM_HOME: process.env.GEM_HOME ?? null,
 		GEM_PATH: process.env.GEM_PATH ?? null,
+		RUBYGEMS_GEMDEPS: process.env.RUBYGEMS_GEMDEPS ?? null,
 		RUBYOPT: process.env.RUBYOPT ?? null,
 		RUBYLIB: process.env.RUBYLIB ?? null,
 		PERL5OPT: process.env.PERL5OPT ?? null,
@@ -467,6 +470,7 @@ function expectDestination(
 			| "BUNDLER_SETUP"
 			| "GEM_HOME"
 			| "GEM_PATH"
+			| "RUBYGEMS_GEMDEPS"
 			| "RUBYOPT"
 			| "RUBYLIB"
 			| "PERL5OPT"
@@ -562,6 +566,7 @@ function expectDestination(
 		expect(spawn.BUNDLER_SETUP).toBe(expected.BUNDLER_SETUP ?? null);
 		expect(spawn.GEM_HOME).toBe(expected.GEM_HOME ?? null);
 		expect(spawn.GEM_PATH).toBe(expected.GEM_PATH ?? null);
+		expect(spawn.RUBYGEMS_GEMDEPS).toBe(expected.RUBYGEMS_GEMDEPS ?? null);
 		expect(spawn.RUBYOPT).toBe(expected.RUBYOPT ?? null);
 		expect(spawn.RUBYLIB).toBe(expected.RUBYLIB ?? null);
 		expect(spawn.PERL5OPT).toBe(expected.PERL5OPT ?? null);
@@ -675,6 +680,7 @@ ERL_ZFLAGS=-eval project-startup-c
 BUNDLER_SETUP=/project/bundler-setup.rb
 GEM_HOME=/project/gem-home
 GEM_PATH=/project/gem-path
+RUBYGEMS_GEMDEPS=/project/Gemfile
 RUBYOPT=-r/project/ruby-startup.rb
 RUBYLIB=/project/ruby-libraries
 PERL5OPT=-MProject::Startup
@@ -731,6 +737,7 @@ OPENSSL_ENGINES=/project/openssl-engines
 			BUNDLER_SETUP: null,
 			GEM_HOME: null,
 			GEM_PATH: null,
+			RUBYGEMS_GEMDEPS: null,
 			RUBYOPT: null,
 			RUBYLIB: null,
 			PERL5OPT: null,
@@ -777,6 +784,7 @@ OPENSSL_ENGINES=/project/openssl-engines
 				BUNDLER_SETUP: "/operator/bundler-setup.rb",
 				GEM_HOME: "/operator/gem-home",
 				GEM_PATH: "/operator/gem-path",
+				RUBYGEMS_GEMDEPS: "/operator/Gemfile",
 				RUBYOPT: "-r/operator/ruby-startup.rb",
 				RUBYLIB: "/operator/ruby-libraries",
 				PERL5OPT: "-MOperator::Startup",
@@ -817,6 +825,7 @@ OPENSSL_ENGINES=/project/openssl-engines
 			BUNDLER_SETUP: "/operator/bundler-setup.rb",
 			GEM_HOME: "/operator/gem-home",
 			GEM_PATH: "/operator/gem-path",
+			RUBYGEMS_GEMDEPS: "/operator/Gemfile",
 			RUBYOPT: "-r/operator/ruby-startup.rb",
 			RUBYLIB: "/operator/ruby-libraries",
 			PERL5OPT: "-MOperator::Startup",
