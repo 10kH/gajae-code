@@ -111,8 +111,18 @@ describe("getProxyForUrl project dotenv", () => {
 		expect(await selectedProxy(tempDir(), { inherited: { HTTPS_PROXY: SHELL } })).toBe(SHELL);
 	});
 
-	it("keeps a shell PI_PROXY when the project dotenv declares a different value", async () => {
+	it("keeps a shell PI_PROXY when the project dotenv declares a different comparable value", async () => {
 		expect(await selectedProxy(tempDir(`PI_PROXY=${PROJECT}\n`), { inherited: { PI_PROXY: SHELL } })).toBe(SHELL);
+	});
+
+	it("ignores a different shell PI_PROXY when the project declaration is dynamic", async () => {
+		expect(
+			await selectedProxy(tempDir(`TARGET=${PROJECT}\nPI_PROXY=$TARGET\n`), { inherited: { PI_PROXY: SHELL } }),
+		).toBeNull();
+	});
+
+	it("ignores a different shell PI_PROXY when the project declaration has quoted inner whitespace", async () => {
+		expect(await selectedProxy(tempDir(`PI_PROXY=" ${PROJECT} "\n`), { inherited: { PI_PROXY: SHELL } })).toBeNull();
 	});
 
 	it("selects the shell HTTPS_PROXY when the project dotenv sets PI_PROXY", async () => {
