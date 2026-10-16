@@ -22178,6 +22178,18 @@ export class AgentSession {
 			if (compactionStatus.kind === "aborted") {
 				return compactionStatus.source === "hook" ? result("not-needed") : result("aborted");
 			}
+			// A skipped compaction (most often: nothing before the keep window to
+			// summarize, e.g. one oversized early message) leaves the context
+			// unchanged. Crossing the threshold is not an overflow: while the
+			// unchanged context still fits the model window with its reserve, send
+			// it, as the agent_end threshold path does. Failing here would end every
+			// later turn of the session with the same error.
+			if (
+				compactionStatus.kind === "skipped" &&
+				contextTokens + effectiveReserveTokens(contextWindow, compactionSettings) <= contextWindow
+			) {
+				return result("not-needed");
+			}
 			return result(
 				"failed",
 				false,
