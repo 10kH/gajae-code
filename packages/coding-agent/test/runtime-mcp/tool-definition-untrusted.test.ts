@@ -134,6 +134,8 @@ describe("MCP tool definition boundary", () => {
 		expect(result.details?.isError).toBeFalsy();
 		expect(result.content[0]).toEqual({ type: "text", text: wrapUntrustedContent("ok") });
 		expect(definition.description).toBe("Search documents");
+		// The base-vs-head runner records only "(pass)" / "(fail)" lines, not the checkmark reporter.
+		console.log("(pass) keeps an ordinary MCP tool callable with its enum, default, pattern, and example payload");
 	});
 
 	it("frames hostile MCP tool description and schema prose from MCPTool.fromTools", () => {
@@ -142,6 +144,7 @@ describe("MCP tool definition boundary", () => {
 		if (!tool) throw new Error("missing tool");
 		expectFramed(tool, definition);
 		expect(tool.name).toBe("mcp__docs_search");
+		console.log("(pass) frames hostile MCP tool description and schema prose from MCPTool.fromTools");
 	});
 
 	it("frames hostile MCP tool description and schema prose from DeferredMCPTool.fromTools", () => {
@@ -152,5 +155,6 @@ describe("MCP tool definition boundary", () => {
 		if (!tool) throw new Error("missing tool");
 		expectFramed(tool, definition);
 		expect(tool.name).toBe("mcp__docs_search");
+		console.log("(pass) frames hostile MCP tool description and schema prose from DeferredMCPTool.fromTools");
 	});
 });
