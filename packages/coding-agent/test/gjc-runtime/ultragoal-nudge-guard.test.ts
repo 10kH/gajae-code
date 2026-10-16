@@ -25,6 +25,10 @@ import {
 	selectUltragoalNudgeTarget,
 	type UltragoalNudgeSurface,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
+import {
+	ULTRAGOAL_SUCCESSION_FENCE_SCHEMA,
+	ultragoalSuccessionFencePath,
+} from "@gajae-code/coding-agent/gjc-runtime/ultragoal-succession";
 import { assertUltragoalAskAllowed } from "@gajae-code/coding-agent/tools/ultragoal-ask-guard";
 import { YAML } from "bun";
 
@@ -55,6 +59,31 @@ const DEFAULT_OBJECTIVE_GOAL = {
 	objective: DEFAULT_ULTRAGOAL_OBJECTIVE,
 	status: "active",
 };
+
+/** Hand off `goalIds` to a successor run by planting the source's ownership fence on disk. */
+async function plantFence(cwd: string, goalIds: string[]): Promise<void> {
+	const fencePath = ultragoalSuccessionFencePath(cwd, TEST_SESSION_ID);
+	await fs.mkdir(path.dirname(fencePath), { recursive: true });
+	await Bun.write(
+		fencePath,
+		`${JSON.stringify({
+			schema: ULTRAGOAL_SUCCESSION_FENCE_SCHEMA,
+			operationId: "f".repeat(64),
+			createdAt: new Date().toISOString(),
+			sourceSessionId: TEST_SESSION_ID,
+			sourceRepository: { schema: "gjc.repository_binding.v1", worktreeRoot: cwd, commonDir: null },
+			targetRepository: {
+				schema: "gjc.repository_binding.v1",
+				worktreeRoot: path.join(cwd, "..", "elsewhere"),
+				commonDir: null,
+			},
+			selectedGoalIds: goalIds,
+			sourceArtifacts: { briefSha256: "", goalsSha256: "", ledgerSha256: "" },
+			offerPath: path.join(cwd, "offer.json"),
+			offerSha256: "0".repeat(64),
+		})}\n`,
+	);
+}
 
 afterEach(async () => {
 	if (ORIGINAL_GJC_SESSION_ID === undefined) delete process.env.GJC_SESSION_ID;
@@ -146,6 +175,42 @@ describe("ultragoal nudge guard", () => {
 	});
 
 	// AC2: after the budget is spent, pause falls back to today's gate (blocked, no infinite loop).
+	// #6807: the nudge target was handed off, so the source has no resolvable work to be
+	// nudged toward; the attempt goes straight to the normal gate and spends no budget.
+	it("does not nudge a pause toward a goal handed off to a successor run", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
+		await plantFence(cwd, ["G001"]);
+
+		await expect(assertUltragoalPauseAllowed(cwd)).rejects.toThrow(/human_blocked/);
+		const ledger = await readUltragoalLedger(cwd, TEST_SESSION_ID);
+		expect(ledger.filter(event => event.event === "nudge")).toEqual([]);
+
+		const classification = await recordUltragoalBlockerClassification({
+			cwd,
+			classification: "human_blocked",
+			evidence: "Committing the successor's initial tree needs owner authorization",
+		});
+		await recordUltragoalCriticVerdict({
+			cwd,
+			terminus: "pause",
+			verdict: "OKAY",
+			evidence: "critic confirms only the human-only authorization remains",
+			classificationEventId: classification.eventId,
+		});
+		await expect(assertUltragoalPauseAllowed(cwd)).resolves.toBeUndefined();
+	});
+
+	it("still nudges toward a goal the source kept when another goal was handed off", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: MULTI_BRIEF });
+		await plantFence(cwd, ["G002"]);
+
+		await expect(assertUltragoalPauseAllowed(cwd)).rejects.toThrow(/try-harder nudge \(1\/10\) for G001/);
+	});
+
 	it("AC2: exhausted pause falls back to today's gate and appends no further nudges", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
