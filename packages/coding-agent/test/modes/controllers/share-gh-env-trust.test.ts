@@ -142,6 +142,7 @@ interface GhSpawn {
 	ERL_FLAGS: string | null;
 	ERL_ZFLAGS: string | null;
 	BUNDLER_SETUP: string | null;
+	BUNDLE_GEMFILE: string | null;
 	GEM_HOME: string | null;
 	GEM_PATH: string | null;
 	RUBYGEMS_GEMDEPS: string | null;
@@ -254,6 +255,7 @@ await fsPromises.appendFile(
 		ERL_FLAGS: process.env.ERL_FLAGS ?? null,
 		ERL_ZFLAGS: process.env.ERL_ZFLAGS ?? null,
 		BUNDLER_SETUP: process.env.BUNDLER_SETUP ?? null,
+		BUNDLE_GEMFILE: process.env.BUNDLE_GEMFILE ?? null,
 		GEM_HOME: process.env.GEM_HOME ?? null,
 		GEM_PATH: process.env.GEM_PATH ?? null,
 		RUBYGEMS_GEMDEPS: process.env.RUBYGEMS_GEMDEPS ?? null,
@@ -471,6 +473,7 @@ function expectDestination(
 			| "ERL_FLAGS"
 			| "ERL_ZFLAGS"
 			| "BUNDLER_SETUP"
+			| "BUNDLE_GEMFILE"
 			| "GEM_HOME"
 			| "GEM_PATH"
 			| "RUBYGEMS_GEMDEPS"
@@ -568,6 +571,7 @@ function expectDestination(
 		expect(spawn.ERL_FLAGS).toBe(expected.ERL_FLAGS ?? null);
 		expect(spawn.ERL_ZFLAGS).toBe(expected.ERL_ZFLAGS ?? null);
 		expect(spawn.BUNDLER_SETUP).toBe(expected.BUNDLER_SETUP ?? null);
+		expect(spawn.BUNDLE_GEMFILE).toBe(expected.BUNDLE_GEMFILE ?? null);
 		expect(spawn.GEM_HOME).toBe(expected.GEM_HOME ?? null);
 		expect(spawn.GEM_PATH).toBe(expected.GEM_PATH ?? null);
 		expect(spawn.RUBYGEMS_GEMDEPS).toBe(expected.RUBYGEMS_GEMDEPS ?? null);
@@ -683,6 +687,7 @@ ERL_AFLAGS=-eval project-startup-a
 ERL_FLAGS=-eval project-startup-b
 ERL_ZFLAGS=-eval project-startup-c
 BUNDLER_SETUP=/project/bundler-setup.rb
+BUNDLE_GEMFILE=/project/Gemfile
 GEM_HOME=/project/gem-home
 GEM_PATH=/project/gem-path
 RUBYGEMS_GEMDEPS=/project/Gemfile
@@ -741,6 +746,7 @@ OPENSSL_ENGINES=/project/openssl-engines
 			ERL_FLAGS: null,
 			ERL_ZFLAGS: null,
 			BUNDLER_SETUP: null,
+			BUNDLE_GEMFILE: null,
 			GEM_HOME: null,
 			GEM_PATH: null,
 			RUBYGEMS_GEMDEPS: null,
@@ -789,6 +795,7 @@ OPENSSL_ENGINES=/project/openssl-engines
 				ERL_FLAGS: "-eval operator-startup-b",
 				ERL_ZFLAGS: "-eval operator-startup-c",
 				BUNDLER_SETUP: "/operator/bundler-setup.rb",
+				BUNDLE_GEMFILE: "/operator/Gemfile",
 				GEM_HOME: "/operator/gem-home",
 				GEM_PATH: "/operator/gem-path",
 				RUBYGEMS_GEMDEPS: "/operator/Gemfile",
@@ -831,6 +838,7 @@ OPENSSL_ENGINES=/project/openssl-engines
 			ERL_FLAGS: "-eval operator-startup-b",
 			ERL_ZFLAGS: "-eval operator-startup-c",
 			BUNDLER_SETUP: "/operator/bundler-setup.rb",
+			BUNDLE_GEMFILE: "/operator/Gemfile",
 			GEM_HOME: "/operator/gem-home",
 			GEM_PATH: "/operator/gem-path",
 			RUBYGEMS_GEMDEPS: "/operator/Gemfile",
