@@ -797,3 +797,38 @@ describe("TTSR AST conditions", () => {
 		expect(manager.checkScope(ruleWithAnyToolScope, editContext)).toBe(true);
 	});
 });
+
+describe("TTSR beforeToolCall integration", () => {
+	it("checkAstCondition triggers for 'write' tool with matching code", async () => {
+		const manager = new TtsrManager();
+		const rule = makeRule({
+			name: "function-rule",
+			scope: ["tool:write"],
+			astCondition: ["function testFn() {}"],
+		});
+
+		manager.addRule(rule);
+
+		const matchContext = { source: "tool" as const, toolName: "write" };
+		const matchingContent = "function testFn() {}";
+
+		const matches = await manager.checkAstCondition(rule, "test.ts", matchingContent);
+		expect(matches).toBe(true);
+	});
+
+	it("checkAstCondition does not trigger for 'write' tool with non-matching code", async () => {
+		const manager = new TtsrManager();
+		const rule = makeRule({
+			name: "function-rule",
+			scope: ["tool:write"],
+			astCondition: ["function testFn() {}"],
+		});
+
+		manager.addRule(rule);
+
+		const nonMatchingContent = "function otherFn() {}";
+
+		const matches = await manager.checkAstCondition(rule, "test.ts", nonMatchingContent);
+		expect(matches).toBe(false);
+	});
+});

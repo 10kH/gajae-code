@@ -284,7 +284,7 @@ import { getDefault, SETTINGS_SCHEMA, type SettingPath } from "../config/setting
 import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import { loadCapability } from "../discovery";
-import { expandApplyPatchToEntries, normalizeDiff, normalizeToLF, ParseError, previewPatch, stripBom } from "../edit";
+import { expandApplyPatchToEntries, normalizeDiff, normalizeToLF, ParseError, previewPatch, replaceText, stripBom, readEditFileText } from "../edit";
 import { MAX_EDIT_FILE_BYTES } from "../edit/read-file";
 import { disposeVmContextsByOwner } from "../eval/js/context-manager";
 import {
@@ -6074,7 +6074,7 @@ export class AgentSession {
 		// intentionally survive the tool call: resumed registrations re-use the
 		// original tool call id and must retain the same owned-completion origin.
 		// They are superseded by a rebind on the same id or by bounded eviction.
-		this.agent.beforeToolCall = ctx => {
+		this.agent.beforeToolCall = async ctx => {
 			const lineageIdHash = this.#turnLineageIdHash;
 			if (lineageIdHash) {
 				bindToolLineage(ctx.toolCall.id, {
@@ -6091,6 +6091,16 @@ export class AgentSession {
 					// AsyncJobManager.endpointIdOf(manager) (review thread P1).
 					endpointId: this.#ownedRegistrationEndpoint(),
 				});
+			}
+			// Check TTSR astCondition rules before tool execution
+			if (
+				(ctx.toolCall.name === "write" || ctx.toolCall.name === "edit") &&
+				ctx.toolCall.arguments
+			) {
+				await this.#checkTtsrAstConditionForToolExecution(
+					ctx.toolCall.name,
+					ctx.toolCall.arguments,
+				);
 			}
 			return undefined;
 		};
@@ -7710,11 +7720,8 @@ export class AgentSession {
 
 		if (event.type === "tool_execution_start") {
 			this.#markRetryReplayUnsafe();
-			// Check TTSR astCondition rules for write/edit tools
-			if ((event.toolName === "write" || event.toolName === "ast_edit") && event.args) {
-				void this.#checkTtsrAstConditionForToolExecution(event.toolName, event.args);
-			}
-		} else if (event.type === "tool_execution_update" || event.type === "tool_execution_end") {
+
+		if (event.type === "tool_execution_update" || event.type === "tool_execution_end") {
 			this.#markRetryReplayUnsafe();
 		} else if (event.type === "message_end") {
 			if (
@@ -9469,9 +9476,54 @@ export class AgentSession {
 	}
 
 	/**
+	 * Compute post-edit content for 'edit' tool by reading the file and applying edits.
+	 * Falls back to undefined if computation fails.
+	 */
+	async #computeEditToolContent(editPath: string, edits: unknown[]): Promise<string | undefined> {
+		if (!Array.isArray(edits) || edits.length === 0) return undefined;
+		
+		try {
+			const cwd = this.sessionManager.getCwd();
+			const absolutePath = resolveToCwd(editPath, cwd);
+			const currentContent = await readEditFileText(absolutePath, editPath);
+			const { text: normalizedContent } = stripBom(currentContent);
+			
+			let result = normalizedContent;
+			for (const edit of edits) {
+				if (!isRecord(edit)) continue;
+				
+				const oldText = edit.old_text;
+				const newText = edit.new_text;
+				if (typeof oldText !== "string" || typeof newText !== "string") continue;
+				
+				const replaceResult = await replaceText(result, oldText, newText, {
+					fuzzy: false,
+					all: edit.all === true,
+				});
+				
+				if (replaceResult.count === 0) {
+					// Edit didn't match; fall back to returning undefined to skip the check
+					return undefined;
+				}
+				
+				result = replaceResult.content;
+			}
+			
+			return result;
+		} catch (error) {
+			logger.debug("TTSR edit content computation failed", {
+				path: editPath,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return undefined;
+		}
+	}
+
+	/**
 	 * Check astCondition rules for a tool call's resulting content and queue for injection.
-	 * Called when a write/edit-style tool call is about to execute with complete arguments.
-	 * Only checks regular file writes; skips archives, sqlite, and conflict paths.
+	 * Awaited before tool execution to ensure deterministic injection.
+	 * Supports: write (content provided), edit (content computed from edits).
+	 * Skips: ast_edit, archives, sqlite, conflict paths, and internal URLs.
 	 */
 	async #checkTtsrAstConditionForToolExecution(toolName: string, args: unknown): Promise<void> {
 		if (!this.#ttsrManager?.hasRules()) return;
@@ -9495,9 +9547,23 @@ export class AgentSession {
 			filePath = writePath;
 			content = typeof args.content === "string" ? args.content : "";
 			if (filePath) filePaths.push(filePath);
-		} else if (toolName === "ast_edit" && isRecord(args)) {
+		} else if (toolName === "edit" && isRecord(args) && typeof args.path === "string") {
+			const editPath = args.path;
+			// Skip special paths (archives, sqlite, conflicts, internal URLs)
+			if (
+				editPath.includes(":") ||
+				editPath.startsWith("conflict") ||
+				editPath.includes("://")
+			) {
+				return;
+			}
+			filePath = editPath;
+			// Compute post-edit content from edits array
+			content = await this.#computeEditToolContent(editPath, args.edits);
+			if (filePath) filePaths.push(filePath);
+		} else if (toolName === "ast_edit") {
 			// For ast_edit, we can't compute the final result without executing it,
-			// so we skip astCondition checks for now (it would require dry-running the edit)
+			// so we skip astCondition checks (it would require dry-running the edit)
 			return;
 		}
 
