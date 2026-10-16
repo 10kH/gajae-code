@@ -44,7 +44,8 @@ function promptText(call: unknown): string {
 }
 
 async function renderAnalysis(contextFiles: Array<{ path: string; content: string }>): Promise<string> {
-	completeSimpleSpy = vi.spyOn(aiCore, "completeSimple").mockImplementation(async () => assistantMessage());
+	const spy = vi.spyOn(aiCore, "completeSimple").mockImplementation(async () => assistantMessage());
+	completeSimpleSpy = spy;
 	const { generateConventionalAnalysis } = await import("../src/commit/analysis/conventional");
 	const analysis = await generateConventionalAnalysis({
 		model,
@@ -55,7 +56,7 @@ async function renderAnalysis(contextFiles: Array<{ path: string; content: strin
 		diff: "diff --git a/src/app.ts b/src/app.ts\n+export const answer = 42;\n",
 	});
 	expect(analysis.type).toBe("chore");
-	return promptText(completeSimpleSpy.mock.calls[0]?.[1]);
+	return promptText(spy.mock.calls[0]?.[1]);
 }
 
 afterEach(() => {
