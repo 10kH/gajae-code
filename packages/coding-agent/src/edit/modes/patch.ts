@@ -644,6 +644,11 @@ export async function executePatchSingle(
 	const resolvedRename = rename ? resolvePlanPath(session, rename) : undefined;
 
 	await assertEditableFile(resolvedPath, path, session.settings);
+	// The rename destination is the path that is written. The source call above
+	// already uses this helper, including generated names that do not exist yet.
+	if (resolvedRename && rename && resolvedRename !== resolvedPath) {
+		await assertEditableFile(resolvedRename, rename, session.settings);
+	}
 
 	// Capture pre-edit content so we can verify the write actually hit disk.
 	// `LspFileSystem.writeFile` delegates to a writethrough callback that, in
