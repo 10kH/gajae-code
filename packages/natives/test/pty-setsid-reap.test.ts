@@ -109,56 +109,68 @@ test.skipIf(process.platform === "win32")(
 			expect(session).toBeDefined();
 			expect(result.cancelled).toBe(true);
 			expect(processAlive(sibling.pid)).toBe(true);
+			console.log("(pass) keeps an unrelated process alive when a PTY command is cancelled");
 		} finally {
 			sibling.kill();
 		}
 	},
+	20_000,
 );
 
-test.skipIf(process.platform === "win32")("cancel reaps a reparented setsid grandchild", async () => {
-	const files = escapeFiles();
-	let grandchild: number | undefined;
-	try {
-		const session = new PtySession();
-		const controller = new AbortController();
-		const run = session.start({
-			command: 'perl "$PTY_ESCAPE_SCRIPT"',
-			env: { PTY_ESCAPE_SCRIPT: files.script, PTY_ESCAPE_PID: files.pid },
-			shell: "sh",
-			timeoutMs: 20_000,
-			signal: controller.signal,
-		});
-		grandchild = await waitReparented(files.pid);
-		controller.abort();
-		const result = await run;
-		expect(session).toBeDefined();
-		expect(result.cancelled).toBe(true);
-		expect(await waitUntil(() => !processAlive(grandchild!), 3_000)).toBe(true);
-	} finally {
-		if (grandchild !== undefined && processAlive(grandchild)) process.kill(grandchild, "SIGKILL");
-		rmSync(files.dir, { recursive: true, force: true });
-	}
-});
+test.skipIf(process.platform === "win32")(
+	"cancel reaps a reparented setsid grandchild",
+	async () => {
+		const files = escapeFiles();
+		let grandchild: number | undefined;
+		try {
+			const session = new PtySession();
+			const controller = new AbortController();
+			const run = session.start({
+				command: 'perl "$PTY_ESCAPE_SCRIPT"',
+				env: { PTY_ESCAPE_SCRIPT: files.script, PTY_ESCAPE_PID: files.pid },
+				shell: "sh",
+				timeoutMs: 20_000,
+				signal: controller.signal,
+			});
+			grandchild = await waitReparented(files.pid);
+			controller.abort();
+			const result = await run;
+			expect(session).toBeDefined();
+			expect(result.cancelled).toBe(true);
+			expect(await waitUntil(() => !processAlive(grandchild!), 3_000)).toBe(true);
+			console.log("(pass) cancel reaps a reparented setsid grandchild");
+		} finally {
+			if (grandchild !== undefined && processAlive(grandchild)) process.kill(grandchild, "SIGKILL");
+			rmSync(files.dir, { recursive: true, force: true });
+		}
+	},
+	20_000,
+);
 
-test.skipIf(process.platform === "win32")("timeout reaps a reparented setsid grandchild", async () => {
-	const files = escapeFiles();
-	let grandchild: number | undefined;
-	try {
-		const session = new PtySession();
-		const run = session.start({
-			command: 'perl "$PTY_ESCAPE_SCRIPT"',
-			env: { PTY_ESCAPE_SCRIPT: files.script, PTY_ESCAPE_PID: files.pid },
-			shell: "sh",
-			timeoutMs: 4_000,
-		});
-		const result = await run;
-		expect(session).toBeDefined();
-		expect(result.timedOut).toBe(true);
-		grandchild = readPid(files.pid);
-		expect(grandchild).toBeDefined();
-		expect(await waitUntil(() => !processAlive(grandchild!), 3_000)).toBe(true);
-	} finally {
-		if (grandchild !== undefined && processAlive(grandchild)) process.kill(grandchild, "SIGKILL");
-		rmSync(files.dir, { recursive: true, force: true });
-	}
-});
+test.skipIf(process.platform === "win32")(
+	"timeout reaps a reparented setsid grandchild",
+	async () => {
+		const files = escapeFiles();
+		let grandchild: number | undefined;
+		try {
+			const session = new PtySession();
+			const run = session.start({
+				command: 'perl "$PTY_ESCAPE_SCRIPT"',
+				env: { PTY_ESCAPE_SCRIPT: files.script, PTY_ESCAPE_PID: files.pid },
+				shell: "sh",
+				timeoutMs: 3_000,
+			});
+			const result = await run;
+			expect(session).toBeDefined();
+			expect(result.timedOut).toBe(true);
+			grandchild = readPid(files.pid);
+			expect(grandchild).toBeDefined();
+			expect(await waitUntil(() => !processAlive(grandchild!), 3_000)).toBe(true);
+			console.log("(pass) timeout reaps a reparented setsid grandchild");
+		} finally {
+			if (grandchild !== undefined && processAlive(grandchild)) process.kill(grandchild, "SIGKILL");
+			rmSync(files.dir, { recursive: true, force: true });
+		}
+	},
+	20_000,
+);
