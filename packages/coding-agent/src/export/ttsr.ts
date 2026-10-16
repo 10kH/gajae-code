@@ -5,9 +5,12 @@
  * the agent's output. When a match occurs, the stream is aborted, the rule is
  * injected as a system reminder, and the request is retried.
  */
+import * as path from "node:path";
+import type { astGrep as astGrepFn } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import type { Rule } from "../capability/rule";
 import type { TtsrSettings } from "../config/settings";
+import { getLanguageFromPath } from "../utils/lang-from-path";
 
 export type TtsrMatchSource = "text" | "thinking" | "tool";
 
@@ -39,6 +42,7 @@ interface TtsrEntry {
 	rule: Rule;
 	conditions: RegExp[];
 	conditionWindows: Array<number | undefined>;
+	astConditions?: string[];
 
 	scope: TtsrScope;
 	globalPathGlobs?: Bun.Glob[];
@@ -339,7 +343,10 @@ export class TtsrManager {
 		}
 
 		const conditions = this.#compileConditions(rule);
-		if (conditions.length === 0) {
+		const astConditions = rule.astCondition ?? [];
+
+		// Rule must have either regex or AST conditions
+		if (conditions.length === 0 && astConditions.length === 0) {
 			return false;
 		}
 
@@ -357,6 +364,7 @@ export class TtsrManager {
 			rule,
 			conditions,
 			conditionWindows,
+			astConditions: astConditions.length > 0 ? astConditions : undefined,
 			scope,
 			globalPathGlobs,
 		});
@@ -364,6 +372,7 @@ export class TtsrManager {
 		logger.debug("TTSR rule registered", {
 			ruleName: rule.name,
 			conditions: rule.condition,
+			astConditions: rule.astCondition,
 			scope: rule.scope,
 			globs: rule.globs,
 		});
@@ -508,5 +517,110 @@ export class TtsrManager {
 	/** Get settings. */
 	getSettings(): Required<TtsrSettings> {
 		return this.#settings;
+	}
+
+	/**
+	 * Check AST conditions for a rule against file content.
+	 * Returns true if any AST condition matches (OR across patterns within a condition).
+	 * Returns false if the rule has no AST conditions, unknown language, or parse failure.
+	 * This is meant to be called from tool execution flow with completed arguments.
+	 */
+	async checkAstCondition(rule: Rule, filePath: string, content: string): Promise<boolean> {
+		if (this.#isDisabled()) {
+			return false;
+		}
+
+		const entry = this.#rules.get(rule.name);
+		if (!entry?.astConditions || entry.astConditions.length === 0) {
+			return false;
+		}
+
+		// Infer language from file path
+		const language = getLanguageFromPath(filePath);
+		if (!language) {
+			logger.debug("TTSR AST condition: unknown language for path", {
+				ruleName: rule.name,
+				filePath,
+			});
+			return false;
+		}
+
+		try {
+			const fs = await import("node:fs/promises");
+			// Create a dedicated temporary directory for AST evaluation
+			// (using /tmp directly hits the scan limit with too many files)
+			const tmpBaseDir = `${Bun.env.TMPDIR || "/tmp"}/ttsr-ast-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+			await fs.mkdir(tmpBaseDir, { recursive: true });
+
+			const ext = path.extname(filePath) || ".tmp";
+			const tmpFile = path.join(tmpBaseDir, `evaluation${ext}`);
+			const fileHandle = Bun.file(tmpFile);
+			await Bun.write(fileHandle, content);
+
+			try {
+				return await this.#evaluateAstCondition(tmpBaseDir, path.basename(tmpFile), language, entry.astConditions);
+			} finally {
+				// Clean up temporary directory and file
+				try {
+					await fs.rm(tmpBaseDir, { recursive: true, force: true });
+				} catch {
+					// Ignore cleanup errors
+				}
+			}
+		} catch (error) {
+			logger.debug("TTSR AST condition evaluation failed", {
+				ruleName: rule.name,
+				filePath,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return false;
+		}
+	}
+
+	/**
+	 * Evaluate AST patterns against a file.
+	 * Returns true if any pattern matches.
+	 */
+	async #evaluateAstCondition(
+		tmpDir: string,
+		fileName: string,
+		language: string,
+		patterns: string[],
+	): Promise<boolean> {
+		try {
+			const astGrepFn = await this.#astGrepNative();
+			// ast_grep expects patterns array, lang (language name), and path (directory to search)
+			// The glob parameter can be used to filter files by name
+			const result = await astGrepFn({
+				patterns,
+				lang: language,
+				path: tmpDir,
+				glob: fileName,
+			});
+
+			if (result?.matches && result.matches.length > 0) {
+				return true;
+			}
+
+			if (result?.parseErrors && result.parseErrors.length > 0) {
+				logger.debug("TTSR AST condition parse errors", {
+					parseErrors: result.parseErrors,
+				});
+			}
+
+			return false;
+		} catch (error) {
+			logger.debug("TTSR AST condition native evaluation error", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return false;
+		}
+	}
+
+	/**
+	 * Load the ast-grep native function.
+	 */
+	async #astGrepNative(): Promise<typeof astGrepFn> {
+		return Promise.resolve((require("@gajae-code/natives") as { astGrep: typeof astGrepFn }).astGrep);
 	}
 }

@@ -205,9 +205,11 @@ After rule discovery in `createAgentSession` (`sdk.ts`):
 - **Full rule content is auto-injected into the system prompt** (before the rulebook rules section).
 - Rule is also addressable via `rule://<name>` for re-reading.
 
-### `condition`, `scope`, and `interruptMode`
+### `condition`, `astCondition`, `scope`, and `interruptMode`
 
-- `condition` is the current TTSR trigger field; legacy `ttsr_trigger` / `ttsrTrigger` are accepted as fallback inputs during parsing.
+- `condition` is the regex-based TTSR trigger field; legacy `ttsr_trigger` / `ttsrTrigger` are accepted as fallback inputs during parsing. Evaluated on streamed tool output (streaming behavior).
+- `astCondition` is the AST-grep pattern-based TTSR trigger field (optional, can coexist with `condition`). Evaluated only on completed tool arguments for `edit`/`write` tools before execution, not on streamed deltas. Language is inferred from the target file path. Parse failures and unknown languages log a debug message and result in non-match (never abort).
+- A rule may have either `condition`, `astCondition`, or both. Rules must have at least one condition type to be registered as TTSR rules.
 - `scope` narrows TTSR matching scope. A condition token that looks like a file glob becomes `tool:edit(<glob>)` and `tool:write(<glob>)` scope entries plus catch-all condition `.*`.
 - `interruptMode` can override the global TTSR interrupt mode for the rule.
 

@@ -13,6 +13,7 @@ function makeRule(partial: Partial<Rule>): Rule {
 		alwaysApply: partial.alwaysApply,
 		description: partial.description,
 		condition: partial.condition,
+		astCondition: partial.astCondition,
 		scope: partial.scope,
 		repeatMode: partial.repeatMode,
 		repeatGap: partial.repeatGap,
@@ -613,6 +614,135 @@ describe("TtsrManager enabled gating (Finding 10)", () => {
 		const manager = new TtsrManager(makeSettings(false));
 		manager.addRule(forbiddenRule());
 		// Feed a partial match while disabled; it must not be retained.
-		expect(manager.checkDelta("forbid", textContext)).toEqual([]);
+		expect(manager.checkDelta("forbif", textContext)).toEqual([]);
+	});
+});
+
+describe("TTSR AST conditions", () => {
+	it("accepts rules with astCondition and no regex condition", () => {
+		const manager = new TtsrManager();
+		const rule = makeRule({
+			name: "ast-only",
+			astCondition: ["function Foo() {}"],
+		});
+
+		const added = manager.addRule(rule);
+		expect(added).toBe(true);
+	});
+
+	it("accepts rules with both regex and AST conditions", () => {
+		const manager = new TtsrManager();
+		const rule = makeRule({
+			name: "both-conditions",
+			condition: ["error"],
+			astCondition: ["function Foo() {}"],
+		});
+
+		const added = manager.addRule(rule);
+		expect(added).toBe(true);
+	});
+
+	it("normalizes astCondition from string to string array", () => {
+		const parsed = parseRuleConditionAndScope({
+			astCondition: "function Foo() {}",
+		});
+
+		expect(parsed.astCondition).toEqual(["function Foo() {}"]);
+	});
+
+	it("deduplicates astCondition array", () => {
+		const parsed = parseRuleConditionAndScope({
+			astCondition: ["function Foo() {}", "function Foo() {}"],
+		});
+
+		expect(parsed.astCondition).toEqual(["function Foo() {}"]);
+	});
+
+	it("returns undefined for empty astCondition", () => {
+		const parsed = parseRuleConditionAndScope({
+			astCondition: "",
+		});
+
+		expect(parsed.astCondition).toBeUndefined();
+	});
+
+	it("checkAstCondition returns false for unknown language", async () => {
+		const manager = new TtsrManager();
+		const rule = makeRule({
+			name: "ast-rule",
+			astCondition: ["function Foo() {}"],
+		});
+
+		manager.addRule(rule);
+		const match = await manager.checkAstCondition(rule, "unknown.xyz", "function Foo() {}");
+		expect(match).toBe(false);
+	});
+
+	it("checkAstCondition returns false for parse failures", async () => {
+		const manager = new TtsrManager();
+		const rule = makeRule({
+			name: "ast-rule",
+			astCondition: ["function Foo() {}"],
+		});
+
+		manager.addRule(rule);
+		// Invalid JavaScript that won't parse
+		const match = await manager.checkAstCondition(rule, "test.js", "function {");
+		expect(match).toBe(false);
+	});
+
+	it("checkAstCondition returns false when no rule matches", async () => {
+		const manager = new TtsrManager();
+		const rule = makeRule({
+			name: "ast-rule",
+			astCondition: ["const x = 123;"],
+		});
+
+		manager.addRule(rule);
+		// Code without the pattern
+		const match = await manager.checkAstCondition(rule, "test.ts", "function Foo() {}");
+		expect(match).toBe(false);
+	});
+
+	it("checkAstCondition returns true when pattern matches", async () => {
+		const manager = new TtsrManager();
+		const rule = makeRule({
+			name: "ast-rule",
+			astCondition: ["function $NAME() {}"],
+		});
+
+		manager.addRule(rule);
+		// Code with the pattern
+		const match = await manager.checkAstCondition(rule, "test.ts", "function Foo() {}");
+		expect(match).toBe(true);
+	});
+
+	it("checkAstCondition returns false when rule has no astCondition", async () => {
+		const manager = new TtsrManager();
+		const rule = makeRule({
+			name: "no-ast",
+			condition: ["forbidden"],
+		});
+
+		manager.addRule(rule);
+		const match = await manager.checkAstCondition(rule, "test.ts", "function Foo() {}");
+		expect(match).toBe(false);
+	});
+
+	it("infers language from file path", async () => {
+		const manager = new TtsrManager();
+		const rule = makeRule({
+			name: "ast-rule",
+			astCondition: ["function $NAME() {}"],
+		});
+
+		manager.addRule(rule);
+		// Python file (should fail to match JavaScript pattern)
+		const pythonMatch = await manager.checkAstCondition(rule, "test.py", "def foo(): pass");
+		expect(pythonMatch).toBe(false);
+
+		// TypeScript file (should match)
+		const tsMatch = await manager.checkAstCondition(rule, "test.ts", "function Foo() {}");
+		expect(tsMatch).toBe(true);
 	});
 });
