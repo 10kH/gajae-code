@@ -877,6 +877,7 @@ describe("TTSR beforeToolCall integration", () => {
 		});
 		ttsrManager.addRule(rule);
 
+		let callCount = 0;
 		const agent = new Agent({
 			initialState: {
 				model,
@@ -885,37 +886,62 @@ describe("TTSR beforeToolCall integration", () => {
 				messages: [],
 			},
 			streamFn: () => {
+				callCount++;
 				const stream = new AssistantMessageEventStream();
 				queueMicrotask(() => {
-					const toolCall: ToolCall = {
-						type: "toolCall",
-						id: "write-call-1",
-						name: "write",
-						arguments: {
-							path: path.join(tempDir, "test.ts"),
-							content: "function testFn() {}",
-						},
-					};
-					stream.push(assistantMessageWithCalls([toolCall]));
-					const message = {
-						role: "assistant" as const,
-						content: [toolCall],
-						api: model.api,
-						provider: model.provider,
-						model: model.id,
-						usage: {
-							input: 1,
-							output: 1,
-							cacheRead: 0,
-							cacheWrite: 0,
-							totalTokens: 2,
-							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-						},
-						stopReason: "toolUse" as const,
-						timestamp: Date.now(),
-					};
-					stream.push({ type: "done", reason: "toolUse", message });
-					stream.end(message);
+					if (callCount === 1) {
+						// First call: return tool call
+						const toolCall: ToolCall = {
+							type: "toolCall",
+							id: "write-call-1",
+							name: "write",
+							arguments: {
+								path: path.join(tempDir, "test.ts"),
+								content: "function testFn() {}",
+							},
+						};
+						stream.push(assistantMessageWithCalls([toolCall]));
+						const message = {
+							role: "assistant" as const,
+							content: [toolCall],
+							api: model.api,
+							provider: model.provider,
+							model: model.id,
+							usage: {
+								input: 1,
+								output: 1,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 2,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "toolUse" as const,
+							timestamp: Date.now(),
+						};
+						stream.push({ type: "done", reason: "toolUse", message });
+					} else {
+						// Second call: return final stop response
+						const message = {
+							role: "assistant" as const,
+							content: [{ type: "text" as const, text: "Done" }],
+							api: model.api,
+							provider: model.provider,
+							model: model.id,
+							usage: {
+								input: 1,
+								output: 1,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 2,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "stop" as const,
+							timestamp: Date.now(),
+						};
+						stream.push({ type: "start", partial: message });
+						stream.push({ type: "done", reason: "stop", message });
+					}
+					stream.end();
 				});
 				return stream;
 			},
@@ -958,6 +984,7 @@ describe("TTSR beforeToolCall integration", () => {
 		});
 		ttsrManager.addRule(rule);
 
+		let callCount = 0;
 		const agent = new Agent({
 			initialState: {
 				model,
@@ -966,37 +993,60 @@ describe("TTSR beforeToolCall integration", () => {
 				messages: [],
 			},
 			streamFn: () => {
+				callCount++;
 				const stream = new AssistantMessageEventStream();
 				queueMicrotask(() => {
-					const toolCall: ToolCall = {
-						type: "toolCall",
-						id: "write-call-1",
-						name: "write",
-						arguments: {
-							path: path.join(tempDir, "test.ts"),
-							content: "function otherFn() {}",
-						},
-					};
-					stream.push(assistantMessageWithCalls([toolCall]));
-					const message = {
-						role: "assistant" as const,
-						content: [toolCall],
-						api: model.api,
-						provider: model.provider,
-						model: model.id,
-						usage: {
-							input: 1,
-							output: 1,
-							cacheRead: 0,
-							cacheWrite: 0,
-							totalTokens: 2,
-							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-						},
-						stopReason: "toolUse" as const,
-						timestamp: Date.now(),
-					};
-					stream.push({ type: "done", reason: "toolUse", message });
-					stream.end(message);
+					if (callCount === 1) {
+						const toolCall: ToolCall = {
+							type: "toolCall",
+							id: "write-call-1",
+							name: "write",
+							arguments: {
+								path: path.join(tempDir, "test.ts"),
+								content: "function otherFn() {}",
+							},
+						};
+						stream.push(assistantMessageWithCalls([toolCall]));
+						const message = {
+							role: "assistant" as const,
+							content: [toolCall],
+							api: model.api,
+							provider: model.provider,
+							model: model.id,
+							usage: {
+								input: 1,
+								output: 1,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 2,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "toolUse" as const,
+							timestamp: Date.now(),
+						};
+						stream.push({ type: "done", reason: "toolUse", message });
+					} else {
+						const message = {
+							role: "assistant" as const,
+							content: [{ type: "text" as const, text: "Done" }],
+							api: model.api,
+							provider: model.provider,
+							model: model.id,
+							usage: {
+								input: 1,
+								output: 1,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 2,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "stop" as const,
+							timestamp: Date.now(),
+						};
+						stream.push({ type: "start", partial: message });
+						stream.push({ type: "done", reason: "stop", message });
+					}
+					stream.end();
 				});
 				return stream;
 			},
@@ -1038,7 +1088,8 @@ describe("TTSR beforeToolCall integration", () => {
 		});
 		ttsrManager.addRule(rule);
 
-		let callCount = 0;
+		let streamCallCount = 0;
+		let toolCallIndex = 0;
 		const agent = new Agent({
 			initialState: {
 				model,
@@ -1047,22 +1098,44 @@ describe("TTSR beforeToolCall integration", () => {
 				messages: [],
 			},
 			streamFn: () => {
+				streamCallCount++;
 				const stream = new AssistantMessageEventStream();
 				queueMicrotask(() => {
-					callCount++;
-					const toolCall: ToolCall = {
-						type: "toolCall",
-						id: `write-call-${callCount}`,
-						name: "write",
-						arguments: {
-							path: path.join(tempDir, `test${callCount}.ts`),
-							content: "function testFn() {}",
-						},
-					};
-					stream.push(assistantMessageWithCalls([toolCall]));
+					// Odd calls (1, 3, 5...): return tool call; even calls (2, 4, 6...): return stop
+					if (streamCallCount % 2 === 1) {
+						toolCallIndex++;
+						const toolCall: ToolCall = {
+							type: "toolCall",
+							id: `write-call-${toolCallIndex}`,
+							name: "write",
+							arguments: {
+								path: path.join(tempDir, `test${toolCallIndex}.ts`),
+								content: "function testFn() {}",
+							},
+						};
+						stream.push(assistantMessageWithCalls([toolCall]));
+						const message = {
+							role: "assistant" as const,
+							content: [toolCall],
+							api: model.api,
+							provider: model.provider,
+							model: model.id,
+							usage: {
+								input: 1,
+								output: 1,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 2,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "toolUse" as const,
+							timestamp: Date.now(),
+						};
+						stream.push({ type: "done", reason: "toolUse", message });
+				} else {
 					const message = {
 						role: "assistant" as const,
-						content: [toolCall],
+						content: [{ type: "text" as const, text: "Done" }],
 						api: model.api,
 						provider: model.provider,
 						model: model.id,
@@ -1074,11 +1147,13 @@ describe("TTSR beforeToolCall integration", () => {
 							totalTokens: 2,
 							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 						},
-						stopReason: "toolUse" as const,
+						stopReason: "stop" as const,
 						timestamp: Date.now(),
 					};
-					stream.push({ type: "done", reason: "toolUse", message });
-					stream.end(message);
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				}
+				stream.end();
 				});
 				return stream;
 			},
@@ -1130,14 +1205,16 @@ describe("TTSR beforeToolCall integration", () => {
 		const rule = makeRule({
 			name: "export-detect",
 			scope: ["tool:edit"],
-			astCondition: ["export function"],
+			astCondition: ["export function testFn() {}"],
 		});
 		ttsrManager.addRule(rule);
 
 		// Create a temp file with initial content
+		// Create a temp file with function that will be exported after edit
 		const testFile = path.join(tempDir, "test.ts");
-		fs.writeFileSync(testFile, "function test() {}\n");
+		fs.writeFileSync(testFile, "function testFn() {}\n");
 
+		let callCount = 0;
 		const agent = new Agent({
 			initialState: {
 				model,
@@ -1146,42 +1223,65 @@ describe("TTSR beforeToolCall integration", () => {
 				messages: [],
 			},
 			streamFn: () => {
+				callCount++;
 				const stream = new AssistantMessageEventStream();
 				queueMicrotask(() => {
-					const toolCall: ToolCall = {
-						type: "toolCall",
-						id: "edit-call-1",
-						name: "edit",
-						arguments: {
-							path: testFile,
-							edits: [
-								{
-									old_text: "function test() {}",
-									new_text: "export function test() {}",
-								},
-							],
-						},
-					};
-					stream.push(assistantMessageWithCalls([toolCall]));
-					const message = {
-						role: "assistant" as const,
-						content: [toolCall],
-						api: model.api,
-						provider: model.provider,
-						model: model.id,
-						usage: {
-							input: 1,
-							output: 1,
-							cacheRead: 0,
-							cacheWrite: 0,
-							totalTokens: 2,
-							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-						},
-						stopReason: "toolUse" as const,
-						timestamp: Date.now(),
-					};
-					stream.push({ type: "done", reason: "toolUse", message });
-					stream.end(message);
+					if (callCount === 1) {
+						const toolCall: ToolCall = {
+							type: "toolCall",
+							id: "edit-call-1",
+							name: "edit",
+							arguments: {
+								path: testFile,
+								edits: [
+									{
+										old_text: "function testFn() {}",
+										new_text: "export function testFn() {}",
+									},
+								],
+							},
+						};
+						stream.push(assistantMessageWithCalls([toolCall]));
+						const message = {
+							role: "assistant" as const,
+							content: [toolCall],
+							api: model.api,
+							provider: model.provider,
+							model: model.id,
+							usage: {
+								input: 1,
+								output: 1,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 2,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "toolUse" as const,
+							timestamp: Date.now(),
+						};
+						stream.push({ type: "done", reason: "toolUse", message });
+					} else {
+						const message = {
+							role: "assistant" as const,
+							content: [{ type: "text" as const, text: "Done" }],
+							api: model.api,
+							provider: model.provider,
+							model: model.id,
+							usage: {
+								input: 1,
+								output: 1,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 2,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "stop" as const,
+							timestamp: Date.now(),
+						};
+						stream.push({ type: "start", partial: message });
+						stream.push({ type: "done", reason: "stop", message });
+					}
+					stream.end();
 				});
 				return stream;
 			},
@@ -1203,6 +1303,10 @@ describe("TTSR beforeToolCall integration", () => {
 				ttsr_triggered_events.push(event as any);
 			}
 		});
+
+		// Verify file was created with initial content
+		const initialContent = fs.readFileSync(testFile, "utf8");
+		expect(initialContent).toContain("function testFn() {}");
 
 		await session.prompt("Export the function");
 		await session.waitForIdle();
