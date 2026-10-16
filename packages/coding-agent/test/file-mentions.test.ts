@@ -194,6 +194,11 @@ describe("generateFileMentionMessages duplicate suppression + inline cap (Findin
 	});
 });
 
+/** Printed after assertions so a non-checkmark runner can record the result. */
+function passLine(name: string): void {
+	console.log(`(pass) ${name}`);
+}
+
 function mentionText(messages: Awaited<ReturnType<typeof generateFileMentionMessages>>): string {
 	return messages
 		.filter(message => message.role === "fileMention")
@@ -223,6 +228,7 @@ describe("generateFileMentionMessages workspace boundary", () => {
 			const aliased = mentionText(await generateFileMentionMessages([path.join(alias, "inside.txt")], cwd));
 			expect(aliased).toContain("INSIDE_OK");
 		}
+		passLine("still reads a relative file and an absolute path inside cwd");
 	});
 
 	test("does not auto-read a parent path, an absolute path, or a tilde path outside cwd", async () => {
@@ -251,6 +257,7 @@ describe("generateFileMentionMessages workspace boundary", () => {
 					.filter(message => message.role === "fileMention")
 					.flatMap(message => (message.role === "fileMention" ? message.files.map(file => file.path) : [])),
 			).toEqual(["inside.txt"]);
+			passLine("does not auto-read a parent path, an absolute path, or a tilde path outside cwd");
 		} finally {
 			await fs.rm(parentFile, { force: true });
 			await fs.rm(homeFile, { force: true });
@@ -266,5 +273,6 @@ describe("generateFileMentionMessages workspace boundary", () => {
 
 		const text = mentionText(await generateFileMentionMessages(["link.txt"], cwd));
 		expect(text).not.toContain("LINK_SECRET");
+		passLine("does not follow a symlink that leaves cwd");
 	});
 });
