@@ -661,25 +661,40 @@ async function writeLockInfo(
 	const handle = await fs.open(`${lockPath}/info`, "wx", 0o600);
 	try {
 		let identity: FileLockStagingFileIdentity;
-		for (;;) {
-			try {
-				const captureIdentity = async (): Promise<FileLockStagingFileIdentity> => {
-					const stats = await handle.stat({ bigint: true });
-					return {
-						dev: canonicalLockDeviceId(stats.dev).toString(),
-						ino: canonicalLockFileId(stats.ino).toString(),
+		try {
+			for (;;) {
+				try {
+					const captureIdentity = async (): Promise<FileLockStagingFileIdentity> => {
+						const stats = await handle.stat({ bigint: true });
+						return {
+							dev: canonicalLockDeviceId(stats.dev).toString(),
+							ino: canonicalLockFileId(stats.ino).toString(),
+						};
 					};
-				};
-				const testCaptureIdentity = FileLockTestHooks.stagingInfoIdentity;
-				identity = testCaptureIdentity
-					? await testCaptureIdentity(`${lockPath}/info`, captureIdentity)
-					: await captureIdentity();
-				break;
-			} catch (error) {
-				if (!isTransientReleaseError(error) || retryBudget.remainingDelays === 0) throw error;
-				retryBudget.remainingDelays--;
-				await sleepFileLockRetry(retryBudget.retryDelayMs, retryBudget.signal);
+					const testCaptureIdentity = FileLockTestHooks.stagingInfoIdentity;
+					identity = testCaptureIdentity
+						? await testCaptureIdentity(`${lockPath}/info`, captureIdentity)
+						: await captureIdentity();
+					break;
+				} catch (error) {
+					if (!isTransientReleaseError(error) || retryBudget.remainingDelays === 0) throw error;
+					retryBudget.remainingDelays--;
+					await sleepFileLockRetry(retryBudget.retryDelayMs, retryBudget.signal);
+				}
 			}
+		} catch (error) {
+			// Without the handle's inode identity, retaining this empty info entry would
+			// make both immediate cleanup and the later orphan reaper fail closed.
+			try {
+				await fs.unlink(`${lockPath}/info`);
+			} catch (cleanupError) {
+				if (!isEnoent(cleanupError))
+					throw new AggregateError(
+						[error, cleanupError],
+						`Failed to remove staged file-lock info after identity capture failed at ${lockPath}.`,
+					);
+			}
+			throw error;
 		}
 		onFileCreated(identity);
 		await handle.writeFile(JSON.stringify(info));

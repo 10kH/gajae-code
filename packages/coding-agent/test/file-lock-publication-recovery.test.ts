@@ -1141,6 +1141,61 @@ test("retries a transient staging info identity stat failure", async () => {
 	expect(await fs.readdir(root)).toEqual([]);
 });
 
+test("reaps an empty staging directory after info identity retries exhaust", async () => {
+	const { root, file, lock } = await makeFixture();
+	const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+	if (!originalPlatform?.configurable) throw new Error("process_platform_not_configurable");
+	let statAttempts = 0;
+	let cleanupAttempts = 0;
+	FileLockTestHooks.stagingIdentityEvidence = () => ({
+		processIncarnation: "staging-owner-before-exit",
+		startTime: null,
+	});
+	FileLockTestHooks.stagingInfoIdentity = async infoPath => {
+		statAttempts++;
+		expect((await fs.lstat(infoPath)).isFile()).toBe(true);
+		throw Object.assign(new Error("persistent staging info stat denial"), { code: "EACCES" });
+	};
+	FileLockTestHooks.cleanupPendingStaging = async () => {
+		cleanupAttempts++;
+		throw Object.assign(new Error("staging cleanup denied"), { code: "EACCES" });
+	};
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree,
+		exactRemoveDirectoryTree: exactRemoveStagingSnapshotForTest,
+	});
+
+	try {
+		Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+		await expect(acquireFileLock(file, { retries: 2, retryDelayMs: 1 })).rejects.toMatchObject({
+			message: "persistent staging info stat denial",
+			code: "EACCES",
+		});
+		expect(statAttempts).toBe(2);
+		expect(cleanupAttempts).toBeGreaterThan(0);
+		const pendingName = (await fs.readdir(root)).find(name => name.includes(".pending."));
+		if (!pendingName) throw new Error("expected the staging root to remain after transient cleanup denial");
+		const pendingPath = path.join(root, pendingName);
+		expect(await fs.readdir(pendingPath)).toEqual([]);
+
+		FileLockTestHooks.cleanupPendingStaging = undefined;
+		FileLockTestHooks.processIncarnation = () => "staging-owner-after-exit";
+		const reaped = await reapOrphanedLockStagingDirs(lock);
+		expect(reaped.removed).toContain(pendingPath);
+		await expect(fs.lstat(pendingPath)).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		Object.defineProperty(process, "platform", originalPlatform);
+		FileLockTestHooks.stagingIdentityEvidence = undefined;
+		FileLockTestHooks.processIncarnation = undefined;
+		FileLockTestHooks.nativeQuarantineBindings = undefined;
+		FileLockTestHooks.cleanupPendingStaging = undefined;
+		FileLockTestHooks.stagingInfoIdentity = undefined;
+	}
+	const release = await acquireFileLock(file, { retries: 1, retryDelayMs: 1 });
+	await release();
+	expect(await fs.readdir(root)).toEqual([]);
+});
+
 test("aborts a transient publication retry before another publish attempt", async () => {
 	const { root, file } = await makeFixture();
 	const firstAttempt = Promise.withResolvers<void>();
