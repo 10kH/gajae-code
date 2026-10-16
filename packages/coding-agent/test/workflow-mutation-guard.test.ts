@@ -121,6 +121,43 @@ function parseStateCommandJson(stdout: string | undefined): Record<string, unkno
 	return JSON.parse(stdout) as Record<string, unknown>;
 }
 
+function makeSeededRandom(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+		return state / 0x1_0000_0000;
+	};
+}
+
+function seededToken(random: () => number, length: number): string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+	let value = "";
+	for (let index = 0; index < length; index++) {
+		value += alphabet[Math.floor(random() * alphabet.length)] ?? "a";
+	}
+	return value;
+}
+
+function quoteBashSingle(value: string): string {
+	return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function quoteBashDouble(value: string): string {
+	return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("$", "\\$").replaceAll("`", "\\`")}"`;
+}
+
+function quoteBashAnsiC(value: string): string {
+	return `$'${value.replaceAll("\\", "\\\\").replaceAll("'", "\\'").replaceAll("\n", "\\n")}'`;
+}
+
+function quoteBashConcatenation(value: string, firstSplit: number, secondSplit: number): string {
+	return [
+		quoteBashSingle(value.slice(0, firstSplit)),
+		quoteBashDouble(value.slice(firstSplit, secondSplit)),
+		quoteBashAnsiC(value.slice(secondSplit)),
+	].join("");
+}
+
 const projectTmpdirProbe = path.join(import.meta.dir, "fixtures/workflow-mutation-tmpdir-probe.ts");
 
 async function runProjectTmpdirProbe(input: {
@@ -2557,6 +2594,118 @@ describe("bash scanner quoting model", () => {
 				args: { code },
 			});
 			expect(decision.blocked, code).toBe(false);
+		}
+	});
+
+	it("keeps generated write payloads blocked across equivalent shell quoting", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		const guardContext = await readWorkflowGuardContext(cwd, { sessionId: "session-a" });
+		const random = makeSeededRandom(0x6801);
+
+		for (let sample = 0; sample < 12; sample++) {
+			const target = `src/generated-${seededToken(random, 8)}.ts`;
+			const content = seededToken(random, 10);
+			const source = `open(${JSON.stringify(target)}, "w").write(${JSON.stringify(content)})`;
+			const firstSplit = 1 + Math.floor(random() * (source.length - 2));
+			const secondSplit = firstSplit + 1 + Math.floor(random() * (source.length - firstSplit - 1));
+			const operands = [
+				quoteBashSingle(source),
+				quoteBashDouble(source),
+				quoteBashAnsiC(source),
+				quoteBashConcatenation(source, firstSplit, secondSplit),
+			];
+			let expectedVerdict: { blocked: boolean; reason: string | undefined; targets: string[] } | undefined;
+
+			for (const operand of operands) {
+				const command = `python3 -c ${operand}`;
+				const decision = await getWorkflowMutationDecision({
+					cwd,
+					sessionId: "session-a",
+					guardContext,
+					tool: tool("bash"),
+					args: { command },
+				});
+				const verdict = {
+					blocked: decision.blocked,
+					reason: decision.reason,
+					targets: decision.targets,
+				};
+				expect(decision.blocked, command).toBe(true);
+				expect(decision.reason, command).toBe("unknown-target");
+				if (expectedVerdict) expect(verdict, command).toEqual(expectedVerdict);
+				else expectedVerdict = verdict;
+			}
+		}
+	});
+
+	it("preserves the merge-base opaque interpreter-write denylist floor", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		const guardContext = await readWorkflowGuardContext(cwd, { sessionId: "session-a" });
+		const random = makeSeededRandom(0x6801_2026);
+		// Exact BASH_OPAQUE_INTERPRETER_WRITE_RE from merge-base 3756eeec.
+		// Generated inputs below are real writes, not inert string-literal matches.
+		const mergeBaseOpaqueInterpreterWriteRe =
+			/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby)\b[^;&|\n]*(?:-c|-e)\b[^;&|\n]*(?:open\s*\(|writeFile(?:Sync)?\s*\(|\.write\s*\()/i;
+
+		for (let sample = 0; sample < 8; sample++) {
+			const target = `src/floor-${seededToken(random, 8)}.ts`;
+			const content = seededToken(random, 10);
+			const destination = JSON.stringify(target);
+			const data = JSON.stringify(content);
+			const scripts = [
+				{ interpreter: "python3 -c", source: `open(${destination}, "w").write(${data})` },
+				{ interpreter: "node -e", source: `require("fs").writeFileSync(${destination}, ${data})` },
+				{ interpreter: "ruby -e", source: `File.open(${destination}, "w").write(${data})` },
+			];
+
+			for (const { interpreter, source } of scripts) {
+				const operands = [quoteBashSingle(source), quoteBashDouble(source), quoteBashAnsiC(source)];
+				for (const operand of operands) {
+					const command = `${interpreter} ${operand}`;
+					expect(mergeBaseOpaqueInterpreterWriteRe.test(command), command).toBe(true);
+					const decision = await getWorkflowMutationDecision({
+						cwd,
+						sessionId: "session-a",
+						guardContext,
+						tool: tool("bash"),
+						args: { command },
+					});
+					expect(decision.blocked, command).toBe(true);
+				}
+			}
+		}
+	});
+
+	it("allows generated inert interpreter literals that resemble write APIs", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		const guardContext = await readWorkflowGuardContext(cwd, { sessionId: "session-a" });
+		const random = makeSeededRandom(0x1_6801_2026);
+		const apiSpellings = ["open(", "writeFileSync(", "appendFileSync(", "shutil.copy(", ".write("];
+
+		for (const api of apiSpellings) {
+			for (let sample = 0; sample < 6; sample++) {
+				const note = `${api} src/literal-${seededToken(random, 8)}.ts`;
+				for (const language of ["python", "node"] as const) {
+					const source =
+						language === "python" ? `print(${JSON.stringify(note)})` : `console.log(${JSON.stringify(note)})`;
+					const alternateSource = language === "python" ? `print('${note}')` : `console.log('${note}')`;
+					const operands = [quoteBashSingle(source), quoteBashAnsiC(source), quoteBashDouble(alternateSource)];
+					for (const operand of operands) {
+						const command = `${language === "python" ? "python3 -c" : "node -e"} ${operand}`;
+						const decision = await getWorkflowMutationDecision({
+							cwd,
+							sessionId: "session-a",
+							guardContext,
+							tool: tool("bash"),
+							args: { command },
+						});
+						expect(decision.blocked, command).toBe(false);
+					}
+				}
+			}
 		}
 	});
 });
