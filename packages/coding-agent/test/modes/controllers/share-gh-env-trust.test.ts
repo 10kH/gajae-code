@@ -954,7 +954,7 @@ DYLD_ROOT_PATH=/project/root
 			GH_HOST: "ghe.example.com",
 			GH_CONFIG_DIR: path.resolve(launchRoot, "operator-config"),
 			GH_TOKEN: "operator-token",
-			XDG_CONFIG_HOME: "operator-xdg-config",
+			XDG_CONFIG_HOME: path.resolve(launchRoot, "operator-xdg-config"),
 			HOME: "operator-home",
 			USERPROFILE: "operator-profile",
 		});
@@ -975,6 +975,19 @@ DYLD_ROOT_PATH=/project/root
 
 		expectDestination(spawns, { GH_CONFIG_DIR: path.resolve(launchRoot, "relative/gh") });
 		for (const spawn of spawns) expect(spawn.cwd).toBe(path.parse(launchRoot).root);
+	});
+
+	it("anchors a preserved relative XDG config home to the launch root", async () => {
+		const spawns = await share({
+			autoload: true,
+			dotenv: "OTHER=1\n",
+			moveAway: true,
+			env: { XDG_CONFIG_HOME: "relative/xdg" },
+		});
+		const launchRoot = spawns[0]?.projectRoot;
+		if (!launchRoot) throw new Error("Share fixture did not record the launch root.");
+
+		expectDestination(spawns, { XDG_CONFIG_HOME: path.resolve(launchRoot, "relative/xdg") });
 	});
 
 	it("anchors relative operator certificate paths to the launch root", async () => {

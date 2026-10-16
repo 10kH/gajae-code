@@ -301,9 +301,11 @@ function ghShareChildEnv(trustedPath: string, env: NodeJS.ProcessEnv = process.e
 			}
 		}
 	}
-	const configDirKey = canonicalEnvKey("GH_CONFIG_DIR");
+	const ghConfigDirKey = canonicalEnvKey("GH_CONFIG_DIR");
+	const xdgConfigHomeKey = canonicalEnvKey("XDG_CONFIG_HOME");
 	for (const name of Object.keys(child)) {
-		if (canonicalEnvKey(name) !== configDirKey) continue;
+		const key = canonicalEnvKey(name);
+		if (key !== ghConfigDirKey && key !== xdgConfigHomeKey) continue;
 		const value = child[name];
 		if (typeof value !== "string" || value.length === 0 || path.isAbsolute(value)) continue;
 		// `gh` children use the filesystem root as cwd to avoid project Bun
