@@ -186,6 +186,49 @@ describe("session HTML export embed", () => {
 		}
 	});
 
+	it("redacts YAML block-scalar credentials in tool-call arguments", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-yaml-block-"));
+		let session: SessionManager | undefined;
+		try {
+			session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session.appendMessage({
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "call-yaml-block",
+						name: "echo",
+						arguments: {
+							config: [
+								"password: | # retained YAML header",
+								"  opaque-html-yaml-secret-123",
+								"",
+								"  opaque-html-yaml-second-secret",
+								"note=keep",
+							].join("\n"),
+						},
+					},
+				],
+				timestamp: 1,
+			} as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+			const outputPath = path.join(tempDir, "export.html");
+			await exportSessionToHtml(session, undefined, { outputPath });
+			const embedded = embeddedSessionText(await Bun.file(outputPath).text());
+			const parsed = JSON.parse(embedded) as {
+				entries: Array<{ message?: { content?: Array<{ arguments?: { config?: string } }> } }>;
+			};
+			const config = parsed.entries[0]?.message?.content?.[0]?.arguments?.config;
+			expect(config).not.toContain("opaque-html-yaml-secret-123");
+			expect(config).not.toContain("opaque-html-yaml-second-secret");
+			expect(config).toContain("password: | # retained YAML header");
+			expect(config).toContain("note=keep");
+			expect(config).toContain("  «redacted»\n\n  «redacted»\nnote=keep");
+		} finally {
+			await session?.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("redacts credentials in tuple, flat, and name-value header records", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-header-tuples-"));
 		let session: SessionManager | undefined;

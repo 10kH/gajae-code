@@ -167,6 +167,80 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("password=«redacted» token=«redacted» note=keep");
 	});
 
+	it("redacts indented YAML credential block scalars before persisting", () => {
+		const target = tempCrashLog();
+		const message = [
+			"password: | # literal header stays",
+			"  opaque-literal-secret-123",
+			"    opaque-literal-second-line-secret",
+			"",
+			"  opaque-literal-after-blank-secret",
+			"note=keep",
+			"password: |-",
+			"  opaque-stripped-literal-secret",
+			"note=keep",
+			"password: |+",
+			"  opaque-kept-literal-secret",
+			"note=keep",
+			"password: >-",
+			"  opaque-folded-secret-456",
+			"",
+			"  opaque-folded-after-blank-secret",
+			"note=keep",
+			"password: >",
+			"  opaque-plain-folded-secret",
+			"note=keep",
+			"password: |2- # indentation indicator",
+			"    opaque-indicated-literal-secret",
+			"note=keep",
+			"password: >-2",
+			"    opaque-reversed-indicated-folded-secret",
+			"note=keep",
+			"password: >+2",
+			"    opaque-indicated-folded-secret",
+			"note=keep",
+			'"password": |',
+			"  opaque-double-quoted-key-secret",
+			"note=keep",
+			"'api_key': >-",
+			"  opaque-single-quoted-key-secret",
+			"note=keep",
+		].join("\n");
+
+		recordFatalCrash("Uncaught Exception", message, { path: target });
+
+		const contents = fs.readFileSync(target, "utf8");
+		for (const secret of [
+			"opaque-literal-secret-123",
+			"opaque-literal-second-line-secret",
+			"opaque-literal-after-blank-secret",
+			"opaque-stripped-literal-secret",
+			"opaque-kept-literal-secret",
+			"opaque-folded-secret-456",
+			"opaque-folded-after-blank-secret",
+			"opaque-plain-folded-secret",
+			"opaque-indicated-literal-secret",
+			"opaque-reversed-indicated-folded-secret",
+			"opaque-indicated-folded-secret",
+			"opaque-double-quoted-key-secret",
+			"opaque-single-quoted-key-secret",
+		]) {
+			expect(contents).not.toContain(secret);
+		}
+		expect(contents).toContain("password: | # literal header stays");
+		expect(contents).toContain("password: |-");
+		expect(contents).toContain("password: |+");
+		expect(contents).toContain("password: >-");
+		expect(contents).toContain("password: >");
+		expect(contents).toContain("password: |2- # indentation indicator");
+		expect(contents).toContain("password: >-2");
+		expect(contents).toContain("password: >+2");
+		expect(contents).toContain('"password": |');
+		expect(contents).toContain("'api_key': >-");
+		expect(contents).toContain("  «redacted»\n    «redacted»\n\n  «redacted»\nnote=keep");
+		expect(contents).toContain("note=keep");
+	});
+
 	it("redacts current vendor token formats, not just the legacy prefixes", () => {
 		const target = tempCrashLog();
 		// GitHub fine-grained PATs use `github_pat_`, not the classic `gh[opsur]_`.

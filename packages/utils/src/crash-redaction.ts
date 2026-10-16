@@ -78,6 +78,83 @@ const CREDENTIAL_CAMEL_ESCAPED_BACKTICK_UNCLOSED_PATTERN = new RegExp(
 );
 const COOKIE_VALUE_PATTERN =
 	/(?:(?<![A-Za-z0-9_-])|(?<=\\n))((?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?cookies?\s*[:=]\s*)((?:(?!\\+n|\\+r\\+n)[^\r\n])*)/gi;
+// Cap key inspection; YAML permits the chomping and indentation indicators in either order.
+const YAML_BLOCK_SCALAR_HEADER_PATTERN =
+	/^([ \t]*)(?:"([^"\r\n]{1,128})"|'([^'\r\n]{1,128})'|([A-Za-z0-9][A-Za-z0-9_. \t-]{0,127}?))[ \t]*:[ \t]*([|>](?:[1-9][+-]?|[+-][1-9]?)?)(?:[ \t]+#.*|[ \t]*)$/;
+
+type YamlBlockScalarHeader = { indentation: number };
+
+function parseCredentialYamlBlockScalarHeader(line: string): YamlBlockScalarHeader | undefined {
+	const match = YAML_BLOCK_SCALAR_HEADER_PATTERN.exec(line);
+	const key = (match?.[2] ?? match?.[3] ?? match?.[4] ?? "").trim();
+	if (match === null || !isCredentialKey(key)) return undefined;
+	return { indentation: (match[1] ?? "").length };
+}
+
+function lineBounds(text: string, start: number): { contentEnd: number; nextLineStart: number } {
+	const newline = text.indexOf("\n", start);
+	const nextLineStart = newline < 0 ? text.length : newline + 1;
+	let contentEnd = newline < 0 ? text.length : newline;
+	if (newline > start && text[newline - 1] === "\r") contentEnd--;
+	return { contentEnd, nextLineStart };
+}
+
+function redactYamlBlockScalars(text: string): string {
+	const output: string[] = [];
+	let copiedUntil = 0;
+	let lineStart = 0;
+
+	while (lineStart < text.length) {
+		const { contentEnd, nextLineStart } = lineBounds(text, lineStart);
+		const header = parseCredentialYamlBlockScalarHeader(text.slice(lineStart, contentEnd));
+		if (header === undefined) {
+			lineStart = nextLineStart;
+			continue;
+		}
+
+		output.push(text.slice(copiedUntil, nextLineStart));
+		let bodyLineStart = nextLineStart;
+		let copiedBodyUntil = bodyLineStart;
+		while (bodyLineStart < text.length) {
+			const bodyLine = lineBounds(text, bodyLineStart);
+			let indentation = 0;
+			while (
+				bodyLineStart + indentation < bodyLine.contentEnd &&
+				(text[bodyLineStart + indentation] === " " || text[bodyLineStart + indentation] === "\t")
+			) {
+				indentation++;
+			}
+
+			if (bodyLineStart + indentation === bodyLine.contentEnd) {
+				bodyLineStart = bodyLine.nextLineStart;
+				continue;
+			}
+			if (indentation <= header.indentation) break;
+
+			output.push(text.slice(copiedBodyUntil, bodyLineStart));
+			let bodyTextEnd = bodyLine.contentEnd;
+			while (
+				bodyTextEnd > bodyLineStart + indentation &&
+				(text[bodyTextEnd - 1] === " " || text[bodyTextEnd - 1] === "\t")
+			) {
+				bodyTextEnd--;
+			}
+			output.push(
+				text.slice(bodyLineStart, bodyLineStart + indentation),
+				"«redacted»",
+				text.slice(bodyTextEnd, bodyLine.nextLineStart),
+			);
+			copiedBodyUntil = bodyLine.nextLineStart;
+			bodyLineStart = bodyLine.nextLineStart;
+		}
+
+		output.push(text.slice(copiedBodyUntil, bodyLineStart));
+		copiedUntil = bodyLineStart;
+		lineStart = bodyLineStart;
+	}
+
+	return copiedUntil === 0 ? text : output.join("") + text.slice(copiedUntil);
+}
 
 function isCookieFieldWhitespace(character: string | undefined): boolean {
 	return character === " " || character === "\t";
@@ -147,6 +224,8 @@ export function isCredentialKey(key: string): boolean {
  */
 export function redactCrashSecrets(text: string): string {
 	let redacted = redactCredentialContainers(text);
+	// Block scalar bodies span lines and must be masked before line-bounded rules handle the header.
+	redacted = redactYamlBlockScalars(redacted);
 	redacted = redacted.replace(
 		/(?<![A-Za-z0-9_-])(?:Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi,
 		"«redacted-auth»",
@@ -204,14 +283,14 @@ export function redactCrashSecrets(text: string): string {
 	// Cookie values may contain semicolon- or comma-separated pairs. Preserve a later,
 	// whitespace-separated diagnostic assignment so the narrower rules can scrub
 	// it independently without losing useful context after the cookie.
-	redacted = redacted.replace(
-		COOKIE_VALUE_PATTERN,
-		(_match, prefix: string, value: string) => `${prefix}«redacted»${cookieDiagnosticSuffix(value)}`,
+	redacted = redacted.replace(COOKIE_VALUE_PATTERN, (_match: string, prefix: string, value: string) =>
+		parseCredentialYamlBlockScalarHeader(_match) === undefined
+			? `${prefix}«redacted»${cookieDiagnosticSuffix(value)}`
+			: _match,
 	);
 	redacted = redacted.replace(CREDENTIAL_AUTH_VALUE_PATTERN, (_match, prefix: string) => `${prefix}«redacted»`);
-	redacted = redacted.replace(
-		CREDENTIAL_AUTHORIZATION_VALUE_PATTERN,
-		(_match, prefix: string) => `${prefix}«redacted»`,
+	redacted = redacted.replace(CREDENTIAL_AUTHORIZATION_VALUE_PATTERN, (_match: string, prefix: string) =>
+		parseCredentialYamlBlockScalarHeader(_match) === undefined ? `${prefix}«redacted»` : _match,
 	);
 	// Escaped delimiters support JSON nested in diagnostic strings. Quoted scalar
 	// values stay within one physical line; closed values also require a field
@@ -275,6 +354,7 @@ function redactCredentialValue(
 	unclosedBacktickOpen: string | undefined,
 	unclosedBacktickQuoted: string | undefined,
 ): string {
+	if (parseCredentialYamlBlockScalarHeader(_match) !== undefined) return _match;
 	if (escapedDoubleQuoted !== undefined && escapedDoubleOpen !== undefined && escapedDoubleClose !== undefined) {
 		return `${prefix}${escapedDoubleOpen}«redacted»${escapedDoubleClose}`;
 	}
