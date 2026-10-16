@@ -27,6 +27,14 @@ const CLR_PROFILER_ENV_KEYS = [
 	"DOTNET_PROFILER_PATH_ARM64",
 ] as const;
 type ClrProfilerEnvironmentKey = (typeof CLR_PROFILER_ENV_KEYS)[number];
+const DOTNET_ROOT_ENV_KEYS = [
+	"DOTNET_ROOT",
+	"DOTNET_ROOT_X86",
+	"DOTNET_ROOT_X64",
+	"DOTNET_ROOT_ARM",
+	"DOTNET_ROOT_ARM64",
+] as const;
+type DotnetRootEnvironmentKey = (typeof DOTNET_ROOT_ENV_KEYS)[number];
 const LUA_INIT_VERSIONED_ENV_KEYS = [
 	"LUA_INIT_5_1",
 	"LUA_INIT_5_2",
@@ -57,6 +65,7 @@ const TRUST_KEYS = [
 	"PYTHONSTARTUP",
 	"JULIA_DEPOT_PATH",
 	"TCL_LIBRARY",
+	"TCLLIBPATH",
 	"LUA_INIT",
 	...LUA_INIT_VERSIONED_ENV_KEYS,
 	"R_ENVIRON",
@@ -68,6 +77,7 @@ const TRUST_KEYS = [
 	"ERL_FLAGS",
 	"ERL_ZFLAGS",
 	"BUNDLER_SETUP",
+	"BUNDLE_GEMFILE",
 	"GEM_HOME",
 	"GEM_PATH",
 	"RUBYGEMS_GEMDEPS",
@@ -76,6 +86,7 @@ const TRUST_KEYS = [
 	"PERL5OPT",
 	"PERL5LIB",
 	"PERLLIB",
+	"JAVA_HOME",
 	"JAVA_TOOL_OPTIONS",
 	"JDK_JAVA_OPTIONS",
 	"_JAVA_OPTIONS",
@@ -83,6 +94,7 @@ const TRUST_KEYS = [
 	"PHPRC",
 	"PHP_INI_SCAN_DIR",
 	"DOTNET_STARTUP_HOOKS",
+	...DOTNET_ROOT_ENV_KEYS,
 	...CLR_PROFILER_ENV_KEYS,
 	"PATH",
 	"HTTP_PROXY",
@@ -163,6 +175,7 @@ interface GhSpawn {
 	OPENSSL_CONF_INCLUDE: string | null;
 	OPENSSL_MODULES: string | null;
 	OPENSSL_ENGINES: string | null;
+	dotnetRootEnvironment: Record<DotnetRootEnvironmentKey, string | null>;
 	profilerEnvironment: Record<ClrProfilerEnvironmentKey, string | null>;
 	GH_HOST: string | null;
 	GH_CONFIG_DIR: string | null;
@@ -277,6 +290,9 @@ await fsPromises.appendFile(
 		OPENSSL_CONF_INCLUDE: process.env.OPENSSL_CONF_INCLUDE ?? null,
 		OPENSSL_MODULES: process.env.OPENSSL_MODULES ?? null,
 		OPENSSL_ENGINES: process.env.OPENSSL_ENGINES ?? null,
+		dotnetRootEnvironment: Object.fromEntries(
+			${JSON.stringify(DOTNET_ROOT_ENV_KEYS)}.map(name => [name, process.env[name] ?? null]),
+		),
 		profilerEnvironment: Object.fromEntries(
 			${JSON.stringify(CLR_PROFILER_ENV_KEYS)}.map(name => [name, process.env[name] ?? null]),
 		),
@@ -518,6 +534,7 @@ function expectDestination(
 		>
 	> & {
 		luaInitVersionedEnvironment?: Partial<GhSpawn["luaInitVersionedEnvironment"]>;
+		dotnetRootEnvironment?: Partial<GhSpawn["dotnetRootEnvironment"]>;
 		profilerEnvironment?: Partial<GhSpawn["profilerEnvironment"]>;
 	},
 	allowPathsInsideLaunchDirectory = false,
@@ -595,6 +612,8 @@ function expectDestination(
 		expect(spawn.OPENSSL_CONF_INCLUDE).toBe(expected.OPENSSL_CONF_INCLUDE ?? null);
 		expect(spawn.OPENSSL_MODULES).toBe(expected.OPENSSL_MODULES ?? null);
 		expect(spawn.OPENSSL_ENGINES).toBe(expected.OPENSSL_ENGINES ?? null);
+		for (const name of DOTNET_ROOT_ENV_KEYS)
+			expect(spawn.dotnetRootEnvironment[name]).toBe(expected.dotnetRootEnvironment?.[name] ?? null);
 		for (const name of CLR_PROFILER_ENV_KEYS)
 			expect(spawn.profilerEnvironment[name]).toBe(expected.profilerEnvironment?.[name] ?? null);
 		expect(spawn.HTTP_PROXY).toBe(expected.HTTP_PROXY ?? null);
@@ -708,6 +727,11 @@ CLASSPATH=/project/classes
 PHPRC=/project/php.ini
 PHP_INI_SCAN_DIR=/project/php-conf.d
 DOTNET_STARTUP_HOOKS=/project/dotnet-startup.dll
+DOTNET_ROOT=/project/dotnet-root
+DOTNET_ROOT_X86=/project/dotnet-root-x86
+DOTNET_ROOT_X64=/project/dotnet-root-x64
+DOTNET_ROOT_ARM=/project/dotnet-root-arm
+DOTNET_ROOT_ARM64=/project/dotnet-root-arm64
 CORECLR_ENABLE_PROFILING=1
 DOTNET_ENABLE_PROFILING=1
 CORECLR_PROFILER={12345678-1234-1234-1234-123456789012}
@@ -777,6 +801,9 @@ OPENSSL_ENGINES=/project/openssl-engines
 
 	it("preserves operator-declared runtime settings", async () => {
 		const luaInitVersionedEnvironment = { LUA_INIT_5_4: "@/operator/lua-init-5.4.lua" };
+		const dotnetRootEnvironment = Object.fromEntries(
+			DOTNET_ROOT_ENV_KEYS.map(name => [name, `/operator/${name.toLowerCase()}`]),
+		) as Record<DotnetRootEnvironmentKey, string>;
 		const profilerEnvironment = Object.fromEntries(
 			CLR_PROFILER_ENV_KEYS.map(name => [name, `operator-${name.toLowerCase()}`]),
 		) as Record<ClrProfilerEnvironmentKey, string>;
@@ -822,6 +849,7 @@ OPENSSL_ENGINES=/project/openssl-engines
 				OPENSSL_CONF_INCLUDE: "/operator/openssl-conf-include",
 				OPENSSL_MODULES: "/operator/openssl-modules",
 				OPENSSL_ENGINES: "/operator/openssl-engines",
+				...dotnetRootEnvironment,
 				...profilerEnvironment,
 			},
 		});
@@ -866,6 +894,7 @@ OPENSSL_ENGINES=/project/openssl-engines
 			OPENSSL_CONF_INCLUDE: "/operator/openssl-conf-include",
 			OPENSSL_MODULES: "/operator/openssl-modules",
 			OPENSSL_ENGINES: "/operator/openssl-engines",
+			dotnetRootEnvironment,
 			profilerEnvironment,
 		});
 	});
