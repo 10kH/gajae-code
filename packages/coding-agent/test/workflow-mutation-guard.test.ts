@@ -2102,8 +2102,10 @@ describe("bash scanner quoting model", () => {
 		const blocked = [
 			"sed -n 'w src/product.ts' stage/pwn.txt",
 			"sed -e 'w src/product.ts' stage/pwn.txt",
+			"sed -n '/needle/w src/product.ts' input",
 			"sed -n 's/a/b/w src/product.ts' stage/pwn.txt",
 			`python3 -c "import shutil; shutil.copy('stage/pwn.txt','src/product.ts')"`,
+			`python3 -c $'open("src/product.ts","w").write("PWNED")'`,
 			`python3 -c "import os; os.system('printf PWNED > src/product.ts')"`,
 			`python3 -c "import os; os.system(command)"`,
 			`node -e "require('fs').appendFileSync('src/product.ts','x')"`,
@@ -2150,6 +2152,7 @@ describe("bash scanner quoting model", () => {
 
 		for (const command of [
 			"sed -n '1p' src/product.ts",
+			"sed -n '/needle/p' 'w src/product.ts'",
 			"sed -n '1p' 'w src/product.ts'",
 			"sed -e '1p' 'w src/product.ts'",
 			"sed -n '1,80p' packages/coding-agent/src/skill-state/workflow-mutation-guard.ts",
@@ -2161,6 +2164,7 @@ describe("bash scanner quoting model", () => {
 			`awk -v x=1 'BEGIN { print x }' input`,
 			`if awk '$1 > "m" { print }' input; then :; fi`,
 			`python3 -c "import os; os.system('ls')"`,
+			`python3 -c $'print("open(")'`,
 			`python3 -c "print('shutil.copy(')"`,
 			`python3 -c "print(1) # shutil.copy('stage/pwn.txt','src/product.ts')"`,
 			`python3 -c "print(1)"`,

@@ -1604,6 +1604,59 @@ function sedWriteName(script: string, index: number): { path: string | null; nex
 	return { path: cursor > start ? script.slice(start, cursor) : null, next: cursor };
 }
 
+function sedAddressEnd(script: string, start: number): number | undefined {
+	if (script[start] === "/") {
+		let cursor = start + 1;
+		while (cursor < script.length) {
+			if (script[cursor] === "\\") {
+				cursor += 2;
+				continue;
+			}
+			if (script[cursor] === "/") return cursor + 1;
+			cursor++;
+		}
+		return undefined;
+	}
+	if (script[start] === "$") return start + 1;
+	if (!/\d/.test(script[start] ?? "")) return undefined;
+	let cursor = start + 1;
+	while (/\d/.test(script[cursor] ?? "")) cursor++;
+	if (script[cursor] === "~") {
+		cursor++;
+		while (/\d/.test(script[cursor] ?? "")) cursor++;
+	}
+	return cursor;
+}
+
+function sedAddressWithModifiersEnd(script: string, start: number): number | undefined {
+	let cursor = sedAddressEnd(script, start);
+	if (cursor === undefined) return undefined;
+	if (script[start] === "/") {
+		while (script[cursor] === "I" || script[cursor] === "M") cursor++;
+	}
+	return cursor;
+}
+
+function sedRegexAddressWritePath(script: string, start: number): string | null | undefined {
+	let cursor = sedAddressWithModifiersEnd(script, start);
+	if (cursor === undefined) return undefined;
+	while (script[cursor] === " " || script[cursor] === "\t") cursor++;
+	if (script[cursor] === ",") {
+		cursor++;
+		while (script[cursor] === " " || script[cursor] === "\t") cursor++;
+		const rangeEnd = sedAddressWithModifiersEnd(script, cursor);
+		if (rangeEnd === undefined) return undefined;
+		cursor = rangeEnd;
+		while (script[cursor] === " " || script[cursor] === "\t") cursor++;
+	}
+	if (script[cursor] === "!") cursor++;
+	while (script[cursor] === " " || script[cursor] === "\t") cursor++;
+	if ((script[cursor] !== "w" && script[cursor] !== "W") || !" \t;\n}".includes(script[cursor + 1] ?? "\n")) {
+		return undefined;
+	}
+	return sedWriteName(script, cursor + 1).path;
+}
+
 /**
  * Filename a sed script writes with the `w`/`W` command or an `s///w file` flag.
  * `undefined` means this text does not write. `null` means it writes without a
@@ -1616,6 +1669,10 @@ function sedScriptWritePath(script: string): string | null | undefined {
 		if (" \t\n;{}".includes(character)) {
 			index++;
 			continue;
+		}
+		if (character === "/" && sedCommandPosition(script, index)) {
+			const writePath = sedRegexAddressWritePath(script, index);
+			if (writePath !== undefined) return writePath;
 		}
 		if ((character === "w" || character === "W") && sedCommandPosition(script, index)) {
 			const next = script[index + 1];
@@ -1817,18 +1874,120 @@ function collectPythonSystemWrites(script: string, targets: ExtractedTargets, de
 	}
 }
 
+function cleanInterpreterCodeWord(word: string): string | undefined {
+	if (!word.startsWith("$'")) {
+		const fullyQuoted = (/^'[^']*'$/.test(word) || /^"(?:\\.|[^"\\])*"$/.test(word)) && word.length >= 2;
+		if (word.includes("$'") && !fullyQuoted) return undefined;
+		return cleanShellWord(word);
+	}
+	if (word.length < 3 || !word.endsWith("'")) return undefined;
+
+	let decoded = "";
+	for (let index = 2; index < word.length - 1; index++) {
+		const character = word[index] ?? "";
+		if (character !== "\\") {
+			if (character === "'") return undefined;
+			decoded += character;
+			continue;
+		}
+		const escapeCode = word[++index];
+		if (escapeCode === undefined) return undefined;
+		switch (escapeCode) {
+			case "a":
+				decoded += "\x07";
+				break;
+			case "b":
+				decoded += "\b";
+				break;
+			case "e":
+			case "E":
+				decoded += "\x1b";
+				break;
+			case "f":
+				decoded += "\f";
+				break;
+			case "n":
+				decoded += "\n";
+				break;
+			case "r":
+				decoded += "\r";
+				break;
+			case "t":
+				decoded += "\t";
+				break;
+			case "v":
+				decoded += "\v";
+				break;
+			case "\\":
+			case "'":
+			case '"':
+			case "?":
+				decoded += escapeCode;
+				break;
+			case "c": {
+				const control = word[++index];
+				if (control === undefined || control.charCodeAt(0) > 0x7f) return undefined;
+				const code = control === "?" ? 0x7f : control.toUpperCase().charCodeAt(0) & 0x1f;
+				if (code === 0) return undefined;
+				decoded += String.fromCharCode(code);
+				break;
+			}
+			case "x": {
+				let digits = "";
+				while (digits.length < 2 && /[\da-f]/i.test(word[index + 1] ?? "")) {
+					digits += word[++index];
+				}
+				if (!digits) return undefined;
+				const code = Number.parseInt(digits, 16);
+				if (code === 0) return undefined;
+				decoded += String.fromCharCode(code);
+				break;
+			}
+			case "u":
+			case "U": {
+				const width = escapeCode === "u" ? 4 : 8;
+				const digits = word.slice(index + 1, index + 1 + width);
+				if (digits.length !== width || !new RegExp(`^[\\da-f]{${width}}$`, "i").test(digits)) return undefined;
+				const code = Number.parseInt(digits, 16);
+				if (code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return undefined;
+				decoded += String.fromCodePoint(code);
+				index += width;
+				break;
+			}
+			default: {
+				if (!/[0-7]/.test(escapeCode)) return undefined;
+				let digits = escapeCode;
+				while (digits.length < 3 && /[0-7]/.test(word[index + 1] ?? "")) {
+					digits += word[++index];
+				}
+				const code = Number.parseInt(digits, 8);
+				if (code === 0 || code > 0xff) return undefined;
+				decoded += String.fromCharCode(code);
+				break;
+			}
+		}
+	}
+	return decoded;
+}
+
 function collectInterpreterOneLinerWrites(command: string, targets: ExtractedTargets, depth: number): void {
 	const api = new RegExp(BASH_INTERPRETER_WRITE_API, "i");
 	const names = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby|perl)\b/gi;
 	for (const match of command.matchAll(names)) {
 		const start = (match.index ?? 0) + match[0].length;
 		const tail = command.slice(start, interpreterStatementEnd(command, start));
-		const parts = shellWords(tail).map(cleanShellWord);
+		const words = shellWords(tail);
+		const parts = words.map(cleanShellWord);
 		const isPython = /\bpython3?\b/i.test(match[0] ?? "");
 		for (let index = 0; index < parts.length; index++) {
 			const part = parts[index] ?? "";
 			if (part !== "-c" && part !== "-e") continue;
-			const script = parts[index + 1] ?? "";
+			const script = cleanInterpreterCodeWord(words[index + 1] ?? "");
+			if (script === undefined) {
+				targets.explicitMutation = true;
+				targets.unknown = true;
+				return;
+			}
 			const commandName = match[0] ?? "";
 			const language = isPython
 				? "py"
