@@ -110,6 +110,11 @@ const BASH_IN_PLACE_MUTATION_COMMAND_RE = new RegExp(
  */
 const BASH_INTERPRETER_WRITE_API =
 	"(?:open\\s*\\(|writeFile(?:Sync)?\\s*\\(|appendFile(?:Sync)?\\s*\\(|\\.write\\s*\\(|shutil\\s*\\.\\s*(?:copy2?|copyfileobj|copyfile)\\s*\\(|os\\s*\\.\\s*symlink\\s*\\()";
+/** Source-evaluation and dynamic-import names make Python payloads opaque to this static scanner. */
+const PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE =
+	/^(?:exec|eval|compile|execfile|__import__|exec_module|import_module|run_path|run_module)\b/;
+const PYTHON_DYNAMIC_EXECUTION_TOKEN_RE =
+	/\b(?:exec|eval|compile|execfile|__import__|exec_module|import_module|run_path|run_module)\b/;
 const BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE = new RegExp(
 	`(?:^|[;&|\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?(?:python3?|node|ruby|perl)\\b[^;&|\\n]*(?:<<[-]?\\s*['"]?\\w+['"]?)[\\s\\S]*${BASH_INTERPRETER_WRITE_API}`,
 	"i",
@@ -1591,14 +1596,7 @@ function sedWriteName(script: string, index: number): { path: string | null; nex
 	let cursor = index;
 	while (cursor < script.length && (script[cursor] === " " || script[cursor] === "\t")) cursor++;
 	const start = cursor;
-	while (
-		cursor < script.length &&
-		script[cursor] !== " " &&
-		script[cursor] !== "\t" &&
-		script[cursor] !== ";" &&
-		script[cursor] !== "\n" &&
-		script[cursor] !== "}"
-	) {
+	while (cursor < script.length && script[cursor] !== ";" && script[cursor] !== "\n" && script[cursor] !== "}") {
 		cursor++;
 	}
 	return { path: cursor > start ? script.slice(start, cursor) : null, next: cursor };
@@ -1637,7 +1635,7 @@ function sedAddressWithModifiersEnd(script: string, start: number): number | und
 	return cursor;
 }
 
-function sedRegexAddressWritePath(script: string, start: number): string | null | undefined {
+function sedRegexAddressWritePath(script: string, start: number): { path: string | null; next: number } | undefined {
 	let cursor = sedAddressWithModifiersEnd(script, start);
 	if (cursor === undefined) return undefined;
 	while (script[cursor] === " " || script[cursor] === "\t") cursor++;
@@ -1654,7 +1652,7 @@ function sedRegexAddressWritePath(script: string, start: number): string | null 
 	if ((script[cursor] !== "w" && script[cursor] !== "W") || !" \t;\n}".includes(script[cursor + 1] ?? "\n")) {
 		return undefined;
 	}
-	return sedWriteName(script, cursor + 1).path;
+	return sedWriteName(script, cursor + 1);
 }
 
 /**
@@ -1664,6 +1662,8 @@ function sedRegexAddressWritePath(script: string, start: number): string | null 
  */
 function sedScriptWritePath(script: string): string | null | undefined {
 	let index = 0;
+	let foundWrite = false;
+	let foundPath: string | null | undefined;
 	while (index < script.length) {
 		const character = script[index] ?? "";
 		if (" \t\n;{}".includes(character)) {
@@ -1671,14 +1671,22 @@ function sedScriptWritePath(script: string): string | null | undefined {
 			continue;
 		}
 		if (character === "/" && sedCommandPosition(script, index)) {
-			const writePath = sedRegexAddressWritePath(script, index);
-			if (writePath !== undefined) return writePath;
+			const written = sedRegexAddressWritePath(script, index);
+			if (written) {
+				if (foundWrite) return null;
+				foundWrite = true;
+				foundPath = written.path;
+				index = Math.max(written.next, index + 1);
+				continue;
+			}
 		}
 		if ((character === "w" || character === "W") && sedCommandPosition(script, index)) {
 			const next = script[index + 1];
 			if (next === undefined || " \t;\n}".includes(next)) {
 				const taken = sedWriteName(script, index + 1);
-				if (taken.path) return taken.path;
+				if (foundWrite) return null;
+				foundWrite = true;
+				foundPath = taken.path;
 				index = Math.max(taken.next, index + 1);
 				continue;
 			}
@@ -1701,7 +1709,12 @@ function sedScriptWritePath(script: string): string | null | undefined {
 						(script[index] === "w" || script[index] === "W") &&
 						(script[index + 1] === " " || script[index + 1] === "\t")
 					) {
-						return sedWriteName(script, index + 1).path;
+						const taken = sedWriteName(script, index + 1);
+						if (foundWrite) return null;
+						foundWrite = true;
+						foundPath = taken.path;
+						index = Math.max(taken.next, index + 1);
+						break;
 					}
 					index++;
 				}
@@ -1710,7 +1723,7 @@ function sedScriptWritePath(script: string): string | null | undefined {
 		}
 		index++;
 	}
-	return undefined;
+	return foundWrite ? foundPath : undefined;
 }
 
 /**
@@ -1981,8 +1994,16 @@ function collectInterpreterOneLinerWrites(command: string, targets: ExtractedTar
 		const isPython = /\bpython3?\b/i.test(match[0] ?? "");
 		for (let index = 0; index < parts.length; index++) {
 			const part = parts[index] ?? "";
-			if (part !== "-c" && part !== "-e") continue;
-			const script = cleanInterpreterCodeWord(words[index + 1] ?? "");
+			let rawScript: string | undefined;
+			if (part === "-c" || part === "-e") {
+				rawScript = words[++index];
+			} else {
+				const attached = /^-[ce](.+)$/.exec(part);
+				if (!attached || (isPython ? attached[0]?.[1] !== "c" : attached[0]?.[1] !== "e")) continue;
+				const rawWord = words[index] ?? "";
+				rawScript = rawWord.startsWith("-") ? rawWord.slice(2) : (attached[1] ?? "");
+			}
+			const script = cleanInterpreterCodeWord(rawScript ?? "");
 			if (script === undefined) {
 				targets.explicitMutation = true;
 				targets.unknown = true;
@@ -2026,7 +2047,11 @@ function interpreterCodeContainsWriteApi(
 					(language === "py" &&
 						/(?:^|[^\w])(?:[rR]?[fF]|[fF][rR])$/.test(script.slice(Math.max(0, index - 3), index)) &&
 						skipped.includes("{"));
-				if (isInterpolated && api.test(skipped)) return true;
+				if (
+					isInterpolated &&
+					(api.test(skipped) || (language === "py" && PYTHON_DYNAMIC_EXECUTION_TOKEN_RE.test(skipped)))
+				)
+					return true;
 				index = next;
 				continue;
 			}
@@ -2040,6 +2065,7 @@ function interpreterCodeContainsWriteApi(
 				continue;
 			}
 		}
+		if (language === "py" && PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))) return true;
 		if (apiAtStart.test(script.slice(index))) return true;
 		index += 1;
 	}
@@ -2453,7 +2479,8 @@ function awkPrograms(words: string[]): { programs: AwkProgramSource[]; unknown: 
 			continue;
 		}
 		if (part === "-W") {
-			if (operand(index) !== "version") {
+			const extension = operand(index);
+			if (extension !== "version" && extension !== "lint") {
 				unknown = true;
 				break;
 			}
@@ -2461,7 +2488,8 @@ function awkPrograms(words: string[]): { programs: AwkProgramSource[]; unknown: 
 			continue;
 		}
 		if (part.startsWith("-W")) {
-			if (part.slice(2) !== "version") {
+			const extension = part.slice(2);
+			if (extension !== "version" && extension !== "lint") {
 				unknown = true;
 				break;
 			}
@@ -2810,6 +2838,12 @@ function simpleLiteral(raw: string): string | null {
 	return /[\\\n${]/.test(body) || body.includes(quote) ? null : body;
 }
 
+function pythonFStringContainsDynamicExecution(code: string, start: number, end: number): boolean {
+	const source = code.slice(start, end);
+	const isFString = /(?:^|[^\w])(?:[rR]?[fF]|[fF][rR])$/.test(code.slice(Math.max(0, start - 3), start));
+	return isFString && source.includes("{") && PYTHON_DYNAMIC_EXECUTION_TOKEN_RE.test(source);
+}
+
 function skipNoise(code: string, index: number, language: "py" | "js"): number {
 	if (language === "py" && (code.startsWith('"""', index) || code.startsWith("'''", index))) {
 		const quote = code.slice(index, index + 3);
@@ -2985,6 +3019,11 @@ function scanInterpreterWrites(code: string, language: "py" | "js", targets: Ext
 	while (index < code.length) {
 		const trivia = skipNoise(code, index, language);
 		if (trivia !== index) {
+			if (language === "py" && pythonFStringContainsDynamicExecution(code, index, trivia)) {
+				targets.explicitMutation = true;
+				targets.unknown = true;
+				return;
+			}
 			index = trivia;
 			continue;
 		}
@@ -2999,6 +3038,11 @@ function scanInterpreterWrites(code: string, language: "py" | "js", targets: Ext
 			continue;
 		}
 		const name = ident[0];
+		if (language === "py" && PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(name)) {
+			targets.explicitMutation = true;
+			targets.unknown = true;
+			return;
+		}
 		if ((name === "write" || name === "append") && previous === ".") {
 			index += name.length;
 			continue;

@@ -1837,6 +1837,17 @@ describe("bash scanner quoting model", () => {
 			expect(decision.reason, `${name} ${JSON.stringify(args)}`).toBe("phase-boundary");
 			expect(decision.message).toBe(RALPLAN_MUTATION_BLOCK_MESSAGE);
 		}
+		for (const [name, args] of [
+			["python", { code: 'exec("open(\\"src/product.ts\\",\\"w\\").write(\\"x\\")")\n' }],
+			["python", { code: `value = f"{exec('open("src/product.ts","w").write("x")')}"\n` }],
+			["eval", { cells: [{ language: "py", code: '__import__("os").system("echo x > src/product.ts")\n' }] }],
+		] as const) {
+			const input = { cwd, sessionId: "session-a", tool: tool(name), args };
+			await expect(assertWorkflowMutationAllowed(input)).rejects.toBeInstanceOf(ToolError);
+			const decision = await getWorkflowMutationDecision(input);
+			expect(decision.blocked, name).toBe(true);
+			expect(decision.reason, `${name} ${JSON.stringify(args)}`).toBe("unknown-target");
+		}
 	});
 
 	it("blocks eval and python product writes during an autoresearch mission", async () => {
@@ -2099,11 +2110,25 @@ describe("bash scanner quoting model", () => {
 		await writeActiveSkill(cwd, "ralplan", "planner");
 		const scratch = path.join(os.tmpdir(), `gjc-plan-bash-${process.pid}.txt`);
 		const escapedScratch = path.join(os.tmpdir(), `gjc-plan-escaped\\${process.pid}.txt`);
+		const unknownTargetCommands = new Set([
+			`python3 -c 'exec("open(\\"src/product.ts\\",\\"w\\").write(\\"PWNED\\")")'`,
+			`python3 -c 'eval("open(\\"src/product.ts\\",\\"w\\").write(\\"PWNED\\")")'`,
+			`python3 -c 'compile(source, "<string>", "exec")'`,
+			`python3 -c '__import__("os").system("echo PWNED > src/product.ts")'`,
+			`python3 -c 'import importlib; importlib.import_module("project_plugin")'`,
+			`python3 -c 'import runpy; runpy.run_path("src/payload.py")'`,
+			`python3 -c 'spec.loader.exec_module(module)'`,
+			`node -e"require('fs').appendFileSync('src/product.ts','x')"`,
+			`perl -e'open(F,">","src/product.ts"); print F "PWNED";'`,
+			`ruby -e'File.open("src/product.ts","w").write("PWNED")'`,
+		]);
 		const blocked = [
+			...unknownTargetCommands,
 			"sed -n 'w src/product.ts' stage/pwn.txt",
 			"sed -e 'w src/product.ts' stage/pwn.txt",
 			"sed -n '/needle/w src/product.ts' input",
 			"sed -n 's/a/b/w src/product.ts' stage/pwn.txt",
+			`sed -n 'w ${scratch};w src/product.ts' input`,
 			`python3 -c "import shutil; shutil.copy('stage/pwn.txt','src/product.ts')"`,
 			`python3 -c $'open("src/product.ts","w").write("PWNED")'`,
 			`python3 -c "import os; os.system('printf PWNED > src/product.ts')"`,
@@ -2126,6 +2151,7 @@ describe("bash scanner quoting model", () => {
 				args: { command },
 			});
 			expect(decision.blocked, command).toBe(true);
+			if (unknownTargetCommands.has(command)) expect(decision.reason, command).toBe("unknown-target");
 		}
 		const systemWrite = await getWorkflowMutationDecision({
 			cwd,
@@ -2160,11 +2186,13 @@ describe("bash scanner quoting model", () => {
 			"awk '$1 > 5 {print $1}' src/product.ts",
 			`awk '$1 > "m" { print }' input`,
 			"awk -W version",
+			"awk -W lint '$1 > 5 { print $1 }' input",
 			`awk 'BEGIN { print 1 # > "src/product.ts"\n}' input`,
 			`awk -v x=1 'BEGIN { print x }' input`,
 			`if awk '$1 > "m" { print }' input; then :; fi`,
 			`python3 -c "import os; os.system('ls')"`,
 			`python3 -c $'print("open(")'`,
+			`python3 -c "print('exec(\\"open(\\")')"`,
 			`python3 -c "print('shutil.copy(')"`,
 			`python3 -c "print(1) # shutil.copy('stage/pwn.txt','src/product.ts')"`,
 			`python3 -c "print(1)"`,
@@ -2172,6 +2200,7 @@ describe("bash scanner quoting model", () => {
 			`node -e "/* appendFileSync('src/product.ts','x') */ console.log(1)"`,
 			`node -e "console.log(1)"`,
 			`perl -e 'print 1'`,
+			`ruby -e'puts "open("'`,
 			"ls src/product.ts",
 			"readlink src/product.ts",
 			`ln -sf stage/pwn.txt ${scratch}`,
@@ -2202,6 +2231,22 @@ describe("bash scanner quoting model", () => {
 			args: { command: "ln -sf stage/pwn.txt src/product.ts" },
 		});
 		expect(outsidePlanning.blocked).toBe(false);
+	});
+
+	it("blocks sed writes whose destination contains spaces", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plan workspace-"));
+		tempRoots.push(cwd);
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		const destination = path.join(cwd, "src", "product.ts");
+		const decision = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("bash"),
+			args: { command: `sed -n 'w ${destination}' input` },
+		});
+
+		expect(decision.blocked).toBe(true);
+		expect(decision.targets).toContain(destination);
 	});
 
 	it("allows a multi-part temp Path write and a non-writing Path read", async () => {

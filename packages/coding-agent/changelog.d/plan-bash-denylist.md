@@ -1,3 +1,3 @@
 ### Fixed
 
-- Planning-phase bash now refuses sed `w` scripts, awk quoted redirections, `ln`, and interpreter writes such as `shutil.copy`, `os.system`, `os.symlink`, `appendFileSync`, and `perl` `open`. Read-only planning commands stay allowed.
+- Planning-phase bash now refuses sed `w` destinations with spaces, awk quoted redirections, `ln`, and interpreter writes including attached `-e` payloads and Python dynamic-evaluation/import forms. Read-only planning commands, including GNU awk `-W lint`, stay allowed.
