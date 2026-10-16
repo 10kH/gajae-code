@@ -932,14 +932,33 @@ DYLD_ROOT_PATH=/project/root
 				USERPROFILE: "operator-profile",
 			},
 		});
+		const launchRoot = spawns[0]?.projectRoot;
+		if (!launchRoot) throw new Error("Share fixture did not record the launch root.");
 		expectDestination(spawns, {
 			GH_HOST: "ghe.example.com",
-			GH_CONFIG_DIR: "operator-config",
+			GH_CONFIG_DIR: path.resolve(launchRoot, "operator-config"),
 			GH_TOKEN: "operator-token",
 			XDG_CONFIG_HOME: "operator-xdg-config",
 			HOME: "operator-home",
 			USERPROFILE: "operator-profile",
 		});
+	});
+
+	it("anchors a preserved relative gh config directory to the launch root", async () => {
+		const spawns = await share({
+			autoload: true,
+			dotenv: "OTHER=1\n",
+			moveAway: true,
+			env: {
+				GH_CONFIG_DIR: "relative/gh",
+				GJC_SHARE_EXPECT_CONFIG: "relative/gh",
+			},
+		});
+		const launchRoot = spawns[0]?.projectRoot;
+		if (!launchRoot) throw new Error("Share fixture did not record the launch root.");
+
+		expectDestination(spawns, { GH_CONFIG_DIR: path.resolve(launchRoot, "relative/gh") });
+		for (const spawn of spawns) expect(spawn.cwd).toBe(path.parse(launchRoot).root);
 	});
 
 	it("keeps operator proxy and CA values that differ from project declarations", async () => {
@@ -969,9 +988,11 @@ SSL_CERT_FILE=project-ca.pem
 				GJC_SHARE_EXPECT_CONFIG: "operator-config",
 			},
 		});
+		const launchRoot = spawns[0]?.projectRoot;
+		if (!launchRoot) throw new Error("Share fixture did not record the launch root.");
 		expectDestination(spawns, {
 			GH_HOST: "ghe.example.com",
-			GH_CONFIG_DIR: "operator-config",
+			GH_CONFIG_DIR: path.resolve(launchRoot, "operator-config"),
 			GH_TOKEN: "operator-token",
 		});
 	});

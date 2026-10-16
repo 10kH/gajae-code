@@ -299,6 +299,15 @@ function ghShareChildEnv(trustedPath: string, env: NodeJS.ProcessEnv = process.e
 			}
 		}
 	}
+	const configDirKey = canonicalEnvKey("GH_CONFIG_DIR");
+	for (const name of Object.keys(child)) {
+		if (canonicalEnvKey(name) !== configDirKey) continue;
+		const value = child[name];
+		if (typeof value !== "string" || value.length === 0 || path.isAbsolute(value)) continue;
+		// `gh` children use the filesystem root as cwd to avoid project Bun
+		// preloads, so retain the launch-directory meaning of relative config paths.
+		child[name] = path.resolve(ghShareLaunchRoot, value);
+	}
 	const pathKey = canonicalEnvKey("PATH");
 	for (const name of Object.keys(child)) {
 		if (canonicalEnvKey(name) === pathKey) delete child[name];
