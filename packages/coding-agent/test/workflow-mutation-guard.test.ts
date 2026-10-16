@@ -2103,12 +2103,13 @@ describe("bash scanner quoting model", () => {
 		}
 	});
 
-	it("blocks a multi-argument Path write and an unresolved Path receiver", async () => {
+	it("blocks Path writes and an unresolved Path receiver", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");
 		for (const code of [
 			'Path("src", "product.ts").write_text("x")\n',
 			'Path("src", "product.ts").write_bytes(b"x")\n',
+			'Path("src", "product.ts").touch()\n',
 		]) {
 			const input = { cwd, sessionId: "session-a", tool: tool("python"), args: { code } };
 			await expect(assertWorkflowMutationAllowed(input)).rejects.toBeInstanceOf(ToolError);
@@ -2160,8 +2161,7 @@ describe("bash scanner quoting model", () => {
 				name: "ANSI-C quoted Python write source",
 				command: `python3 -c $'open("src/product.ts","w").write("PWNED")'`,
 				blocked: true,
-				reason: "phase-boundary",
-				target: "src/product.ts",
+				reason: "unknown-target",
 			},
 			{
 				name: "Python exec-wrapped write source",
@@ -2325,6 +2325,13 @@ describe("bash scanner quoting model", () => {
 				target: "src/product.ts",
 			},
 			{
+				name: "sed write in a conditional command position",
+				command: "if sed -n 'w src/product.ts' <<<x; then :; fi",
+				blocked: true,
+				reason: "phase-boundary",
+				target: "src/product.ts",
+			},
+			{
 				name: "sed write after a semicolon in the quoted program",
 				command: "sed -n '1p;w src/product.ts' packages/coding-agent/package.json",
 				blocked: true,
@@ -2360,8 +2367,7 @@ describe("bash scanner quoting model", () => {
 				name: "Python built-in open for writing",
 				command: `python3 -c 'open("src/product.ts", "w").write("PWNED")'`,
 				blocked: true,
-				reason: "phase-boundary",
-				target: "src/product.ts",
+				reason: "unknown-target",
 			},
 			{
 				name: "Python pathlib Path.write_bytes",
@@ -2376,6 +2382,24 @@ describe("bash scanner quoting model", () => {
 				blocked: true,
 				reason: "phase-boundary",
 				target: "src/product.ts",
+			},
+			{
+				name: "Python pathlib Path.touch retains the legacy write-API denial",
+				command: `python3 -c 'from pathlib import Path; Path("src/product.ts").touch()'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Python tempfile file write retains the legacy write-API denial",
+				command: `python3 -c $'import tempfile\\nf=tempfile.NamedTemporaryFile(dir=".", delete=False)\\nf.write(b"x")'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Python non-path write API retains the legacy denial",
+				command: `python3 -c 'fwrite("src/product.ts", "PWNED")'`,
+				blocked: true,
+				reason: "unknown-target",
 			},
 			{
 				name: "Node process.stdout.write rebound to a file writer",
@@ -2429,6 +2453,11 @@ describe("bash scanner quoting model", () => {
 			{
 				name: "sed input filename that resembles a write script",
 				command: "sed -n '1p' 'w src/product.ts'",
+				blocked: false,
+			},
+			{
+				name: "conditional read-only sed remains allowed",
+				command: "if sed -n '1p' input; then :; fi",
 				blocked: false,
 			},
 			{

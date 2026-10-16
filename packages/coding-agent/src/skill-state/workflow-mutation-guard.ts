@@ -108,8 +108,29 @@ const BASH_IN_PLACE_MUTATION_COMMAND_RE = new RegExp(
  * same way `open(` / `writeFile(` / `.write(` already do. `perl` is included
  * because `perl -e 'open(...)'` is that same call.
  */
-const BASH_INTERPRETER_WRITE_API =
-	"(?:open\\s*\\(|writeFile(?:Sync)?\\s*\\(|appendFile(?:Sync)?\\s*\\(|file_put_contents\\s*\\(|fwrite\\s*\\(|fputs\\s*\\(|unlink\\s*\\(|rename\\s*\\(|mkdir\\s*\\(|rmdir\\s*\\(|copy\\s*\\(|symlink\\s*\\(|link\\s*\\(|move_uploaded_file\\s*\\(|truncate\\s*\\(|touch\\s*\\(|\\.write\\s*\\(|shutil\\s*\\.\\s*(?:copy2?|copyfileobj|copyfile)\\s*\\(|os\\s*\\.\\s*symlink\\s*\\()";
+const BASH_INTERPRETER_WRITE_API_PATTERNS = [
+	"open\\s*\\(",
+	"writeFile(?:Sync)?\\s*\\(",
+	"appendFile(?:Sync)?\\s*\\(",
+	"file_put_contents\\s*\\(",
+	"fwrite\\s*\\(",
+	"fputs\\s*\\(",
+	"unlink\\s*\\(",
+	"rename\\s*\\(",
+	"mkdir\\s*\\(",
+	"rmdir\\s*\\(",
+	"copy\\s*\\(",
+	"symlink\\s*\\(",
+	"link\\s*\\(",
+	"move_uploaded_file\\s*\\(",
+	"truncate\\s*\\(",
+	"touch\\s*\\(",
+	"\\.write\\s*\\(",
+	"shutil\\s*\\.\\s*(?:copy2?|copyfileobj|copyfile)\\s*\\(",
+	"os\\s*\\.\\s*symlink\\s*\\(",
+] as const;
+const BASH_INTERPRETER_WRITE_API = `(?:${BASH_INTERPRETER_WRITE_API_PATTERNS.join("|")})`;
+const BASH_INTERPRETER_WRITE_API_EXCLUDING_OPEN = `(?:${BASH_INTERPRETER_WRITE_API_PATTERNS.slice(1).join("|")})`;
 const INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE =
 	/^\b(?:(?:process|Bun|Deno|sys)\s*\.\s*(?:stdout|stderr)|(?:(?:globalThis|global)\s*\.\s*)?console)(?:\s*(?:\.\s*[\w$]+|\[\s*[^\]]+\s*\]))?\s*(?:\|\|=|&&=|\?\?=|[+\-*/%&|^]?=(?!=|>))/;
 /**
@@ -1594,7 +1615,7 @@ function extractSubstitutionBodies(command: string): SubstitutionBody[] {
 }
 
 const BASH_SED_COMMAND_RE = new RegExp(
-	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?sed\\b((?:'[^']*'|"(?:\\\\.|[^"\\\\])*"|\\\\.|[^'";&|()\\n\\\\])*)`,
+	`(?:^|[;&|(\\n])\\s*(?:(?:if|then|else|elif|do|in|while|until)\\s+)*(?:!\\s+)?(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?sed\\b((?:'[^']*'|"(?:\\\\.|[^"\\\\])*"|\\\\.|[^'";&|()\\n\\\\])*)`,
 	"gi",
 );
 const BASH_AWK_COMMAND_RE = new RegExp(
@@ -2063,6 +2084,12 @@ function collectInterpreterOneLinerWrites(command: string, targets: ExtractedTar
 						: "perl";
 			if (/^(?:python|pypy)/.test(binary)) {
 				scanInterpreterWrites(script, "py", targets);
+				if (
+					interpreterCodeContainsWriteApi(script, "py", new RegExp(BASH_INTERPRETER_WRITE_API_EXCLUDING_OPEN, "i"))
+				) {
+					targets.explicitMutation = true;
+					targets.unknown = true;
+				}
 				collectPythonSystemWrites(script, targets, depth);
 				continue;
 			}
@@ -2100,7 +2127,7 @@ function interpreterCodeContainsWriteApi(
 	language: "py" | "js" | "ruby" | "perl",
 	api: RegExp,
 ): boolean {
-	const apiAtStart = new RegExp(`^(?:${BASH_INTERPRETER_WRITE_API})`, "i");
+	const apiAtStart = new RegExp(`^(?:${api.source})`, "i");
 	let index = 0;
 	while (index < script.length) {
 		if (language === "py" || language === "js") {
@@ -3231,7 +3258,7 @@ function scanInterpreterWrites(code: string, language: "py" | "js", targets: Ext
 				index += 1;
 				continue;
 			}
-			const method = /^\s*\.\s*(write_\w+|open)\s*\(/.exec(code.slice(ctor.after));
+			const method = /^\s*\.\s*(write_\w+|open|touch)\s*\(/.exec(code.slice(ctor.after));
 			if (method) {
 				const writes = method[1] === "open" ? pathlibOpenModeWrites(code, ctor.after) : true;
 				if (writes !== false) {
