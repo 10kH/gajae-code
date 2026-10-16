@@ -199,6 +199,12 @@ describe("recordFatalCrash", () => {
 			"password: >+2",
 			"    opaque-indicated-folded-secret",
 			"note=keep",
+			"- password: |",
+			"    opaque-sequence-literal-secret",
+			"  note: keep after sequence",
+			"  - password_confirmation: >-",
+			"      opaque-nested-sequence-secret",
+			"    note: keep nested sequence",
 			'"password": |',
 			"  opaque-double-quoted-key-secret",
 			"note=keep",
@@ -222,6 +228,8 @@ describe("recordFatalCrash", () => {
 			"opaque-indicated-literal-secret",
 			"opaque-reversed-indicated-folded-secret",
 			"opaque-indicated-folded-secret",
+			"opaque-sequence-literal-secret",
+			"opaque-nested-sequence-secret",
 			"opaque-double-quoted-key-secret",
 			"opaque-single-quoted-key-secret",
 		]) {
@@ -235,6 +243,10 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("password: |2- # indentation indicator");
 		expect(contents).toContain("password: >-2");
 		expect(contents).toContain("password: >+2");
+		expect(contents).toContain("- password: |");
+		expect(contents).toContain("  - password_confirmation: >-");
+		expect(contents).toContain("  note: keep after sequence");
+		expect(contents).toContain("    note: keep nested sequence");
 		expect(contents).toContain('"password": |');
 		expect(contents).toContain("'api_key': >-");
 		expect(contents).toContain("  «redacted»\n    «redacted»\n\n  «redacted»\nnote=keep");
