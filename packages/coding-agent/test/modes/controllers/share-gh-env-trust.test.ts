@@ -70,6 +70,7 @@ const TRUST_KEYS = [
 	"USERPROFILE",
 	"APPDATA",
 	"BASH_ENV",
+	"BUN_OPTIONS",
 	"ENV",
 	"ZDOTDIR",
 	"NODE_OPTIONS",
@@ -150,6 +151,7 @@ interface GhSpawn {
 	bunfigPreloadExecuted: boolean;
 	PATH: string;
 	BASH_ENV: string | null;
+	BUN_OPTIONS: string | null;
 	ENV: string | null;
 	ZDOTDIR: string | null;
 	NODE_OPTIONS: string | null;
@@ -266,6 +268,7 @@ await fsPromises.appendFile(
 			: false,
 		PATH: process.env.PATH ?? "",
 		BASH_ENV: process.env.BASH_ENV ?? null,
+		BUN_OPTIONS: process.env.BUN_OPTIONS ?? null,
 		ENV: process.env.ENV ?? null,
 		ZDOTDIR: process.env.ZDOTDIR ?? null,
 		NODE_OPTIONS: process.env.NODE_OPTIONS ?? null,
@@ -496,6 +499,7 @@ function expectDestination(
 			| "USERPROFILE"
 			| "APPDATA"
 			| "BASH_ENV"
+			| "BUN_OPTIONS"
 			| "ENV"
 			| "ZDOTDIR"
 			| "NODE_OPTIONS"
@@ -597,6 +601,7 @@ function expectDestination(
 		expect(spawn.USERPROFILE).toBe(expected.USERPROFILE ?? null);
 		expect(spawn.APPDATA).toBe(expected.APPDATA ?? null);
 		expect(spawn.BASH_ENV).toBe(expected.BASH_ENV ?? null);
+		expect(spawn.BUN_OPTIONS).toBe(expected.BUN_OPTIONS ?? null);
 		expect(spawn.ENV).toBe(expected.ENV ?? null);
 		expect(spawn.ZDOTDIR).toBe(expected.ZDOTDIR ?? null);
 		expect(spawn.NODE_OPTIONS).toBe(expected.NODE_OPTIONS ?? null);
@@ -959,8 +964,12 @@ OPENSSL_ENGINES=/project/openssl-engines
 	});
 
 	it("runs Bun-based gh wrappers outside project bunfig preloads", async () => {
-		const spawns = await share({ bunfigPreload: true });
-		expectDestination(spawns, {});
+		const spawns = await share({
+			bunfigPreload: true,
+			autoload: true,
+			dotenv: "BUN_OPTIONS=--preload=/definitely-not-a-real-gjc-preload.ts",
+		});
+		expectDestination(spawns, { BUN_OPTIONS: null });
 		expect(spawns.map(spawn => spawn.bunfigPreloadExecuted)).toEqual([false, false]);
 	});
 
