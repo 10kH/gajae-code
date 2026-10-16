@@ -43,6 +43,21 @@ const LUA_INIT_VERSIONED_ENV_KEYS = [
 	"LUA_INIT_5_5",
 ] as const;
 type LuaInitVersionedEnvironmentKey = (typeof LUA_INIT_VERSIONED_ENV_KEYS)[number];
+const LUA_MODULE_PATH_ENV_KEYS = [
+	"LUA_PATH",
+	"LUA_CPATH",
+	"LUA_PATH_5_1",
+	"LUA_PATH_5_2",
+	"LUA_PATH_5_3",
+	"LUA_PATH_5_4",
+	"LUA_PATH_5_5",
+	"LUA_CPATH_5_1",
+	"LUA_CPATH_5_2",
+	"LUA_CPATH_5_3",
+	"LUA_CPATH_5_4",
+	"LUA_CPATH_5_5",
+] as const;
+type LuaModulePathEnvironmentKey = (typeof LUA_MODULE_PATH_ENV_KEYS)[number];
 const TRUST_KEYS = [
 	"GH_HOST",
 	"GH_CONFIG_DIR",
@@ -68,6 +83,7 @@ const TRUST_KEYS = [
 	"TCLLIBPATH",
 	"LUA_INIT",
 	...LUA_INIT_VERSIONED_ENV_KEYS,
+	...LUA_MODULE_PATH_ENV_KEYS,
 	"R_ENVIRON",
 	"R_ENVIRON_USER",
 	"R_PROFILE",
@@ -145,6 +161,7 @@ interface GhSpawn {
 	TCLLIBPATH: string | null;
 	LUA_INIT: string | null;
 	luaInitVersionedEnvironment: Record<LuaInitVersionedEnvironmentKey, string | null>;
+	luaModulePathEnvironment: Record<LuaModulePathEnvironmentKey, string | null>;
 	R_ENVIRON: string | null;
 	R_ENVIRON_USER: string | null;
 	R_PROFILE: string | null;
@@ -259,6 +276,9 @@ await fsPromises.appendFile(
 		LUA_INIT: process.env.LUA_INIT ?? null,
 		luaInitVersionedEnvironment: Object.fromEntries(
 			${JSON.stringify(LUA_INIT_VERSIONED_ENV_KEYS)}.map(name => [name, process.env[name] ?? null]),
+		),
+		luaModulePathEnvironment: Object.fromEntries(
+			${JSON.stringify(LUA_MODULE_PATH_ENV_KEYS)}.map(name => [name, process.env[name] ?? null]),
 		),
 		R_ENVIRON: process.env.R_ENVIRON ?? null,
 		R_ENVIRON_USER: process.env.R_ENVIRON_USER ?? null,
@@ -534,6 +554,7 @@ function expectDestination(
 		>
 	> & {
 		luaInitVersionedEnvironment?: Partial<GhSpawn["luaInitVersionedEnvironment"]>;
+		luaModulePathEnvironment?: Partial<GhSpawn["luaModulePathEnvironment"]>;
 		dotnetRootEnvironment?: Partial<GhSpawn["dotnetRootEnvironment"]>;
 		profilerEnvironment?: Partial<GhSpawn["profilerEnvironment"]>;
 	},
@@ -582,6 +603,8 @@ function expectDestination(
 		expect(spawn.LUA_INIT).toBe(expected.LUA_INIT ?? null);
 		for (const name of LUA_INIT_VERSIONED_ENV_KEYS)
 			expect(spawn.luaInitVersionedEnvironment[name]).toBe(expected.luaInitVersionedEnvironment?.[name] ?? null);
+		for (const name of LUA_MODULE_PATH_ENV_KEYS)
+			expect(spawn.luaModulePathEnvironment[name]).toBe(expected.luaModulePathEnvironment?.[name] ?? null);
 		expect(spawn.R_ENVIRON).toBe(expected.R_ENVIRON ?? null);
 		expect(spawn.R_ENVIRON_USER).toBe(expected.R_ENVIRON_USER ?? null);
 		expect(spawn.R_PROFILE).toBe(expected.R_PROFILE ?? null);
@@ -701,6 +724,18 @@ LUA_INIT_5_2=@/project/lua-init-5.2.lua
 LUA_INIT_5_3=@/project/lua-init-5.3.lua
 LUA_INIT_5_4=@/project/lua-init-5.4.lua
 LUA_INIT_5_5=@/project/lua-init-5.5.lua
+LUA_PATH=/project/lua-path
+LUA_CPATH=/project/lua-cpath
+LUA_PATH_5_1=/project/lua-path-5.1
+LUA_PATH_5_2=/project/lua-path-5.2
+LUA_PATH_5_3=/project/lua-path-5.3
+LUA_PATH_5_4=/project/lua-path-5.4
+LUA_PATH_5_5=/project/lua-path-5.5
+LUA_CPATH_5_1=/project/lua-cpath-5.1
+LUA_CPATH_5_2=/project/lua-cpath-5.2
+LUA_CPATH_5_3=/project/lua-cpath-5.3
+LUA_CPATH_5_4=/project/lua-cpath-5.4
+LUA_CPATH_5_5=/project/lua-cpath-5.5
 R_ENVIRON=/project/site.Renviron
 R_ENVIRON_USER=/project/user.Renviron
 R_PROFILE=/project/site.Rprofile
@@ -801,6 +836,9 @@ OPENSSL_ENGINES=/project/openssl-engines
 
 	it("preserves operator-declared runtime settings", async () => {
 		const luaInitVersionedEnvironment = { LUA_INIT_5_4: "@/operator/lua-init-5.4.lua" };
+		const luaModulePathEnvironment = Object.fromEntries(
+			LUA_MODULE_PATH_ENV_KEYS.map(name => [name, `/operator/${name.toLowerCase()}`]),
+		) as Record<LuaModulePathEnvironmentKey, string>;
 		const dotnetRootEnvironment = Object.fromEntries(
 			DOTNET_ROOT_ENV_KEYS.map(name => [name, `/operator/${name.toLowerCase()}`]),
 		) as Record<DotnetRootEnvironmentKey, string>;
@@ -849,6 +887,7 @@ OPENSSL_ENGINES=/project/openssl-engines
 				OPENSSL_CONF_INCLUDE: "/operator/openssl-conf-include",
 				OPENSSL_MODULES: "/operator/openssl-modules",
 				OPENSSL_ENGINES: "/operator/openssl-engines",
+				...luaModulePathEnvironment,
 				...dotnetRootEnvironment,
 				...profilerEnvironment,
 			},
@@ -894,6 +933,7 @@ OPENSSL_ENGINES=/project/openssl-engines
 			OPENSSL_CONF_INCLUDE: "/operator/openssl-conf-include",
 			OPENSSL_MODULES: "/operator/openssl-modules",
 			OPENSSL_ENGINES: "/operator/openssl-engines",
+			luaModulePathEnvironment,
 			dotnetRootEnvironment,
 			profilerEnvironment,
 		});
