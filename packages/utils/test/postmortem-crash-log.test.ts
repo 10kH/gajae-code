@@ -309,6 +309,16 @@ describe("recordFatalCrash", () => {
 		expect(redactCrashSecrets("password=correct Secret Access Key=second-secret note=keep")).toBe(
 			"password=«redacted» Secret Access Key=«redacted» note=keep",
 		);
+		expect(redactCrashSecrets("password=opaque-secret status: failed")).toBe("password=«redacted» status: failed");
+	});
+
+	it("redacts shell-concatenated suffixes after quoted credentials", () => {
+		expect(redactCrashSecrets('password="correct-horse-"battery-staple note=keep')).toBe(
+			'password="«redacted»" note=keep',
+		);
+		expect(redactCrashSecrets("password='correct-horse-'battery-staple status: failed")).toBe(
+			"password='«redacted»' status: failed",
+		);
 	});
 
 	it("redacts short values under sensitive labels", async () => {

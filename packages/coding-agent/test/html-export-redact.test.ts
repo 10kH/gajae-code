@@ -87,6 +87,8 @@ describe("session HTML export embed", () => {
 					"clone: https://alice:correct@horse@example.com/repo.git?keep=1",
 					"database: postgresql+asyncpg://alice:opaque-database-password@example.com/db",
 					"password_confirmation=opaque-snake-confirmation passwordConfirmation=opaque-camel-confirmation",
+					'password="correct-horse-"battery-staple note=keep',
+					"password=opaque-secret status: failed",
 					"password=correct,horse",
 					"password=correct;horse",
 					"password=correct horse battery staple token=second-secret note=keep",
@@ -110,6 +112,9 @@ describe("session HTML export embed", () => {
 				"correct;horse",
 				"opaque-snake-confirmation",
 				"opaque-camel-confirmation",
+				"correct-horse-",
+				"battery-staple",
+				"opaque-secret",
 				"correct horse battery staple",
 				"second-secret",
 				"alpha}suffix",
@@ -125,6 +130,8 @@ describe("session HTML export embed", () => {
 			expect(embedded).toContain("postgresql+asyncpg://«redacted-url-credential»@example.com/db");
 			expect(exportedContent).toContain("password=«redacted»");
 			expect(exportedContent).toContain("password_confirmation=«redacted» passwordConfirmation=«redacted»");
+			expect(exportedContent).toContain('password="«redacted»" note=keep');
+			expect(exportedContent).toContain("password=«redacted» status: failed");
 			expect(exportedContent).toContain("password=«redacted» token=«redacted» note=keep");
 			expect(exportedContent).toContain('password="«redacted»\nstack "frame"\nafter=keep');
 			expect(exportedContent).toContain("credentials=«redacted»\nstack frame\nafter=keep");

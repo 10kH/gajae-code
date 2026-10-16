@@ -39,10 +39,11 @@ const AUTHORIZATION_HEADER_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["'\x60]
 // Avoid splitting recognized multiword labels at their final component (e.g. `API Key`).
 const CREDENTIAL_COMPOUND_FIELD_PREFIX =
 	"(?:api|account|access|refresh|id|session|client|aws|secret|private|encryption|signing|key)";
-const CREDENTIAL_WHITESPACE_FOLLOWING_FIELD_PATTERN = String.raw`[ \t]+(?:${CREDENTIAL_KEY_LABELS}|(?<!(?:^|[^A-Za-z0-9_.=:-])${CREDENTIAL_COMPOUND_FIELD_PREFIX}[ \t])[A-Za-z][A-Za-z0-9_.-]{0,127})[ \t]*=`;
+const CREDENTIAL_WHITESPACE_FOLLOWING_FIELD_PATTERN = String.raw`[ \t]+(?:${CREDENTIAL_KEY_LABELS}|(?<!(?:^|[^A-Za-z0-9_.=:-])${CREDENTIAL_COMPOUND_FIELD_PREFIX}[ \t])[A-Za-z][A-Za-z0-9_.-]{0,127})[ \t]*[=:]`;
 const CREDENTIAL_FOLLOWING_FIELD_PATTERN = String.raw`(?:[,;][ \t]*[A-Za-z][A-Za-z0-9_. \t-]{0,127}[ \t]*[=:]|${CREDENTIAL_WHITESPACE_FOLLOWING_FIELD_PATTERN})`;
 const CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY = String.raw`(?:(?!\\+n|\\+r\\+n|${CREDENTIAL_FOLLOWING_FIELD_PATTERN})(?:\\[^\r\n]|[^\s"'\x60}\]]))(?:(?!\\+n|\\+r\\+n|${CREDENTIAL_FOLLOWING_FIELD_PATTERN})(?:\\[^\r\n]|[^\r\n"'}\]]))*`;
 const CREDENTIAL_VALUE_QUOTED_BOUNDARY = String.raw`(?=$|[\s,;}):.\]]|/?>)`;
+const CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN = String.raw`[^\s,;}\]]*`;
 const CREDENTIAL_AUTH_VALUE_PATTERN = new RegExp(
 	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(?:Bearer|Basic|Token)\s+${CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY}`,
 	"gi",
@@ -51,7 +52,7 @@ const CREDENTIAL_AUTHORIZATION_VALUE_PATTERN = new RegExp(
 	String.raw`${AUTHORIZATION_HEADER_PREFIX}(?!\s*(?:["'«\x60]|\\+["'\x60]))(?:(?!\\+n|\\+r\\+n)[^\r\n])+`,
 	"gi",
 );
-const CREDENTIAL_VALUE_PATTERN_BODY = String.raw`(?:(\\+")((?:\\[^\r\n]|[^"\\\r\n])*?)(\\+")${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(")((?:\\[^\r\n]|[^"\\\r\n])*)(")|(\\+')((?:\\[^\r\n]|[^'\\\r\n])*?)(\\+')${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(')((?:\\[^\r\n]|[^'\\\r\n])*)(')|(\x60)((?:\\[^\r\n]|[^\x60\\\r\n])*)(\x60)${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|(\x60)([^\r\n]*)(?=\r?\n|$)|(${CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY}))`;
+const CREDENTIAL_VALUE_PATTERN_BODY = String.raw`(?:(\\+")((?:\\[^\r\n]|[^"\\\r\n])*?)(\\+")${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(")((?:\\[^\r\n]|[^"\\\r\n])*)(")${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(\\+')((?:\\[^\r\n]|[^'\\\r\n])*?)(\\+')${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(')((?:\\[^\r\n]|[^'\\\r\n])*)(')${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(\x60)((?:\\[^\r\n]|[^\x60\\\r\n])*)(\x60)${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|(\x60)([^\r\n]*)(?=\r?\n|$)|(${CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY}))`;
 const CREDENTIAL_VALUE_PATTERN = new RegExp(
 	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(?!\\+\x60)${CREDENTIAL_VALUE_PATTERN_BODY}`,
 	"gi",
@@ -61,11 +62,11 @@ const CREDENTIAL_CAMEL_VALUE_PATTERN = new RegExp(
 	"g",
 );
 const CREDENTIAL_ESCAPED_BACKTICK_VALUE_PATTERN = new RegExp(
-	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(\\+\x60)((?:\\[^\r\n]|[^\x60\\\r\n])*?)(\\+\x60)${CREDENTIAL_VALUE_QUOTED_BOUNDARY}`,
+	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(\\+\x60)((?:\\[^\r\n]|[^\x60\\\r\n])*?)(\\+\x60)${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}`,
 	"gi",
 );
 const CREDENTIAL_CAMEL_ESCAPED_BACKTICK_VALUE_PATTERN = new RegExp(
-	String.raw`${CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX}(\\+\x60)((?:\\[^\r\n]|[^\x60\\\r\n])*?)(\\+\x60)${CREDENTIAL_VALUE_QUOTED_BOUNDARY}`,
+	String.raw`${CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX}(\\+\x60)((?:\\[^\r\n]|[^\x60\\\r\n])*?)(\\+\x60)${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}`,
 	"g",
 );
 const CREDENTIAL_ESCAPED_BACKTICK_UNCLOSED_PATTERN = new RegExp(
