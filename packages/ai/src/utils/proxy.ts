@@ -1,6 +1,7 @@
 import * as net from "node:net";
 import * as tls from "node:tls";
-import { canonicalEnvKey, projectEnvSnapshot } from "@gajae-code/utils/env-file";
+import { loadedProjectEnvSnapshot } from "@gajae-code/utils";
+import { canonicalEnvKey } from "@gajae-code/utils/env-file";
 
 export interface ProxyConnectOptions {
 	signal?: AbortSignal;
@@ -49,11 +50,11 @@ function firstEnvValue(...names: string[]): string | undefined {
 	return undefined;
 }
 
-// Bun autoloads cwd dotenv into process.env before this module loads and does
-// not record which entries came from the file. Compare against the startup
-// snapshot: a dynamic declaration is refused, and a runtime value equal to the
-// declared text is ambiguous. A shell value that differs is still a selector.
-const projectProxyEnv = projectEnvSnapshot();
+// This module may load lazily after --worktree changes cwd. Use the shared
+// process-startup snapshot captured by @gajae-code/utils before that transition.
+// A dynamic declaration is refused, and a runtime value equal to the declared
+// text is ambiguous. A distinct shell value remains a selector.
+const projectProxyEnv = loadedProjectEnvSnapshot();
 
 function projectSuppliedProxy(name: string, runtime: string): boolean {
 	const key = canonicalEnvKey(name);
