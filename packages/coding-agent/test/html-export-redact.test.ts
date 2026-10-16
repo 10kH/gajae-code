@@ -204,6 +204,8 @@ describe("session HTML export embed", () => {
 							headerRecords: [
 								{ name: "X-Api-Key", value: "opaque-record-api-secret" },
 								{ key: "AccountKey", value: "opaque-record-account-secret" },
+								{ Key: "Authorization", Value: "opaque-pascal-header-auth-secret" },
+								{ Name: "X-Api-Key", Value: "opaque-pascal-header-api-secret" },
 								{ name: "Content-Type", value: "application/json" },
 							],
 						},
@@ -227,6 +229,8 @@ describe("session HTML export embed", () => {
 			expect(embedded).not.toContain("opaque-flat-auth-secret");
 			expect(embedded).not.toContain("opaque-record-api-secret");
 			expect(embedded).not.toContain("opaque-record-account-secret");
+			expect(embedded).not.toContain("opaque-pascal-header-auth-secret");
+			expect(embedded).not.toContain("opaque-pascal-header-api-secret");
 			expect(headers).toEqual([
 				["X-Api-Key", "«redacted»"],
 				["Authorization", "«redacted»"],
@@ -243,6 +247,8 @@ describe("session HTML export embed", () => {
 			expect(headerRecords).toEqual([
 				{ name: "X-Api-Key", value: "«redacted»" },
 				{ key: "AccountKey", value: "«redacted»" },
+				{ Key: "Authorization", Value: "«redacted»" },
+				{ Name: "X-Api-Key", Value: "«redacted»" },
 				{ name: "Content-Type", value: "application/json" },
 			]);
 		} finally {
@@ -269,6 +275,9 @@ describe("session HTML export embed", () => {
 								"client.secret": "opaque-dotted-client-secret-value",
 								"db.password": "opaque-dotted-db-password-value",
 								"api.key": "opaque-dotted-api-key-value",
+								"API Key": "opaque-spaced-api-key-value",
+								"Private Key": "opaque-spaced-private-key-value",
+								"Secret Access Key": "opaque-spaced-secret-access-key-value",
 								"aws.secret.access.key": "opaque-dotted-aws-secret-value",
 								token: "opaque-token-value",
 								authToken: "opaque-auth-token-value",
@@ -336,6 +345,9 @@ describe("session HTML export embed", () => {
 				"opaque-dotted-client-secret-value",
 				"opaque-dotted-db-password-value",
 				"opaque-dotted-api-key-value",
+				"opaque-spaced-api-key-value",
+				"opaque-spaced-private-key-value",
+				"opaque-spaced-secret-access-key-value",
 				"opaque-dotted-aws-secret-value",
 				"opaque-auth-token-value",
 				"opaque-github-token-value",
@@ -383,6 +395,9 @@ describe("session HTML export embed", () => {
 				"client.secret": "«redacted»",
 				"db.password": "«redacted»",
 				"api.key": "«redacted»",
+				"API Key": "«redacted»",
+				"Private Key": "«redacted»",
+				"Secret Access Key": "«redacted»",
 				"aws.secret.access.key": "«redacted»",
 				token: "«redacted»",
 				authToken: "«redacted»",

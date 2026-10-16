@@ -278,15 +278,23 @@ function redactJsonValue(value: unknown): unknown {
 	}
 	if (value === null || typeof value !== "object") return value;
 	const source = value as Record<string, unknown>;
-	const hasCredentialHeaderName =
-		(typeof source.name === "string" && isCredentialKey(source.name)) ||
-		(typeof source.key === "string" && isCredentialKey(source.key));
-	const redactHeaderValue = hasCredentialHeaderName && Object.hasOwn(source, "value");
+	const sourceKeys = Object.keys(source);
+	let hasCredentialHeaderName = false;
+	let hasHeaderValue = false;
+	for (const key of sourceKeys) {
+		const field = key.toLowerCase();
+		if (field === "value") hasHeaderValue = true;
+		if (field !== "name" && field !== "key") continue;
+		const headerName = source[key];
+		if (typeof headerName === "string" && isCredentialKey(headerName)) hasCredentialHeaderName = true;
+	}
+	const redactHeaderValue = hasCredentialHeaderName && hasHeaderValue;
 	const redacted = Object.create(null) as Record<string, unknown>;
 	const nextSuffixByKey = new Map<string, number>();
-	for (const key of Object.keys(source)) {
+	for (const key of sourceKeys) {
 		const redactedKey = uniqueJsonObjectKey(redacted, redactCrashSecrets(key), nextSuffixByKey);
-		redacted[redactedKey] = redactHeaderValue && key === "value" ? "«redacted»" : redactKeyedValue(key, source[key]);
+		redacted[redactedKey] =
+			redactHeaderValue && key.toLowerCase() === "value" ? "«redacted»" : redactKeyedValue(key, source[key]);
 	}
 	return redacted;
 }
