@@ -87,6 +87,7 @@ describe("session HTML export embed", () => {
 					"clone: https://alice:correct@horse@example.com/repo.git?keep=1",
 					"database: postgresql+asyncpg://alice:opaque-database-password@example.com/db",
 					"Endpoint=sb://host/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=opaque-servicebus-secret-123",
+					"Endpoint=https://host/;SharedAccessSignature=sv=2026-01-01&sig=opaque-sas-secret&sp=rw",
 					"password_confirmation=opaque-snake-confirmation passwordConfirmation=opaque-camel-confirmation",
 					'password="correct-horse-"battery-staple note=keep',
 					"password=opaque-secret status: failed",
@@ -111,6 +112,7 @@ describe("session HTML export embed", () => {
 				"correct@horse",
 				"opaque-database-password",
 				"opaque-servicebus-secret-123",
+				"opaque-sas-secret",
 				"correct,horse",
 				"correct;horse",
 				"opaque-snake-confirmation",
@@ -137,6 +139,7 @@ describe("session HTML export embed", () => {
 			expect(exportedContent).toContain(
 				"Endpoint=sb://host/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=«redacted»",
 			);
+			expect(exportedContent).toContain("Endpoint=https://host/;SharedAccessSignature=«redacted»");
 			expect(exportedContent).toContain("password_confirmation=«redacted» passwordConfirmation=«redacted»");
 			expect(exportedContent).toContain('password="«redacted»" note=keep');
 			expect(exportedContent).toContain("password=«redacted» status: failed");
@@ -194,6 +197,7 @@ describe("session HTML export embed", () => {
 							passwordConfirmation: "opaque-nested-camel-confirmation",
 							SharedAccessKey: "opaque-nested-servicebus-key",
 							SharedAccessKeyName: "RootManageSharedAccessKey",
+							SharedAccessSignature: "sv=2026-01-01&sig=opaque-nested-sas-secret&sp=rw",
 							note: ORDINARY_SENTENCE,
 						},
 					},
@@ -207,11 +211,13 @@ describe("session HTML export embed", () => {
 			expect(embedded).not.toContain("opaque-nested-snake-confirmation");
 			expect(embedded).not.toContain("opaque-nested-camel-confirmation");
 			expect(embedded).not.toContain("opaque-nested-servicebus-key");
+			expect(embedded).not.toContain("opaque-nested-sas-secret");
 			expect(embedded).toContain("«redacted»");
 			expect(embedded).toContain('"password_confirmation":"«redacted»"');
 			expect(embedded).toContain('"passwordConfirmation":"«redacted»"');
 			expect(embedded).toContain('"SharedAccessKey":"«redacted»"');
 			expect(embedded).toContain('"SharedAccessKeyName":"RootManageSharedAccessKey"');
+			expect(embedded).toContain('"SharedAccessSignature":"«redacted»"');
 			expect(embedded).toContain(ORDINARY_SENTENCE);
 		} finally {
 			await session?.close();

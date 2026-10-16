@@ -580,6 +580,21 @@ describe("recordFatalCrash", () => {
 		);
 	});
 
+	it("redacts Azure SharedAccessSignature connection-string fields", () => {
+		const keys = [
+			"SharedAccessSignature",
+			"sharedAccessSignature",
+			"shared_access_signature",
+			"shared-access-signature",
+			"shared.access.signature",
+		];
+		for (const key of keys) expect(isCredentialKey(key)).toBe(true);
+		expect(isCredentialKey("SharedAccessSignatureName")).toBe(false);
+
+		const connectionString = "Endpoint=sb://host/;SharedAccessSignature=sv=2026-01-01&sig=opaque-sas-secret&sp=rw";
+		expect(redactCrashSecrets(connectionString)).toBe("Endpoint=sb://host/;SharedAccessSignature=«redacted»");
+	});
+
 	it("redacts abbreviated password credential fields", () => {
 		for (const key of ["pwd", "dbPwd", "user_pwd"]) expect(isCredentialKey(key)).toBe(true);
 		expect(redactCrashSecrets("pwd=opaque-pwd dbPwd=opaque-db-pwd user_pwd=opaque-user-pwd")).toBe(
