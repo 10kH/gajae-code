@@ -80,8 +80,20 @@ fs.writeFileSync(target, "EDITED\\n");
 process.exit(0);
 `;
 
+function checked(name: string, fn: () => Promise<void>): void {
+	it(name, async () => {
+		try {
+			await fn();
+		} catch (error) {
+			console.log(`(fail) ${name}`);
+			throw error;
+		}
+		console.log(`(pass) ${name}`);
+	});
+}
+
 describe("openInEditor temp file", () => {
-	it("still returns the editor rewrite and keeps the requested extension", async () => {
+	checked("keeps an editor rewrite and the requested extension", async () => {
 		const dir = makeDir();
 		const resultPath = path.join(dir, "result.json");
 		process.env.EDITOR_RESULT = resultPath;
@@ -94,7 +106,7 @@ describe("openInEditor temp file", () => {
 		expect(recorded.path.endsWith(".todo.md")).toBe(true);
 	});
 
-	it("still returns null when the editor exits non-zero", async () => {
+	checked("keeps a null result when the editor exits non-zero", async () => {
 		const dir = makeDir();
 		const result = await openInEditor(editorCommand(dir, "process.exit(3);\n"), "ORIGINAL\n", {
 			stdio: quietStdio(),
@@ -102,43 +114,47 @@ describe("openInEditor temp file", () => {
 		expect(result).toBeNull();
 	});
 
-	it.skipIf(!symlinkOk)("does not follow a preexisting symlink at the predictable temp name", async () => {
-		const dir = makeDir();
-		const victim = path.join(dir, "victim");
-		fs.writeFileSync(victim, "SAFE");
-		const resultPath = path.join(dir, "result.json");
-		process.env.EDITOR_RESULT = resultPath;
-		const editor = editorCommand(dir, recordingEditor);
-		const now = Date.now;
-		const fixed = 1_700_000_000_000;
-		Date.now = () => fixed;
-		try {
-			const observed = Snowflake.next();
-			const nextSeq = (Snowflake.getSequence(observed) + 1) & Snowflake.MAX_SEQUENCE;
-			const id = Snowflake.formatParts(fixed - Snowflake.EPOCH_TIMESTAMP, nextSeq);
-			const linkPath = path.join(os.tmpdir(), `gjc-editor-${id}.md`);
-			plantedLinks.push(linkPath);
+	if (!symlinkOk) {
+		it.skip("does not follow a preexisting symlink at the predictable temp name", () => {});
+	}
+	if (symlinkOk)
+		checked("does not follow a preexisting symlink at the predictable temp name", async () => {
+			const dir = makeDir();
+			const victim = path.join(dir, "victim");
+			fs.writeFileSync(victim, "SAFE");
+			const resultPath = path.join(dir, "result.json");
+			process.env.EDITOR_RESULT = resultPath;
+			const editor = editorCommand(dir, recordingEditor);
+			const now = Date.now;
+			const fixed = 1_700_000_000_000;
+			Date.now = () => fixed;
 			try {
-				fs.unlinkSync(linkPath);
-			} catch {
-				// No prior file at the predicted name.
+				const observed = Snowflake.next();
+				const nextSeq = (Snowflake.getSequence(observed) + 1) & Snowflake.MAX_SEQUENCE;
+				const id = Snowflake.formatParts(fixed - Snowflake.EPOCH_TIMESTAMP, nextSeq);
+				const linkPath = path.join(os.tmpdir(), `gjc-editor-${id}.md`);
+				plantedLinks.push(linkPath);
+				try {
+					fs.unlinkSync(linkPath);
+				} catch {
+					// No prior file at the predicted name.
+				}
+				fs.symlinkSync(victim, linkPath);
+				const result = await openInEditor(editor, "ORIGINAL\n", {
+					stdio: quietStdio(),
+				});
+				expect(result).toBe("EDITED");
+				expect(fs.readFileSync(victim, "utf8")).toBe("SAFE");
+				const recorded = JSON.parse(fs.readFileSync(resultPath, "utf8")) as {
+					path: string;
+					symlink: boolean;
+					mode: number;
+				};
+				expect(recorded.symlink).toBe(false);
+				expect(recorded.path).not.toBe(linkPath);
+				expect(recorded.mode & 0o077).toBe(0);
+			} finally {
+				Date.now = now;
 			}
-			fs.symlinkSync(victim, linkPath);
-			const result = await openInEditor(editor, "ORIGINAL\n", {
-				stdio: quietStdio(),
-			});
-			expect(result).toBe("EDITED");
-			expect(fs.readFileSync(victim, "utf8")).toBe("SAFE");
-			const recorded = JSON.parse(fs.readFileSync(resultPath, "utf8")) as {
-				path: string;
-				symlink: boolean;
-				mode: number;
-			};
-			expect(recorded.symlink).toBe(false);
-			expect(recorded.path).not.toBe(linkPath);
-			expect(recorded.mode & 0o077).toBe(0);
-		} finally {
-			Date.now = now;
-		}
-	});
+		});
 });
