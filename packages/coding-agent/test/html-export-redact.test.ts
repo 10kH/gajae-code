@@ -175,7 +175,7 @@ describe("session HTML export embed", () => {
 		}
 	});
 
-	it("redacts credentials in serialized header tuples", async () => {
+	it("redacts credentials in nested and flat serialized header arrays", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-header-tuples-"));
 		let session: SessionManager | undefined;
 		try {
@@ -193,6 +193,14 @@ describe("session HTML export embed", () => {
 								["Authorization", "Bearer opaque-auth-secret"],
 								["Content-Type", "application/json"],
 							],
+							rawHeaders: [
+								"X-Api-Key",
+								"opaque-flat-secret",
+								"Authorization",
+								"Bearer opaque-flat-auth-secret",
+								"Content-Type",
+								"application/json",
+							],
 						},
 					},
 				],
@@ -204,13 +212,25 @@ describe("session HTML export embed", () => {
 			const parsed = JSON.parse(embedded) as {
 				entries: Array<{ message?: { content?: Array<{ arguments?: Record<string, unknown> }> } }>;
 			};
-			const headers = parsed.entries[0]?.message?.content?.[0]?.arguments?.headers;
+			const args = parsed.entries[0]?.message?.content?.[0]?.arguments;
+			const headers = args?.headers;
+			const rawHeaders = args?.rawHeaders;
 			expect(embedded).not.toContain("opaque-secret-123");
 			expect(embedded).not.toContain("opaque-auth-secret");
+			expect(embedded).not.toContain("opaque-flat-secret");
+			expect(embedded).not.toContain("opaque-flat-auth-secret");
 			expect(headers).toEqual([
 				["X-Api-Key", "«redacted»"],
 				["Authorization", "«redacted»"],
 				["Content-Type", "application/json"],
+			]);
+			expect(rawHeaders).toEqual([
+				"X-Api-Key",
+				"«redacted»",
+				"Authorization",
+				"«redacted»",
+				"Content-Type",
+				"application/json",
 			]);
 		} finally {
 			await session?.close();

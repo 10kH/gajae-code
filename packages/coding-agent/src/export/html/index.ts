@@ -261,8 +261,18 @@ async function writeSessionHtml(
 function redactJsonValue(value: unknown): unknown {
 	if (typeof value === "string") return redactCrashSecrets(value);
 	if (Array.isArray(value)) {
-		if (value.length === 2 && typeof value[0] === "string" && isCredentialKey(value[0])) {
-			return [redactJsonValue(value[0]), "«redacted»"];
+		const isFlatKeyValueArray =
+			value.length > 0 &&
+			value.length % 2 === 0 &&
+			value.every((item, index) => index % 2 === 1 || typeof item === "string");
+		if (isFlatKeyValueArray) {
+			return value.map((item, index) => {
+				if (index % 2 === 1) {
+					const key = value[index - 1];
+					if (typeof key === "string" && isCredentialKey(key)) return "«redacted»";
+				}
+				return redactJsonValue(item);
+			});
 		}
 		return value.map(item => redactJsonValue(item));
 	}
