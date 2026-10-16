@@ -30,6 +30,15 @@ function canonical(value: unknown): string {
 }
 const digest = (value: unknown) => createHash("sha256").update(canonical(value)).digest("hex");
 
+function generatedUnknownBrokerCodes(seed: number, count: number): string[] {
+	let state = seed >>> 0;
+	const next = () => {
+		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+		return state;
+	};
+	return Array.from({ length: count }, () => `generated_${next().toString(36)}_${next().toString(36)}`);
+}
+
 function lifecycleService(broker: Broker): SessionLifecycleService {
 	return new SessionLifecycleService({
 		global: async (operation, input, options) => broker.handleRequest(operation, input, options.idempotencyKey),
@@ -119,6 +128,53 @@ test("only proven final unrelated legacy rows pass an actual managed empty-sessi
 		expect(await Bun.file(target.sessionPath).exists()).toBe(false);
 	}
 }, 20_000);
+
+test("generated broker codes keep legacy ambiguity uncertain and preserve unrelated certainty", async () => {
+	let responseCode = "legacy_lifecycle_ambiguous";
+	const service = new SessionLifecycleService({
+		global: async () => ({
+			ok: false,
+			error: { code: responseCode, message: "fixture broker failure" },
+		}),
+	});
+	const cases = [
+		{ code: "legacy_lifecycle_ambiguous", certainty: "uncertain" },
+		{ code: "terminal_uncertain", certainty: "uncertain" },
+		{ code: "cleanup_pending", certainty: "cleanup_pending" },
+		{ code: "unavailable", certainty: "retryable" },
+		{ code: "broker_restarting", certainty: "retryable" },
+		{ code: "readiness_timeout", certainty: "retryable" },
+		{ code: "startup_admission_timeout", certainty: "retryable" },
+		...generatedUnknownBrokerCodes(0x6832, 96).map(code => ({ code, certainty: "terminal" })),
+	];
+
+	for (const [index, item] of cases.entries()) {
+		responseCode = item.code;
+		const result = await service.delete({
+			actor: { id: "generated-code-property", namespace: "test" },
+			capability: "session.delete",
+			requestKey: `generated-code-${index}`,
+			target: { sessionId: "property-session" },
+		});
+		expect(result).toMatchObject({
+			ok: false,
+			certainty: item.certainty,
+			error: { code: item.code },
+		});
+		if (item.code !== "legacy_lifecycle_ambiguous") continue;
+		if (result.ok) throw new Error("Unexpected successful lifecycle result");
+		const rendered = await renderPublicCommandFailure(lifecyclePublicFailure(result), {
+			command: ["sdk", "session", "delete", "property-session"],
+			json: true,
+		});
+		expect(rendered.envelope.error.outcomeCertainty).toBe("unknown");
+		expect(rendered.envelope.error.retryability).toBe("unknown");
+		expect(rendered.envelope.error.nextSteps.map(step => step.description)).toContain(
+			"The operation outcome is unknown. Reconcile available evidence and do not blindly retry.",
+		);
+		expect(rendered.envelope.diagnostics?.map(item => item.code)).toEqual(["lifecycle_legacy_history_ambiguous"]);
+	}
+});
 
 test("final legacy rows with matching or missing target evidence remain fenced", async () => {
 	for (const matching of [true, false]) {

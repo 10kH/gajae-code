@@ -2423,34 +2423,35 @@ where
 	if is_v3_frame(text) {
 		// event_replay can negotiate capabilities on the same authenticated socket
 		// as hello. Publish the merged native snapshot before forwarding the request.
-		if let Ok(frame) = serde_json::from_str::<serde_json::Value>(text) {
-			if frame.get("type").and_then(serde_json::Value::as_str) == Some("event_replay") {
-				if let Some(requested) = frame
-					.get("capabilities")
-					.and_then(serde_json::Value::as_array)
-				{
-					if requested.iter().all(serde_json::Value::is_string) {
-						if let Some(connection) = state.connections.lock().get_mut(connection_id) {
-							for capability in requested.iter().filter_map(serde_json::Value::as_str) {
-								if !connection
-									.capabilities
-									.iter()
-									.any(|existing| existing == capability)
-								{
-									connection.capabilities.push(capability.to_owned());
-								}
-							}
-							connection.negotiation = Negotiation::Negotiated;
-							*awaiting = false;
-							let _ = state.cap_tx.send(CapabilityUpdate {
-								connection_id: connection_id.to_owned(),
-								capabilities:  connection.capabilities.clone(),
-							});
+		if let Ok(frame) = serde_json::from_str::<serde_json::Value>(text)
+			&& frame.get("type").and_then(serde_json::Value::as_str) == Some("event_replay")
+			&& let Some(requested) = frame
+				.get("capabilities")
+				.and_then(serde_json::Value::as_array)
+			&& requested.iter().all(serde_json::Value::is_string)
+		{
+			let _ = state
+				.connections
+				.lock()
+				.get_mut(connection_id)
+				.map(|connection| {
+					for capability in requested.iter().filter_map(serde_json::Value::as_str) {
+						if !connection
+							.capabilities
+							.iter()
+							.any(|existing| existing == capability)
+						{
+							connection.capabilities.push(capability.to_owned());
 						}
-						let _ = direct_tx.send(DirectCommand::ReevaluateAsk);
 					}
-				}
-			}
+					connection.negotiation = Negotiation::Negotiated;
+					*awaiting = false;
+					let _ = state.cap_tx.send(CapabilityUpdate {
+						connection_id: connection_id.to_owned(),
+						capabilities:  connection.capabilities.clone(),
+					});
+				});
+			let _ = direct_tx.send(DirectCommand::ReevaluateAsk);
 		}
 		return state
 			.frame_tx

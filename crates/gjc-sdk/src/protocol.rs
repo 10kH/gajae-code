@@ -1210,7 +1210,7 @@ pub mod capabilities {
 	/// Live + finalized turn streaming.
 	pub const TURN_STREAM: &str = "turn_stream";
 	/// Observe live turn content without owning the submission (requires
-	/// TURN_STREAM).
+	/// `TURN_STREAM`).
 	pub const SESSION_HOST_OBSERVER_V1: &str = "session_host_observer_v1";
 	/// Image attachments.
 	pub const IMAGES: &str = "images";
