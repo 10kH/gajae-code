@@ -228,6 +228,7 @@ describe("recordFatalCrash", () => {
 
 	it("redacts unquoted multiword credentials while preserving following fields", () => {
 		expect(redactCrashSecrets("password=correct horse battery staple")).toBe("password=«redacted»");
+		expect(redactCrashSecrets(`token=secret ${"horse ".repeat(250)}`)).toBe("token=«redacted»");
 		expect(redactCrashSecrets("password=correct horse battery staple token=second-secret note=keep")).toBe(
 			"password=«redacted» token=«redacted» note=keep",
 		);

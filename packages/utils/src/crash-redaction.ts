@@ -39,7 +39,7 @@ const AUTHORIZATION_HEADER_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["'\x60]
 // Avoid splitting recognized multiword labels at their final component (e.g. `API Key`).
 const CREDENTIAL_COMPOUND_FIELD_PREFIX =
 	"(?:api|account|access|refresh|id|session|client|aws|secret|private|encryption|signing|key)";
-const CREDENTIAL_WHITESPACE_FOLLOWING_FIELD_PATTERN = String.raw`[ \t]+(?<!(?:^|[^A-Za-z0-9_.=:-])${CREDENTIAL_COMPOUND_FIELD_PREFIX}[ \t])(?:${CREDENTIAL_KEY_PATTERN}|${CREDENTIAL_CAMEL_KEY_PATTERN}|[A-Za-z][A-Za-z0-9_.-]{0,127})[ \t]*=`;
+const CREDENTIAL_WHITESPACE_FOLLOWING_FIELD_PATTERN = String.raw`[ \t]+(?:${CREDENTIAL_KEY_LABELS}|(?<!(?:^|[^A-Za-z0-9_.=:-])${CREDENTIAL_COMPOUND_FIELD_PREFIX}[ \t])[A-Za-z][A-Za-z0-9_.-]{0,127})[ \t]*=`;
 const CREDENTIAL_FOLLOWING_FIELD_PATTERN = String.raw`(?:[,;][ \t]*[A-Za-z][A-Za-z0-9_. \t-]{0,127}[ \t]*[=:]|${CREDENTIAL_WHITESPACE_FOLLOWING_FIELD_PATTERN})`;
 const CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY = String.raw`(?:(?!\\+n|\\+r\\+n|${CREDENTIAL_FOLLOWING_FIELD_PATTERN})(?:\\[^\r\n]|[^\s"'\x60}\]]))(?:(?!\\+n|\\+r\\+n|${CREDENTIAL_FOLLOWING_FIELD_PATTERN})(?:\\[^\r\n]|[^\r\n"'}\]]))*`;
 const CREDENTIAL_VALUE_QUOTED_BOUNDARY = String.raw`(?=$|[\s,;}):.\]]|/?>)`;
