@@ -360,6 +360,45 @@ describe("ultragoal nudge guard", () => {
 		).resolves.toBeUndefined();
 	});
 
+	it("keeps aggregate drop guarded by nudging a retained goal when the first target was handed off", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await setProjectBudget(cwd, 1);
+		await createUltragoalPlan({ cwd, brief: MULTI_BRIEF });
+		await plantFence(cwd, ["G001"]);
+
+		await expect(
+			assertUltragoalDropAllowed({ cwd, currentGoal: DEFAULT_OBJECTIVE_GOAL, sessionId: TEST_SESSION_ID }),
+		).rejects.toThrow(/try-harder nudge \(1\/1\) for G002/);
+		const ledger = await readUltragoalLedger(cwd, TEST_SESSION_ID);
+		const nudges = ledger.filter(event => event.event === "nudge");
+		expect(nudges).toHaveLength(1);
+		expect(nudges[0]).toMatchObject({ goalId: "G002", surface: "drop", attempt: 1 });
+
+		const status = await getUltragoalStatus(cwd, TEST_SESSION_ID);
+		expect(status).toMatchObject({ nudgeGoalId: "G002", nudgeCount: 1, nudgeRemaining: 0 });
+
+		// The existing drop path remains available after the retained goal's budget is exhausted.
+		await expect(
+			assertUltragoalDropAllowed({ cwd, currentGoal: DEFAULT_OBJECTIVE_GOAL, sessionId: TEST_SESSION_ID }),
+		).resolves.toBeUndefined();
+		expect((await readUltragoalLedger(cwd, TEST_SESSION_ID)).filter(event => event.event === "nudge")).toHaveLength(
+			1,
+		);
+	});
+
+	it("allows aggregate drop when all unfinished stories were handed off", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
+		await plantFence(cwd, ["G001"]);
+
+		await expect(
+			assertUltragoalDropAllowed({ cwd, currentGoal: DEFAULT_OBJECTIVE_GOAL, sessionId: TEST_SESSION_ID }),
+		).resolves.toBeUndefined();
+		expect((await readUltragoalLedger(cwd, TEST_SESSION_ID)).filter(event => event.event === "nudge")).toEqual([]);
+	});
+
 	// AC7: an unreadable durable state cannot be classified, so the drop fails closed.
 	it("AC7: drop classification fails closed when goals.json is corrupt", async () => {
 		const cwd = await tempDir();

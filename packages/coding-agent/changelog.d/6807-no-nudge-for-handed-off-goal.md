@@ -1,3 +1,3 @@
 ### Fixed
 
-- Stop Ultragoal try-harder nudges from targeting a goal that was handed off to a successor run; a pause, ask or premature-complete attempt about that goal now goes straight to its normal gate instead of spending the nudge budget on work the source no longer owns (#6807).
+- Stop Ultragoal try-harder nudges from targeting goals handed off to a successor run. When a retained source-owned goal remains, nudges target that work instead, keeping aggregate drop guarded until its nudge budget is exhausted; when no retained target remains, the guard falls through to its normal gate without spending budget (#6807).
