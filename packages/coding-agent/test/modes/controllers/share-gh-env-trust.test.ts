@@ -63,6 +63,7 @@ const TRUST_KEYS = [
 	"R_ENVIRON_USER",
 	"R_PROFILE",
 	"R_PROFILE_USER",
+	"ELIXIR_ERL_OPTIONS",
 	"ERL_AFLAGS",
 	"ERL_FLAGS",
 	"ERL_ZFLAGS",
@@ -132,6 +133,7 @@ interface GhSpawn {
 	R_ENVIRON_USER: string | null;
 	R_PROFILE: string | null;
 	R_PROFILE_USER: string | null;
+	ELIXIR_ERL_OPTIONS: string | null;
 	ERL_AFLAGS: string | null;
 	ERL_FLAGS: string | null;
 	ERL_ZFLAGS: string | null;
@@ -239,6 +241,7 @@ await fsPromises.appendFile(
 		R_ENVIRON_USER: process.env.R_ENVIRON_USER ?? null,
 		R_PROFILE: process.env.R_PROFILE ?? null,
 		R_PROFILE_USER: process.env.R_PROFILE_USER ?? null,
+		ELIXIR_ERL_OPTIONS: process.env.ELIXIR_ERL_OPTIONS ?? null,
 		ERL_AFLAGS: process.env.ERL_AFLAGS ?? null,
 		ERL_FLAGS: process.env.ERL_FLAGS ?? null,
 		ERL_ZFLAGS: process.env.ERL_ZFLAGS ?? null,
@@ -451,6 +454,7 @@ function expectDestination(
 			| "R_ENVIRON_USER"
 			| "R_PROFILE"
 			| "R_PROFILE_USER"
+			| "ELIXIR_ERL_OPTIONS"
 			| "ERL_AFLAGS"
 			| "ERL_FLAGS"
 			| "ERL_ZFLAGS"
@@ -543,6 +547,7 @@ function expectDestination(
 		expect(spawn.R_ENVIRON_USER).toBe(expected.R_ENVIRON_USER ?? null);
 		expect(spawn.R_PROFILE).toBe(expected.R_PROFILE ?? null);
 		expect(spawn.R_PROFILE_USER).toBe(expected.R_PROFILE_USER ?? null);
+		expect(spawn.ELIXIR_ERL_OPTIONS).toBe(expected.ELIXIR_ERL_OPTIONS ?? null);
 		expect(spawn.ERL_AFLAGS).toBe(expected.ERL_AFLAGS ?? null);
 		expect(spawn.ERL_FLAGS).toBe(expected.ERL_FLAGS ?? null);
 		expect(spawn.ERL_ZFLAGS).toBe(expected.ERL_ZFLAGS ?? null);
@@ -653,6 +658,7 @@ R_ENVIRON=/project/site.Renviron
 R_ENVIRON_USER=/project/user.Renviron
 R_PROFILE=/project/site.Rprofile
 R_PROFILE_USER=/project/user.Rprofile
+ELIXIR_ERL_OPTIONS=-eval project-startup-elixir
 ERL_AFLAGS=-eval project-startup-a
 ERL_FLAGS=-eval project-startup-b
 ERL_ZFLAGS=-eval project-startup-c
@@ -706,6 +712,7 @@ OPENSSL_ENGINES=/project/openssl-engines
 			R_ENVIRON_USER: null,
 			R_PROFILE: null,
 			R_PROFILE_USER: null,
+			ELIXIR_ERL_OPTIONS: null,
 			ERL_AFLAGS: null,
 			ERL_FLAGS: null,
 			ERL_ZFLAGS: null,
@@ -749,6 +756,7 @@ OPENSSL_ENGINES=/project/openssl-engines
 				R_ENVIRON_USER: "/operator/user.Renviron",
 				R_PROFILE: "/operator/site.Rprofile",
 				R_PROFILE_USER: "/operator/user.Rprofile",
+				ELIXIR_ERL_OPTIONS: "-eval operator-startup-elixir",
 				ERL_AFLAGS: "-eval operator-startup-a",
 				ERL_FLAGS: "-eval operator-startup-b",
 				ERL_ZFLAGS: "-eval operator-startup-c",
@@ -786,6 +794,7 @@ OPENSSL_ENGINES=/project/openssl-engines
 			R_ENVIRON_USER: "/operator/user.Renviron",
 			R_PROFILE: "/operator/site.Rprofile",
 			R_PROFILE_USER: "/operator/user.Rprofile",
+			ELIXIR_ERL_OPTIONS: "-eval operator-startup-elixir",
 			ERL_AFLAGS: "-eval operator-startup-a",
 			ERL_FLAGS: "-eval operator-startup-b",
 			ERL_ZFLAGS: "-eval operator-startup-c",
