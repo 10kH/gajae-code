@@ -1,0 +1,164 @@
+import { expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { PtySession } from "../native/index.js";
+
+const ESCAPE_SCRIPT = `use POSIX;
+my $pidfile = $ENV{PTY_ESCAPE_PID} or die "missing pidfile\\n";
+my $pid = fork();
+die "fork: $!\\n" unless defined $pid;
+if ($pid == 0) {
+	POSIX::setsid() == -1 and die "setsid: $!\\n";
+	my $child = fork();
+	die "fork2: $!\\n" unless defined $child;
+	if ($child == 0) {
+		open my $fh, ">", $pidfile or die "open: $!\\n";
+		print $fh "$$\\n";
+		close $fh;
+		sleep 60;
+		exit 0;
+	}
+	select(undef, undef, undef, 0.5);
+	exit 0;
+}
+sleep 60;
+`;
+
+function processAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function waitUntil(predicate: () => boolean, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (predicate()) return true;
+		await Bun.sleep(20);
+	}
+	return predicate();
+}
+
+function readPid(path: string): number | undefined {
+	try {
+		const pid = Number(readFileSync(path, "utf8").trim());
+		return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function escapeFiles(): { dir: string; script: string; pid: string } {
+	const dir = mkdtempSync(join(tmpdir(), "pty-setsid-"));
+	const script = join(dir, "escape.pl");
+	const pid = join(dir, "escape.pid");
+	writeFileSync(script, ESCAPE_SCRIPT);
+	return { dir, script, pid };
+}
+
+async function waitReparented(pidPath: string): Promise<number> {
+	let pid: number | undefined;
+	let birthPpid: number | undefined;
+	const found = await waitUntil(() => {
+		if (pid === undefined) {
+			pid = readPid(pidPath);
+			if (pid !== undefined) {
+				try {
+					birthPpid = Number(
+						Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(pid)])
+							.stdout.toString()
+							.trim(),
+					);
+				} catch {
+					birthPpid = undefined;
+				}
+			}
+		}
+		if (pid === undefined) return false;
+		const ppid = Number(
+			Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(pid)])
+				.stdout.toString()
+				.trim(),
+		);
+		return Number.isInteger(ppid) && ppid !== birthPpid;
+	}, 8_000);
+	if (!found || pid === undefined) throw new Error("setsid grandchild was not reparented");
+	return pid;
+}
+
+test.skipIf(process.platform === "win32")(
+	"keeps an unrelated process alive when a PTY command is cancelled",
+	async () => {
+		const sibling = Bun.spawn(["sleep", "30"], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+		try {
+			const session = new PtySession();
+			const controller = new AbortController();
+			const run = session.start({
+				command: "sleep 30",
+				shell: "sh",
+				timeoutMs: 10_000,
+				signal: controller.signal,
+			});
+			await Bun.sleep(300);
+			controller.abort();
+			const result = await run;
+			expect(session).toBeDefined();
+			expect(result.cancelled).toBe(true);
+			expect(processAlive(sibling.pid)).toBe(true);
+		} finally {
+			sibling.kill();
+		}
+	},
+);
+
+test.skipIf(process.platform === "win32")("cancel reaps a reparented setsid grandchild", async () => {
+	const files = escapeFiles();
+	let grandchild: number | undefined;
+	try {
+		const session = new PtySession();
+		const controller = new AbortController();
+		const run = session.start({
+			command: 'perl "$PTY_ESCAPE_SCRIPT"',
+			env: { PTY_ESCAPE_SCRIPT: files.script, PTY_ESCAPE_PID: files.pid },
+			shell: "sh",
+			timeoutMs: 20_000,
+			signal: controller.signal,
+		});
+		grandchild = await waitReparented(files.pid);
+		controller.abort();
+		const result = await run;
+		expect(session).toBeDefined();
+		expect(result.cancelled).toBe(true);
+		expect(await waitUntil(() => !processAlive(grandchild!), 3_000)).toBe(true);
+	} finally {
+		if (grandchild !== undefined && processAlive(grandchild)) process.kill(grandchild, "SIGKILL");
+		rmSync(files.dir, { recursive: true, force: true });
+	}
+});
+
+test.skipIf(process.platform === "win32")("timeout reaps a reparented setsid grandchild", async () => {
+	const files = escapeFiles();
+	let grandchild: number | undefined;
+	try {
+		const session = new PtySession();
+		const run = session.start({
+			command: 'perl "$PTY_ESCAPE_SCRIPT"',
+			env: { PTY_ESCAPE_SCRIPT: files.script, PTY_ESCAPE_PID: files.pid },
+			shell: "sh",
+			timeoutMs: 4_000,
+		});
+		const result = await run;
+		expect(session).toBeDefined();
+		expect(result.timedOut).toBe(true);
+		grandchild = readPid(files.pid);
+		expect(grandchild).toBeDefined();
+		expect(await waitUntil(() => !processAlive(grandchild!), 3_000)).toBe(true);
+	} finally {
+		if (grandchild !== undefined && processAlive(grandchild)) process.kill(grandchild, "SIGKILL");
+		rmSync(files.dir, { recursive: true, force: true });
+	}
+});

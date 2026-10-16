@@ -250,19 +250,48 @@ fn terminate_pty_processes(
 	child: &mut Box<dyn Child + Send + Sync>,
 	child_pid: Option<i32>,
 	process_group_id: Option<i32>,
+	observed: Option<&mut ps::TerminationTargets>,
 ) {
-	let mut targets = ps::TerminationTargets::new();
-	if let Some(pgid) = process_group_id {
-		targets.add_pgid(pgid);
-	}
+	let mut owned = ps::TerminationTargets::new();
+	let targets = observed.unwrap_or(&mut owned);
 	if let Some(pid) = child_pid {
 		targets.add_pid(pid);
 	}
-
-	targets.signal(ps::TERM_SIGNAL);
+	#[cfg(unix)]
+	{
+		// Freeze the PTY group before any catchable signal. A TERM handler can
+		// otherwise setsid and double-fork out of both the group and the tree.
+		if let Some(pgid) = process_group_id.filter(|pgid| *pgid > 0) {
+			let _ = ps::kill_process_group(pgid, pi_shell::process::STOP_SIGNAL);
+			let _ = pi_shell::process::add_process_group_members(targets, pgid);
+		}
+		targets.retain_owned_descendants();
+		// Stop setsid descendants that already left the group, then walk once
+		// more so a child forked just before the stop is pinned too.
+		targets.signal_processes(pi_shell::process::STOP_SIGNAL);
+		targets.retain_owned_descendants();
+		targets.clear_pgids();
+		targets.signal_processes(ps::KILL_SIGNAL);
+		if let Some(pgid) = process_group_id.filter(|pgid| *pgid > 0) {
+			let _ = ps::kill_process_group(pgid, ps::KILL_SIGNAL);
+		}
+	}
+	#[cfg(not(unix))]
+	{
+		if let Some(pgid) = process_group_id {
+			targets.add_pgid(pgid);
+		}
+		targets.signal(ps::TERM_SIGNAL);
+		targets.signal(ps::KILL_SIGNAL);
+	}
 	let _ = child.kill();
-	targets.signal(ps::KILL_SIGNAL);
 }
+
+/// How often to pin live PTY descendants. A setsid child that double-forks
+/// leaves both the process group and the tree; the retained process handles
+/// are what cancel and timeout can still signal after that reparent.
+#[cfg(unix)]
+const PTY_DESCENDANT_SCAN_INTERVAL: Duration = Duration::from_millis(40);
 fn reap_terminated_child(
 	child: &mut Box<dyn Child + Send + Sync>,
 	deadline: Instant,
@@ -366,7 +395,7 @@ impl Drop for PostSpawnSetupGuard {
 		}
 		drop(self.writer.take());
 		if let Some(child) = self.child.as_mut() {
-			terminate_pty_processes(child, self.child_pid, self.process_group_id);
+			terminate_pty_processes(child, self.child_pid, self.process_group_id, None);
 			let _ = reap_terminated_child(child, Instant::now() + TERMINATED_REAP_TIMEOUT);
 		}
 		drop(self.master.take());
@@ -710,6 +739,12 @@ fn run_pty_sync(
 	});
 
 	let (mut child, master, mut writer, child_pid, process_group_id) = setup_guard.disarm();
+	let mut observed = ps::TerminationTargets::new();
+	if let Some(pid) = child_pid {
+		observed.add_pid(pid);
+	}
+	#[cfg(unix)]
+	let mut next_descendant_scan = Instant::now();
 	let mut timed_out = false;
 	let mut cancelled = false;
 	let mut reader_done = false;
@@ -717,11 +752,16 @@ fn run_pty_sync(
 	let mut terminate_requested = false;
 	let mut reader_drain_deadline: Option<Instant> = None;
 	while exit_code.is_none() || !reader_done {
+		#[cfg(unix)]
+		if !terminate_requested && Instant::now() >= next_descendant_scan {
+			observed.retain_owned_descendants();
+			next_descendant_scan = Instant::now() + PTY_DESCENDANT_SCAN_INTERVAL;
+		}
 		if !terminate_requested && let Err(err) = ct.heartbeat() {
 			let message = err.to_string();
 			timed_out = message.contains("Timeout");
 			cancelled = !timed_out;
-			terminate_pty_processes(&mut child, child_pid, process_group_id);
+			terminate_pty_processes(&mut child, child_pid, process_group_id, Some(&mut observed));
 			terminate_requested = true;
 			reader_drain_deadline = Some(Instant::now() + POST_CANCEL_DRAIN_TIMEOUT);
 		}
@@ -738,7 +778,12 @@ fn run_pty_sync(
 				Ok(ControlMessage::Kill) => {
 					cancelled = true;
 					if !terminate_requested {
-						terminate_pty_processes(&mut child, child_pid, process_group_id);
+						terminate_pty_processes(
+							&mut child,
+							child_pid,
+							process_group_id,
+							Some(&mut observed),
+						);
 						terminate_requested = true;
 						reader_drain_deadline = Some(Instant::now() + POST_CANCEL_DRAIN_TIMEOUT);
 					}
@@ -758,7 +803,12 @@ fn run_pty_sync(
 					if !emit_reader_event(event, on_chunk.as_ref()) {
 						cancelled = true;
 						if !terminate_requested {
-							terminate_pty_processes(&mut child, child_pid, process_group_id);
+							terminate_pty_processes(
+								&mut child,
+								child_pid,
+								process_group_id,
+								Some(&mut observed),
+							);
 							terminate_requested = true;
 							reader_drain_deadline = Some(Instant::now() + POST_CANCEL_DRAIN_TIMEOUT);
 						}
@@ -801,7 +851,12 @@ fn run_pty_sync(
 					if !emit_reader_event(event, on_chunk.as_ref()) {
 						cancelled = true;
 						if !terminate_requested {
-							terminate_pty_processes(&mut child, child_pid, process_group_id);
+							terminate_pty_processes(
+								&mut child,
+								child_pid,
+								process_group_id,
+								Some(&mut observed),
+							);
 							terminate_requested = true;
 							reader_drain_deadline = Some(Instant::now() + POST_CANCEL_DRAIN_TIMEOUT);
 						}
@@ -859,7 +914,7 @@ fn run_pty_sync(
 	// output and signal EOF on the output pipe, causing the reader thread to exit.
 	// On Windows, use a generous timeout to accommodate ConPTY's async teardown.
 	if exit_code.is_some() && !terminate_requested && !reader_done {
-		terminate_pty_processes(&mut child, child_pid, process_group_id);
+		terminate_pty_processes(&mut child, child_pid, process_group_id, Some(&mut observed));
 	}
 	if !reader_done {
 		#[cfg(windows)]
@@ -936,9 +991,9 @@ mod tests {
 	};
 
 	use super::*;
-	static PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
+	pub(crate) static PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-	fn test_config(command: &str) -> PtyRunConfig {
+	pub(crate) fn test_config(command: &str) -> PtyRunConfig {
 		PtyRunConfig {
 			command:   command.to_string(),
 			cwd:       None,
@@ -977,12 +1032,12 @@ mod tests {
 	}
 
 	#[cfg(unix)]
-	fn process_exists(pid: i32) -> bool {
+	pub(crate) fn process_exists(pid: i32) -> bool {
 		unsafe { libc::kill(pid, 0) == 0 }
 	}
 
 	#[cfg(unix)]
-	fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
+	pub(crate) fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
 		let deadline = Instant::now() + timeout;
 		while Instant::now() < deadline {
 			if !process_exists(pid) {
@@ -994,7 +1049,7 @@ mod tests {
 	}
 
 	#[cfg(unix)]
-	fn test_path(name: &str) -> PathBuf {
+	pub(crate) fn test_path(name: &str) -> PathBuf {
 		let mut path = std::env::temp_dir();
 		path.push(format!("pi-natives-pty-{name}-{}", std::process::id()));
 		let _ = fs::remove_file(&path);
@@ -1249,3 +1304,7 @@ mod tests {
 		let _ = fs::remove_file(pid_path);
 	}
 }
+
+#[cfg(all(test, unix))]
+#[path = "../tests/pty_setsid_reap.rs"]
+mod setsid_reap;
