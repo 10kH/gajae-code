@@ -306,10 +306,13 @@ export function createMCPToolName(serverName: string, toolName: string): string 
 	return `mcp__${sanitizedServerName}_${normalizedToolName}`;
 }
 
-/** Instance payloads. Framing these would change the arguments a tool still accepts. */
+/** Instance payloads on a schema node. Framing these would change the arguments a tool still accepts. */
 const MCP_SCHEMA_LITERAL_KEYS = new Set(["default", "const", "enum", "examples", "example"]);
 /** Prose the model reads. Structural keywords such as type, pattern, and $ref stay literal. */
 const MCP_SCHEMA_PROSE_KEYS = new Set(["description", "title", "$comment"]);
+/** Values are schemas keyed by a name that is not itself a schema keyword. */
+const MCP_SCHEMA_MAP_KEYS = new Set(["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"]);
+const MCP_SCHEMA_LIST_KEYS = new Set(["anyOf", "oneOf", "allOf", "prefixItems"]);
 
 function assignOwn(target: Record<string, unknown>, key: string, value: unknown): void {
 	if (key === "__proto__") {
@@ -319,11 +322,18 @@ function assignOwn(target: Record<string, unknown>, key: string, value: unknown)
 	target[key] = value;
 }
 
-function frameMcpSchemaProse(value: unknown, seen: WeakSet<object>): unknown {
+function frameMcpSchemaMap(map: Record<string, unknown>, seen: WeakSet<object>): Record<string, unknown> {
+	const output: Record<string, unknown> = {};
+	for (const name of Object.keys(map)) assignOwn(output, name, frameMcpSchemaNode(map[name], seen));
+	return output;
+}
+
+/** Frame one schema node. Property names inside schema maps are not treated as keywords. */
+function frameMcpSchemaNode(value: unknown, seen: WeakSet<object>): unknown {
 	if (!value || typeof value !== "object") return value;
 	if (seen.has(value)) return value;
 	seen.add(value);
-	if (Array.isArray(value)) return value.map(item => frameMcpSchemaProse(item, seen));
+	if (Array.isArray(value)) return value.map(item => frameMcpSchemaNode(item, seen));
 	const output: Record<string, unknown> = {};
 	for (const key of Object.keys(value)) {
 		const child = (value as Record<string, unknown>)[key];
@@ -335,7 +345,19 @@ function frameMcpSchemaProse(value: unknown, seen: WeakSet<object>): unknown {
 			assignOwn(output, key, wrapUntrustedContent(child));
 			continue;
 		}
-		assignOwn(output, key, frameMcpSchemaProse(child, seen));
+		if (MCP_SCHEMA_MAP_KEYS.has(key) && child && typeof child === "object" && !Array.isArray(child)) {
+			assignOwn(output, key, frameMcpSchemaMap(child as Record<string, unknown>, seen));
+			continue;
+		}
+		if (MCP_SCHEMA_LIST_KEYS.has(key) && Array.isArray(child)) {
+			assignOwn(
+				output,
+				key,
+				child.map(item => frameMcpSchemaNode(item, seen)),
+			);
+			continue;
+		}
+		assignOwn(output, key, frameMcpSchemaNode(child, seen));
 	}
 	return output;
 }
@@ -345,7 +367,7 @@ function mcpModelDescription(description: string | undefined, serverName: string
 }
 
 function mcpModelParameters(inputSchema: MCPToolDefinition["inputSchema"]): TSchema {
-	return frameMcpSchemaProse(normalizeSchemaForMCP(inputSchema), new WeakSet()) as TSchema;
+	return frameMcpSchemaNode(normalizeSchemaForMCP(inputSchema), new WeakSet()) as TSchema;
 }
 
 /**
