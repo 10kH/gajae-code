@@ -1,8 +1,20 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+import { Agent, type AgentTool } from "@gajae-code/agent-core";
+import { getBundledModel, type ToolCall } from "@gajae-code/ai";
+import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { parseRuleConditionAndScope, type Rule } from "@gajae-code/coding-agent/capability/rule";
 import { buildRuleFromMarkdown } from "@gajae-code/coding-agent/discovery/helpers";
 import { TtsrManager } from "@gajae-code/coding-agent/export/ttsr";
+import { Settings } from "../src/config/settings";
+import { EditTool } from "../src/edit";
+import { WriteTool } from "../src/tools/write";
+import { AgentSession } from "../src/session/agent-session";
+import { SessionManager } from "../src/session/session-manager";
+import { Snowflake } from "@gajae-code/utils";
+import type { ToolSession } from "../src/tools";
 
 function makeRule(partial: Partial<Rule>): Rule {
 	return {
@@ -799,36 +811,336 @@ describe("TTSR AST conditions", () => {
 });
 
 describe("TTSR beforeToolCall integration", () => {
-	it("checkAstCondition triggers for 'write' tool with matching code", async () => {
-		const manager = new TtsrManager();
-		const rule = makeRule({
-			name: "function-rule",
-			scope: ["tool:write"],
-			astCondition: ["function testFn() {}"],
-		});
+	let session: AgentSession;
+	let tempDir: string;
 
-		manager.addRule(rule);
-
-		const matchContext = { source: "tool" as const, toolName: "write" };
-		const matchingContent = "function testFn() {}";
-
-		const matches = await manager.checkAstCondition(rule, "test.ts", matchingContent);
-		expect(matches).toBe(true);
+	beforeEach(() => {
+		tempDir = path.join(os.tmpdir(), `ttsr-integration-test-${Snowflake.next()}`);
+		fs.mkdirSync(tempDir, { recursive: true });
 	});
 
-	it("checkAstCondition does not trigger for 'write' tool with non-matching code", async () => {
-		const manager = new TtsrManager();
+	afterEach(async () => {
+		if (session) {
+			await session.dispose();
+		}
+		if (tempDir && fs.existsSync(tempDir)) {
+			fs.rmSync(tempDir, { recursive: true });
+		}
+	});
+
+	function createToolSession(): ToolSession {
+		return {
+			cwd: tempDir,
+			hasUI: false,
+			enableLsp: false,
+			settings: Settings.isolated(),
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			getArtifactsDir: () => null,
+			getSessionId: () => null,
+			getPlanModeState: () => undefined,
+		} as unknown as ToolSession;
+	}
+
+	function assistantMessageWithCalls(calls: ToolCall[]): Parameters<typeof AssistantMessageEventStream.prototype.push>[0] {
+		return {
+			type: "start",
+			partial: {
+				content: calls.map(call => ({
+					type: "toolCall" as const,
+					id: call.id,
+					name: call.name,
+					arguments: call.arguments,
+				})),
+				stopReason: "toolCall" as const,
+			},
+		};
+	}
+
+	it("beforeToolCall checks astCondition for write tool with matching code and triggers ttsr_triggered event", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const writeTool = new WriteTool(createToolSession());
+		const ttsrManager = new TtsrManager();
 		const rule = makeRule({
-			name: "function-rule",
+			name: "function-detect",
 			scope: ["tool:write"],
 			astCondition: ["function testFn() {}"],
 		});
+		ttsrManager.addRule(rule);
 
-		manager.addRule(rule);
+		const agent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [writeTool],
+				messages: [],
+			},
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const toolCall: ToolCall = {
+						type: "toolCall",
+						id: "write-call-1",
+						name: "write",
+						arguments: {
+							path: path.join(tempDir, "test.ts"),
+							content: "function testFn() {}",
+						},
+					};
+					stream.push(assistantMessageWithCalls([toolCall]));
+					const message = {
+						content: [toolCall],
+						stopReason: "toolCall" as const,
+					};
+					stream.push({ type: "done", reason: "toolCall", message });
+				});
+				return stream;
+			},
+		});
 
-		const nonMatchingContent = "function otherFn() {}";
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			ttsrManager,
+			toolRegistry: new Map([[writeTool.name, writeTool as AgentTool]]),
+		});
 
-		const matches = await manager.checkAstCondition(rule, "test.ts", nonMatchingContent);
-		expect(matches).toBe(false);
+		const ttsr_triggered_events: Array<{ type: string; rules: Rule[] }> = [];
+		session.subscribe(event => {
+			if (event.type === "ttsr_triggered") {
+				ttsr_triggered_events.push(event as any);
+			}
+		});
+
+		await session.prompt("Write a test function");
+		await session.waitForIdle();
+
+		// Verify ttsr_triggered event was emitted with matching rule
+		expect(ttsr_triggered_events.length).toBeGreaterThan(0);
+		const triggeredRules = ttsr_triggered_events.flatMap(e => e.rules);
+		expect(triggeredRules.some(r => r.name === "function-detect")).toBe(true);
+	});
+
+	it("beforeToolCall does not trigger event for write tool with non-matching code", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const writeTool = new WriteTool(createToolSession());
+		const ttsrManager = new TtsrManager();
+		const rule = makeRule({
+			name: "function-detect",
+			scope: ["tool:write"],
+			astCondition: ["function testFn() {}"],
+		});
+		ttsrManager.addRule(rule);
+
+		const agent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [writeTool],
+				messages: [],
+			},
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const toolCall: ToolCall = {
+						type: "toolCall",
+						id: "write-call-1",
+						name: "write",
+						arguments: {
+							path: path.join(tempDir, "test.ts"),
+							content: "function otherFn() {}",
+						},
+					};
+					stream.push(assistantMessageWithCalls([toolCall]));
+					const message = {
+						content: [toolCall],
+						stopReason: "toolCall" as const,
+					};
+					stream.push({ type: "done", reason: "toolCall", message });
+				});
+				return stream;
+			},
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			ttsrManager,
+			toolRegistry: new Map([[writeTool.name, writeTool as AgentTool]]),
+		});
+
+		const ttsr_triggered_events: Array<{ type: string; rules: Rule[] }> = [];
+		session.subscribe(event => {
+			if (event.type === "ttsr_triggered") {
+				ttsr_triggered_events.push(event as any);
+			}
+		});
+
+		await session.prompt("Write a test function");
+		await session.waitForIdle();
+
+		// No TTSR event should be triggered because content doesn't match the astCondition
+		expect(ttsr_triggered_events.length).toBe(0);
+	});
+
+	it("gating: second matching write call does not trigger event under once mode", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const writeTool = new WriteTool(createToolSession());
+		const ttsrManager = new TtsrManager();
+		const rule = makeRule({
+			name: "function-detect",
+			scope: ["tool:write"],
+			astCondition: ["function testFn() {}"],
+			repeatMode: "once",
+		});
+		ttsrManager.addRule(rule);
+
+		let callCount = 0;
+		const agent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [writeTool],
+				messages: [],
+			},
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					callCount++;
+					const toolCall: ToolCall = {
+						type: "toolCall",
+						id: `write-call-${callCount}`,
+						name: "write",
+						arguments: {
+							path: path.join(tempDir, `test${callCount}.ts`),
+							content: "function testFn() {}",
+						},
+					};
+					stream.push(assistantMessageWithCalls([toolCall]));
+					const message = {
+						content: [toolCall],
+						stopReason: "toolCall" as const,
+					};
+					stream.push({ type: "done", reason: "toolCall", message });
+				});
+				return stream;
+			},
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			ttsrManager,
+			toolRegistry: new Map([[writeTool.name, writeTool as AgentTool]]),
+		});
+
+		const ttsr_triggered_events: Array<{ type: string; rules: Rule[] }> = [];
+		session.subscribe(event => {
+			if (event.type === "ttsr_triggered") {
+				ttsr_triggered_events.push(event as any);
+			}
+		});
+
+		// First matching write
+		await session.prompt("Write first function");
+		await session.waitForIdle();
+		const eventsAfterFirst = ttsr_triggered_events.length;
+
+		// Verify rule triggered on first write
+		expect(eventsAfterFirst).toBeGreaterThan(0);
+		const firstTriggeredRules = ttsr_triggered_events.flatMap(e => e.rules);
+		expect(firstTriggeredRules.some(r => r.name === "function-detect")).toBe(true);
+
+		// Check that rule was marked as injected
+		const injectedAfterFirst = ttsrManager.getInjectedRuleNames();
+		expect(injectedAfterFirst).toContain("function-detect");
+
+		// Second matching write - rule should NOT trigger again due to once mode
+		await session.prompt("Write second function");
+		await session.waitForIdle();
+
+		// No new events should be triggered on second matching write
+		expect(ttsr_triggered_events.length).toBe(eventsAfterFirst);
+	});
+
+	it("beforeToolCall checks astCondition for edit tool with matching post-edit content", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const editTool = new EditTool(createToolSession());
+		const ttsrManager = new TtsrManager();
+		const rule = makeRule({
+			name: "export-detect",
+			scope: ["tool:edit"],
+			astCondition: ["export function"],
+		});
+		ttsrManager.addRule(rule);
+
+		// Create a temp file with initial content
+		const testFile = path.join(tempDir, "test.ts");
+		fs.writeFileSync(testFile, "function test() {}\n");
+
+		const agent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [editTool],
+				messages: [],
+			},
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const toolCall: ToolCall = {
+						type: "toolCall",
+						id: "edit-call-1",
+						name: "edit",
+						arguments: {
+							path: testFile,
+							edits: [
+								{
+									old_text: "function test() {}",
+									new_text: "export function test() {}",
+								},
+							],
+						},
+					};
+					stream.push(assistantMessageWithCalls([toolCall]));
+					const message = {
+						content: [toolCall],
+						stopReason: "toolCall" as const,
+					};
+					stream.push({ type: "done", reason: "toolCall", message });
+				});
+				return stream;
+			},
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			ttsrManager,
+			toolRegistry: new Map([[editTool.name, editTool as AgentTool]]),
+		});
+
+		const ttsr_triggered_events: Array<{ type: string; rules: Rule[] }> = [];
+		session.subscribe(event => {
+			if (event.type === "ttsr_triggered") {
+				ttsr_triggered_events.push(event as any);
+			}
+		});
+
+		await session.prompt("Export the function");
+		await session.waitForIdle();
+
+		// Verify ttsr_triggered event was emitted with matching rule
+		expect(ttsr_triggered_events.length).toBeGreaterThan(0);
+		const triggeredRules = ttsr_triggered_events.flatMap(e => e.rules);
+		expect(triggeredRules.some(r => r.name === "export-detect")).toBe(true);
 	});
 });
