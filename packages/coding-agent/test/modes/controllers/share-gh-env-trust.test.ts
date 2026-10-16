@@ -68,6 +68,8 @@ const TRUST_KEYS = [
 	"ERL_FLAGS",
 	"ERL_ZFLAGS",
 	"BUNDLER_SETUP",
+	"GEM_HOME",
+	"GEM_PATH",
 	"RUBYOPT",
 	"RUBYLIB",
 	"PERL5OPT",
@@ -138,6 +140,8 @@ interface GhSpawn {
 	ERL_FLAGS: string | null;
 	ERL_ZFLAGS: string | null;
 	BUNDLER_SETUP: string | null;
+	GEM_HOME: string | null;
+	GEM_PATH: string | null;
 	RUBYOPT: string | null;
 	RUBYLIB: string | null;
 	PERL5OPT: string | null;
@@ -246,6 +250,8 @@ await fsPromises.appendFile(
 		ERL_FLAGS: process.env.ERL_FLAGS ?? null,
 		ERL_ZFLAGS: process.env.ERL_ZFLAGS ?? null,
 		BUNDLER_SETUP: process.env.BUNDLER_SETUP ?? null,
+		GEM_HOME: process.env.GEM_HOME ?? null,
+		GEM_PATH: process.env.GEM_PATH ?? null,
 		RUBYOPT: process.env.RUBYOPT ?? null,
 		RUBYLIB: process.env.RUBYLIB ?? null,
 		PERL5OPT: process.env.PERL5OPT ?? null,
@@ -459,6 +465,8 @@ function expectDestination(
 			| "ERL_FLAGS"
 			| "ERL_ZFLAGS"
 			| "BUNDLER_SETUP"
+			| "GEM_HOME"
+			| "GEM_PATH"
 			| "RUBYOPT"
 			| "RUBYLIB"
 			| "PERL5OPT"
@@ -552,6 +560,8 @@ function expectDestination(
 		expect(spawn.ERL_FLAGS).toBe(expected.ERL_FLAGS ?? null);
 		expect(spawn.ERL_ZFLAGS).toBe(expected.ERL_ZFLAGS ?? null);
 		expect(spawn.BUNDLER_SETUP).toBe(expected.BUNDLER_SETUP ?? null);
+		expect(spawn.GEM_HOME).toBe(expected.GEM_HOME ?? null);
+		expect(spawn.GEM_PATH).toBe(expected.GEM_PATH ?? null);
 		expect(spawn.RUBYOPT).toBe(expected.RUBYOPT ?? null);
 		expect(spawn.RUBYLIB).toBe(expected.RUBYLIB ?? null);
 		expect(spawn.PERL5OPT).toBe(expected.PERL5OPT ?? null);
@@ -634,7 +644,7 @@ APPDATA=project-appdata
 		expectDestination(spawns, {});
 	});
 
-	it("omits project dotenv shell and interpreter startup hooks from both gh spawns", async () => {
+	it("omits project dotenv startup hooks and runtime paths from both gh spawns", async () => {
 		const spawns = await share({
 			autoload: true,
 			dotenv: `BASH_ENV=/project/bash-startup
@@ -663,6 +673,8 @@ ERL_AFLAGS=-eval project-startup-a
 ERL_FLAGS=-eval project-startup-b
 ERL_ZFLAGS=-eval project-startup-c
 BUNDLER_SETUP=/project/bundler-setup.rb
+GEM_HOME=/project/gem-home
+GEM_PATH=/project/gem-path
 RUBYOPT=-r/project/ruby-startup.rb
 RUBYLIB=/project/ruby-libraries
 PERL5OPT=-MProject::Startup
@@ -717,6 +729,8 @@ OPENSSL_ENGINES=/project/openssl-engines
 			ERL_FLAGS: null,
 			ERL_ZFLAGS: null,
 			BUNDLER_SETUP: null,
+			GEM_HOME: null,
+			GEM_PATH: null,
 			RUBYOPT: null,
 			RUBYLIB: null,
 			PERL5OPT: null,
@@ -761,6 +775,8 @@ OPENSSL_ENGINES=/project/openssl-engines
 				ERL_FLAGS: "-eval operator-startup-b",
 				ERL_ZFLAGS: "-eval operator-startup-c",
 				BUNDLER_SETUP: "/operator/bundler-setup.rb",
+				GEM_HOME: "/operator/gem-home",
+				GEM_PATH: "/operator/gem-path",
 				RUBYOPT: "-r/operator/ruby-startup.rb",
 				RUBYLIB: "/operator/ruby-libraries",
 				PERL5OPT: "-MOperator::Startup",
@@ -799,6 +815,8 @@ OPENSSL_ENGINES=/project/openssl-engines
 			ERL_FLAGS: "-eval operator-startup-b",
 			ERL_ZFLAGS: "-eval operator-startup-c",
 			BUNDLER_SETUP: "/operator/bundler-setup.rb",
+			GEM_HOME: "/operator/gem-home",
+			GEM_PATH: "/operator/gem-path",
 			RUBYOPT: "-r/operator/ruby-startup.rb",
 			RUBYLIB: "/operator/ruby-libraries",
 			PERL5OPT: "-MOperator::Startup",
