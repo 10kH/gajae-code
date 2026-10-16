@@ -2106,10 +2106,12 @@ describe("bash scanner quoting model", () => {
 	});
 
 	it("keeps planning Bash interpreter and inline-program boundaries fail-closed", async () => {
-		const cwd = await makeTempRoot();
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plan workspace-"));
+		tempRoots.push(cwd);
 		await writeActiveSkill(cwd, "ralplan", "planner");
 		const scratch = path.join(os.tmpdir(), `gjc-plan-multi-write-${process.pid}.txt`);
 		const escapedScratch = path.join(os.tmpdir(), `gjc-plan-escaped\\${process.pid}.txt`);
+		const spacedProjectTarget = path.join(cwd, "src", "product.ts");
 		const cases: Array<{
 			name: string;
 			command: string;
@@ -2132,6 +2134,12 @@ describe("bash scanner quoting model", () => {
 			{
 				name: "Python eval-wrapped write source",
 				command: `python3 -c 'eval(${JSON.stringify('open("src/product.ts","w").write("PWNED")')})'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Ruby attached -e write source",
+				command: `ruby -e'File.open("src/product.ts","w").write("PWNED")'`,
 				blocked: true,
 				reason: "unknown-target",
 			},
@@ -2187,6 +2195,13 @@ describe("bash scanner quoting model", () => {
 				target: "src/product.ts",
 			},
 			{
+				name: "sed destination is not truncated to a neutral temporary prefix",
+				command: `sed -n 'w ${spacedProjectTarget}' input`,
+				blocked: true,
+				reason: "phase-boundary",
+				target: spacedProjectTarget,
+			},
+			{
 				name: "later sed destination after a temporary first destination",
 				command: `sed -n 'w ${scratch};w src/product.ts' input`,
 				blocked: true,
@@ -2204,7 +2219,7 @@ describe("bash scanner quoting model", () => {
 			},
 			{
 				name: "Node eval and write API names in inert output text",
-				command: `node -e "console.log('eval writeFileSync(')"`,
+				command: `node -e "console.log('exec eval compile writeFileSync(')"`,
 				blocked: false,
 			},
 			{
