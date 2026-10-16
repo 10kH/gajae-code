@@ -685,10 +685,18 @@ mod platform {
 		/// that terminate descendants MUST NOT treat that as an empty
 		/// descendant set.
 		pub fn descendants_observed(&self) -> Option<Vec<Self>> {
+			// A recycled PID must not donate the new occupant's children.
+			// Identity mismatch is an observed empty set, not an unreadable table.
+			if self.live_bsdinfo().is_none() {
+				return Some(Vec::new());
+			}
 			// One process-table snapshot per walk — building it inside the recursion
 			// would re-scan every pid for every visited node, producing an `O(N · D)`
 			// kernel call pattern. Mirrors the Windows implementation.
 			let tree = build_process_tree()?;
+			if self.live_bsdinfo().is_none() {
+				return Some(Vec::new());
+			}
 			let mut out = Vec::new();
 			let mut visited = HashSet::new();
 			visited.insert(self.pid);
@@ -1105,6 +1113,41 @@ mod platform {
 			offset = end + 1;
 		}
 		args
+	}
+
+	#[cfg(test)]
+	#[test]
+	fn descendants_observed_skips_reused_pid() {
+		use std::{process::Command, thread, time::Duration};
+
+		let mut child = Command::new("sleep")
+			.arg("30")
+			.stdin(std::process::Stdio::null())
+			.stdout(std::process::Stdio::null())
+			.stderr(std::process::Stdio::null())
+			.spawn()
+			.expect("spawn sleep");
+		let child_pid = i32::try_from(child.id()).expect("child pid fits in i32");
+		let self_pid = i32::try_from(std::process::id()).expect("self pid fits in i32");
+		let live = Process::from_pid(self_pid).expect("live self");
+		let mut visible = false;
+		for _ in 0..40 {
+			if live.descendants().iter().any(|descendant| descendant.pid() == child_pid) {
+				visible = true;
+				break;
+			}
+			thread::sleep(Duration::from_millis(25));
+		}
+		let stale = Process { pid: self_pid, start_tvsec: 0, start_tvusec: 0 };
+		let observed = stale.descendants_observed().expect("process table");
+		let _ = child.kill();
+		let _ = child.wait();
+		assert!(visible, "child pid {child_pid} never appeared under the live process");
+		assert_ne!(live.incarnation(), stale.incarnation());
+		assert!(
+			observed.iter().all(|descendant| descendant.pid() != child_pid),
+			"recycled pid handle adopted child {child_pid}"
+		);
 	}
 }
 #[cfg(target_os = "windows")]

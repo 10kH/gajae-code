@@ -1306,5 +1306,5 @@ mod tests {
 }
 
 #[cfg(all(test, unix))]
-#[path = "../tests/pty_setsid_reap.rs"]
+#[path = "tests/pty_setsid_reap.rs"]
 mod setsid_reap;
