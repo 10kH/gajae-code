@@ -137,7 +137,9 @@ test.skipIf(process.platform === "win32")(
 			const result = await run;
 			expect(session).toBeDefined();
 			expect(result.cancelled).toBe(true);
-			expect(await waitUntil(() => !processAlive(grandchild!), 3_000)).toBe(true);
+			const reaped = await waitUntil(() => !processAlive(grandchild!), 3_000);
+			if (!reaped) console.log("(fail) cancel reaps a reparented setsid grandchild");
+			expect(reaped).toBe(true);
 			console.log("(pass) cancel reaps a reparented setsid grandchild");
 		} finally {
 			if (grandchild !== undefined && processAlive(grandchild)) process.kill(grandchild, "SIGKILL");
@@ -165,7 +167,9 @@ test.skipIf(process.platform === "win32")(
 			expect(result.timedOut).toBe(true);
 			grandchild = readPid(files.pid);
 			expect(grandchild).toBeDefined();
-			expect(await waitUntil(() => !processAlive(grandchild!), 3_000)).toBe(true);
+			const reaped = await waitUntil(() => !processAlive(grandchild!), 3_000);
+			if (!reaped) console.log("(fail) timeout reaps a reparented setsid grandchild");
+			expect(reaped).toBe(true);
 			console.log("(pass) timeout reaps a reparented setsid grandchild");
 		} finally {
 			if (grandchild !== undefined && processAlive(grandchild)) process.kill(grandchild, "SIGKILL");

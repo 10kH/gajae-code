@@ -685,17 +685,19 @@ mod platform {
 		/// that terminate descendants MUST NOT treat that as an empty
 		/// descendant set.
 		pub fn descendants_observed(&self) -> Option<Vec<Self>> {
-			// A recycled PID must not donate the new occupant's children.
-			// Identity mismatch is an observed empty set, not an unreadable table.
-			if self.live_bsdinfo().is_none() {
-				return Some(Vec::new());
+			match self.walk_identity() {
+				WalkIdentity::Unreadable => return None,
+				WalkIdentity::ConfirmedGone => return Some(Vec::new()),
+				WalkIdentity::Same => {},
 			}
 			// One process-table snapshot per walk — building it inside the recursion
 			// would re-scan every pid for every visited node, producing an `O(N · D)`
 			// kernel call pattern. Mirrors the Windows implementation.
 			let tree = build_process_tree()?;
-			if self.live_bsdinfo().is_none() {
-				return Some(Vec::new());
+			match self.walk_identity() {
+				WalkIdentity::Unreadable => return None,
+				WalkIdentity::ConfirmedGone => return Some(Vec::new()),
+				WalkIdentity::Same => {},
 			}
 			let mut out = Vec::new();
 			let mut visited = HashSet::new();
@@ -755,6 +757,23 @@ mod platform {
 				Some(info)
 			} else {
 				None
+			}
+		}
+
+		fn walk_identity(&self) -> WalkIdentity {
+			#[cfg(test)]
+			if let Some(scripted) = take_scripted_walk_identity() {
+				return scripted;
+			}
+			let info = read_bsdinfo(self.pid);
+			if BSD_LOOKUP_UNREADABLE.with(|flag| flag.get()) {
+				return WalkIdentity::Unreadable;
+			}
+			match info {
+				Some(info) if info.start_tvsec == self.start_tvsec && info.start_tvusec == self.start_tvusec => {
+					WalkIdentity::Same
+				},
+				_ => WalkIdentity::ConfirmedGone,
 			}
 		}
 	}
@@ -986,7 +1005,28 @@ mod platform {
 		read_i32(KINFO_PROC_PID) == pid && read_i32(KINFO_PROC_STAT) == SZOMB
 	}
 
+	#[derive(Clone, Copy)]
+	enum WalkIdentity { Same, ConfirmedGone, Unreadable }
+
+	thread_local! {
+		static BSD_LOOKUP_UNREADABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+	}
+
+	#[cfg(test)]
+	thread_local! {
+		static WALK_IDENTITY_SCRIPT: std::cell::RefCell<Vec<WalkIdentity>> = const { std::cell::RefCell::new(Vec::new()) };
+	}
+
+	#[cfg(test)]
+	fn take_scripted_walk_identity() -> Option<WalkIdentity> {
+		WALK_IDENTITY_SCRIPT.with(|script| {
+			let mut queued = script.borrow_mut();
+			if queued.is_empty() { None } else { Some(queued.remove(0)) }
+		})
+	}
+
 	fn read_bsdinfo(pid: i32) -> Option<ProcInfo> {
+		BSD_LOOKUP_UNREADABLE.with(|flag| flag.set(false));
 		let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
 		let mut buffer = [0u8; KINFO_PROC_SIZE];
 		let mut len = buffer.len();
@@ -1003,8 +1043,11 @@ mod platform {
 				0,
 			)
 		};
-		// A pid that does not exist returns success with zero bytes written.
-		if rc != 0 || len != KINFO_PROC_SIZE {
+		if rc != 0 || (len != 0 && len != KINFO_PROC_SIZE) {
+			BSD_LOOKUP_UNREADABLE.with(|flag| flag.set(true));
+			return None;
+		}
+		if len != KINFO_PROC_SIZE {
 			return None;
 		}
 		let read_i32 = |offset: usize| {
@@ -1114,6 +1157,10 @@ mod platform {
 		}
 		args
 	}
+
+	#[cfg(test)]
+	#[path = "tests/macos_walk_identity.rs"]
+	mod macos_walk_identity;
 
 	#[cfg(test)]
 	#[test]
