@@ -217,7 +217,12 @@ describe("session HTML export embed", () => {
 								{ key: "AccountKey", value: "opaque-record-account-secret" },
 								{ Key: "Authorization", Value: "opaque-pascal-header-auth-secret" },
 								{ Name: "X-Api-Key", Value: "opaque-pascal-header-api-secret" },
+								{
+									Name: "Authorization",
+									Values: ["opaque-plural-auth-secret-one", "opaque-plural-auth-secret-two"],
+								},
 								{ name: "Content-Type", value: "application/json" },
+								{ Name: "Content-Type", Values: ["application/json", "text/plain"] },
 							],
 						},
 					},
@@ -242,6 +247,8 @@ describe("session HTML export embed", () => {
 			expect(embedded).not.toContain("opaque-record-account-secret");
 			expect(embedded).not.toContain("opaque-pascal-header-auth-secret");
 			expect(embedded).not.toContain("opaque-pascal-header-api-secret");
+			expect(embedded).not.toContain("opaque-plural-auth-secret-one");
+			expect(embedded).not.toContain("opaque-plural-auth-secret-two");
 			expect(headers).toEqual([
 				["X-Api-Key", "«redacted»"],
 				["Authorization", "«redacted»"],
@@ -260,7 +267,9 @@ describe("session HTML export embed", () => {
 				{ key: "AccountKey", value: "«redacted»" },
 				{ Key: "Authorization", Value: "«redacted»" },
 				{ Name: "X-Api-Key", Value: "«redacted»" },
+				{ Name: "Authorization", Values: ["«redacted»", "«redacted»"] },
 				{ name: "Content-Type", value: "application/json" },
+				{ Name: "Content-Type", Values: ["application/json", "text/plain"] },
 			]);
 		} finally {
 			await session?.close();

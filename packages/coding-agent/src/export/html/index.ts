@@ -283,7 +283,7 @@ function redactJsonValue(value: unknown): unknown {
 	let hasHeaderValue = false;
 	for (const key of sourceKeys) {
 		const field = key.toLowerCase();
-		if (field === "value") hasHeaderValue = true;
+		if (field === "value" || field === "values") hasHeaderValue = true;
 		if (field !== "name" && field !== "key") continue;
 		const headerName = source[key];
 		if (typeof headerName === "string" && isCredentialKey(headerName)) hasCredentialHeaderName = true;
@@ -293,8 +293,14 @@ function redactJsonValue(value: unknown): unknown {
 	const nextSuffixByKey = new Map<string, number>();
 	for (const key of sourceKeys) {
 		const redactedKey = uniqueJsonObjectKey(redacted, redactCrashSecrets(key), nextSuffixByKey);
-		redacted[redactedKey] =
-			redactHeaderValue && key.toLowerCase() === "value" ? "«redacted»" : redactKeyedValue(key, source[key]);
+		const field = key.toLowerCase();
+		if (redactHeaderValue && (field === "value" || field === "values")) {
+			const headerValue = source[key];
+			redacted[redactedKey] =
+				field === "values" && Array.isArray(headerValue) ? headerValue.map(() => "«redacted»") : "«redacted»";
+		} else {
+			redacted[redactedKey] = redactKeyedValue(key, source[key]);
+		}
 	}
 	return redacted;
 }
