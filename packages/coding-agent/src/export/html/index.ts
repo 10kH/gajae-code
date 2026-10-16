@@ -278,11 +278,15 @@ function redactJsonValue(value: unknown): unknown {
 	}
 	if (value === null || typeof value !== "object") return value;
 	const source = value as Record<string, unknown>;
+	const hasCredentialHeaderName =
+		(typeof source.name === "string" && isCredentialKey(source.name)) ||
+		(typeof source.key === "string" && isCredentialKey(source.key));
+	const redactHeaderValue = hasCredentialHeaderName && Object.hasOwn(source, "value");
 	const redacted = Object.create(null) as Record<string, unknown>;
 	const nextSuffixByKey = new Map<string, number>();
 	for (const key of Object.keys(source)) {
 		const redactedKey = uniqueJsonObjectKey(redacted, redactCrashSecrets(key), nextSuffixByKey);
-		redacted[redactedKey] = redactKeyedValue(key, source[key]);
+		redacted[redactedKey] = redactHeaderValue && key === "value" ? "«redacted»" : redactKeyedValue(key, source[key]);
 	}
 	return redacted;
 }

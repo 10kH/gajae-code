@@ -175,7 +175,7 @@ describe("session HTML export embed", () => {
 		}
 	});
 
-	it("redacts credentials in nested and flat serialized header arrays", async () => {
+	it("redacts credentials in tuple, flat, and name-value header records", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-header-tuples-"));
 		let session: SessionManager | undefined;
 		try {
@@ -201,6 +201,11 @@ describe("session HTML export embed", () => {
 								"Content-Type",
 								"application/json",
 							],
+							headerRecords: [
+								{ name: "X-Api-Key", value: "opaque-record-api-secret" },
+								{ key: "AccountKey", value: "opaque-record-account-secret" },
+								{ name: "Content-Type", value: "application/json" },
+							],
 						},
 					},
 				],
@@ -215,10 +220,13 @@ describe("session HTML export embed", () => {
 			const args = parsed.entries[0]?.message?.content?.[0]?.arguments;
 			const headers = args?.headers;
 			const rawHeaders = args?.rawHeaders;
+			const headerRecords = args?.headerRecords;
 			expect(embedded).not.toContain("opaque-secret-123");
 			expect(embedded).not.toContain("opaque-auth-secret");
 			expect(embedded).not.toContain("opaque-flat-secret");
 			expect(embedded).not.toContain("opaque-flat-auth-secret");
+			expect(embedded).not.toContain("opaque-record-api-secret");
+			expect(embedded).not.toContain("opaque-record-account-secret");
 			expect(headers).toEqual([
 				["X-Api-Key", "«redacted»"],
 				["Authorization", "«redacted»"],
@@ -231,6 +239,11 @@ describe("session HTML export embed", () => {
 				"«redacted»",
 				"Content-Type",
 				"application/json",
+			]);
+			expect(headerRecords).toEqual([
+				{ name: "X-Api-Key", value: "«redacted»" },
+				{ key: "AccountKey", value: "«redacted»" },
+				{ name: "Content-Type", value: "application/json" },
 			]);
 		} finally {
 			await session?.close();
