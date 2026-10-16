@@ -193,3 +193,78 @@ describe("generateFileMentionMessages duplicate suppression + inline cap (Findin
 		expect(inlineBody).toHaveLength(DEFAULT_FILE_MENTION_INLINE_BYTES);
 	});
 });
+
+function mentionText(messages: Awaited<ReturnType<typeof generateFileMentionMessages>>): string {
+	return messages
+		.filter(message => message.role === "fileMention")
+		.flatMap(message => (message.role === "fileMention" ? message.files.map(file => file.content) : []))
+		.join("\n");
+}
+
+describe("generateFileMentionMessages workspace boundary", () => {
+	test("still reads a relative file and an absolute path inside cwd", async () => {
+		const cwd = await createTempDir();
+		await Bun.write(path.join(cwd, "inside.txt"), "INSIDE_OK");
+		await fs.mkdir(path.join(cwd, "sub"));
+		await Bun.write(path.join(cwd, "sub", "nested.txt"), "NESTED_OK");
+
+		const relative = mentionText(await generateFileMentionMessages(["inside.txt"], cwd));
+		expect(relative).toContain("INSIDE_OK");
+
+		const absolute = mentionText(await generateFileMentionMessages([path.join(cwd, "inside.txt")], cwd));
+		expect(absolute).toContain("INSIDE_OK");
+
+		const stayedInside = mentionText(await generateFileMentionMessages(["sub/../sub/nested.txt"], cwd));
+		expect(stayedInside).toContain("NESTED_OK");
+
+		const real = await fs.realpath(cwd);
+		const alias = real.startsWith("/private/") ? real.slice("/private".length) : `/private${real}`;
+		if (alias !== real) {
+			const aliased = mentionText(await generateFileMentionMessages([path.join(alias, "inside.txt")], cwd));
+			expect(aliased).toContain("INSIDE_OK");
+		}
+	});
+
+	test("does not auto-read a parent path, an absolute path, or a tilde path outside cwd", async () => {
+		const cwd = await createTempDir();
+		await Bun.write(path.join(cwd, "inside.txt"), "INSIDE_OK");
+		const outsideDir = await createTempDir();
+		const parentName = `up-${path.basename(cwd)}.txt`;
+		const parentFile = path.join(path.dirname(cwd), parentName);
+		const homeName = `.gjc-mention-${path.basename(cwd)}`;
+		const homeFile = path.join(os.homedir(), homeName);
+		await Bun.write(path.join(outsideDir, "abs.txt"), "ABS_SECRET");
+		await Bun.write(parentFile, "PARENT_SECRET");
+		await Bun.write(homeFile, "TILDE_SECRET");
+		try {
+			const messages = await generateFileMentionMessages(
+				["inside.txt", path.join(outsideDir, "abs.txt"), `../${parentName}`, `~/${homeName}`],
+				cwd,
+			);
+			const text = mentionText(messages);
+			expect(text).toContain("INSIDE_OK");
+			expect(text).not.toContain("ABS_SECRET");
+			expect(text).not.toContain("PARENT_SECRET");
+			expect(text).not.toContain("TILDE_SECRET");
+			expect(
+				messages
+					.filter(message => message.role === "fileMention")
+					.flatMap(message => (message.role === "fileMention" ? message.files.map(file => file.path) : [])),
+			).toEqual(["inside.txt"]);
+		} finally {
+			await fs.rm(parentFile, { force: true });
+			await fs.rm(homeFile, { force: true });
+		}
+	});
+
+	test("does not follow a symlink that leaves cwd", async () => {
+		const cwd = await createTempDir();
+		const outsideDir = await createTempDir();
+		const secret = path.join(outsideDir, "secret.txt");
+		await Bun.write(secret, "LINK_SECRET");
+		await fs.symlink(secret, path.join(cwd, "link.txt"));
+
+		const text = mentionText(await generateFileMentionMessages(["link.txt"], cwd));
+		expect(text).not.toContain("LINK_SECRET");
+	});
+});
