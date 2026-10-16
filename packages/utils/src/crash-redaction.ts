@@ -72,7 +72,7 @@ const CREDENTIAL_CAMEL_ESCAPED_BACKTICK_UNCLOSED_PATTERN = new RegExp(
 	"g",
 );
 const COOKIE_VALUE_PATTERN =
-	/(?:(?<![A-Za-z0-9_-])|(?<=\\n))((?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?cookie\s*[:=]\s*)((?:(?!\\+n|\\+r\\+n)[^\r\n])*)/gi;
+	/(?:(?<![A-Za-z0-9_-])|(?<=\\n))((?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?cookies?\s*[:=]\s*)((?:(?!\\+n|\\+r\\+n)[^\r\n])*)/gi;
 
 function isCookieFieldWhitespace(character: string | undefined): boolean {
 	return character === " " || character === "\t";

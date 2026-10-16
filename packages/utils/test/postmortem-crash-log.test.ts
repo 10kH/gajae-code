@@ -248,6 +248,18 @@ describe("recordFatalCrash", () => {
 		expect(redacted).toContain("note=keep");
 	});
 
+	it("redacts multi-pair values under plural cookie labels", () => {
+		const redacted = redactCrashSecrets(
+			"cookies=session=topsecret; csrf=alsosecret note=keep\nset_cookies=refresh=opaque-refresh-cookie; xsrf=opaque-xsrf-token",
+		);
+
+		expect(redacted).toBe("cookies=«redacted» note=keep\nset_cookies=«redacted»");
+		expect(redacted).not.toContain("topsecret");
+		expect(redacted).not.toContain("alsosecret");
+		expect(redacted).not.toContain("opaque-refresh-cookie");
+		expect(redacted).not.toContain("opaque-xsrf-token");
+	});
+
 	it("redacts escaped-quoted containers across embedded closing delimiters", () => {
 		const serialized = String.raw`credentials={\"primary\":\"alpha}suffix\",\"secondary\":\"beta-secret\"} note=keep`;
 		const redacted = redactCrashSecrets(serialized);
