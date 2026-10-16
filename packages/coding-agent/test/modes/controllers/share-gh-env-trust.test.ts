@@ -55,6 +55,7 @@ const TRUST_KEYS = [
 	"PYTHONPATH",
 	"PYTHONUSERBASE",
 	"PYTHONSTARTUP",
+	"JULIA_DEPOT_PATH",
 	"TCL_LIBRARY",
 	"LUA_INIT",
 	...LUA_INIT_VERSIONED_ENV_KEYS,
@@ -122,6 +123,7 @@ interface GhSpawn {
 	PYTHONPATH: string | null;
 	PYTHONUSERBASE: string | null;
 	PYTHONSTARTUP: string | null;
+	JULIA_DEPOT_PATH: string | null;
 	TCL_LIBRARY: string | null;
 	LUA_INIT: string | null;
 	luaInitVersionedEnvironment: Record<LuaInitVersionedEnvironmentKey, string | null>;
@@ -225,6 +227,7 @@ await fsPromises.appendFile(
 		PYTHONPATH: process.env.PYTHONPATH ?? null,
 		PYTHONUSERBASE: process.env.PYTHONUSERBASE ?? null,
 		PYTHONSTARTUP: process.env.PYTHONSTARTUP ?? null,
+		JULIA_DEPOT_PATH: process.env.JULIA_DEPOT_PATH ?? null,
 		TCL_LIBRARY: process.env.TCL_LIBRARY ?? null,
 		LUA_INIT: process.env.LUA_INIT ?? null,
 		luaInitVersionedEnvironment: Object.fromEntries(
@@ -438,6 +441,7 @@ function expectDestination(
 			| "PYTHONPATH"
 			| "PYTHONUSERBASE"
 			| "PYTHONSTARTUP"
+			| "JULIA_DEPOT_PATH"
 			| "TCL_LIBRARY"
 			| "LUA_INIT"
 			| "R_ENVIRON"
@@ -526,6 +530,7 @@ function expectDestination(
 		expect(spawn.PYTHONPATH).toBe(expected.PYTHONPATH ?? null);
 		expect(spawn.PYTHONUSERBASE).toBe(expected.PYTHONUSERBASE ?? null);
 		expect(spawn.PYTHONSTARTUP).toBe(expected.PYTHONSTARTUP ?? null);
+		expect(spawn.JULIA_DEPOT_PATH).toBe(expected.JULIA_DEPOT_PATH ?? null);
 		expect(spawn.TCL_LIBRARY).toBe(expected.TCL_LIBRARY ?? null);
 		expect(spawn.LUA_INIT).toBe(expected.LUA_INIT ?? null);
 		for (const name of LUA_INIT_VERSIONED_ENV_KEYS)
@@ -631,6 +636,7 @@ PYTHONHOME=/project/python-home
 PYTHONPATH=/project/python-path
 PYTHONUSERBASE=/project/python-user-base
 PYTHONSTARTUP=/project/python-startup.py
+JULIA_DEPOT_PATH=/project/julia-depot
 TCL_LIBRARY=/project/tcl-library
 LUA_INIT=@/project/lua-init.lua
 LUA_INIT_5_1=@/project/lua-init-5.1.lua
@@ -687,6 +693,7 @@ OPENSSL_MODULES=/project/openssl-modules
 			PYTHONPATH: null,
 			PYTHONUSERBASE: null,
 			PYTHONSTARTUP: null,
+			JULIA_DEPOT_PATH: null,
 			TCL_LIBRARY: null,
 			LUA_INIT: null,
 			R_ENVIRON: null,
