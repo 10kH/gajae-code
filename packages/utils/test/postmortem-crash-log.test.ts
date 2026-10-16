@@ -205,6 +205,15 @@ describe("recordFatalCrash", () => {
 			"  - password_confirmation: >-",
 			"      opaque-nested-sequence-secret",
 			"    note: keep nested sequence",
+			"password: &credential |",
+			"  opaque-anchored-block-secret",
+			"note: keep after anchor",
+			"password: !!str >-",
+			"  opaque-tagged-block-secret",
+			"note: keep after tag",
+			"password: &credential !!str |",
+			"  opaque-anchored-tagged-block-secret",
+			"note: keep after anchor and tag",
 			'"password": |',
 			"  opaque-double-quoted-key-secret",
 			"note=keep",
@@ -230,6 +239,9 @@ describe("recordFatalCrash", () => {
 			"opaque-indicated-folded-secret",
 			"opaque-sequence-literal-secret",
 			"opaque-nested-sequence-secret",
+			"opaque-anchored-block-secret",
+			"opaque-tagged-block-secret",
+			"opaque-anchored-tagged-block-secret",
 			"opaque-double-quoted-key-secret",
 			"opaque-single-quoted-key-secret",
 		]) {
@@ -247,6 +259,12 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("  - password_confirmation: >-");
 		expect(contents).toContain("  note: keep after sequence");
 		expect(contents).toContain("    note: keep nested sequence");
+		expect(contents).toContain("password: &credential |");
+		expect(contents).toContain("password: !!str >-");
+		expect(contents).toContain("password: &credential !!str |");
+		expect(contents).toContain("note: keep after anchor");
+		expect(contents).toContain("note: keep after tag");
+		expect(contents).toContain("note: keep after anchor and tag");
 		expect(contents).toContain('"password": |');
 		expect(contents).toContain("'api_key': >-");
 		expect(contents).toContain("  «redacted»\n    «redacted»\n\n  «redacted»\nnote=keep");

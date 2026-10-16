@@ -94,6 +94,7 @@ describe("session HTML export embed", () => {
 					"password=correct,horse",
 					"password=correct;horse",
 					"items:\n  - password: |\n      opaque-html-sequence-secret\n    note: keep",
+					"password: &credential !!str |\n  opaque-html-anchored-secret\nnote: keep",
 					"password=correct horse battery staple token=second-secret note=keep",
 					'password="secret\nstack "frame"\nafter=keep',
 					"credentials={secret=abc\nstack frame\nafter=keep",
@@ -122,6 +123,7 @@ describe("session HTML export embed", () => {
 				"opaque-secret",
 				"correct horse battery staple",
 				"opaque-html-sequence-secret",
+				"opaque-html-anchored-secret",
 				"second-secret",
 				"alpha}suffix",
 				"beta-secret",
@@ -136,6 +138,7 @@ describe("session HTML export embed", () => {
 			expect(embedded).toContain("postgresql+asyncpg://«redacted-url-credential»@example.com/db");
 			expect(exportedContent).toContain("password=«redacted»");
 			expect(exportedContent).toContain("  - password: |\n      «redacted»\n    note: keep");
+			expect(exportedContent).toContain("password: &credential !!str |\n  «redacted»\nnote: keep");
 			expect(exportedContent).toContain(
 				"Endpoint=sb://host/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=«redacted»",
 			);

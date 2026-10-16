@@ -81,7 +81,7 @@ const COOKIE_VALUE_PATTERN =
 	/(?:(?<![A-Za-z0-9_-])|(?<=\\n))((?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?cookies?\s*[:=]\s*)((?:(?!\\+n|\\+r\\+n)[^\r\n])*)/gi;
 // Cap key inspection; YAML permits the chomping and indentation indicators in either order.
 const YAML_BLOCK_SCALAR_HEADER_PATTERN =
-	/^([ \t]*(?:-[ \t]+)?)(?:"([^"\r\n]{1,128})"|'([^'\r\n]{1,128})'|([A-Za-z0-9][A-Za-z0-9_. \t-]{0,127}?))[ \t]*:[ \t]*([|>](?:[1-9][+-]?|[+-][1-9]?)?)(?:[ \t]+#.*|[ \t]*)$/;
+	/^([ \t]*(?:-[ \t]+)?)(?:"([^"\r\n]{1,128})"|'([^'\r\n]{1,128})'|([A-Za-z0-9][A-Za-z0-9_. \t-]{0,127}?))[ \t]*:[ \t]*(?:[ \t]+(?:&[^ \t\r\n]{1,128}|![^ \t\r\n]{1,128}))*[ \t]*([|>](?:[1-9][+-]?|[+-][1-9]?)?)(?:[ \t]+#.*|[ \t]*)$/;
 
 type YamlBlockScalarHeader = { indentation: number };
 
