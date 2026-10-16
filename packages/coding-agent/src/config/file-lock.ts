@@ -194,6 +194,10 @@ type LockInfo = FileLockOwnerToken;
 export const FileLockTestHooks: {
 	afterParentMkdir?: (lockPath: string) => void | Promise<void>;
 	afterStagingInfoWrite?: (stagingPath: string) => void | Promise<void>;
+	stagingInfoIdentity?: (
+		infoPath: string,
+		capture: () => Promise<FileLockStagingFileIdentity>,
+	) => Promise<FileLockStagingFileIdentity>;
 	beforeRemovalOwnerPublish?: (transitionPath: string) => void | Promise<void>;
 	cleanupPendingStaging?: (stagingPath: string) => Promise<void>;
 	stagingRootIdentity?: (stagingPath: string) => FileLockStagingRootIdentity | Promise<FileLockStagingRootIdentity>;
@@ -646,6 +650,7 @@ function lockInfo(ownerHostId: string | undefined, ownerToken: string): LockInfo
 async function writeLockInfo(
 	lockPath: string,
 	info: LockInfo,
+	retryBudget: FileLockAcquisitionRetryBudget,
 	onFileCreated: (identity: FileLockStagingFileIdentity) => void,
 ): Promise<LockInfo> {
 	// Owner metadata must stay readable by its own process under a restrictive
@@ -655,11 +660,28 @@ async function writeLockInfo(
 	// a same-name replacement instead of treating a later tree snapshot as authority.
 	const handle = await fs.open(`${lockPath}/info`, "wx", 0o600);
 	try {
-		const stats = await handle.stat({ bigint: true });
-		onFileCreated({
-			dev: canonicalLockDeviceId(stats.dev).toString(),
-			ino: canonicalLockFileId(stats.ino).toString(),
-		});
+		let identity: FileLockStagingFileIdentity;
+		for (;;) {
+			try {
+				const captureIdentity = async (): Promise<FileLockStagingFileIdentity> => {
+					const stats = await handle.stat({ bigint: true });
+					return {
+						dev: canonicalLockDeviceId(stats.dev).toString(),
+						ino: canonicalLockFileId(stats.ino).toString(),
+					};
+				};
+				const testCaptureIdentity = FileLockTestHooks.stagingInfoIdentity;
+				identity = testCaptureIdentity
+					? await testCaptureIdentity(`${lockPath}/info`, captureIdentity)
+					: await captureIdentity();
+				break;
+			} catch (error) {
+				if (!isTransientReleaseError(error) || retryBudget.remainingDelays === 0) throw error;
+				retryBudget.remainingDelays--;
+				await sleepFileLockRetry(retryBudget.retryDelayMs, retryBudget.signal);
+			}
+		}
+		onFileCreated(identity);
 		await handle.writeFile(JSON.stringify(info));
 		await handle.chmod(0o600);
 		return info;
@@ -2494,7 +2516,7 @@ async function tryAcquireLock(
 			throw new FileLockStagingCleanupError(lockPath, pendingPath, error);
 		}
 		await fs.chmod(pendingPath, 0o700);
-		await writeLockInfo(pendingPath, owner, infoFileIdentity => {
+		await writeLockInfo(pendingPath, owner, retryBudget, infoFileIdentity => {
 			if (!pendingStagingIdentity) throw new Error("Staged file-lock root identity is unavailable.");
 			pendingStagingIdentity = { ...pendingStagingIdentity, infoFileIdentity };
 		});

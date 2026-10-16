@@ -60,6 +60,7 @@ afterEach(async () => {
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
 	FileLockTestHooks.cleanupPendingStaging = undefined;
 	FileLockTestHooks.afterStagingInfoWrite = undefined;
+	FileLockTestHooks.stagingInfoIdentity = undefined;
 	for (const { directory, forgetGrant } of tempDirs.splice(0)) {
 		try {
 			await fs.rm(directory, { recursive: true, force: true });
@@ -1091,6 +1092,51 @@ test("cleans a Windows staging setup failure using the created info identity", a
 	} finally {
 		Object.defineProperty(process, "platform", originalPlatform);
 		FileLockTestHooks.nativeQuarantineBindings = undefined;
+	}
+	expect(await fs.readdir(root)).toEqual([]);
+});
+
+test("retries a transient staging info identity stat failure", async () => {
+	const { root, file, lock } = await makeFixture();
+	const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+	if (!originalPlatform?.configurable) throw new Error("process_platform_not_configurable");
+	let statAttempts = 0;
+	let release: (() => Promise<void>) | undefined;
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree: snapshotDirectoryTree,
+		exactRemoveDirectoryTree: exactRemoveStagingSnapshotForTest,
+	});
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			await fs.rename(source, destination);
+			return successfulPublication("windows_rename_noreplace");
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+	FileLockTestHooks.stagingInfoIdentity = async (infoPath, capture) => {
+		statAttempts++;
+		expect((await fs.lstat(infoPath)).isFile()).toBe(true);
+		if (statAttempts === 1) throw Object.assign(new Error("transient staging info stat denial"), { code: "EACCES" });
+		return await capture();
+	};
+
+	try {
+		Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+		release = await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
+		expect(statAttempts).toBe(2);
+		expect((await fs.readdir(root)).filter(name => name.includes(".pending."))).toHaveLength(0);
+		await release();
+		release = undefined;
+		await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		try {
+			if (release) await release();
+		} finally {
+			Object.defineProperty(process, "platform", originalPlatform);
+			FileLockTestHooks.nativeQuarantineBindings = undefined;
+			FileLockTestHooks.nativePublicationBindings = undefined;
+			FileLockTestHooks.stagingInfoIdentity = undefined;
+		}
 	}
 	expect(await fs.readdir(root)).toEqual([]);
 });
