@@ -9561,7 +9561,10 @@ export class AgentSession {
 			}
 			filePath = editPath;
 			// Compute post-edit content from edits array
-			content = await this.#computeEditToolContent(editPath, args.edits);
+			const edits = Array.isArray(args.edits) ? args.edits : undefined;
+			if (edits !== undefined) {
+				content = await this.#computeEditToolContent(editPath, edits);
+			}
 			if (filePath) filePaths.push(filePath);
 		} else if (toolName === "ast_edit") {
 			// For ast_edit, we can't compute the final result without executing it,

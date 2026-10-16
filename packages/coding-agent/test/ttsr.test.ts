@@ -8,13 +8,15 @@ import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { parseRuleConditionAndScope, type Rule } from "@gajae-code/coding-agent/capability/rule";
 import { buildRuleFromMarkdown } from "@gajae-code/coding-agent/discovery/helpers";
 import { TtsrManager } from "@gajae-code/coding-agent/export/ttsr";
+import { Snowflake } from "@gajae-code/utils";
+import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { EditTool } from "../src/edit";
-import { WriteTool } from "../src/tools/write";
 import { AgentSession } from "../src/session/agent-session";
+import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
-import { Snowflake } from "@gajae-code/utils";
 import type { ToolSession } from "../src/tools";
+import { WriteTool } from "../src/tools/write";
 
 function makeRule(partial: Partial<Rule>): Rule {
 	return {
@@ -813,10 +815,15 @@ describe("TTSR AST conditions", () => {
 describe("TTSR beforeToolCall integration", () => {
 	let session: AgentSession;
 	let tempDir: string;
+	let authStorage: AuthStorage;
+	let modelRegistry: ModelRegistry;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		tempDir = path.join(os.tmpdir(), `ttsr-integration-test-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
+		authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		modelRegistry = new ModelRegistry(authStorage);
 	});
 
 	afterEach(async () => {
@@ -842,7 +849,9 @@ describe("TTSR beforeToolCall integration", () => {
 		} as unknown as ToolSession;
 	}
 
-	function assistantMessageWithCalls(calls: ToolCall[]): Parameters<typeof AssistantMessageEventStream.prototype.push>[0] {
+	function assistantMessageWithCalls(
+		calls: ToolCall[],
+	): Parameters<typeof AssistantMessageEventStream.prototype.push>[0] {
 		return {
 			type: "start",
 			partial: {
@@ -852,8 +861,8 @@ describe("TTSR beforeToolCall integration", () => {
 					name: call.name,
 					arguments: call.arguments,
 				})),
-				stopReason: "toolCall" as const,
-			},
+				stopReason: "toolUse" as const,
+			} as any,
 		};
 	}
 
@@ -889,10 +898,24 @@ describe("TTSR beforeToolCall integration", () => {
 					};
 					stream.push(assistantMessageWithCalls([toolCall]));
 					const message = {
+						role: "assistant" as const,
 						content: [toolCall],
-						stopReason: "toolCall" as const,
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: {
+							input: 1,
+							output: 1,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 2,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "toolUse" as const,
+						timestamp: Date.now(),
 					};
-					stream.push({ type: "done", reason: "toolCall", message });
+					stream.push({ type: "done", reason: "toolUse", message });
+					stream.end(message);
 				});
 				return stream;
 			},
@@ -904,6 +927,7 @@ describe("TTSR beforeToolCall integration", () => {
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			ttsrManager,
+			modelRegistry,
 			toolRegistry: new Map([[writeTool.name, writeTool as AgentTool]]),
 		});
 
@@ -955,10 +979,24 @@ describe("TTSR beforeToolCall integration", () => {
 					};
 					stream.push(assistantMessageWithCalls([toolCall]));
 					const message = {
+						role: "assistant" as const,
 						content: [toolCall],
-						stopReason: "toolCall" as const,
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: {
+							input: 1,
+							output: 1,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 2,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "toolUse" as const,
+						timestamp: Date.now(),
 					};
-					stream.push({ type: "done", reason: "toolCall", message });
+					stream.push({ type: "done", reason: "toolUse", message });
+					stream.end(message);
 				});
 				return stream;
 			},
@@ -970,6 +1008,7 @@ describe("TTSR beforeToolCall integration", () => {
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			ttsrManager,
+			modelRegistry,
 			toolRegistry: new Map([[writeTool.name, writeTool as AgentTool]]),
 		});
 
@@ -1022,10 +1061,24 @@ describe("TTSR beforeToolCall integration", () => {
 					};
 					stream.push(assistantMessageWithCalls([toolCall]));
 					const message = {
+						role: "assistant" as const,
 						content: [toolCall],
-						stopReason: "toolCall" as const,
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: {
+							input: 1,
+							output: 1,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 2,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "toolUse" as const,
+						timestamp: Date.now(),
 					};
-					stream.push({ type: "done", reason: "toolCall", message });
+					stream.push({ type: "done", reason: "toolUse", message });
+					stream.end(message);
 				});
 				return stream;
 			},
@@ -1037,6 +1090,7 @@ describe("TTSR beforeToolCall integration", () => {
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			ttsrManager,
+			modelRegistry,
 			toolRegistry: new Map([[writeTool.name, writeTool as AgentTool]]),
 		});
 
@@ -1110,10 +1164,24 @@ describe("TTSR beforeToolCall integration", () => {
 					};
 					stream.push(assistantMessageWithCalls([toolCall]));
 					const message = {
+						role: "assistant" as const,
 						content: [toolCall],
-						stopReason: "toolCall" as const,
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: {
+							input: 1,
+							output: 1,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 2,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "toolUse" as const,
+						timestamp: Date.now(),
 					};
-					stream.push({ type: "done", reason: "toolCall", message });
+					stream.push({ type: "done", reason: "toolUse", message });
+					stream.end(message);
 				});
 				return stream;
 			},
@@ -1125,6 +1193,7 @@ describe("TTSR beforeToolCall integration", () => {
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			ttsrManager,
+			modelRegistry,
 			toolRegistry: new Map([[editTool.name, editTool as AgentTool]]),
 		});
 
