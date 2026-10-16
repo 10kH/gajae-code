@@ -612,6 +612,28 @@ describe("recordFatalCrash", () => {
 		}
 	});
 
+	it("preserves later diagnostics when quoted credentials are unterminated", () => {
+		const rawDouble = `password="secret
+stack "frame"
+after=keep`;
+		const escapedDouble = String.raw`password=\"secret
+stack \"frame\"
+after=keep`;
+		const rawSingle = `password='secret
+stack 'frame'
+after=keep`;
+		const escapedSingle = "password=\\'secret\nstack \\'frame\\'\nafter=keep";
+		const rawBacktick = "password=`secret\nstack `frame`\nafter=keep";
+		const escapedBacktick = "password=\\`secret\nstack \\`frame\\`\nafter=keep";
+
+		for (const input of [rawDouble, escapedDouble, rawSingle, escapedSingle, rawBacktick, escapedBacktick]) {
+			const redacted = redactCrashSecrets(input);
+			expect(redacted.split("\n")[1]).toBe(input.split("\n")[1]);
+			expect(redacted.split("\n")[2]).toBe("after=keep");
+			expect(redacted.split("\n")[0]).toContain("«redacted»");
+		}
+	});
+
 	it("preserves credential lookalikes outside the supported token boundaries", () => {
 		const target = tempCrashLog();
 		const lookalikes = [

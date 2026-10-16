@@ -46,7 +46,7 @@ const CREDENTIAL_AUTHORIZATION_VALUE_PATTERN = new RegExp(
 	String.raw`${AUTHORIZATION_HEADER_PREFIX}(?!\s*(?:["'«\x60]|\\+["'\x60]))(?:(?!\\+n|\\+r\\+n)[^\r\n])+`,
 	"gi",
 );
-const CREDENTIAL_VALUE_PATTERN_BODY = String.raw`(?:(\\+")((?:\\[\s\S]|[^"\\])*?)(\\+")${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(")((?:\\[\s\S]|[^"\\])*)(")|(\\+')((?:\\[\s\S]|[^'\\])*?)(\\+')${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(')((?:\\[\s\S]|[^'\\])*)(')|(\x60)((?:\\[\s\S]|[^\x60\\])*)(\x60)${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|(\x60)([^\r\n]*)(?=\r?\n|$)|(${CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY}))`;
+const CREDENTIAL_VALUE_PATTERN_BODY = String.raw`(?:(\\+")((?:\\[^\r\n]|[^"\\\r\n])*?)(\\+")${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(")((?:\\[^\r\n]|[^"\\\r\n])*)(")|(\\+')((?:\\[^\r\n]|[^'\\\r\n])*?)(\\+')${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(')((?:\\[^\r\n]|[^'\\\r\n])*)(')|(\x60)((?:\\[^\r\n]|[^\x60\\\r\n])*)(\x60)${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|(\x60)([^\r\n]*)(?=\r?\n|$)|(${CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY}))`;
 const CREDENTIAL_VALUE_PATTERN = new RegExp(
 	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(?!\\+\x60)${CREDENTIAL_VALUE_PATTERN_BODY}`,
 	"gi",
@@ -56,11 +56,11 @@ const CREDENTIAL_CAMEL_VALUE_PATTERN = new RegExp(
 	"g",
 );
 const CREDENTIAL_ESCAPED_BACKTICK_VALUE_PATTERN = new RegExp(
-	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(\\+\x60)((?:\\[\s\S]|[^\x60\\])*?)(\\+\x60)${CREDENTIAL_VALUE_QUOTED_BOUNDARY}`,
+	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(\\+\x60)((?:\\[^\r\n]|[^\x60\\\r\n])*?)(\\+\x60)${CREDENTIAL_VALUE_QUOTED_BOUNDARY}`,
 	"gi",
 );
 const CREDENTIAL_CAMEL_ESCAPED_BACKTICK_VALUE_PATTERN = new RegExp(
-	String.raw`${CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX}(\\+\x60)((?:\\[\s\S]|[^\x60\\])*?)(\\+\x60)${CREDENTIAL_VALUE_QUOTED_BOUNDARY}`,
+	String.raw`${CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX}(\\+\x60)((?:\\[^\r\n]|[^\x60\\\r\n])*?)(\\+\x60)${CREDENTIAL_VALUE_QUOTED_BOUNDARY}`,
 	"g",
 );
 const CREDENTIAL_ESCAPED_BACKTICK_UNCLOSED_PATTERN = new RegExp(
@@ -208,11 +208,12 @@ export function redactCrashSecrets(text: string): string {
 		CREDENTIAL_AUTHORIZATION_VALUE_PATTERN,
 		(_match, prefix: string) => `${prefix}«redacted»`,
 	);
-	// Escaped delimiters support JSON nested in diagnostic strings. Their quoted
-	// branch stops at a closing delimiter followed by a field boundary, while an
-	// unterminated value is redacted through the end of its line. Capture each
-	// complete key once and inspect its suffix; repeated compound-prefix groups
-	// backtrack quadratically on long attacker-controlled identifiers.
+	// Escaped delimiters support JSON nested in diagnostic strings. Quoted scalar
+	// values stay within one physical line; closed values also require a field
+	// boundary after the closing delimiter, while unterminated values redact
+	// through the end of their line. Capture each complete key once and inspect
+	// its suffix; repeated compound-prefix groups backtrack quadratically on long
+	// attacker-controlled identifiers.
 	if (CREDENTIAL_ASSIGNMENT_CANDIDATE_PATTERN.test(redacted)) {
 		redacted = redacted.replace(
 			CREDENTIAL_ESCAPED_BACKTICK_VALUE_PATTERN,
