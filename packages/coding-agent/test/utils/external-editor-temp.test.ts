@@ -7,6 +7,15 @@ import { openInEditor } from "../../src/utils/external-editor";
 
 const tempDirs: string[] = [];
 const plantedLinks: string[] = [];
+const quietFds: number[] = [];
+
+function quietStdio(): [number, number, number] {
+	const devnull = process.platform === "win32" ? "NUL" : "/dev/null";
+	const stdin = fs.openSync(devnull, "r");
+	const stdout = fs.openSync(devnull, "w");
+	quietFds.push(stdin, stdout);
+	return [stdin, stdout, stdout];
+}
 
 function canSymlink(): boolean {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-editor-link-probe-"));
@@ -35,6 +44,13 @@ afterEach(() => {
 		}
 	}
 	delete process.env.EDITOR_RESULT;
+	for (const fd of quietFds.splice(0)) {
+		try {
+			fs.closeSync(fd);
+		} catch {
+			// Already closed with the child.
+		}
+	}
 });
 
 function makeDir(): string {
@@ -71,7 +87,7 @@ describe("openInEditor temp file", () => {
 		process.env.EDITOR_RESULT = resultPath;
 		const result = await openInEditor(editorCommand(dir, recordingEditor), "ORIGINAL\n", {
 			extension: ".todo.md",
-			stdio: ["ignore", "ignore", "ignore"],
+			stdio: quietStdio(),
 		});
 		expect(result).toBe("EDITED");
 		const recorded = JSON.parse(fs.readFileSync(resultPath, "utf8")) as { path: string };
@@ -81,7 +97,7 @@ describe("openInEditor temp file", () => {
 	it("still returns null when the editor exits non-zero", async () => {
 		const dir = makeDir();
 		const result = await openInEditor(editorCommand(dir, "process.exit(3);\n"), "ORIGINAL\n", {
-			stdio: ["ignore", "ignore", "ignore"],
+			stdio: quietStdio(),
 		});
 		expect(result).toBeNull();
 	});
@@ -109,7 +125,7 @@ describe("openInEditor temp file", () => {
 			}
 			fs.symlinkSync(victim, linkPath);
 			const result = await openInEditor(editor, "ORIGINAL\n", {
-				stdio: ["ignore", "ignore", "ignore"],
+				stdio: quietStdio(),
 			});
 			expect(result).toBe("EDITED");
 			expect(fs.readFileSync(victim, "utf8")).toBe("SAFE");
