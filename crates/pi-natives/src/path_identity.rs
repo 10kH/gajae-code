@@ -5467,6 +5467,8 @@ pub(crate) mod platform {
 		// SAFETY: zero is valid initialized storage for fstat output; caller_fd is
 		// retained by the host FileHandle for the duration of this synchronous call.
 		let mut file_stat: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: caller_fd remains live through this synchronous call and file_stat is
+		// writable.
 		if unsafe { libc::fstat(caller_fd, &mut file_stat) } != 0 {
 			return NativeExactUnlinkResult::failure(security_code(&std::io::Error::last_os_error()));
 		}
@@ -5482,6 +5484,7 @@ pub(crate) mod platform {
 		};
 		// SAFETY: zero is valid initialized storage for fstat output.
 		let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: parent_fd is live and parent_stat is writable initialized output.
 		let parent_stat_result = unsafe { libc::fstat(parent_fd, &mut parent_stat) };
 		// SAFETY: open_parent_no_follow returned ownership of this descriptor.
 		unsafe { libc::close(parent_fd) };
