@@ -11068,10 +11068,9 @@ mod platform {
 		NativeDirectoryTreeSnapshot, NativeExactUnlinkResult, NativeOwnerOnlySecurityResult,
 		NativePermissionRepairResult, STATUS_INVALID_PARAMETER, STATUS_SHARING_VIOLATION,
 		directory_tree_transition_name, exact_replace_open_error_code,
-		is_retryable_exact_replace_status, native_windows_error_code,
-		ntstatus_code, open_with_transient_retry, publication_rename_error_code,
-		rename_with_transient_retry, retained_replace_error_code, sha256,
-		volume_case_sensitivity_from_flags,
+		is_retryable_exact_replace_status, native_windows_error_code, ntstatus_code,
+		open_with_transient_retry, publication_rename_error_code, rename_with_transient_retry,
+		retained_replace_error_code, sha256, volume_case_sensitivity_from_flags,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
