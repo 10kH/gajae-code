@@ -132,7 +132,7 @@ const BASH_INTERPRETER_WRITE_API_PATTERNS = [
 const BASH_INTERPRETER_WRITE_API = `(?:${BASH_INTERPRETER_WRITE_API_PATTERNS.join("|")})`;
 const BASH_INTERPRETER_WRITE_API_EXCLUDING_OPEN = `(?:${BASH_INTERPRETER_WRITE_API_PATTERNS.slice(1).join("|")})`;
 const INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE =
-	/^\b(?:(?:process|Bun|Deno|sys)(?:\s*\.\s*(?:stdout|stderr)|\s*\[\s*[^\]]+\s*\])|(?:(?:globalThis|global)\s*\.\s*)?console)(?:\s*(?:\.\s*[\w$]+|\[\s*[^\]]+\s*\]))?\s*(?:\|\|=|&&=|\?\?=|[+\-*/%&|^]?=(?!=|>))/;
+	/^\b(?:(?:process|Bun|Deno|sys)(?:\s*\.\s*(?:stdout|stderr)|\s*\[\s*["'`](?:stdout|stderr)["'`]\s*\])|(?:process|Bun|Deno|sys)\s*\[\s*[^\]]+\s*\]\s*(?:\.\s*write|\[\s*["'`]write["'`]\s*\])|(?:(?:globalThis|global)\s*\.\s*)?console)(?:\s*(?:\.\s*[\w$]+|\[\s*[^\]]+\s*\]))?\s*(?:\|\|=|&&=|\?\?=|[+\-*/%&|^]?=(?!=|>))/;
 /**
  * Inline interpreter source is opaque whenever it exposes code evaluation or
  * reflective loading. This deliberately scans the complete source spelling,

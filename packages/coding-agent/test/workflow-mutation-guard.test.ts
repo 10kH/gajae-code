@@ -2439,6 +2439,12 @@ describe("bash scanner quoting model", () => {
 				reason: "unknown-target",
 			},
 			{
+				name: "Node computed process stream method rebound to a file writer",
+				command: `node -e 'const stream="stdout";process[stream].write=process.getBuiltinModule("fs").writeFileSync;process.stdout.write("src/product.ts","PWNED")'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
 				name: "Node console method rebound to a file writer",
 				command: `node -e 'console.log=process.getBuiltinModule("fs").writeFileSync;console.log("src/product.ts","PWNED")'`,
 				blocked: true,
@@ -2645,6 +2651,7 @@ describe("bash scanner quoting model", () => {
 			`node -e "/* appendFileSync('src/product.ts','x') */ console.log(1)"`,
 			`node -e "console.log(1)"`,
 			`node -e 'process.stdout.write("status")'`,
+			`node -e 'process["exitCode"]=1;console.log("status")'`,
 			`node -e "console.log('process.stdout.write = fs.writeFileSync')"`,
 			`perl -e 'print 1'`,
 			`ruby -e'puts "open("'`,
