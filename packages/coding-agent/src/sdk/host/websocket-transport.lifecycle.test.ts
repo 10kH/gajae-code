@@ -44,6 +44,14 @@ async function waitForFrame(
 	}
 }
 
+async function waitFor(predicate: () => boolean, label: string): Promise<void> {
+	const deadline = Date.now() + 5_000;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${label}`);
+		await Bun.sleep(5);
+	}
+}
+
 describe("SDK WebSocket transport lifecycle", () => {
 	test("concurrent start calls share one endpoint and one server", async () => {
 		const stateRoot = await tempStateRoot();
@@ -208,7 +216,7 @@ describe("SDK WebSocket transport lifecycle", () => {
 			await fs.rm(stateRoot, { recursive: true, force: true });
 		}
 	});
-	test("loopback replay preserves split hello and observer capabilities across subset replays", async () => {
+	test("loopback replay preserves replay-first, split, and subset capability negotiation", async () => {
 		const stateRoot = await tempStateRoot();
 		const transport = await createSdkWebSocketTransport({
 			sessionId: "loopback-split-capabilities",
@@ -226,7 +234,24 @@ describe("SDK WebSocket transport lifecycle", () => {
 				frames.push(JSON.parse(String((event as MessageEvent).data)) as Record<string, unknown>);
 			});
 			await waitForFrame(frames, frame => frame.type === "hello", "server hello");
+			socket.send(
+				JSON.stringify({
+					type: "event_replay",
+					id: "replay-before-hello",
+					sinceSeq: 0,
+					capabilities: [],
+				}),
+			);
+			await waitForFrame(
+				frames,
+				frame => frame.type === "event_replay_result" && frame.id === "replay-before-hello",
+				"replay before hello",
+			);
 			socket.send(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: [TURN_STREAM_CAPABILITY] }));
+			await waitFor(
+				() => runtime.connectionIdsWithCapabilities([TURN_STREAM_CAPABILITY]).length === 1,
+				"hello after replay",
+			);
 
 			const replayIds = ["observer-addition", "observer-subset", "observer-empty"];
 			for (const [index, capabilities] of [

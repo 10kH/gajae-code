@@ -226,11 +226,12 @@ export async function createSdkWebSocketTransport(
 										);
 										return;
 									}
+									const isInitialHello =
+										frame.type === "hello" &&
+										frame.protocolVersion === 3 &&
+										!helloReceived.has(socket.data.connectionId);
 									if (
-										((frame.type === "hello" &&
-											frame.protocolVersion === 3 &&
-											!helloReceived.has(socket.data.connectionId)) ||
-											frame.type === "event_replay") &&
+										(isInitialHello || frame.type === "event_replay") &&
 										(frame.capabilities === undefined ||
 											(Array.isArray(frame.capabilities) &&
 												frame.capabilities.every((value: unknown) => typeof value === "string")))
@@ -241,7 +242,7 @@ export async function createSdkWebSocketTransport(
 												...((frame.capabilities as string[] | undefined) ?? []),
 											]),
 										];
-										helloReceived.add(socket.data.connectionId);
+										if (isInitialHello) helloReceived.add(socket.data.connectionId);
 										negotiatedCapabilities.set(socket.data.connectionId, new Set(capabilities));
 										capabilitiesHandler?.(socket.data.connectionId, capabilities);
 									}
