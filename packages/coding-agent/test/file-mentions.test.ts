@@ -7,7 +7,9 @@ import { resolveReadPath } from "@gajae-code/coding-agent/tools/path-utils";
 import {
 	DEFAULT_FILE_MENTION_INLINE_BYTES,
 	generateFileMentionMessages,
+	isCanonicalWindowsPathWithin,
 } from "@gajae-code/coding-agent/utils/file-mentions";
+import { directoryCaseSensitive } from "@gajae-code/natives";
 
 const tempDirs: string[] = [];
 
@@ -230,6 +232,13 @@ function mentionText(messages: Awaited<ReturnType<typeof generateFileMentionMess
 }
 
 describe("generateFileMentionMessages workspace boundary", () => {
+	test("checks canonical Windows path components case-sensitively", () => {
+		expect(isCanonicalWindowsPathWithin("C:\\work\\Workspace", "C:\\work\\Workspace\\inside.txt")).toBe(true);
+		expect(isCanonicalWindowsPathWithin("C:\\work\\Workspace", "C:\\work\\workspace\\secret.txt")).toBe(false);
+		expect(isCanonicalWindowsPathWithin("C:\\work\\Workspace", "C:\\work\\WorkspaceSibling\\secret.txt")).toBe(false);
+		expect(isCanonicalWindowsPathWithin("C:\\work\\Workspace", "D:\\work\\Workspace\\secret.txt")).toBe(false);
+	});
+
 	test("still reads a relative file and an absolute path inside cwd", async () => {
 		const cwd = await createTempDir();
 		await Bun.write(path.join(cwd, "inside.txt"), "INSIDE_OK");
@@ -245,6 +254,31 @@ describe("generateFileMentionMessages workspace boundary", () => {
 			expect(stayedInside).toContain("NESTED_OK");
 		});
 	});
+
+	const caseSensitiveDirectory = process.env.GJC_TEST_CASE_SENSITIVE_DIRECTORY;
+	test.skipIf(process.platform !== "win32" || !caseSensitiveDirectory)(
+		"does not auto-read a case-only sibling on a case-sensitive Windows directory",
+		async () => {
+			const root = caseSensitiveDirectory!;
+			expect(directoryCaseSensitive(root)).toBe(true);
+			const base = `gjc-file-mentions-${process.pid}-${Date.now()}`;
+			const cwd = path.join(root, `${base}-Workspace`);
+			const sibling = path.join(root, `${base}-workspace`);
+			try {
+				await fs.mkdir(cwd);
+				await fs.mkdir(sibling);
+				const secret = path.join(sibling, "secret.txt");
+				await Bun.write(secret, "CASE_SENSITIVE_SIBLING_SECRET");
+				expect(await fs.realpath(cwd)).not.toBe(await fs.realpath(sibling));
+
+				const text = mentionText(await generateFileMentionMessages([secret], cwd));
+				expect(text).not.toContain("CASE_SENSITIVE_SIBLING_SECRET");
+			} finally {
+				await fs.rm(cwd, { recursive: true, force: true });
+				await fs.rm(sibling, { recursive: true, force: true });
+			}
+		},
+	);
 
 	test.skipIf(process.platform !== "darwin")(
 		"still reads an inside file through the macOS private alias",

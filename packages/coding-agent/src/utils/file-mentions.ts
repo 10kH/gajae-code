@@ -314,6 +314,26 @@ export function extractFileMentions(text: string): string[] {
 }
 
 /**
+ * Compare canonical Windows paths without folding directory names: individual
+ * directories can opt into case-sensitive names.
+ */
+export function isCanonicalWindowsPathWithin(root: string, candidate: string): boolean {
+	if (!path.win32.isAbsolute(root) || !path.win32.isAbsolute(candidate)) return false;
+
+	const canonicalRoot = path.win32.resolve(root);
+	const canonicalCandidate = path.win32.resolve(candidate);
+	const rootParts = path.win32.parse(canonicalRoot);
+	const candidateParts = path.win32.parse(canonicalCandidate);
+	if (rootParts.root !== candidateParts.root) return false;
+
+	const rootSegments = canonicalRoot.slice(rootParts.root.length).split(path.win32.sep).filter(Boolean);
+	const candidateSegments = canonicalCandidate.slice(candidateParts.root.length).split(path.win32.sep).filter(Boolean);
+	if (candidateSegments.length < rootSegments.length) return false;
+
+	return rootSegments.every((segment, index) => segment === candidateSegments[index]);
+}
+
+/**
  * Generate a FileMentionMessage containing the contents of mentioned files.
  * Returns empty array if no files could be read.
  */
@@ -336,6 +356,8 @@ export async function generateFileMentionMessages(
 	if (filePaths.length === 0) return [];
 
 	const autoResizeImages = options?.autoResizeImages ?? true;
+	const canonicalWindowsCwd = process.platform === "win32" ? await fs.realpath(cwd).catch(() => undefined) : undefined;
+	if (process.platform === "win32" && canonicalWindowsCwd === undefined) return [];
 
 	const files: FileMentionMessage["files"] = [];
 	let mentionCandidatesPromise: Promise<MentionCandidate[]> | null = null;
@@ -351,10 +373,22 @@ export async function generateFileMentionMessages(
 			continue;
 		}
 		const absolutePath = resolveReadPath(resolvedPath, cwd);
-		// Skip `..`, `~`, and outside absolute paths. Read the canonical path so
+		// Skip `..`, `~`, and outside absolute paths. On Windows, realpath both
+		// paths and compare exact components because directories can be case-sensitive.
+		// Fail closed if either real path is unavailable. Read the canonical path so
 		// replacing the original mention symlink does not retarget this read.
-		const canonicalPath = resolveEquivalentPath(absolutePath);
-		if (!pathIsWithin(cwd, canonicalPath)) {
+		const canonicalPath =
+			process.platform === "win32"
+				? await fs.realpath(absolutePath).catch(() => undefined)
+				: resolveEquivalentPath(absolutePath);
+		if (!canonicalPath) {
+			continue;
+		}
+		const staysWithinSession =
+			process.platform === "win32"
+				? canonicalWindowsCwd !== undefined && isCanonicalWindowsPathWithin(canonicalWindowsCwd, canonicalPath)
+				: pathIsWithin(cwd, canonicalPath);
+		if (!staysWithinSession) {
 			continue;
 		}
 		// Duplicate suppression, keyed by absolute path: same path shown earlier this
