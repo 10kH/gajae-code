@@ -7,6 +7,7 @@ import {
 	type Api,
 	type Context,
 	Effort,
+	getAntigravityUserAgent,
 	getBundledModels,
 	getGeminiCliUserAgent,
 	getSupportedEfforts,
@@ -3767,30 +3768,65 @@ describe("ModelRegistry", () => {
 
 					const requestStart = requests.length;
 					await registry.refreshProvider(provider, "online", sessionA);
+					const projectAIdsBeforeB = new Set(
+						registry
+							.getAvailable(sessionA)
+							.filter(model => model.provider === provider)
+							.map(model => model.id),
+					);
+					expect(projectAIdsBeforeB.has(`${projectA}-model`)).toBe(true);
 					await registry.refreshProvider(provider, "online-if-uncached", sessionB);
 
 					expect(requests.slice(requestStart)).toEqual([
 						{ accessToken, project: projectA },
 						{ accessToken, project: projectB },
 					]);
-					expect(registry.find(provider, `${projectB}-model`)).toBeDefined();
-					const availableIds = new Set(
+					const projectAAvailableIds = new Set(
+						registry
+							.getAvailable(sessionA)
+							.filter(model => model.provider === provider)
+							.map(model => model.id),
+					);
+					const projectBAvailableIds = new Set(
+						registry
+							.getAvailable(sessionB)
+							.filter(model => model.provider === provider)
+							.map(model => model.id),
+					);
+					const unscopedAvailableIds = new Set(
 						registry
 							.getAvailable()
 							.filter(model => model.provider === provider)
 							.map(model => model.id),
 					);
-					expect(availableIds.has(`${projectA}-model`)).toBe(false);
-					expect(availableIds.has(`${projectB}-model`)).toBe(true);
+					const projectAAllIds = new Set(
+						registry
+							.getAll(sessionA)
+							.filter(model => model.provider === provider)
+							.map(model => model.id),
+					);
+					const staticModelId = provider === "google-antigravity" ? "gemini-2.5-flash" : "gemini-2.0-flash";
+					expect(projectAAvailableIds.has(staticModelId)).toBe(true);
+					expect(projectBAvailableIds.has(staticModelId)).toBe(true);
+					expect(projectAAllIds.has(`${projectA}-model`)).toBe(true);
+					expect(projectAAllIds.has(`${projectB}-model`)).toBe(false);
+					expect(registry.find(provider, `${projectA}-model`, sessionA)).toBeDefined();
+					expect(registry.find(provider, `${projectB}-model`, sessionA)).toBeUndefined();
+					expect(projectAAvailableIds.has(`${projectA}-model`)).toBe(true);
+					expect(projectAAvailableIds.has(`${projectB}-model`)).toBe(false);
+					expect(projectBAvailableIds.has(`${projectA}-model`)).toBe(false);
+					expect(projectBAvailableIds.has(`${projectB}-model`)).toBe(true);
+					expect(unscopedAvailableIds.has(`${projectA}-model`)).toBe(false);
+					expect(unscopedAvailableIds.has(`${projectB}-model`)).toBe(false);
 
 					await registry.refreshProvider(provider, "offline", sessionA);
 					const offlineAvailableIds = new Set(
 						registry
-							.getAvailable()
+							.getAvailable(sessionA)
 							.filter(model => model.provider === provider)
 							.map(model => model.id),
 					);
-					expect(offlineAvailableIds.has(`${projectA}-model`)).toBe(false);
+					expect(offlineAvailableIds.has(`${projectA}-model`)).toBe(true);
 					expect(offlineAvailableIds.has(`${projectB}-model`)).toBe(false);
 				}
 			} finally {
@@ -3862,7 +3898,7 @@ describe("ModelRegistry", () => {
 					await registry.refreshProvider(provider, "online-if-uncached");
 
 					expect(requests.slice(requestStart)).toEqual([
-						{ provider, userAgent: getGeminiCliUserAgent(), body: {} },
+						{ provider, userAgent: getAntigravityUserAgent(), body: {} },
 					]);
 					expect(registry.find(provider, "gemini-4-argon")).toBeDefined();
 				}
@@ -3970,7 +4006,16 @@ describe("ModelRegistry", () => {
 					{ accessToken, project: projectA },
 					{ accessToken, project: projectB },
 				]);
-				expect(registry.find(provider, `${projectB}-model`)).toBeDefined();
+				expect(
+					registry
+						.getAvailable(sessionId)
+						.some(model => model.provider === provider && model.id === `${projectB}-model`),
+				).toBe(true);
+				expect(
+					registry
+						.getAvailable(sessionId)
+						.some(model => model.provider === provider && model.id === `${projectA}-model`),
+				).toBe(false);
 			} finally {
 				await registry.dispose();
 			}

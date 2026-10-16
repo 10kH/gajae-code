@@ -189,6 +189,7 @@ import {
 	parsePersistedCredentialSelector,
 	resolveStartupAuthConfig,
 	type StartupAuthConfigSnapshot,
+	startupAuthConfigError,
 } from "../session/startup-auth-config";
 import {
 	isOwnedCompletionEnvelopeAllowed,
@@ -795,7 +796,7 @@ export async function discoverAuthStorage(
 			credentialRankingMode,
 			credentialPreferences,
 		});
-		return await reloadDiscoveredAuthStorage(storage);
+		return rejectDuplicateCredentialPreferences(await reloadDiscoveredAuthStorage(storage), agentDir);
 	}
 	const dbPath = getAgentDbPath(agentDir);
 	const storage = await AuthStorage.create(dbPath, {
@@ -804,7 +805,7 @@ export async function discoverAuthStorage(
 		credentialRankingMode,
 		credentialPreferences,
 	});
-	return await reloadDiscoveredAuthStorage(storage);
+	return rejectDuplicateCredentialPreferences(await reloadDiscoveredAuthStorage(storage), agentDir);
 }
 
 async function reloadDiscoveredAuthStorage(storage: AuthStorage): Promise<AuthStorage> {
@@ -819,6 +820,26 @@ async function reloadDiscoveredAuthStorage(storage: AuthStorage): Promise<AuthSt
 		throw error;
 	}
 	return storage;
+}
+
+/**
+ * Two preference entries can name one stored account through different selectors (`email:` and `account:` for the
+ * same login). Only the loaded rows reveal that, so the startup-config check finishes here and fails closed like any
+ * other invalid preference list.
+ */
+function rejectDuplicateCredentialPreferences(storage: AuthStorage, agentDir: string): AuthStorage {
+	const duplicates = storage.findDuplicateCredentialPreferences();
+	if (duplicates.length === 0) return storage;
+	logger.warn("Configured credential preferences name one account twice", {
+		providers: duplicates.map(({ provider }) => sanitizeProviderForLog(provider)),
+	});
+	const error = startupAuthConfigError(agentDir, "invalid-credential-preferences");
+	try {
+		storage.close();
+	} catch (cleanupError) {
+		throw attachStartupCleanupDiagnostic(error, cleanupError);
+	}
+	throw error;
 }
 
 /** Ranking is resolved as part of the typed startup-auth snapshot. */
@@ -2237,7 +2258,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			? { aliasIntent: "preset-equivalent" }
 			: undefined;
 		const allowedModels = await logger.time("resolveAllowedModels", () =>
-			resolveAllowedModels(modelRegistry, settings, modelMatchPreferences),
+			resolveAllowedModels(modelRegistry, settings, modelMatchPreferences, credentialSessionId),
 		);
 		const defaultRoleSpec = logger.time("resolveDefaultModelRole", () =>
 			resolveModelRoleValue(settings.getModelRole("default"), allowedModels, {
@@ -3288,6 +3309,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getWorkflowGateEmitter: () => session?.getWorkflowGateEmitter(),
 			getAskAnswerSource: () => session?.getAskAnswerSource(),
 			getGoalRuntime: () => session?.goalRuntime,
+			getSdkPermissionMode: () => session?.sdkPermissionMode ?? "allow",
 			getClientBridge: () => session?.clientBridge,
 			getCompactContext: () => session.formatCompactContext(),
 			getTodoPhases: () => session.getTodoPhases(),
@@ -4206,18 +4228,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			});
 		}
 
-		// Extension modules are discovered at session startup from the canonical
-		// native locations (`<agentDir>/extensions`, `<cwd>/.gjc/extensions`),
-		// installed plugin bundles, the `extensions` setting, and explicitly
-		// supplied `additionalExtensionPaths`. `disableExtensionDiscovery` keeps its
-		// documented opt-out semantics: explicit paths still load, matching
+		// Extension modules are discovered at session startup from the user agent
+		// directory, installed plugin bundles, the user/global `extensions` setting,
+		// and explicitly supplied `additionalExtensionPaths`. A repository
+		// `.gjc/extensions` tree is not imported. `disableExtensionDiscovery` keeps
+		// its documented opt-out semantics: explicit paths still load, matching
 		// `cli/list-models.ts`. A caller-supplied `preloadedExtensions` result
 		// suppresses discovery entirely.
 		const explicitExtensionPaths = options.additionalExtensionPaths ?? [];
-		// The `extensions` setting is schema-typed as an array of paths, but a
-		// hand-edited config can hold an invalid shape; discovery must degrade to
-		// no extra paths instead of aborting startup for every session.
-		const extensionsSettingPaths = Array.isArray(settings.get("extensions")) ? settings.get("extensions") : [];
+		// The merged `extensions` value includes the project layer, which can name
+		// any module. Only the user/global list is imported. A hand-edited value
+		// with an invalid shape contributes no extra paths.
+		const globalExtensionPaths = settings.getGlobal("extensions");
+		const extensionsSettingPaths = Array.isArray(globalExtensionPaths) ? globalExtensionPaths : [];
 		// Discovery must never block session creation: a filesystem or plugin-registry
 		// failure degrades to the explicit paths and then to no extensions at all, and
 		// the failure stays observable in `extensionsResult.errors`.
@@ -4420,7 +4443,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					startupModelReference.id,
 					startupCredentialSelector,
 				);
-			const currentStartupModel = modelRegistry.find(startupModelReference.provider, startupModelReference.id);
+			const currentStartupModel = modelRegistry.find(
+				startupModelReference.provider,
+				startupModelReference.id,
+				credentialSessionId,
+			);
 			const providerMismatchRejectsTarget =
 				startupCredentialProviderMismatch &&
 				modelRegistry.requiresStoredLiteralCredentialCacheAdmission(
@@ -4445,7 +4472,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		// Resolve deferred --model pattern now that extension models are registered.
 		if (!model && options.modelPattern && !startupCredentialModelRejected) {
-			const availableModels = modelRegistry.getAll();
+			const availableModels = modelRegistry.getAll(credentialSessionId);
 			const matchPreferences = {
 				usageOrder: settings.getStorage()?.getModelUsageOrder(),
 			};
@@ -4487,7 +4514,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		) {
 			// Re-resolve the allowed set: extension factories above may have
 			// registered providers/models that weren't visible at startup.
-			const allowedFallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
+			const allowedFallbackCandidates = await resolveAllowedModels(
+				modelRegistry,
+				settings,
+				modelMatchPreferences,
+				credentialSessionId,
+			);
 			// Candidate order is not a quality signal: catalogs sort retired models
 			// ahead of current ones whenever their IDs carry older date suffixes, so
 			// an unconfigured install would otherwise start on a model its provider

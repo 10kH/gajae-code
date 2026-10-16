@@ -2073,6 +2073,10 @@ interface ModelManagerDiscoveryOptions {
 	isCurrentContext?: () => boolean;
 }
 
+interface GoogleSessionDiscoveryCatalog {
+	models: Model<Api>[];
+}
+
 interface ConfiguredDiscoveryResult {
 	provider: string;
 	current: boolean;
@@ -2293,9 +2297,11 @@ export class ModelRegistry {
 		bySelector: new Map(),
 		aliases: new Map(),
 	};
-	#availableModelsCache: Model<Api>[] | undefined;
-	#availableModelsDisabledProviders: string | undefined;
-	#availableModelsEnvFingerprint: string | undefined;
+	#availableModelsCache = new Map<
+		string,
+		{ models: Model<Api>[]; disabledProviders: string; envFingerprint: string }
+	>();
+	#googleSessionDiscoveryCatalogs = new Map<string, Map<string, GoogleSessionDiscoveryCatalog>>();
 	#sessionCanonicalVariants = new Map<string, string>();
 	#customProviderApiKeys: Map<string, string> = new Map();
 	#customProviderApiKeyEnvNames: Map<string, string> = new Map();
@@ -2454,6 +2460,12 @@ export class ModelRegistry {
 
 	#copyRuntimeStateFrom(source: ModelRegistry): void {
 		this.#sessionCanonicalVariants = new Map(source.#sessionCanonicalVariants);
+		this.#googleSessionDiscoveryCatalogs = new Map(
+			[...source.#googleSessionDiscoveryCatalogs].map(([provider, catalogs]) => [
+				provider,
+				new Map([...catalogs].map(([identity, catalog]) => [identity, { models: [...catalog.models] }])),
+			]),
+		);
 		this.#suppressedSelectors = new Map(source.#suppressedSelectors);
 		this.#selectorCircuits = new Map(
 			[...source.#selectorCircuits].map(([selector, circuit]) => [selector, structuredClone(circuit)]),
@@ -2533,13 +2545,9 @@ export class ModelRegistry {
 			other.#availableModelsCache,
 			this.#availableModelsCache,
 		];
-		[this.#availableModelsDisabledProviders, other.#availableModelsDisabledProviders] = [
-			other.#availableModelsDisabledProviders,
-			this.#availableModelsDisabledProviders,
-		];
-		[this.#availableModelsEnvFingerprint, other.#availableModelsEnvFingerprint] = [
-			other.#availableModelsEnvFingerprint,
-			this.#availableModelsEnvFingerprint,
+		[this.#googleSessionDiscoveryCatalogs, other.#googleSessionDiscoveryCatalogs] = [
+			other.#googleSessionDiscoveryCatalogs,
+			this.#googleSessionDiscoveryCatalogs,
 		];
 		[this.#customProviderApiKeys, other.#customProviderApiKeys] = [
 			other.#customProviderApiKeys,
@@ -2688,7 +2696,7 @@ export class ModelRegistry {
 		other.#modelBindingsApplier.setBindings(previousBindings);
 		this.#modelBindingsApplier.apply();
 		this.#modelsConfigFile.invalidate();
-		this.#availableModelsCache = undefined;
+		this.#invalidateAvailableModels();
 	}
 
 	#reconcileOwnedConfigApiKeys(
@@ -2854,6 +2862,7 @@ export class ModelRegistry {
 			for (const provider of changedProviders) {
 				copyProviderEntry(registry.#configuredDiscoveryEvidence, this.#configuredDiscoveryEvidence, provider);
 				copyProviderEntry(registry.#descriptorDiscoveryEvidence, this.#descriptorDiscoveryEvidence, provider);
+				registry.#googleSessionDiscoveryCatalogs.delete(provider);
 				copyProviderEntry(registry.#descriptorDiscoveryGenerations, this.#descriptorDiscoveryGenerations, provider);
 				copyProviderEntry(registry.#providerEvidenceApiKeys, this.#providerEvidenceApiKeys, provider);
 				copyProviderEntry(
@@ -4430,6 +4439,12 @@ export class ModelRegistry {
 		credentialSessionId?: string,
 	): Promise<void> {
 		const profileAvailabilityEvidenceBefore = this.#profileAvailabilityEvidenceFingerprint();
+		const googleDescriptorGenerationsBefore = new Map(
+			(["google-antigravity", "google-gemini-cli"] as const).map(provider => [
+				provider,
+				this.#descriptorDiscoveryGenerations.get(provider) ?? 0,
+			]),
+		);
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		const selectedDiscoverableProviders = (
 			providerFilter
@@ -4581,6 +4596,38 @@ export class ModelRegistry {
 				return false;
 			}
 		});
+		let sessionCatalogChanged = false;
+		for (const provider of ["google-antigravity", "google-gemini-cli"] as const) {
+			if (
+				this.authStorage.getEffectiveCredentialType(provider, credentialSessionId, {
+					owner: this.#authStorageConfigOwner,
+				}) !== "oauth"
+			) {
+				continue;
+			}
+			if (
+				(this.#descriptorDiscoveryGenerations.get(provider) ?? 0) ===
+				googleDescriptorGenerationsBefore.get(provider)
+			) {
+				continue;
+			}
+			const evidence = this.#descriptorDiscoveryEvidence.get(provider);
+			if (!evidence) continue;
+			const identity = this.#googleDescriptorContextIdentity(
+				provider,
+				evidence.authGeneration,
+				evidence.endpoint,
+				evidence.projectId,
+			);
+			if (!identity || identity !== this.#googleSessionDescriptorIdentity(provider, credentialSessionId)) continue;
+			const catalogs = this.#googleSessionDiscoveryCatalogs.get(provider) ?? new Map();
+			const models = currentBuiltInDiscovered.filter(model => model.provider === provider);
+			const previous = catalogs.get(identity);
+			if (models.length === 0 && evidence.fresh === false && previous !== undefined) continue;
+			if (!isDeepStrictEqual(previous?.models, models)) sessionCatalogChanged = true;
+			catalogs.set(identity, { models });
+			this.#googleSessionDiscoveryCatalogs.set(provider, catalogs);
+		}
 		const configuredDiscoveryEvidence = new Map(
 			currentConfiguredDiscoveryResults
 				.filter(result => result.current)
@@ -4648,6 +4695,10 @@ export class ModelRegistry {
 				);
 			});
 		}
+		if (sessionCatalogChanged) {
+			this.#invalidateAvailableModels();
+			this.#notifyCatalogChanged();
+		}
 		if (discovered.length === 0) {
 			if (
 				clearPublishedModelIds.size > 0 ||
@@ -4658,6 +4709,53 @@ export class ModelRegistry {
 			return;
 		}
 		this.#mergeDiscoveredModels(discovered);
+	}
+
+	#googleDescriptorContextIdentity(
+		provider: "google-antigravity" | "google-gemini-cli",
+		authGeneration: string,
+		endpoint: string,
+		projectId?: string,
+	): string | undefined {
+		return fingerprintDescriptorDiscoveryProvenance(provider, authGeneration, endpoint, projectId);
+	}
+
+	#googleSessionDescriptorIdentity(
+		provider: "google-antigravity" | "google-gemini-cli",
+		credentialSessionId?: string,
+	): string | undefined {
+		if (
+			this.authStorage.getEffectiveCredentialType(provider, credentialSessionId, {
+				owner: this.#authStorageConfigOwner,
+			}) !== "oauth"
+		) {
+			return undefined;
+		}
+		const credential = this.authStorage.getOAuthCredential(provider, credentialSessionId, {
+			owner: this.#authStorageConfigOwner,
+		});
+		if (!credential) return undefined;
+		const endpoint = this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(provider) ?? "");
+		try {
+			return this.#googleDescriptorContextIdentity(
+				provider,
+				this.#getProviderEvidenceGeneration(provider, credential.access),
+				endpoint,
+				credential.projectId?.trim() || undefined,
+			);
+		} catch {
+			return undefined;
+		}
+	}
+
+	#getGoogleSessionDiscoveryModels(credentialSessionId: string): Model<Api>[] {
+		const models: Model<Api>[] = [];
+		for (const provider of ["google-antigravity", "google-gemini-cli"] as const) {
+			const identity = this.#googleSessionDescriptorIdentity(provider, credentialSessionId);
+			if (!identity) continue;
+			models.push(...(this.#googleSessionDiscoveryCatalogs.get(provider)?.get(identity)?.models ?? []));
+		}
+		return models;
 	}
 
 	#profileAvailabilityEvidenceFingerprint(): string {
@@ -4694,22 +4792,26 @@ export class ModelRegistry {
 	}
 
 	#mergeDiscoveredModels(discovered: readonly Model<Api>[]): void {
+		this.#models = this.#resolveDiscoveredModelCatalog(this.#models, discovered);
+		this.#rebuildCanonicalIndex();
+	}
+
+	#resolveDiscoveredModelCatalog(baseModels: readonly Model<Api>[], discovered: readonly Model<Api>[]): Model<Api>[] {
 		const discoveredModels = this.#applyHardcodedModelPolicies(
 			discovered.map(model =>
 				mergeDiscoveredModel(
 					model,
-					this.find(model.provider, model.id),
+					baseModels.find(candidate => candidate.provider === model.provider && candidate.id === model.id),
 					this.#resolveProviderOverride(model.provider),
 				),
 			),
 		);
-		const resolved = this.#mergeResolvedModels(this.#models, discoveredModels);
+		const resolved = this.#mergeResolvedModels([...baseModels], discoveredModels);
 		const withConfigModels = this.#mergeCustomModels(resolved, this.#customModelOverlays);
 		// Merge runtime extension models so they survive online discovery completion
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
-		this.#models = this.#finalizeModels(this.#applyRuntimeProviderOverrides(withModelOverrides));
-		this.#rebuildCanonicalIndex();
+		return this.#finalizeModels(this.#applyRuntimeProviderOverrides(withModelOverrides));
 	}
 
 	async #discoverProviderModels(
@@ -6368,9 +6470,7 @@ export class ModelRegistry {
 	}
 
 	#invalidateAvailableModels(): void {
-		this.#availableModelsCache = undefined;
-		this.#availableModelsDisabledProviders = undefined;
-		this.#availableModelsEnvFingerprint = undefined;
+		this.#availableModelsCache.clear();
 	}
 
 	#notifyCatalogChanged(): void {
@@ -6445,10 +6545,11 @@ export class ModelRegistry {
 
 	/**
 	 * Get all models (embedded + accepted registry + custom).
+	 * Supplying a credential session selects only that session's Google OAuth discovery catalog.
 	 * If models.yml had errors, returns embedded plus accepted registry models.
 	 */
-	getAll(): Model<Api>[] {
-		return this.#models;
+	getAll(credentialSessionId?: string): Model<Api>[] {
+		return credentialSessionId === undefined ? this.#models : this.#getCredentialScopedCatalog(credentialSessionId);
 	}
 
 	/** Provider ids declared in models.yml, including override-only providers. */
@@ -6536,12 +6637,16 @@ export class ModelRegistry {
 		);
 	}
 
-	#isModelAvailable(model: Model<Api>, disabledProviders?: ReadonlySet<string>): boolean {
+	#isModelAvailable(
+		model: Model<Api>,
+		disabledProviders?: ReadonlySet<string>,
+		credentialSessionId?: string,
+	): boolean {
 		const disabled = disabledProviders ?? getDisabledProviderIdsFromSettings(this.#settings);
 		return (
 			!disabled.has(model.provider) &&
 			(this.#keylessProviders.has(model.provider) ||
-				this.authStorage.hasAuth(model.provider, undefined, { owner: this.#authStorageConfigOwner }))
+				this.authStorage.hasAuth(model.provider, credentialSessionId, { owner: this.#authStorageConfigOwner }))
 		);
 	}
 	/** Per-query precomputed variant filter inputs; plan fields are authoritative when provided. */
@@ -6976,23 +7081,51 @@ export class ModelRegistry {
 	 * is authoritative for visibility: live discovery only enriches entries and
 	 * adds unknown ids, and never removes a bundled model. A provider that cannot
 	 * serve a model reports its own error when the model is used.
+	 * Without a credential session, project-scoped Google OAuth discoveries are omitted.
 	 */
-	getAvailable(): Model<Api>[] {
+	getAvailable(credentialSessionId?: string): Model<Api>[] {
 		this.#synchronizeEnvironmentCredentials();
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		const disabledProviderKey = [...disabledProviders].sort().join("\u0000");
 		const envFingerprint = envAvailabilityFingerprint(this.#configuredApiKeyEnvNames);
-		if (
-			this.#availableModelsCache &&
-			this.#availableModelsDisabledProviders === disabledProviderKey &&
-			this.#availableModelsEnvFingerprint === envFingerprint
-		) {
-			return this.#availableModelsCache;
+		const cacheKey = credentialSessionId ?? "";
+		const cached = this.#availableModelsCache.get(cacheKey);
+		if (cached?.disabledProviders === disabledProviderKey && cached.envFingerprint === envFingerprint) {
+			return cached.models;
 		}
-		this.#availableModelsCache = this.#models.filter(model => this.#isModelAvailable(model, disabledProviders));
-		this.#availableModelsDisabledProviders = disabledProviderKey;
-		this.#availableModelsEnvFingerprint = envFingerprint;
-		return this.#availableModelsCache;
+		const catalog = this.#getCredentialScopedCatalog(credentialSessionId);
+		const models = catalog.filter(model => this.#isModelAvailable(model, disabledProviders, credentialSessionId));
+		this.#availableModelsCache.set(cacheKey, {
+			models,
+			disabledProviders: disabledProviderKey,
+			envFingerprint,
+		});
+		return models;
+	}
+
+	#getCredentialScopedCatalog(credentialSessionId?: string): Model<Api>[] {
+		const sessionScopedProviders = new Set(
+			(["google-antigravity", "google-gemini-cli"] as const).filter(
+				provider =>
+					this.authStorage.getEffectiveCredentialType(provider, credentialSessionId, {
+						owner: this.#authStorageConfigOwner,
+					}) === "oauth",
+			),
+		);
+		const commonModels = this.#models.filter(model => {
+			if (model.provider !== "google-antigravity" && model.provider !== "google-gemini-cli") {
+				return true;
+			}
+			if (!sessionScopedProviders.has(model.provider) || this.#discoveryManager.providerIds().has(model.provider))
+				return true;
+			return this.#providerActivity.get(model.provider)?.staticModelIds.has(model.id) === true;
+		});
+		const scopedDiscovered = credentialSessionId ? this.#getGoogleSessionDiscoveryModels(credentialSessionId) : [];
+		const catalog =
+			scopedDiscovered.length > 0
+				? this.#resolveDiscoveredModelCatalog(commonModels, scopedDiscovered)
+				: commonModels;
+		return catalog;
 	}
 
 	#synchronizeEnvironmentCredentials(): void {
@@ -7178,8 +7311,9 @@ export class ModelRegistry {
 	/**
 	 * Find a model by provider and ID.
 	 */
-	find(provider: string, modelId: string): Model<Api> | undefined {
-		return resolveProviderModelReference(provider, modelId, this.#models);
+	find(provider: string, modelId: string, credentialSessionId?: string): Model<Api> | undefined {
+		const models = credentialSessionId === undefined ? this.#models : this.getAll(credentialSessionId);
+		return resolveProviderModelReference(provider, modelId, models);
 	}
 
 	/**

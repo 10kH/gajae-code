@@ -13485,7 +13485,7 @@ export class AgentSession {
 	}
 
 	resolveRoleModel(role: string): Model | undefined {
-		return this.#resolveRoleModelFull(role, this.#modelRegistry.getAvailable(), this.model).model;
+		return this.#resolveRoleModelFull(role, this.#modelRegistry.getAvailable(this.credentialSessionId), this.model).model;
 	}
 
 	/**
@@ -13494,7 +13494,7 @@ export class AgentSession {
 	 * from role configuration (e.g., "anthropic/Anthropic model-sonnet-4-5:xhigh").
 	 */
 	resolveRoleModelWithThinking(role: string): ResolvedModelRoleValue {
-		return this.#resolveRoleModelFull(role, this.#modelRegistry.getAvailable(), this.model);
+		return this.#resolveRoleModelFull(role, this.#modelRegistry.getAvailable(this.credentialSessionId), this.model);
 	}
 
 	get promptTemplates(): ReadonlyArray<PromptTemplate> {
@@ -18953,7 +18953,7 @@ export class AgentSession {
 									this.getUserModelSelectionRevision() === selectionRevisionBeforeRollback
 								) {
 									const restoredModel = this.#modelRegistry
-										.getAvailable()
+										.getAvailable(this.credentialSessionId)
 										.find(
 											model =>
 												model.provider === selectedModelBeforeRollback.provider &&
@@ -19056,7 +19056,7 @@ export class AgentSession {
 		const current = this.model;
 		if (!current) return undefined;
 		const updated = registry
-			.getAvailable()
+			.getAvailable(this.credentialSessionId)
 			.find(model => model.provider === current.provider && model.id === current.id);
 		if (!updated) throw new ConfigurationReloadError("MODEL_UNAVAILABLE");
 		return updated;
@@ -19608,7 +19608,7 @@ export class AgentSession {
 	 * configured default as an alternative to the session's saved model.
 	 */
 	resolveConfiguredDefaultModel(): Model | undefined {
-		const availableModels = this.#modelRegistry.getAvailable();
+		const availableModels = this.#modelRegistry.getAvailable(this.credentialSessionId);
 		return this.#resolveRoleModelFull("default", availableModels, undefined).model;
 	}
 
@@ -20164,7 +20164,7 @@ export class AgentSession {
 		roleOrder: readonly string[],
 		canonicalSessionId: string | undefined,
 	): RoleModelCycleCandidate[] {
-		const availableModels = this.#modelRegistry.getAvailable();
+		const availableModels = this.#modelRegistry.getAvailable(this.credentialSessionId);
 		const currentModel = this.model;
 		if (availableModels.length === 0 || !currentModel) return [];
 
@@ -20286,7 +20286,7 @@ export class AgentSession {
 	}
 
 	async #cycleAvailableModel(direction: "forward" | "backward"): Promise<ModelCycleResult | undefined> {
-		const availableModels = this.#modelRegistry.getAvailable();
+		const availableModels = this.#modelRegistry.getAvailable(this.credentialSessionId);
 		if (availableModels.length <= 1) return undefined;
 
 		const currentModel = this.model;
@@ -20316,7 +20316,7 @@ export class AgentSession {
 	 * Get all available models with valid API keys.
 	 */
 	getAvailableModels(): Model[] {
-		return this.#modelRegistry.getAvailable();
+		return this.#modelRegistry.getAvailable(this.credentialSessionId);
 	}
 
 	// =========================================================================
@@ -22845,7 +22845,7 @@ export class AgentSession {
 		signal?: AbortSignal,
 	): Promise<Model | undefined> {
 		if (signal?.aborted) return undefined;
-		const availableModels = this.#modelRegistry.getAvailable();
+		const availableModels = this.#modelRegistry.getAvailable(this.credentialSessionId);
 		if (availableModels.length === 0) return undefined;
 
 		const candidate = this.#resolveContextPromotionConfiguredTarget(currentModel, availableModels);
@@ -23282,7 +23282,11 @@ export class AgentSession {
 		const currentModel = this.model;
 		if (currentModel && modelsAreEqual(candidate, currentModel)) return "active session model";
 		for (const role of MODEL_ROLE_IDS) {
-			const roleModel = this.#resolveRoleModelFull(role, this.#modelRegistry.getAvailable(), currentModel).model;
+			const roleModel = this.#resolveRoleModelFull(
+				role,
+				this.#modelRegistry.getAvailable(this.credentialSessionId),
+				currentModel,
+			).model;
 			if (roleModel && modelsAreEqual(candidate, roleModel)) return `modelRoles.${role}`;
 		}
 		return "configured compaction fallback";
@@ -23408,7 +23412,9 @@ export class AgentSession {
 		signal: AbortSignal,
 		options?: SummaryOptions,
 	): Promise<CompactionResult> {
-		const candidates = this.#getCompactionModelCandidates(this.#modelRegistry.getAvailable());
+		const candidates = this.#getCompactionModelCandidates(
+			this.#modelRegistry.getAvailable(this.credentialSessionId),
+		);
 		const telemetry = resolveTelemetry(this.agent.telemetry, this.sessionId);
 		let previousCandidate: Model | undefined;
 		let previousFailure: unknown;
@@ -23569,7 +23575,7 @@ export class AgentSession {
 		const reachableModels =
 			handoffSelected && this.model
 				? [this.model]
-				: this.#getCompactionModelCandidates(this.#modelRegistry.getAvailable());
+				: this.#getCompactionModelCandidates(this.#modelRegistry.getAvailable(this.credentialSessionId));
 		const hookServesMaintenance =
 			!handoffSelected && this.#extensionRunner?.hasHandlers("session_before_compact") === true;
 		if (
@@ -23712,7 +23718,7 @@ export class AgentSession {
 				throw new Error("No model selected");
 			}
 
-			const availableModels = this.#modelRegistry.getAvailable();
+			const availableModels = this.#modelRegistry.getAvailable(this.credentialSessionId);
 			if (availableModels.length === 0) {
 				await compactionStateSnapshotPromise;
 				throw this.#buildCompactionAuthError(this.model);
@@ -25234,7 +25240,7 @@ export class AgentSession {
 			const resolved =
 				profileResolution?.kind === "resolved"
 					? profileResolution.value
-					: resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
+					: resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(this.credentialSessionId), {
 							settings: this.settings,
 							matchPreferences: { usageOrder: this.settings.getStorage()?.getModelUsageOrder() },
 							modelRegistry: this.#modelRegistry,
