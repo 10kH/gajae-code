@@ -204,6 +204,7 @@ import {
 	hasFsCode,
 	isEacces,
 	isEnoent,
+	isRecord,
 	isUnexpectedSocketCloseMessage,
 	logger,
 	prompt,
@@ -7707,11 +7708,13 @@ export class AgentSession {
 			}
 		}
 
-		if (
-			event.type === "tool_execution_start" ||
-			event.type === "tool_execution_update" ||
-			event.type === "tool_execution_end"
-		) {
+		if (event.type === "tool_execution_start") {
+			this.#markRetryReplayUnsafe();
+			// Check TTSR astCondition rules for write/edit tools
+			if ((event.toolName === "write" || event.toolName === "ast_edit") && event.args) {
+				void this.#checkTtsrAstConditionForToolExecution(event.toolName, event.args);
+			}
+		} else if (event.type === "tool_execution_update" || event.type === "tool_execution_end") {
 			this.#markRetryReplayUnsafe();
 		} else if (event.type === "message_end") {
 			if (
@@ -9463,6 +9466,80 @@ export class AgentSession {
 		this.#ttsrManager?.markInjectedByNames(uniqueRuleNames);
 		const records = this.#ttsrManager?.getInjectedRecords().filter(record => uniqueRuleNames.includes(record.name));
 		this.sessionManager.appendTtsrInjection(uniqueRuleNames, records, this.#ttsrManager?.getMessageCount());
+	}
+
+	/**
+	 * Check astCondition rules for a tool call's resulting content and queue for injection.
+	 * Called when a write/edit-style tool call is about to execute with complete arguments.
+	 * Only checks regular file writes; skips archives, sqlite, and conflict paths.
+	 */
+	async #checkTtsrAstConditionForToolExecution(toolName: string, args: unknown): Promise<void> {
+		if (!this.#ttsrManager?.hasRules()) return;
+
+		const matchContext: TtsrMatchContext = { source: "tool", toolName };
+		const filePaths: string[] = [];
+		let content: string | undefined;
+		let filePath: string | undefined;
+
+		// Extract file path and content based on tool type
+		if (toolName === "write" && isRecord(args) && typeof args.path === "string") {
+			const writePath = args.path;
+			// Skip special paths (archives, sqlite, conflicts, internal URLs)
+			if (
+				writePath.includes(":") ||
+				writePath.startsWith("conflict") ||
+				writePath.includes("://")
+			) {
+				return;
+			}
+			filePath = writePath;
+			content = typeof args.content === "string" ? args.content : "";
+			if (filePath) filePaths.push(filePath);
+		} else if (toolName === "ast_edit" && isRecord(args)) {
+			// For ast_edit, we can't compute the final result without executing it,
+			// so we skip astCondition checks for now (it would require dry-running the edit)
+			return;
+		}
+
+		if (!filePath || content === undefined) return;
+
+		// Get all rules with astConditions
+		const rulesWithAstCondition = this.#ttsrManager.getRules()
+			.filter(rule => rule.astCondition && rule.astCondition.length > 0);
+
+		if (rulesWithAstCondition.length === 0) return;
+
+		const matchedRules: Rule[] = [];
+		matchContext.filePaths = filePaths;
+
+		// Check each rule's astConditions against the content
+		for (const rule of rulesWithAstCondition) {
+			// Check scope first
+			const scopeMatches = this.#ttsrManager.checkScope(rule, matchContext);
+			if (!scopeMatches) continue;
+
+			// Check if rule can trigger (repeat gating)
+			if (!this.#ttsrManager.canTrigger(rule.name)) continue;
+
+			// Check astConditions
+			try {
+				const astMatches = await this.#ttsrManager.checkAstCondition(rule, filePath, content);
+				if (astMatches) {
+					matchedRules.push(rule);
+				}
+			} catch (error) {
+				logger.debug("TTSR astCondition check failed", {
+					ruleName: rule.name,
+					filePath,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+
+		if (matchedRules.length > 0) {
+			this.#addPendingTtsrInjections(matchedRules);
+			this.#emitSessionEvent({ type: "ttsr_triggered", rules: matchedRules }).catch(() => {});
+		}
 	}
 
 	#findTtsrAssistantIndex(targetTimestamp: number | undefined): number {

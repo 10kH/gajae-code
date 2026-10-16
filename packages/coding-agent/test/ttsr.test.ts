@@ -745,4 +745,55 @@ describe("TTSR AST conditions", () => {
 		const tsMatch = await manager.checkAstCondition(rule, "test.ts", "function Foo() {}");
 		expect(tsMatch).toBe(true);
 	});
+
+	it("getRules returns all registered rules", () => {
+		const manager = new TtsrManager();
+		const rule1 = makeRule({ name: "rule-1", condition: ["pattern1"] });
+		const rule2 = makeRule({ name: "rule-2", astCondition: ["pattern2"] });
+
+		manager.addRule(rule1);
+		manager.addRule(rule2);
+
+		const rules = manager.getRules();
+		expect(rules).toHaveLength(2);
+		expect(rules.map(r => r.name)).toEqual(["rule-1", "rule-2"]);
+	});
+
+	it("canTrigger respects repeat gating", () => {
+		const manager = new TtsrManager();
+		const rule = makeRule({ name: "rule-1", condition: ["pattern"] });
+
+		manager.addRule(rule);
+		expect(manager.canTrigger("rule-1")).toBe(true);
+
+		// Mark as injected
+		manager.markInjectedByNames(["rule-1"]);
+		// With default repeatMode "once", should not trigger again
+		expect(manager.canTrigger("rule-1")).toBe(false);
+	});
+
+	it("checkScope matches tool scope context", () => {
+		const manager = new TtsrManager();
+		const ruleWithToolScope = makeRule({
+			name: "tool-rule",
+			condition: ["pattern"],
+			scope: ["tool:write"],
+		});
+		const ruleWithAnyToolScope = makeRule({
+			name: "any-tool-rule",
+			condition: ["pattern"],
+			scope: ["tool"],
+		});
+
+		manager.addRule(ruleWithToolScope);
+		manager.addRule(ruleWithAnyToolScope);
+
+		const writeContext = { source: "tool" as const, toolName: "write" };
+		const editContext = { source: "tool" as const, toolName: "edit" };
+
+		expect(manager.checkScope(ruleWithToolScope, writeContext)).toBe(true);
+		expect(manager.checkScope(ruleWithToolScope, editContext)).toBe(false);
+		expect(manager.checkScope(ruleWithAnyToolScope, writeContext)).toBe(true);
+		expect(manager.checkScope(ruleWithAnyToolScope, editContext)).toBe(true);
+	});
 });

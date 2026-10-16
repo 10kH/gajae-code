@@ -520,6 +520,29 @@ export class TtsrManager {
 	}
 
 	/**
+	 * Get all registered rules (internal access for tool execution flow).
+	 */
+	getRules(): Rule[] {
+		return Array.from(this.#rules.values()).map(entry => entry.rule);
+	}
+
+	/**
+	 * Check if a rule can be triggered (internal access for tool execution flow).
+	 */
+	canTrigger(ruleName: string): boolean {
+		return this.#canTrigger(ruleName);
+	}
+
+	/**
+	 * Check scope for a rule against a context (internal access for tool execution flow).
+	 */
+	checkScope(rule: Rule, context: TtsrMatchContext): boolean {
+		const entry = this.#rules.get(rule.name);
+		if (!entry) return false;
+		return this.#matchesScope(entry, context);
+	}
+
+	/**
 	 * Check AST conditions for a rule against file content.
 	 * Returns true if any AST condition matches (OR across patterns within a condition).
 	 * Returns false if the rule has no AST conditions, unknown language, or parse failure.
