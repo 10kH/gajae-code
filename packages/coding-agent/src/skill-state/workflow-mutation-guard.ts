@@ -110,11 +110,14 @@ const BASH_IN_PLACE_MUTATION_COMMAND_RE = new RegExp(
  */
 const BASH_INTERPRETER_WRITE_API =
 	"(?:open\\s*\\(|writeFile(?:Sync)?\\s*\\(|appendFile(?:Sync)?\\s*\\(|\\.write\\s*\\(|shutil\\s*\\.\\s*(?:copy2?|copyfileobj|copyfile)\\s*\\(|os\\s*\\.\\s*symlink\\s*\\()";
-/** Source-evaluation and dynamic-import names make Python payloads opaque to this static scanner. */
+/** Source evaluation and dynamic imports make Python payloads opaque to this static scanner. */
 const PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE =
-	/^(?:exec|eval|compile|execfile|__import__|exec_module|import_module|run_path|run_module)\b/;
+	/^(?:exec|eval|execfile|__import__|exec_module|import_module|run_path|run_module)\b/;
 const PYTHON_DYNAMIC_EXECUTION_TOKEN_RE =
-	/\b(?:exec|eval|compile|execfile|__import__|exec_module|import_module|run_path|run_module)\b/;
+	/\b(?:exec|eval|execfile|__import__|exec_module|import_module|run_path|run_module)\b/;
+/** JavaScript eval and Function construct executable code from runtime strings. */
+const JAVASCRIPT_DYNAMIC_EXECUTION_IDENTIFIER_RE = /^(?:eval|Function)\b/;
+const JAVASCRIPT_DYNAMIC_EXECUTION_TOKEN_RE = /\b(?:eval|Function)\b/;
 const BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE = new RegExp(
 	`(?:^|[;&|\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?(?:python3?|node|ruby|perl)\\b[^;&|\\n]*(?:<<[-]?\\s*['"]?\\w+['"]?)[\\s\\S]*${BASH_INTERPRETER_WRITE_API}`,
 	"i",
@@ -2049,7 +2052,9 @@ function interpreterCodeContainsWriteApi(
 						skipped.includes("{"));
 				if (
 					isInterpolated &&
-					(api.test(skipped) || (language === "py" && PYTHON_DYNAMIC_EXECUTION_TOKEN_RE.test(skipped)))
+					(api.test(skipped) ||
+						(language === "py" && PYTHON_DYNAMIC_EXECUTION_TOKEN_RE.test(skipped)) ||
+						(language === "js" && JAVASCRIPT_DYNAMIC_EXECUTION_TOKEN_RE.test(skipped)))
 				)
 					return true;
 				index = next;
@@ -2066,6 +2071,7 @@ function interpreterCodeContainsWriteApi(
 			}
 		}
 		if (language === "py" && PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))) return true;
+		if (language === "js" && JAVASCRIPT_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))) return true;
 		if (apiAtStart.test(script.slice(index))) return true;
 		index += 1;
 	}
@@ -2523,6 +2529,7 @@ function awkPrograms(words: string[]): { programs: AwkProgramSource[]; unknown: 
 		programs.push(programSource(word));
 		break;
 	}
+	if (hasFileProgram) unknown = true;
 	return { programs, unknown };
 }
 

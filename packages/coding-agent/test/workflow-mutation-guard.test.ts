@@ -2105,6 +2105,163 @@ describe("bash scanner quoting model", () => {
 		expect(decision.targets).toContain(productPath);
 	});
 
+	it("keeps planning Bash interpreter and inline-program boundaries fail-closed", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		const scratch = path.join(os.tmpdir(), `gjc-plan-multi-write-${process.pid}.txt`);
+		const escapedScratch = path.join(os.tmpdir(), `gjc-plan-escaped\\${process.pid}.txt`);
+		const cases: Array<{
+			name: string;
+			command: string;
+			blocked: boolean;
+			reason?: "phase-boundary" | "unknown-target";
+			target?: string;
+		}> = [
+			{
+				name: "ANSI-C quoted Python write source",
+				command: `python3 -c $'open("src/product.ts","w").write("PWNED")'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Python exec-wrapped write source",
+				command: `python3 -c 'exec(${JSON.stringify('open("src/product.ts","w").write("PWNED")')})'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Python eval-wrapped write source",
+				command: `python3 -c 'eval(${JSON.stringify('open("src/product.ts","w").write("PWNED")')})'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Node eval-wrapped write source",
+				command: `node -e 'eval(${JSON.stringify('require("fs").writeFileSync("src/product.ts","PWNED")')})'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Node Function constructor source",
+				command: `node -e 'Function(${JSON.stringify('require("fs").writeFileSync("src/product.ts","PWNED")')})()'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Node dynamic eval inside an interpolated template",
+				command: "node -e '`" + "$" + "{eval(command)}`'",
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "opaque AWK file program",
+				command: "awk -f scripts/plan.awk",
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "opaque long-option AWK file program",
+				command: "awk --file=scripts/plan.awk",
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "AWK assignment option before quoted program",
+				command: `awk -v x=1 'BEGIN { print "PWNED" > "src/product.ts" }' input`,
+				blocked: true,
+				reason: "phase-boundary",
+				target: "src/product.ts",
+			},
+			{
+				name: "AWK second statement in quoted program",
+				command: `awk 'BEGIN { print 1; print "PWNED" > "src/product.ts" }' input`,
+				blocked: true,
+				reason: "phase-boundary",
+				target: "src/product.ts",
+			},
+			{
+				name: "sed addressed write after regex address",
+				command: "sed -n '/needle/w src/product.ts' input",
+				blocked: true,
+				reason: "phase-boundary",
+				target: "src/product.ts",
+			},
+			{
+				name: "later sed destination after a temporary first destination",
+				command: `sed -n 'w ${scratch};w src/product.ts' input`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "compile-only Python code object containing a write",
+				command: `python3 -c 'compile(${JSON.stringify('open("src/product.ts","w").write("x")')}, "<string>", "exec")'`,
+				blocked: false,
+			},
+			{
+				name: "Python exec/eval/compile API names in inert output text",
+				command: `python3 -c "print('exec eval compile shutil.copy(')"`,
+				blocked: false,
+			},
+			{
+				name: "Node eval and write API names in inert output text",
+				command: `node -e "console.log('eval writeFileSync(')"`,
+				blocked: false,
+			},
+			{
+				name: "Python API name in comment",
+				command: `python3 -c "print(1) # shutil.copy('stage/pwn.txt','src/product.ts')"`,
+				blocked: false,
+			},
+			{
+				name: "Node write API name in comment",
+				command: `node -e "/* writeFileSync('src/product.ts','x') */ console.log(1)"`,
+				blocked: false,
+			},
+			{
+				name: "Python literal read-only os.system command",
+				command: `python3 -c "import os; os.system('ls')"`,
+				blocked: false,
+			},
+			{
+				name: "sed input filename that resembles a write script",
+				command: "sed -n '1p' 'w src/product.ts'",
+				blocked: false,
+			},
+			{
+				name: "AWK quoted string comparison rather than redirection",
+				command: `awk '$1 > "m" { print }' input`,
+				blocked: false,
+			},
+			{
+				name: "GNU AWK informational version query",
+				command: "awk -W version",
+				blocked: false,
+			},
+			{
+				name: "GNU AWK lint option and read-only program",
+				command: "awk -W lint '$1 > 5 { print $1 }' input",
+				blocked: false,
+			},
+			{
+				name: "AWK escaped temporary destination",
+				command: `awk 'BEGIN { printf "x" > ${JSON.stringify(escapedScratch)} }'`,
+				blocked: false,
+			},
+		];
+
+		for (const scenario of cases) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command: scenario.command },
+			});
+			expect(decision.blocked, scenario.name).toBe(scenario.blocked);
+			if (scenario.reason) expect(decision.reason, scenario.name).toBe(scenario.reason);
+			if (scenario.target) expect(decision.targets, scenario.name).toContain(scenario.target);
+		}
+	});
+
 	it("blocks planning bash writes outside the old denylist and still allows read-only commands", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");
@@ -2113,7 +2270,6 @@ describe("bash scanner quoting model", () => {
 		const unknownTargetCommands = new Set([
 			`python3 -c 'exec("open(\\"src/product.ts\\",\\"w\\").write(\\"PWNED\\")")'`,
 			`python3 -c 'eval("open(\\"src/product.ts\\",\\"w\\").write(\\"PWNED\\")")'`,
-			`python3 -c 'compile(source, "<string>", "exec")'`,
 			`python3 -c '__import__("os").system("echo PWNED > src/product.ts")'`,
 			`python3 -c 'import importlib; importlib.import_module("project_plugin")'`,
 			`python3 -c 'import runpy; runpy.run_path("src/payload.py")'`,
