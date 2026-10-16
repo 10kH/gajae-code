@@ -351,8 +351,8 @@ export async function generateFileMentionMessages(
 			continue;
 		}
 		const absolutePath = resolveReadPath(resolvedPath, cwd);
-		// Read the canonical path that pathIsWithin accepts. A later symlink swap
-		// cannot retarget the bytes, and `..`, `~`, and outside absolute paths are skipped.
+		// Skip `..`, `~`, and outside absolute paths. Read the canonical path so
+		// replacing the original mention symlink does not retarget this read.
 		const canonicalPath = resolveEquivalentPath(absolutePath);
 		if (!pathIsWithin(cwd, canonicalPath)) {
 			continue;

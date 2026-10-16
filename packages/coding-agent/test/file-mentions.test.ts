@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -194,10 +195,32 @@ describe("generateFileMentionMessages duplicate suppression + inline cap (Findin
 	});
 });
 
-/** Printed after assertions so a non-checkmark runner can record the result. */
-function passLine(name: string): void {
+/** Record the assertion result. A failure is rethrown so the case stays red. */
+async function checkCase(name: string, body: () => Promise<void>): Promise<void> {
+	try {
+		await body();
+	} catch (error) {
+		console.log(`(fail) ${name}`);
+		throw error;
+	}
 	console.log(`(pass) ${name}`);
 }
+
+function symlinkCreationAllowed(): boolean {
+	const dir = fsSync.mkdtempSync(path.join(os.tmpdir(), "pi-symlink-probe-"));
+	try {
+		fsSync.symlinkSync(dir, path.join(dir, "link"));
+		return true;
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "EPERM" || code === "EACCES") return false;
+		throw error;
+	} finally {
+		fsSync.rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+const canCreateSymlink = symlinkCreationAllowed();
 
 function mentionText(messages: Awaited<ReturnType<typeof generateFileMentionMessages>>): string {
 	return messages
@@ -213,23 +236,31 @@ describe("generateFileMentionMessages workspace boundary", () => {
 		await fs.mkdir(path.join(cwd, "sub"));
 		await Bun.write(path.join(cwd, "sub", "nested.txt"), "NESTED_OK");
 
-		const relative = mentionText(await generateFileMentionMessages(["inside.txt"], cwd));
-		expect(relative).toContain("INSIDE_OK");
-
-		const absolute = mentionText(await generateFileMentionMessages([path.join(cwd, "inside.txt")], cwd));
-		expect(absolute).toContain("INSIDE_OK");
-
-		const stayedInside = mentionText(await generateFileMentionMessages(["sub/../sub/nested.txt"], cwd));
-		expect(stayedInside).toContain("NESTED_OK");
-
-		const real = await fs.realpath(cwd);
-		const alias = real.startsWith("/private/") ? real.slice("/private".length) : `/private${real}`;
-		if (alias !== real) {
-			const aliased = mentionText(await generateFileMentionMessages([path.join(alias, "inside.txt")], cwd));
-			expect(aliased).toContain("INSIDE_OK");
-		}
-		passLine("still reads a relative file and an absolute path inside cwd");
+		await checkCase("still reads a relative file and an absolute path inside cwd", async () => {
+			const relative = mentionText(await generateFileMentionMessages(["inside.txt"], cwd));
+			expect(relative).toContain("INSIDE_OK");
+			const absolute = mentionText(await generateFileMentionMessages([path.join(cwd, "inside.txt")], cwd));
+			expect(absolute).toContain("INSIDE_OK");
+			const stayedInside = mentionText(await generateFileMentionMessages(["sub/../sub/nested.txt"], cwd));
+			expect(stayedInside).toContain("NESTED_OK");
+		});
 	});
+
+	test.skipIf(process.platform !== "darwin")(
+		"still reads an inside file through the macOS private alias",
+		async () => {
+			const cwd = await createTempDir();
+			await Bun.write(path.join(cwd, "inside.txt"), "ALIAS_OK");
+			const real = await fs.realpath(cwd);
+			await checkCase("still reads an inside file through the macOS private alias", async () => {
+				expect(real.startsWith("/private/")).toBe(true);
+				const aliasFile = path.join(real.slice("/private".length), "inside.txt");
+				expect(await fs.realpath(aliasFile)).toBe(path.join(real, "inside.txt"));
+				const aliased = mentionText(await generateFileMentionMessages([aliasFile], cwd));
+				expect(aliased).toContain("ALIAS_OK");
+			});
+		},
+	);
 
 	test("does not auto-read a parent path, an absolute path, or a tilde path outside cwd", async () => {
 		const cwd = await createTempDir();
@@ -243,36 +274,48 @@ describe("generateFileMentionMessages workspace boundary", () => {
 		await Bun.write(parentFile, "PARENT_SECRET");
 		await Bun.write(homeFile, "TILDE_SECRET");
 		try {
-			const messages = await generateFileMentionMessages(
-				["inside.txt", path.join(outsideDir, "abs.txt"), `../${parentName}`, `~/${homeName}`],
-				cwd,
+			await checkCase(
+				"does not auto-read a parent path, an absolute path, or a tilde path outside cwd",
+				async () => {
+					const messages = await generateFileMentionMessages(
+						["inside.txt", path.join(outsideDir, "abs.txt"), `../${parentName}`, `~/${homeName}`],
+						cwd,
+					);
+					const text = mentionText(messages);
+					expect(text).toContain("INSIDE_OK");
+					expect(text).not.toContain("ABS_SECRET");
+					expect(text).not.toContain("PARENT_SECRET");
+					expect(text).not.toContain("TILDE_SECRET");
+					expect(
+						messages
+							.filter(message => message.role === "fileMention")
+							.flatMap(message => (message.role === "fileMention" ? message.files.map(file => file.path) : [])),
+					).toEqual(["inside.txt"]);
+				},
 			);
-			const text = mentionText(messages);
-			expect(text).toContain("INSIDE_OK");
-			expect(text).not.toContain("ABS_SECRET");
-			expect(text).not.toContain("PARENT_SECRET");
-			expect(text).not.toContain("TILDE_SECRET");
-			expect(
-				messages
-					.filter(message => message.role === "fileMention")
-					.flatMap(message => (message.role === "fileMention" ? message.files.map(file => file.path) : [])),
-			).toEqual(["inside.txt"]);
-			passLine("does not auto-read a parent path, an absolute path, or a tilde path outside cwd");
 		} finally {
 			await fs.rm(parentFile, { force: true });
 			await fs.rm(homeFile, { force: true });
 		}
 	});
 
-	test("does not follow a symlink that leaves cwd", async () => {
+	test.skipIf(!canCreateSymlink)("does not follow a symlink that leaves cwd", async () => {
 		const cwd = await createTempDir();
 		const outsideDir = await createTempDir();
 		const secret = path.join(outsideDir, "secret.txt");
 		await Bun.write(secret, "LINK_SECRET");
-		await fs.symlink(secret, path.join(cwd, "link.txt"));
-
-		const text = mentionText(await generateFileMentionMessages(["link.txt"], cwd));
-		expect(text).not.toContain("LINK_SECRET");
-		passLine("does not follow a symlink that leaves cwd");
+		try {
+			await fs.symlink(secret, path.join(cwd, "link.txt"));
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "EPERM" || code === "EACCES") {
+				throw new Error(`symlink creation failed with ${code}; the case should have been skipped`);
+			}
+			throw error;
+		}
+		await checkCase("does not follow a symlink that leaves cwd", async () => {
+			const text = mentionText(await generateFileMentionMessages(["link.txt"], cwd));
+			expect(text).not.toContain("LINK_SECRET");
+		});
 	});
 });
