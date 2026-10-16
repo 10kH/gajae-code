@@ -1896,10 +1896,10 @@ const EXECUTION_APPROVAL_TRANSCRIPT_MAX_BYTES = 128 * 1024 * 1024;
 const DEEP_INTERVIEW_EXECUTION_APPROVAL_RECORD_MAX_BYTES = 16 * 1024;
 const DEEP_INTERVIEW_EXECUTION_APPROVAL_ID_MAX_LENGTH = 256;
 
+// The boundary binds approval to transcript content (prefix length/sha256, leaf, Ask call), not to
+// the file's inode: SessionManager persists full rewrites by atomic rename, which replaces the inode.
 export interface ExecutionApprovalTranscriptBoundary {
 	byte_length: number;
-	device: string;
-	inode: string;
 	leaf_id: string | null;
 	approval_tool_call_id: string;
 }
@@ -1909,10 +1909,6 @@ function isExecutionApprovalTranscriptBoundary(value: unknown): value is Executi
 		isPlainObject(value) &&
 		Number.isSafeInteger(value.byte_length) &&
 		(value.byte_length as number) > 0 &&
-		typeof value.device === "string" &&
-		/^\d+$/.test(value.device) &&
-		typeof value.inode === "string" &&
-		/^\d+$/.test(value.inode) &&
 		(value.leaf_id === null || isExecutionApprovalId(value.leaf_id)) &&
 		isExecutionApprovalId(value.approval_tool_call_id)
 	);
@@ -2037,8 +2033,6 @@ export async function captureExecutionApprovalTranscriptBoundary(
 		throw new StateCommandError(2, "execution approval transcript boundary lacks the current Ask call");
 	return {
 		byte_length: Buffer.byteLength(text),
-		device: after.dev.toString(),
-		inode: after.ino.toString(),
 		leaf_id: prefix.leaf,
 		approval_tool_call_id: approvalToolCallId,
 	};
@@ -2062,13 +2056,8 @@ export async function assertExecutionApprovalTranscriptBoundary(
 	const after = await fs.lstat(transcriptPath, { bigint: true });
 	if ((await fs.realpath(transcriptPath)) !== path.resolve(transcriptPath))
 		throw new StateCommandError(2, "execution approval transcript path is not canonical");
-	if (
-		!sameBoundedFileIdentity(before, after) ||
-		after.dev.toString() !== boundary.device ||
-		after.ino.toString() !== boundary.inode ||
-		text === undefined
-	)
-		throw new StateCommandError(2, "execution approval transcript identity changed");
+	if (!sameBoundedFileIdentity(before, after) || text === undefined)
+		throw new StateCommandError(2, "execution approval transcript changed while it was read");
 	const bytes = Buffer.from(text);
 	const prefix = bytes.subarray(0, boundary.byte_length);
 	if (prefix.length !== boundary.byte_length || createHash("sha256").update(prefix).digest("hex") !== transcriptSha256)
@@ -3221,6 +3210,21 @@ async function assertSanctionedExecutionApprovalAudit(
 		mutationId !== `deep-interview:approve-execution:${approvedAt}`
 	)
 		throw new StateCommandError(2, "deep-interview execution approval lacks sanctioned transition provenance");
+
+	// The approval index is written only after the append-only ledger entry.
+	// A pending journal means that append did not finish, so the index must
+	// not authorize execution handoff.
+	let approvalJournal: WorkflowTransactionJournal | undefined;
+	try {
+		approvalJournal = await readWorkflowTransactionJournal(cwd, sessionId, mutationId);
+	} catch (error) {
+		throw new StateCommandError(
+			2,
+			`failed to read execution approval journal: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (approvalJournal?.status === "pending")
+		throw new StateCommandError(2, "deep-interview execution approval journal is incomplete");
 
 	const indexedApprovalPath = path.join(sessionStateDir(cwd, sessionId), "deep-interview-approval-audit.json");
 	let indexedRaw = "";
@@ -5067,8 +5071,6 @@ async function appendExecutionApprovalAudit(
 	} = {},
 ): Promise<void> {
 	const entry = buildExecutionApprovalAuditEntry(options);
-	await writeExecutionApprovalIndex(options, entry);
-	await hooks.afterIndex?.();
 	const filePath = auditPath(options.cwd, options.sessionId);
 	await withWorkflowStateLock(
 		filePath,
@@ -5089,6 +5091,8 @@ async function appendExecutionApprovalAudit(
 		},
 		{ cwd: options.cwd },
 	);
+	await writeExecutionApprovalIndex(options, entry);
+	await hooks.afterIndex?.();
 	await hooks.afterAudit?.();
 }
 
@@ -5296,8 +5300,6 @@ async function handleApproveExecutionRecordLocked(
 				indexedMatches = isPlainObject(parsed) && JSON.stringify(parsed) === JSON.stringify(expectedApprovalEntry);
 			} catch {}
 		}
-		if (!indexedMatches) await writeExecutionApprovalIndex(approvalOptions, expectedApprovalEntry);
-		recoverySteps.add("approval-index");
 		let approvalAuditOffset = pendingJournal.approval_audit_offset;
 		if (!recoverySteps.has("approval-audit")) {
 			approvalAuditOffset = await appendExecutionApprovalAuditIdempotent(
@@ -5312,6 +5314,8 @@ async function handleApproveExecutionRecordLocked(
 			);
 			recoverySteps.add("approval-audit");
 		}
+		if (!indexedMatches) await writeExecutionApprovalIndex(approvalOptions, expectedApprovalEntry);
+		recoverySteps.add("approval-index");
 		await updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id, {
 			steps: [...recoverySteps],
 			approval_audit_offset: approvalAuditOffset,

@@ -11,6 +11,7 @@ import { createSdkSessionRuntimeExtension, terminalStoppedOutcome } from "../src
 import type { SdkFrame } from "../src/sdk/host/types";
 import { AgentSession, type AgentSessionEvent } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
+import { testBrokerDiscovery } from "./sdk-test-broker-discovery";
 
 /**
  * The SDK-only host publishes the lifecycle boundary that settles an externally
@@ -105,6 +106,7 @@ test("disowned SDK steering cohorts share streams and terminals without adopting
 		modelRegistry: {
 			getApiKey: async () => "test-key",
 			getAuthStorageOwner: () => undefined,
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 		} as never,
 		extensionRunner: {
 			hasHandlers: () => true,
@@ -127,6 +129,7 @@ test("disowned SDK steering cohorts share streams and terminals without adopting
 	} as unknown as ExtensionAPI;
 	createSdkSessionRuntimeExtension(api, {
 		agentDir: cwd,
+		ensureBrokerImpl: async () => testBrokerDiscovery,
 		settings,
 		createTransport: async ({ sessionId, stateRoot, token }) => ({
 			sessionId,

@@ -1,12 +1,21 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { exactRemoveDirectoryTree, snapshotDirectoryTree } from "@gajae-code/natives";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
-import { acquireFileLock, type FileLockOwnerToken, FileLockTestHooks } from "../src/config/file-lock";
+import { acquireFileLock, type FileLockOwnerToken, FileLockTestHooks, withFileLock } from "../src/config/file-lock";
 
 const roots: string[] = [];
+type ControlledReleaseRetry = {
+	cancelled: boolean;
+	callback: () => void | Promise<void>;
+};
+const controlledReleaseRetries: ControlledReleaseRetry[] = [];
+
 afterEach(async () => {
+	for (const timer of controlledReleaseRetries.splice(0)) timer.cancelled = true;
+	vi.restoreAllMocks();
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
 	FileLockTestHooks.beforeRemovalOwnerPublish = undefined;
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
@@ -25,6 +34,35 @@ async function record(transition: string, owner: FileLockOwnerToken) {
 		`${transition}.owner`,
 		JSON.stringify({ owner, rootDev: stat.dev.toString(), rootIno: stat.ino.toString() }),
 	);
+}
+
+function controlReleasePendingRetries(): void {
+	const realSetTimeout = globalThis.setTimeout;
+	const realClearTimeout = globalThis.clearTimeout;
+	const controlledSetTimeout = (callback: () => void | Promise<void>, delay?: number): NodeJS.Timeout => {
+		if ([250, 1_000, 5_000, 15_000, 60_000].includes(delay ?? 0)) {
+			const timer = { cancelled: false, callback };
+			controlledReleaseRetries.push(timer);
+			return timer as unknown as NodeJS.Timeout;
+		}
+		return realSetTimeout(callback, delay);
+	};
+	const controlledClearTimeout = (timer: unknown): void => {
+		if (typeof timer === "object" && timer !== null && "cancelled" in timer && "callback" in timer) {
+			(timer as ControlledReleaseRetry).cancelled = true;
+			return;
+		}
+		realClearTimeout(timer as NodeJS.Timeout);
+	};
+	vi.spyOn(globalThis, "setTimeout").mockImplementation(controlledSetTimeout as unknown as typeof setTimeout);
+	vi.spyOn(globalThis, "clearTimeout").mockImplementation(controlledClearTimeout as unknown as typeof clearTimeout);
+}
+
+async function runNextControlledReleaseRetry(): Promise<void> {
+	const timer = controlledReleaseRetries.shift();
+	expect(timer).toBeDefined();
+	if (!timer || timer.cancelled) throw new Error("Expected an active pending release retry");
+	await timer.callback();
 }
 
 const deadOwner: FileLockOwnerToken = { pid: 2147483647, timestamp: Date.now(), owner_token: "dead-remover" };
@@ -201,6 +239,65 @@ test("a foreign remover is never probed or displaced using local pid evidence", 
 	expect(await Bun.file(path.join(transition, "payload")).text()).toBe("foreign payload");
 });
 
+test.skipIf(process.platform === "win32").each([
+	["host-qualified", "local-host"],
+	["unqualified", undefined],
+] as const)(
+	"%s successor retries release behind a foreign sidecar-only remover without changing its owner",
+	async (_name, ownerHostId) => {
+		const { file, lock, transition } = await fixture();
+		const foreignOwner: FileLockOwnerToken = {
+			pid: 2147483646,
+			timestamp: Date.now(),
+			owner_token: "foreign-remover",
+			owner_host_id: "foreign-host",
+		};
+		const recordPath = `${transition}.owner`;
+		const foreignRecord = JSON.stringify({ owner: foreignOwner, rootDev: "0", rootIno: "0" });
+		await Bun.write(recordPath, foreignRecord);
+		expect(await fs.exists(transition)).toBe(false);
+
+		let callbackCommitted = false;
+		let releaseTransitionProbes = 0;
+		let foreignRecordWasUntouched = false;
+		const realLstat = fs.lstat;
+		vi.spyOn(fs, "lstat").mockImplementation((async (target, options) => {
+			if (callbackCommitted && String(target) === transition && ++releaseTransitionProbes === 1) {
+				try {
+					return await realLstat(target, options);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+					foreignRecordWasUntouched = (await Bun.file(recordPath).text()) === foreignRecord;
+					await fs.rm(recordPath);
+					throw error;
+				}
+			}
+			return realLstat(target, options);
+		}) as typeof fs.lstat);
+		const kill = vi.spyOn(process, "kill");
+
+		await expect(
+			withFileLock(
+				file,
+				async () => {
+					await Bun.write(file, "committed successor state");
+					callbackCommitted = true;
+					expect(await Bun.file(recordPath).text()).toBe(foreignRecord);
+					return "successor callback committed";
+				},
+				{ ownerHostId, retries: 2, retryDelayMs: 1 },
+			),
+		).resolves.toBe("successor callback committed");
+
+		expect(foreignRecordWasUntouched).toBe(true);
+		expect(releaseTransitionProbes).toBeGreaterThan(1);
+		expect(kill.mock.calls.filter(([pid]) => pid === foreignOwner.pid)).toHaveLength(0);
+		expect(await Bun.file(file).text()).toBe("committed successor state");
+		expect(await fs.exists(recordPath)).toBe(false);
+		expect(await fs.exists(lock)).toBe(false);
+	},
+);
+
 test.each(["local-host", "previous-local-host"])("dead %s remover is adopted on the same installation", async host => {
 	const { file, transition } = await fixture();
 	await fs.mkdir(transition);
@@ -231,3 +328,160 @@ for (const payload of ["", "unproven payload"]) {
 		expect(await Bun.file(path.join(transition, "info")).text()).toBe(payload);
 	});
 }
+
+/**
+ * A live remover's `.removing.owner` record outlives its tree: the record is cleared only
+ * after native removal returns. A lock acquired in that window must still release.
+ */
+async function liveRemoverRecord(transition: string): Promise<void> {
+	const incarnation = nativeProcessBindings().Process.fromPid(process.pid)?.incarnation;
+	expect(incarnation).toBeString();
+	await Bun.write(
+		`${transition}.owner`,
+		JSON.stringify({
+			owner: { pid: process.pid, timestamp: Date.now(), process_incarnation: incarnation },
+			rootDev: "0",
+			rootIno: "0",
+		}),
+	);
+}
+
+async function lingeringLiveRemoverRecord(transition: string, clearAfterMs: number): Promise<void> {
+	await liveRemoverRecord(transition);
+	setTimeout(() => void fs.rm(`${transition}.owner`, { force: true }), clearAfterMs);
+}
+
+async function waitForAbsence(target: string, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (!(await fs.exists(target))) return true;
+		await Bun.sleep(25);
+	}
+	return !(await fs.exists(target));
+}
+
+test("release retries behind a live remover's lingering record instead of reporting owner_changed", async () => {
+	const { file, lock, transition } = await fixture();
+	const release = await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
+	await lingeringLiveRemoverRecord(transition, 100);
+	await release();
+	expect(await fs.exists(lock)).toBe(false);
+});
+
+test.skipIf(process.platform === "win32")(
+	"release retries behind a foreign remover's lingering sidecar without removing it",
+	async () => {
+		const { file, lock, transition } = await fixture();
+		const release = await acquireFileLock(file, { ownerHostId: "local-host", retries: 2, retryDelayMs: 1 });
+		const recordBytes = JSON.stringify({
+			owner: { ...deadOwner, owner_host_id: "foreign-host" },
+			rootDev: "0",
+			rootIno: "0",
+		});
+		await Bun.write(`${transition}.owner`, recordBytes);
+
+		let settled = false;
+		const releasePromise = release();
+		const observedRelease = releasePromise.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+		await Bun.sleep(75);
+		expect(settled).toBe(false);
+		expect(await Bun.file(`${transition}.owner`).text()).toBe(recordBytes);
+		await fs.rm(`${transition}.owner`);
+		await observedRelease;
+
+		expect(await fs.exists(lock)).toBe(false);
+	},
+);
+
+test("a release that outlasts its retry budget finishes in the background without reacquisition", async () => {
+	const { file, lock, transition } = await fixture();
+	const release = await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
+	await lingeringLiveRemoverRecord(transition, 1_000);
+	await expect(release()).rejects.toThrow("removal_record_busy");
+	expect(await fs.exists(lock)).toBe(true);
+	expect(await waitForAbsence(lock, 4_000)).toBe(true);
+});
+
+test("background release retries never remove a successor generation", async () => {
+	const { file, lock } = await fixture();
+	const release = await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
+	const successor = { pid: process.pid, timestamp: Date.now() + 1_000, owner_token: "successor" };
+	await Bun.write(path.join(lock, "info"), JSON.stringify(successor));
+	await expect(release()).rejects.toThrow("Failed to release file lock: owner_changed.");
+	await Bun.sleep(1_500);
+	expect(await Bun.file(path.join(lock, "info")).json()).toEqual(successor);
+});
+
+test("background release retries do not authorize a copied-info replacement root", async () => {
+	const { file, lock, transition } = await fixture();
+	const release = await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
+	const originalInfo = await Bun.file(path.join(lock, "info")).text();
+	controlReleasePendingRetries();
+	await liveRemoverRecord(transition);
+	await expect(release()).rejects.toThrow("removal_record_busy");
+
+	await fs.rename(lock, `${lock}.original`);
+	await fs.mkdir(lock);
+	await Bun.write(path.join(lock, "info"), originalInfo);
+	let replacementSnapshots = 0;
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree(target) {
+			if (target === lock) replacementSnapshots++;
+			return snapshotDirectoryTree(target);
+		},
+		exactRemoveDirectoryTree,
+	});
+	await fs.rm(`${transition}.owner`);
+	await runNextControlledReleaseRetry();
+
+	expect(replacementSnapshots).toBe(1);
+	expect(await Bun.file(path.join(lock, "info")).text()).toBe(originalInfo);
+	expect(await Bun.file(path.join(`${lock}.original`, "info")).text()).toBe(originalInfo);
+	expect(await fs.exists(lock)).toBe(true);
+	expect(await fs.exists(`${lock}.original`)).toBe(true);
+});
+
+test("explicit pending release retries do not authorize a copied-info replacement root", async () => {
+	const { file, lock, transition } = await fixture();
+	const release = await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
+	const originalInfo = await Bun.file(path.join(lock, "info")).text();
+	controlReleasePendingRetries();
+	await liveRemoverRecord(transition);
+	await expect(release()).rejects.toThrow("removal_record_busy");
+
+	await fs.rename(lock, `${lock}.original`);
+	await fs.mkdir(lock);
+	await Bun.write(path.join(lock, "info"), originalInfo);
+	await fs.rm(`${transition}.owner`);
+	await expect(release()).rejects.toThrow("Failed to release file lock: owner_changed.");
+
+	expect(await Bun.file(path.join(lock, "info")).text()).toBe(originalInfo);
+	expect(await Bun.file(path.join(`${lock}.original`, "info")).text()).toBe(originalInfo);
+	expect(await fs.exists(lock)).toBe(true);
+	expect(await fs.exists(`${lock}.original`)).toBe(true);
+});
+
+test("a pending release cannot capture identity after its initial capture fails", async () => {
+	const { file, lock } = await fixture();
+	const release = await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
+	const originalInfo = await Bun.file(path.join(lock, "info")).text();
+	controlReleasePendingRetries();
+	const lstat = vi
+		.spyOn(fs, "lstat")
+		.mockRejectedValueOnce(Object.assign(new Error("permission denied"), { code: "EACCES" }));
+
+	await expect(release()).rejects.toThrow("Failed to release file lock: owner_changed.");
+	expect(lstat.mock.calls[0]).toEqual([lock, { bigint: true }]);
+	lstat.mockRestore();
+	await expect(release()).rejects.toThrow("Failed to release file lock: owner_changed.");
+
+	expect(await Bun.file(path.join(lock, "info")).text()).toBe(originalInfo);
+	expect(await fs.exists(lock)).toBe(true);
+});

@@ -144,6 +144,19 @@ This boundary prevents a child from newly loading caller-cwd or user-global Bun 
 
 Broker and per-session discovery tokens remain in their authoritative private discovery files for SDK-core resolution. Launch errors, logs, and diagnostics redact those tokens and never include the child environment or isolation configuration contents.
 
+### Recovering legacy broker locks
+
+Broker lock records written before host qualification do not identify which machine created them. A machine cannot safely infer that such a lock belongs to it from a locally absent or reused PID when the agent directory is shared. GJC therefore refuses to reclaim a host-unqualified lock automatically; the error links here rather than treating an unverifiable owner as dead.
+
+For a legacy lock that blocks startup, recover it only after confirming that every GJC broker using the same agent directory has stopped on every host that can access that directory:
+
+1. Stop the GJC processes or supervisor services that can start the broker on each host using that agent directory. Do not proceed while any broker may still be serving sessions or renewing discovery.
+2. Copy `sdk/broker.lock` and `sdk/broker.json` to a backup location outside the agent directory. Preserve the originals until startup and session state have been checked.
+3. Move both `sdk/broker.lock` and `sdk/broker.json` out of the `sdk` directory. Do not use this procedure for a host-qualified lock or while any host may still be running a broker.
+4. Start one GJC process using the agent directory and verify broker startup before restarting other clients or supervisors.
+
+This procedure is a one-time operator migration for old host-unqualified records, not a way to take over a lock from a running broker. If all brokers cannot be stopped or the record already contains a host identity, preserve the lock and investigate the owning host instead.
+
 ## Internal protocol
 
 The following frame shapes are SDK-core implementation details for maintainers.
@@ -477,7 +490,7 @@ grace period, which is not configurable. A controlled terminal failure reaches A
 as JSON-RPC `-32603` with `data.code` of `prompt_failed` or
 `prompt_deadline_exceeded`.
 
-`sdk.flushWorktreeOnDeadline` (default `true`) autosaves uncommitted changes in the session's linked worktree as a WIP commit when a prompt deadline retires a prompt. For a primary checkout it requires an explicit `true` opt-in, because the checkout is a directory the session does not own; without it, the flush is skipped and the prompt still terminalizes.
+`sdk.flushWorktreeOnDeadline` (default `true`) autosaves uncommitted changes in the session's linked worktree as a WIP commit when a prompt deadline retires a prompt. For a primary checkout it requires an explicit `true` opt-in written in the user/global config or a runtime override, because the checkout is a directory the session does not own. A project `.gjc/settings.json` or `.gjc/config.yml` does not count. Without that user opt-in, the flush is skipped and the prompt still terminalizes.
 
 At expiry, the SDK fences the exact accepted prompt's run and waits for its
 dispatched tools to settle before publishing `prompt_deadline_exceeded`. A

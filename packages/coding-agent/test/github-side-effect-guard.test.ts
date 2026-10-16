@@ -101,7 +101,7 @@ async function createSession(
 		agent,
 		sessionManager,
 		settings,
-		modelRegistry: {} as never,
+		modelRegistry: { withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body() } as never,
 		toolRegistry: new Map(tools.map(entry => [entry.name, entry])),
 	});
 	sess.setSdkPermissionMode(permissionMode);

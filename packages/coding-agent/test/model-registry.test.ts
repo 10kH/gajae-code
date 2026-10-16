@@ -21,6 +21,7 @@ import {
 	kNoAuth,
 	MODEL_ROLE_IDS,
 	ModelRegistry,
+	type ModelsConfigReloadCandidate,
 	requiresExplicitThinkingChoice,
 } from "@gajae-code/coding-agent/config/model-registry";
 import {
@@ -692,6 +693,31 @@ describe("ModelRegistry", () => {
 			const openaiModel = registry.find("openai", "gpt-5-mini");
 
 			expect(openaiModel?.cacheRetention).toBe("long");
+		});
+
+		test("inherits provider streamIdleTimeoutMs and honors per-model overrides", () => {
+			writeRawModelsJson({
+				openai: {
+					streamIdleTimeoutMs: 240_000,
+					modelOverrides: {
+						"gpt-5-mini": { streamIdleTimeoutMs: 450_000 },
+					},
+				},
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-responses",
+					streamIdleTimeoutMs: 300_000,
+					models: [{ id: "claude-opus-5-5" }, { id: "deepseek-v4.1-flash", streamIdleTimeoutMs: 450_000 }],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			expect(registry.find("openai", "gpt-5")).toMatchObject({ streamIdleTimeoutMs: 240_000 });
+			expect(registry.find("openai", "gpt-5-mini")).toMatchObject({ streamIdleTimeoutMs: 450_000 });
+			expect(registry.find("proxy", "claude-opus-5-5")).toMatchObject({ streamIdleTimeoutMs: 300_000 });
+			expect(registry.find("proxy", "deepseek-v4.1-flash")).toMatchObject({ streamIdleTimeoutMs: 450_000 });
 		});
 
 		test("propagates declared image output capability for custom models", () => {
@@ -1601,7 +1627,7 @@ describe("ModelRegistry", () => {
 				const resolved = registry.resolveCanonicalModel(record.id, { availableOnly: false, candidates });
 				expect(selection.model).toBe(resolved);
 			}
-		});
+		}, 15_000);
 		// Sticky state mutates per call, so each scenario runs batch and per-record
 		// passes in the same order on independent registries. Split into one test
 		// per scenario: a single combined test exceeded the default 5s test
@@ -3475,6 +3501,54 @@ describe("ModelRegistry", () => {
 			const model = registry.find("custom-local", "gpt-5.4");
 			expect(model?.contextWindow).toBe(1_000_000);
 			expect(model?.baseUrl).toBe("http://127.0.0.1:8080");
+		});
+
+		test("does not persist model override idle timeouts in discovery cache", async () => {
+			const provider = "timeout-cache-proxy";
+			const baseUrl = "http://127.0.0.1:8080";
+			const writeConfig = (providerTimeout: number, modelOverride?: number) => {
+				writeRawModelsJson({
+					[provider]: {
+						baseUrl,
+						apiKey: "TEST_KEY",
+						api: "openai-responses",
+						streamIdleTimeoutMs: providerTimeout,
+						discovery: { type: "llama.cpp" },
+						...(modelOverride === undefined
+							? {}
+							: { modelOverrides: { "cached-model": { streamIdleTimeoutMs: modelOverride } } }),
+					},
+				});
+			};
+
+			writeConfig(180_000, 300_000);
+			const settings = Settings.isolated();
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, settings, { automaticRefresh: false });
+			let requests = 0;
+			using _hook = hookFetch(input => {
+				const url = input instanceof Request ? input.url : String(input);
+				if (url !== `${baseUrl}/models`) throw new Error(`Unexpected discovery URL: ${url}`);
+				requests++;
+				return Response.json({ data: [{ id: "cached-model" }] });
+			});
+
+			try {
+				await registry.refreshProvider(provider, "online");
+				expect(registry.find(provider, "cached-model")).toMatchObject({ streamIdleTimeoutMs: 300_000 });
+				expect(
+					readModelCache(provider, 86_400_000, Date.now, cacheDbPath)?.models.find(
+						model => model.id === "cached-model",
+					)?.streamIdleTimeoutMs,
+				).toBeUndefined();
+
+				writeConfig(450_000);
+				await registry.refresh("offline");
+
+				expect(registry.find(provider, "cached-model")).toMatchObject({ streamIdleTimeoutMs: 450_000 });
+				expect(requests).toBe(1);
+			} finally {
+				registry.dispose();
+			}
 		});
 
 		test.each([
@@ -6562,6 +6636,524 @@ describe("ModelRegistry", () => {
 		);
 	});
 
+	test("rejects provider stream idle timeouts on non-OpenAI-compatible built-ins", () => {
+		writeRawModelsConfig({
+			providers: {
+				anthropic: {
+					streamIdleTimeoutMs: 300_000,
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain(
+			'"streamIdleTimeoutMs" is only supported with openai-completions or openai-responses APIs',
+		);
+	});
+
+	test("validates provider stream idle timeouts against bundled APIs before provider API overrides", () => {
+		writeRawModelsConfig({
+			providers: {
+				anthropic: {
+					api: "openai-completions",
+					streamIdleTimeoutMs: 300_000,
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain(
+			'"streamIdleTimeoutMs" is only supported with openai-completions or openai-responses APIs',
+		);
+	});
+
+	test("applies provider stream idle timeouts only to OpenAI models in mixed built-ins", () => {
+		writeRawModelsConfig({
+			providers: {
+				"github-copilot": {
+					streamIdleTimeoutMs: 300_000,
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getError()).toBeUndefined();
+		expect(registry.find("github-copilot", "gpt-4.1")).toMatchObject({ streamIdleTimeoutMs: 300_000 });
+		expect(registry.find("github-copilot", "claude-sonnet-4")).not.toHaveProperty("streamIdleTimeoutMs");
+	});
+
+	test("validates provider timeouts against retained bundled models when custom models are Anthropic-only", () => {
+		writeRawModelsConfig({
+			providers: {
+				"github-copilot": {
+					baseUrl: "https://copilot-proxy.example.com/v1",
+					auth: "none",
+					streamIdleTimeoutMs: 300_000,
+					models: [{ id: "custom-claude", api: "anthropic-messages" }],
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, Settings.isolated(), { automaticRefresh: false });
+		expect(registry.getError()).toBeUndefined();
+		expect(registry.find("github-copilot", "gpt-4.1")).toMatchObject({ streamIdleTimeoutMs: 300_000 });
+		expect(registry.find("github-copilot", "custom-claude")).toMatchObject({ api: "anthropic-messages" });
+		expect(registry.find("github-copilot", "custom-claude")).not.toHaveProperty("streamIdleTimeoutMs");
+	});
+
+	test("applies provider stream idle timeouts only to OpenAI models in mixed custom lists", () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					streamIdleTimeoutMs: 300_000,
+					models: [
+						{ id: "gpt-model", api: "openai-completions" },
+						{ id: "claude-model", api: "anthropic-messages" },
+					],
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getError()).toBeUndefined();
+		expect(registry.find("proxy", "gpt-model")).toMatchObject({ streamIdleTimeoutMs: 300_000 });
+		expect(registry.find("proxy", "claude-model")).not.toHaveProperty("streamIdleTimeoutMs");
+	});
+
+	test("rejects provider stream idle timeouts when custom models have no OpenAI-compatible API", () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					streamIdleTimeoutMs: 300_000,
+					models: [{ id: "claude-model", api: "anthropic-messages" }],
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain(
+			'"streamIdleTimeoutMs" is only supported with openai-completions or openai-responses APIs',
+		);
+	});
+
+	test.each([
+		["implicit OpenAI discovery", { api: "openai-completions" }],
+		[
+			"explicit OpenAI prefix discovery",
+			{
+				api: "anthropic-messages",
+				discovery: { type: "openai-models-list", apiByModelPrefix: { "gpt-": "openai-completions" } },
+			},
+		],
+	] as const)("validates provider timeouts against %s with Anthropic-only custom models", (_route, routeConfig) => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					auth: "none",
+					streamIdleTimeoutMs: 300_000,
+					models: [{ id: "claude-model", api: "anthropic-messages" }],
+					...routeConfig,
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, Settings.isolated(), { automaticRefresh: false });
+		expect(registry.getError()).toBeUndefined();
+		expect(registry.find("proxy", "claude-model")).not.toHaveProperty("streamIdleTimeoutMs");
+	});
+
+	test("drops inherited provider timeouts when a custom model changes a bundled model API", () => {
+		writeRawModelsConfig({
+			providers: {
+				openai: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					streamIdleTimeoutMs: 300_000,
+					models: [
+						{ id: "gpt-4.1", api: "anthropic-messages" },
+						{ id: "custom-openai-model", api: "openai-completions" },
+					],
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getError()).toBeUndefined();
+		expect(registry.find("openai", "gpt-4.1")).toMatchObject({ api: "anthropic-messages" });
+		expect(registry.find("openai", "gpt-4.1")).not.toHaveProperty("streamIdleTimeoutMs");
+		expect(registry.find("openai", "custom-openai-model")).toMatchObject({
+			api: "openai-completions",
+			streamIdleTimeoutMs: 300_000,
+		});
+	});
+
+	test("validates stream idle modelOverrides case-insensitively", () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					models: [{ id: "Model-X", api: "openai-responses" }],
+					modelOverrides: { "model-x": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getError()).toBeUndefined();
+		expect(registry.find("proxy", "Model-X")).toMatchObject({ streamIdleTimeoutMs: 300_000 });
+	});
+
+	test("validates mixed-case stream idle modelOverrides for bundled models", () => {
+		writeRawModelsConfig({
+			providers: {
+				"github-copilot": {
+					modelOverrides: { "GPT-4.1": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getError()).toBeUndefined();
+		expect(registry.find("github-copilot", "gpt-4.1")).toMatchObject({ streamIdleTimeoutMs: 300_000 });
+	});
+
+	test("validates bundled model API before a provider API override", () => {
+		writeRawModelsConfig({
+			providers: {
+				"github-copilot": {
+					api: "openai-completions",
+					modelOverrides: { "claude-sonnet-4": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain(
+			'modelOverrides "streamIdleTimeoutMs" is only supported with openai-completions or openai-responses APIs',
+		);
+	});
+
+	test("uses bundled model APIs when discovery has no model-specific route", () => {
+		writeRawModelsConfig({
+			providers: {
+				"opencode-go": {
+					api: "openai-completions",
+					discovery: { type: "openai-models-list" },
+					modelOverrides: { "minimax-m2.5": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain(
+			'modelOverrides "streamIdleTimeoutMs" is only supported with openai-completions or openai-responses APIs',
+		);
+	});
+
+	test("rejects stream idle modelOverrides for explicit Anthropic discovery routes", () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					discovery: { type: "openai-models-list", apiByModelPrefix: { "claude-": "anthropic-messages" } },
+					modelOverrides: { "claude-sonnet-4": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain(
+			' modelOverrides "streamIdleTimeoutMs" is only supported with openai-completions or openai-responses APIs',
+		);
+	});
+
+	test("defers model timeout overrides for implicit discovery until the catalog is resolved", () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					modelOverrides: { "claude-opus-5": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getError()).toBeUndefined();
+	});
+
+	test("validates discovered idle timeout overrides against the catalog owner", async () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					discovery: { type: "openai-models-list" },
+					modelOverrides: { "claude-opus-5": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getError()).toBeUndefined();
+		using _hook = hookFetch(
+			() =>
+				new Response(JSON.stringify({ data: [{ id: "claude-opus-5", owned_by: "openai" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+		);
+		await registry.refreshProvider("proxy", "online");
+
+		expect(registry.find("proxy", "claude-opus-5")).toMatchObject({
+			api: "openai-completions",
+			streamIdleTimeoutMs: 300_000,
+		});
+	});
+
+	test("defers discovered timeout overrides when the provider default conflicts with the catalog owner", async () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "anthropic-messages",
+					discovery: { type: "openai-models-list" },
+					modelOverrides: { "gpt-5": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getError()).toBeUndefined();
+		using _hook = hookFetch(
+			() =>
+				new Response(JSON.stringify({ data: [{ id: "gpt-5", owned_by: "openai" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+		);
+		await registry.refreshProvider("proxy", "online");
+
+		expect(registry.find("proxy", "gpt-5")).toMatchObject({
+			api: "openai-completions",
+			streamIdleTimeoutMs: 300_000,
+		});
+	});
+
+	test("does not apply discovered idle timeout overrides when the catalog resolves to Anthropic", async () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					discovery: { type: "openai-models-list" },
+					modelOverrides: { "claude-opus-5": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getError()).toBeUndefined();
+		using _hook = hookFetch(
+			() =>
+				new Response(JSON.stringify({ data: [{ id: "claude-opus-5", owned_by: "anthropic" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+		);
+
+		await registry.refreshProvider("proxy", "online");
+		expect(registry.find("proxy", "claude-opus-5")).toMatchObject({ api: "anthropic-messages" });
+		expect(registry.find("proxy", "claude-opus-5")).not.toHaveProperty("streamIdleTimeoutMs");
+	});
+
+	test("hydrates cached Anthropic routes without applying deferred timeout overrides", async () => {
+		const provider = "cached-timeout-proxy";
+		const baseUrl = "https://proxy.example.com/v1";
+		const registrySettings = Settings.isolated();
+		const writeConfig = (includeOverride: boolean) => {
+			writeRawModelsConfig({
+				providers: {
+					[provider]: {
+						baseUrl,
+						apiKey: "TEST_KEY",
+						api: "openai-completions",
+						discovery: { type: "openai-models-list" },
+						...(includeOverride ? { modelOverrides: { "claude-opus-5": { streamIdleTimeoutMs: 300_000 } } } : {}),
+					},
+				},
+			});
+		};
+		writeConfig(false);
+
+		let requests = 0;
+		using _hook = hookFetch(input => {
+			const url = input instanceof Request ? input.url : String(input);
+			if (url !== `${baseUrl}/models`) throw new Error(`Unexpected discovery URL: ${url}`);
+			requests++;
+			return Response.json({ data: [{ id: "claude-opus-5", owned_by: "anthropic" }] });
+		});
+
+		const discovered = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, { automaticRefresh: false });
+		try {
+			await discovered.refreshProvider(provider, "online");
+			expect(discovered.find(provider, "claude-opus-5")).toMatchObject({ api: "anthropic-messages" });
+		} finally {
+			discovered.dispose();
+		}
+
+		writeConfig(true);
+		const reloaded = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, { automaticRefresh: false });
+		try {
+			expect(reloaded.find(provider, "claude-opus-5")).toMatchObject({ api: "anthropic-messages" });
+			expect(reloaded.find(provider, "claude-opus-5")).not.toHaveProperty("streamIdleTimeoutMs");
+			expect(requests).toBe(1);
+		} finally {
+			reloaded.dispose();
+		}
+	});
+
+	test("validates discovery API prefixes case-insensitively for modelOverrides", () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					discovery: {
+						type: "openai-models-list",
+						apiByModelPrefix: { "vendor-": "anthropic-messages" },
+					},
+					modelOverrides: { "VENDOR-OPUS": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain(
+			'modelOverrides "streamIdleTimeoutMs" is only supported with openai-completions or openai-responses APIs',
+		);
+	});
+
+	test("routes discovered model IDs with case-insensitive API prefixes", async () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					discovery: {
+						type: "openai-models-list",
+						apiByModelPrefix: { "VENDOR-": "anthropic-messages" },
+					},
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		using _hook = hookFetch(
+			() =>
+				new Response(JSON.stringify({ data: [{ id: "vendor-opus" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+		);
+		await registry.refreshProvider("proxy", "online");
+
+		expect(registry.find("proxy", "vendor-opus")).toMatchObject({ api: "anthropic-messages" });
+	});
+
+	test("does not apply provider stream idle timeouts to discovered Anthropic routes", async () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					auth: "none",
+					api: "openai-completions",
+					streamIdleTimeoutMs: 300_000,
+					discovery: {
+						type: "openai-models-list",
+						apiByModelPrefix: { "claude-": "anthropic-messages" },
+					},
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		using _hook = hookFetch(
+			() =>
+				new Response(
+					JSON.stringify({
+						data: [{ id: "claude-sonnet-4" }, { id: "gpt-5" }, { id: "opaque-model", owned_by: "anthropic" }],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				),
+		);
+		await registry.refreshProvider("proxy", "online");
+
+		expect(registry.find("proxy", "claude-sonnet-4")).toMatchObject({ api: "anthropic-messages" });
+		expect(registry.find("proxy", "claude-sonnet-4")).not.toHaveProperty("streamIdleTimeoutMs");
+		expect(registry.find("proxy", "opaque-model")).toMatchObject({ api: "anthropic-messages" });
+		expect(registry.find("proxy", "opaque-model")).not.toHaveProperty("streamIdleTimeoutMs");
+		expect(registry.find("proxy", "gpt-5")).toMatchObject({
+			api: "openai-completions",
+			streamIdleTimeoutMs: 300_000,
+		});
+	});
+
+	test("rejects model-configured stream idle timeouts on pi-native transport", () => {
+		const timeoutConfigs: Array<Record<string, unknown>> = [
+			{ streamIdleTimeoutMs: 300_000 },
+			{ models: [{ id: "upstream/custom-model", streamIdleTimeoutMs: 300_000 }] },
+			{ modelOverrides: { "upstream/custom-model": { streamIdleTimeoutMs: 300_000 } } },
+		];
+
+		for (const timeoutConfig of timeoutConfigs) {
+			writeRawModelsConfig({
+				providers: {
+					gateway: {
+						baseUrl: "http://127.0.0.1:4000",
+						apiKey: "TEST_KEY",
+						api: "openai-completions",
+						transport: "pi-native",
+						models: [{ id: "upstream/custom-model" }],
+						...timeoutConfig,
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(String(registry.getError()?.message)).toContain(
+				'"streamIdleTimeoutMs" is not supported with "transport: pi-native"',
+			);
+		}
+	});
+
+	test("rejects stream idle timeout values above the platform timer range", () => {
+		writeRawModelsConfig({
+			providers: {
+				openai: {
+					streamIdleTimeoutMs: 2 ** 31,
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain("2147483647");
+	});
+
 	test("rejects runtime provider-only request shaping without an OpenAI-compatible API", () => {
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
 
@@ -6625,7 +7217,86 @@ describe("ModelRegistry", () => {
 		}
 	});
 
-	test("materializes a resolved runtime apiKey in auth headers", async () => {
+	test("does not reapply runtime provider keys over a session pin during static reload", async () => {
+		const envName = "GJC_TEST_RUNTIME_PROVIDER_PINNED_RELOAD_KEY";
+		const restoreKey = setEnvForTest(envName, "initial-runtime-provider-key");
+		const sessionId = "runtime-provider-pinned-reload-session";
+		let registry: ModelRegistry | undefined;
+		try {
+			await authStorage.set("runtime-proxy", [
+				{
+					type: "oauth",
+					access: "runtime-proxy-pinned-oauth-access",
+					refresh: "runtime-proxy-pinned-oauth-refresh",
+					expires: Date.now() + 60_000,
+					email: "runtime-proxy@example.com",
+				},
+			]);
+			writeRawModelsJson({
+				"runtime-proxy": {
+					...providerConfig(
+						"https://static-proxy-before.example/v1",
+						[{ id: "static-before" }],
+						"openai-completions",
+					),
+				},
+			});
+			registry = new ModelRegistry(authStorage, modelsJsonPath);
+			registry.registerProvider("runtime-proxy", {
+				baseUrl: "https://runtime-proxy.example/v1",
+				apiKey: envName,
+				api: "openai-completions",
+				authHeader: true,
+				models: [
+					{
+						id: "runtime-model",
+						name: "Runtime Model",
+						reasoning: false,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 100_000,
+						maxTokens: 8_000,
+					},
+				],
+			});
+			expect(await registry.getApiKeyForProvider("runtime-proxy")).toBe("initial-runtime-provider-key");
+
+			// Static reload drops owner keys before reapplying runtime registrations.
+			authStorage.clearConfigApiKeys(registry.getAuthStorageOwner());
+			authStorage.acquireCredentialScope(sessionId);
+			authStorage.setSessionCredentialSelector(sessionId, "runtime-proxy", {
+				kind: "email",
+				value: "runtime-proxy@example.com",
+			});
+			Bun.env[envName] = "rotated-runtime-provider-key";
+			writeRawModelsJson({
+				"runtime-proxy": {
+					...providerConfig(
+						"https://static-proxy-after.example/v1",
+						[{ id: "static-after" }],
+						"openai-completions",
+					),
+				},
+			});
+			await registry.refresh("offline");
+
+			expect(authStorage.hasConfigApiKey("runtime-proxy", registry.getAuthStorageOwner())).toBe(false);
+			await expect(
+				authStorage.peekApiKey("runtime-proxy", {
+					sessionId,
+					owner: registry.getAuthStorageOwner(),
+				}),
+			).resolves.toBe("runtime-proxy-pinned-oauth-access");
+			expect(registry.find("runtime-proxy", "runtime-model")?.headers?.Authorization).toBeUndefined();
+			expect(registry.getEffectiveProviderAuth("runtime-proxy", sessionId)).toBe("oauth");
+		} finally {
+			registry?.dispose();
+			authStorage.releaseCredentialScope(sessionId);
+			restoreKey();
+		}
+	});
+
+	test("materializes a resolved runtime provider apiKey in auth headers", async () => {
 		const envName = "GJC_TEST_RUNTIME_AUTH_HEADER_KEY";
 		const restoreKey = setEnvForTest(envName, "resolved-runtime-auth-key");
 		try {
@@ -6808,6 +7479,42 @@ describe("ModelRegistry", () => {
 
 			expect(getModelsForProvider(registry, "local")).toHaveLength(0);
 			expect(registry.getProviderBaseUrl("local")).toBeUndefined();
+		});
+
+		test("applies provider and model override idle timeouts to models.yml openaiCompat endpoints", async () => {
+			writeRawModelsConfig({
+				providers: {
+					"local-proxy": {
+						openaiCompat: {
+							baseUrl: "http://127.0.0.1:1234",
+							apiKey: "LOCAL_TEST_KEY",
+						},
+						streamIdleTimeoutMs: 300_000,
+						modelOverrides: { "model-with-override": { streamIdleTimeoutMs: 450_000 } },
+					},
+				},
+			});
+			using _hook = hookFetch((input, init) => {
+				expect(String(input)).toBe("http://127.0.0.1:1234/v1/models");
+				expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer LOCAL_TEST_KEY");
+				return new Response(JSON.stringify({ data: [{ id: "local-model" }, { id: "model-with-override" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refresh();
+
+			expect(registry.find("local-proxy", "local-model")).toMatchObject({
+				api: "openai-completions",
+				baseUrl: "http://127.0.0.1:1234/v1",
+				streamIdleTimeoutMs: 300_000,
+			});
+			expect(registry.find("local-proxy", "model-with-override")).toMatchObject({
+				api: "openai-completions",
+				streamIdleTimeoutMs: 450_000,
+			});
 		});
 
 		test("parses providers.local.openaiCompat and discovers OpenAI-compatible models", async () => {
@@ -9689,6 +10396,918 @@ describe("ModelRegistry", () => {
 				getApiKeySpy.mockRestore();
 			}
 		});
+	});
+});
+
+describe("ModelRegistry config reload", () => {
+	let tempDir: string;
+	let modelsPath: string;
+	let authStorage: AuthStorage;
+	let registry: ModelRegistry;
+	let previousPresetRegistryDisabled: string | undefined;
+
+	beforeEach(async () => {
+		resetSettingsForTest();
+		previousPresetRegistryDisabled = Bun.env.GJC_MODEL_PRESET_REGISTRY_DISABLED;
+		Bun.env.GJC_MODEL_PRESET_REGISTRY_DISABLED = "true";
+		tempDir = path.resolve(
+			import.meta.dir,
+			"../../../.gjc/evidence/config-hot-reload",
+			`registry-${Snowflake.next()}`,
+		);
+		fs.mkdirSync(tempDir, { recursive: true });
+		modelsPath = path.join(tempDir, "models.json");
+		await Bun.write(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					"reload-proxy": {
+						baseUrl: "https://old.example.com/v1",
+						apiKey: "old-models-key",
+						api: "openai-responses",
+						models: [{ id: "old-model" }],
+					},
+				},
+			}),
+		);
+		authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+		registry = new ModelRegistry(authStorage, modelsPath, undefined, { automaticRefresh: false });
+	});
+
+	afterEach(async () => {
+		await registry.dispose();
+		authStorage.close();
+		resetSettingsForTest();
+		if (previousPresetRegistryDisabled === undefined) delete Bun.env.GJC_MODEL_PRESET_REGISTRY_DISABLED;
+		else Bun.env.GJC_MODEL_PRESET_REGISTRY_DISABLED = previousPresetRegistryDisabled;
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	test("stages the supplied snapshot without mutating live models or auth until commit", async () => {
+		const snapshotText = JSON.stringify({
+			providers: {
+				"reload-proxy": {
+					baseUrl: "https://new.example.com/v1",
+					apiKey: "new-models-key",
+					api: "openai-responses",
+					models: [{ id: "new-model" }],
+				},
+			},
+		});
+		const candidate = await registry.stageModelsConfigReload({
+			path: modelsPath,
+			text: snapshotText,
+			identity: "snapshot-revision-2",
+		});
+
+		expect(registry.getModelsConfigPath()).toBe(modelsPath);
+		expect(candidate.valid).toBe(true);
+		expect(candidate.diagnostics.valid).toBe(true);
+		expect(candidate.registry.find("reload-proxy", "new-model")).toBeDefined();
+		expect(candidate.registry.getModelProfiles()).toBeInstanceOf(Map);
+		expect(registry.find("reload-proxy", "old-model")).toBeDefined();
+		expect(registry.find("reload-proxy", "new-model")).toBeUndefined();
+		expect(await authStorage.peekApiKey("reload-proxy")).toBe("old-models-key");
+
+		candidate.commit();
+		expect(registry.find("reload-proxy", "old-model")).toBeUndefined();
+		expect(registry.find("reload-proxy", "new-model")).toBeDefined();
+		expect(await authStorage.peekApiKey("reload-proxy")).toBe("new-models-key");
+
+		candidate.rollback();
+		expect(registry.find("reload-proxy", "old-model")).toBeDefined();
+		expect(registry.find("reload-proxy", "new-model")).toBeUndefined();
+		expect(await authStorage.peekApiKey("reload-proxy")).toBe("old-models-key");
+		candidate.rollback();
+	});
+
+	test("rebases provider discovery that drains ahead of a staged reload publication", async () => {
+		const initialConfig = {
+			providers: {
+				"reload-proxy": {
+					baseUrl: "https://old.example.com/v1",
+					apiKey: "old-models-key",
+					api: "openai-responses",
+					models: [{ id: "old-model", name: "Before" }],
+				},
+				"reload-race": {
+					baseUrl: "https://race.example.com/v1",
+					api: "openai-completions",
+					discovery: { type: "openai-models-list" },
+				},
+			},
+		};
+		await Bun.write(modelsPath, JSON.stringify(initialConfig));
+		await registry.refreshStatic();
+		authStorage.setRuntimeApiKey("reload-race", "race-key");
+
+		const nextConfig = structuredClone(initialConfig);
+		nextConfig.providers["reload-proxy"].models[0]!.name = "After";
+		const candidate = await registry.stageModelsConfigReload({
+			path: modelsPath,
+			text: JSON.stringify(nextConfig),
+			identity: "unrelated-provider-edit",
+		});
+		const response = Promise.withResolvers<Response>();
+		const requestStarted = Promise.withResolvers<void>();
+		using _hook = hookFetch(input => {
+			requestStarted.resolve();
+			expect(String(input)).toBe("https://race.example.com/v1/models");
+			return response.promise;
+		});
+		const refresh = registry.refreshProvider("reload-race", "online");
+		await requestStarted.promise;
+		const publicationFence = registry.acquirePublicationFence();
+		let releaseFence: (() => void) | undefined;
+		try {
+			await Bun.sleep(0);
+			response.resolve(
+				new Response(JSON.stringify({ data: [{ id: "refreshed-model" }] }), {
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+			releaseFence = await publicationFence;
+			await refresh;
+			candidate.commit();
+			candidate.finalize();
+			expect(registry.find("reload-race", "refreshed-model")).toBeDefined();
+			expect(registry.find("reload-race", "old-model")).toBeUndefined();
+			expect(registry.find("reload-proxy", "old-model")?.name).toBe("After");
+		} finally {
+			response.resolve(new Response(JSON.stringify({ data: [] }), { status: 200 }));
+			releaseFence?.();
+			candidate.rollback();
+		}
+	});
+
+	test("preserves authoritative discovery for an unchanged literal-key provider across reload", async () => {
+		let candidate: ModelsConfigReloadCandidate | undefined;
+		try {
+			const providerId = "literal-discovery";
+			const discoveredId = "authoritatively-discovered-model";
+			const initialConfig = JSON.parse(await Bun.file(modelsPath).text()) as {
+				providers: Record<string, unknown>;
+			};
+			initialConfig.providers[providerId] = {
+				baseUrl: "https://literal-discovery.example/v1",
+				api: "openai-responses",
+				apiKey: "literal-openai-key",
+				discovery: { type: "openai-models-list" },
+			};
+			await Bun.write(modelsPath, JSON.stringify(initialConfig));
+			await registry.refreshStatic();
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("https://literal-discovery.example/v1/models");
+				return new Response(JSON.stringify({ data: [{ id: discoveredId }] }), {
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			await registry.refreshProvider(providerId, "online");
+			expect(registry.getAll().some(model => model.provider === providerId && model.id === discoveredId)).toBe(true);
+			expect(registry.getActiveProviders().some(provider => provider.provider === providerId)).toBe(true);
+
+			const nextConfig = structuredClone(initialConfig);
+			const reloadProxy = nextConfig.providers["reload-proxy"] as {
+				models: Array<{ id: string; name?: string }>;
+			};
+			reloadProxy.models[0]!.name = "Unrelated edit";
+			candidate = await registry.stageModelsConfigReload({
+				path: modelsPath,
+				text: JSON.stringify(nextConfig),
+				identity: "literal-key-unrelated-edit",
+			});
+			expect(candidate.valid).toBe(true);
+			candidate.commit();
+			candidate.finalize();
+			expect(registry.getAll().some(model => model.provider === providerId && model.id === discoveredId)).toBe(true);
+			expect(registry.getActiveProviders().some(provider => provider.provider === providerId)).toBe(true);
+		} finally {
+			candidate?.rollback();
+		}
+	});
+
+	test("rejects a candidate literal key while a stored OAuth credential is pinned", async () => {
+		const pinnedModelsPath = path.join(tempDir, "pinned-models.json");
+		const apiKeyEnv = "GJC_TEST_PINNED_RELOAD_API_KEY";
+		const previousApiKey = Bun.env[apiKeyEnv];
+		delete Bun.env[apiKeyEnv];
+		const pinnedSessionId = "pinned-reload-session";
+		const initialConfig = {
+			providers: {
+				"pinned-provider": {
+					baseUrl: "https://pinned.example/v1",
+					api: "openai-responses",
+					apiKeyEnv,
+					models: [{ id: "pinned-model" }],
+				},
+			},
+		};
+		let pinnedRegistry: ModelRegistry | undefined;
+		let candidate: ModelsConfigReloadCandidate | undefined;
+		try {
+			await Bun.write(pinnedModelsPath, JSON.stringify(initialConfig));
+			pinnedRegistry = new ModelRegistry(authStorage, pinnedModelsPath, undefined, { automaticRefresh: false });
+			await authStorage.set("pinned-provider", [
+				{
+					type: "oauth",
+					access: "pinned-oauth-access",
+					refresh: "pinned-oauth-refresh",
+					expires: Date.now() + 60_000,
+					email: "pinned@example.com",
+				},
+			]);
+			authStorage.setSessionCredentialSelector(pinnedSessionId, "pinned-provider", {
+				kind: "email",
+				value: "pinned@example.com",
+			});
+			const nextConfig = {
+				providers: {
+					"pinned-provider": {
+						...initialConfig.providers["pinned-provider"],
+						apiKey: "candidate-literal-key",
+					},
+				},
+			};
+			candidate = await pinnedRegistry.stageModelsConfigReload({
+				path: pinnedModelsPath,
+				text: JSON.stringify(nextConfig),
+				identity: "pinned-literal-key",
+			});
+			expect(candidate.valid).toBe(false);
+			expect(candidate.diagnostics.errors.join(" ")).toContain("credential pin is active");
+			candidate.rollback();
+			expect(pinnedRegistry.find("pinned-provider", "pinned-model")).toBeDefined();
+			expect(await authStorage.peekApiKey("pinned-provider", { sessionId: pinnedSessionId })).toBe(
+				"pinned-oauth-access",
+			);
+			expect(authStorage.hasEffectiveCredentialSelector("pinned-provider", pinnedSessionId)).toBe(true);
+		} finally {
+			candidate?.rollback();
+			authStorage.clearSessionCredentialSelector("pinned-provider", pinnedSessionId);
+			await pinnedRegistry?.dispose();
+			if (previousApiKey === undefined) delete Bun.env[apiKeyEnv];
+			else Bun.env[apiKeyEnv] = previousApiKey;
+		}
+	});
+
+	test("allows an unrelated staged reload with an inherited runtime key and active session pin", async () => {
+		const provider = "runtime-pinned-reload";
+		const sessionId = "runtime-pinned-reload-session";
+		let candidate: ModelsConfigReloadCandidate | undefined;
+		try {
+			await authStorage.set(provider, [
+				{
+					type: "oauth",
+					access: "runtime-pinned-oauth-access",
+					refresh: "runtime-pinned-oauth-refresh",
+					expires: Date.now() + 60_000,
+					email: "runtime-pinned@example.com",
+				},
+			]);
+			registry.registerProvider(provider, {
+				baseUrl: "https://runtime-pinned.example/v1",
+				api: "openai-responses",
+				apiKey: "inherited-runtime-key",
+			});
+			expect(authStorage.hasConfigApiKey(provider, registry.getAuthStorageOwner())).toBe(true);
+			authStorage.clearConfigApiKeys(registry.getAuthStorageOwner());
+			expect(authStorage.hasConfigApiKey(provider, registry.getAuthStorageOwner())).toBe(false);
+			authStorage.setSessionCredentialSelector(sessionId, provider, {
+				kind: "email",
+				value: "runtime-pinned@example.com",
+			});
+
+			candidate = await registry.stageModelsConfigReload({
+				path: modelsPath,
+				text: JSON.stringify({
+					providers: {
+						"reload-proxy": {
+							baseUrl: "https://old.example.com/v1",
+							apiKey: "old-models-key",
+							api: "openai-responses",
+							models: [{ id: "old-model", name: "Updated unrelated model" }],
+						},
+					},
+				}),
+				identity: "unrelated-reload-with-inherited-runtime-key",
+			});
+			expect(candidate.valid).toBe(true);
+			expect(candidate.diagnostics.errors).toEqual([]);
+			candidate.commit();
+			candidate.finalize();
+
+			expect(registry.find("reload-proxy", "old-model")?.name).toBe("Updated unrelated model");
+			expect(authStorage.hasConfigApiKey(provider, registry.getAuthStorageOwner())).toBe(false);
+			expect(authStorage.hasEffectiveCredentialSelector(provider, sessionId)).toBe(true);
+			await expect(authStorage.peekApiKey(provider, { sessionId })).resolves.toBe("runtime-pinned-oauth-access");
+
+			candidate = await registry.stageModelsConfigReload({
+				path: modelsPath,
+				text: JSON.stringify({
+					providers: {
+						"reload-proxy": {
+							baseUrl: "https://old.example.com/v1",
+							apiKey: "old-models-key",
+							api: "openai-responses",
+							models: [{ id: "old-model" }],
+						},
+						[provider]: {
+							baseUrl: "https://runtime-pinned.example/v1",
+							api: "openai-responses",
+							apiKey: "new-conflicting-config-key",
+							models: [{ id: "config-model" }],
+						},
+					},
+				}),
+				identity: "new-config-key-over-inherited-runtime-key",
+			});
+			expect(candidate.valid).toBe(false);
+			expect(candidate.diagnostics.errors.join(" ")).toContain("credential pin is active");
+			candidate.rollback();
+			expect(registry.find(provider, "config-model")).toBeUndefined();
+			expect(authStorage.hasConfigApiKey(provider, registry.getAuthStorageOwner())).toBe(false);
+			await expect(authStorage.peekApiKey(provider, { sessionId })).resolves.toBe("runtime-pinned-oauth-access");
+
+			candidate = await registry.stageModelsConfigReload({
+				path: modelsPath,
+				text: JSON.stringify({
+					providers: {
+						"reload-proxy": {
+							baseUrl: "https://old.example.com/v1",
+							apiKey: "old-models-key",
+							api: "openai-responses",
+							models: [{ id: "old-model", name: "Second unrelated edit" }],
+						},
+					},
+				}),
+				identity: "second-unrelated-reload-with-inherited-runtime-key",
+			});
+			expect(candidate.valid).toBe(true);
+			candidate.rollback();
+		} finally {
+			candidate?.rollback();
+			authStorage.clearSessionCredentialSelector(provider, sessionId);
+		}
+	});
+
+	test("rejects a newly pinned config key at commit without publishing it", async () => {
+		const pinnedModelsPath = path.join(tempDir, "commit-race-pinned-models.json");
+		const provider = "commit-race-pinned-provider";
+		const apiKeyEnv = `GJC_TEST_COMMIT_RACE_API_KEY_${Snowflake.next()}`;
+		const previousApiKey = Bun.env[apiKeyEnv];
+		delete Bun.env[apiKeyEnv];
+		const sessionId = "commit-race-pinned-session";
+		const initialConfig = {
+			providers: {
+				[provider]: {
+					baseUrl: "https://commit-race.example/v1",
+					api: "openai-responses",
+					apiKeyEnv,
+					models: [{ id: "old-model" }],
+				},
+			},
+		};
+		let pinnedRegistry: ModelRegistry | undefined;
+		let candidate: ModelsConfigReloadCandidate | undefined;
+		try {
+			await Bun.write(pinnedModelsPath, JSON.stringify(initialConfig));
+			pinnedRegistry = new ModelRegistry(authStorage, pinnedModelsPath, undefined, { automaticRefresh: false });
+			const candidateConfig = {
+				providers: {
+					[provider]: {
+						...initialConfig.providers[provider],
+						apiKey: "new-conflicting-config-key",
+						models: [{ id: "candidate-model" }],
+					},
+				},
+			};
+			const stagedCandidate = await pinnedRegistry.stageModelsConfigReload({
+				path: pinnedModelsPath,
+				text: JSON.stringify(candidateConfig),
+				identity: "key-before-commit-time-pin",
+			});
+			candidate = stagedCandidate;
+			expect(stagedCandidate.valid).toBe(true);
+
+			await authStorage.set(provider, [
+				{
+					type: "oauth",
+					access: "commit-race-pinned-oauth-access",
+					refresh: "commit-race-pinned-oauth-refresh",
+					expires: Date.now() + 60_000,
+					email: "commit-race-pinned@example.com",
+				},
+			]);
+			authStorage.setSessionCredentialSelector(sessionId, provider, {
+				kind: "email",
+				value: "commit-race-pinned@example.com",
+			});
+
+			expect(() => stagedCandidate.commit()).toThrow(/credential pin is active or unavailable/);
+			expect(pinnedRegistry.find(provider, "old-model")).toBeDefined();
+			expect(pinnedRegistry.find(provider, "candidate-model")).toBeUndefined();
+			expect(authStorage.hasConfigApiKey(provider, pinnedRegistry.getAuthStorageOwner())).toBe(false);
+			await expect(authStorage.peekApiKey(provider, { sessionId })).resolves.toBe("commit-race-pinned-oauth-access");
+		} finally {
+			candidate?.rollback();
+			authStorage.clearSessionCredentialSelector(provider, sessionId);
+			await pinnedRegistry?.dispose();
+			if (previousApiKey === undefined) delete Bun.env[apiKeyEnv];
+			else Bun.env[apiKeyEnv] = previousApiKey;
+		}
+	});
+
+	test("keeps a pinned session credential authoritative across offline static refresh", async () => {
+		const pinnedModelsPath = path.join(tempDir, "pinned-offline-refresh-models.json");
+		const pinnedSessionId = "pinned-offline-refresh-session";
+		const authProvider = "anthropic";
+		const apiKeyEnv = "GJC_TEST_PINNED_OFFLINE_REFRESH_API_KEY";
+		const apiKeyEnvNames = [apiKeyEnv, "ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_FOUNDRY_API_KEY"];
+		const previousApiKeys = new Map(apiKeyEnvNames.map(name => [name, Bun.env[name]] as const));
+		for (const name of apiKeyEnvNames) delete Bun.env[name];
+		const initialConfig = {
+			providers: {
+				[authProvider]: {
+					baseUrl: "https://pinned.example/v1",
+					api: "anthropic-messages",
+					auth: "oauth",
+					apiKeyEnv,
+					models: [{ id: "pinned-model" }],
+				},
+			},
+		};
+		const conflictingConfig = {
+			providers: {
+				[authProvider]: {
+					...initialConfig.providers[authProvider],
+					apiKey: "conflicting-literal-key",
+				},
+			},
+		};
+		let pinnedRegistry: ModelRegistry | undefined;
+		let capturedCandidate: ModelsConfigReloadCandidate | undefined;
+		let rejectedCandidate: ModelsConfigReloadCandidate | undefined;
+		try {
+			const capturedText = JSON.stringify(initialConfig);
+			await Bun.write(pinnedModelsPath, capturedText);
+			pinnedRegistry = new ModelRegistry(authStorage, pinnedModelsPath, undefined, { automaticRefresh: false });
+			await authStorage.set(authProvider, [
+				{
+					type: "oauth",
+					access: "pinned-oauth-access",
+					refresh: "pinned-oauth-refresh",
+					expires: Date.now() + 60_000,
+					email: "pinned@example.com",
+				},
+			]);
+			authStorage.setSessionCredentialSelector(pinnedSessionId, authProvider, {
+				kind: "email",
+				value: "pinned@example.com",
+			});
+
+			capturedCandidate = await pinnedRegistry.stageModelsConfigReload({
+				path: pinnedModelsPath,
+				text: capturedText,
+				identity: "captured-valid-snapshot",
+			});
+			expect(capturedCandidate.diagnostics.errors.map(String)).toEqual([]);
+			expect(capturedCandidate.valid).toBe(true);
+
+			const conflictingText = JSON.stringify(conflictingConfig);
+			await Bun.write(pinnedModelsPath, conflictingText);
+			rejectedCandidate = await pinnedRegistry.stageModelsConfigReload({
+				path: pinnedModelsPath,
+				text: conflictingText,
+				identity: "newer-conflicting-snapshot",
+			});
+			expect(rejectedCandidate.valid).toBe(false);
+			expect(rejectedCandidate.diagnostics.errors.join(" ")).toContain("credential pin is active");
+			rejectedCandidate.rollback();
+
+			capturedCandidate.commit();
+			capturedCandidate.finalize();
+			expect(authStorage.hasEffectiveCredentialSelector(authProvider, pinnedSessionId)).toBe(true);
+			await pinnedRegistry.refreshStatic();
+
+			expect(authStorage.hasEffectiveCredentialSelector(authProvider, pinnedSessionId)).toBe(true);
+			expect(authStorage.hasConfigApiKey(authProvider, pinnedRegistry.getAuthStorageOwner())).toBe(false);
+			await expect(authStorage.peekApiKey(authProvider, { sessionId: pinnedSessionId })).resolves.toBe(
+				"pinned-oauth-access",
+			);
+			await pinnedRegistry.refresh("offline", pinnedSessionId);
+
+			expect(authStorage.hasEffectiveCredentialSelector(authProvider, pinnedSessionId)).toBe(true);
+			expect(authStorage.hasConfigApiKey(authProvider, pinnedRegistry.getAuthStorageOwner())).toBe(false);
+			await expect(authStorage.peekApiKey(authProvider, { sessionId: pinnedSessionId })).resolves.toBe(
+				"pinned-oauth-access",
+			);
+			authStorage.clearSessionCredentialSelector(authProvider, pinnedSessionId);
+			expect(await pinnedRegistry.getApiKeyForProvider(authProvider, pinnedSessionId)).not.toBe(
+				"conflicting-literal-key",
+			);
+		} finally {
+			rejectedCandidate?.rollback();
+			capturedCandidate?.rollback();
+			authStorage.clearSessionCredentialSelector(authProvider, pinnedSessionId);
+			await pinnedRegistry?.dispose();
+			for (const [name, value] of previousApiKeys) {
+				if (value === undefined) delete Bun.env[name];
+				else Bun.env[name] = value;
+			}
+		}
+	});
+
+	test("keeps unresolved apiKeyEnv candidates safe while a session pin is active", async () => {
+		const modelsPathForTest = path.join(tempDir, "unresolved-pinned-api-key-env-models.json");
+		const apiKeyEnv = `GJC_TEST_UNRESOLVED_PINNED_KEY_${Snowflake.next()}`;
+		const previousApiKey = Bun.env[apiKeyEnv];
+		delete Bun.env[apiKeyEnv];
+		const provider = "anthropic";
+		const sessionId = "unresolved-pinned-api-key-env-session";
+		const initialConfig = {
+			providers: {
+				[provider]: {
+					baseUrl: "https://unresolved-pin.example/v1",
+					api: "anthropic-messages",
+					auth: "oauth",
+					models: [{ id: "unresolved-pin-model" }],
+				},
+			},
+		};
+		let pinnedRegistry: ModelRegistry | undefined;
+		let candidate: ModelsConfigReloadCandidate | undefined;
+		try {
+			await Bun.write(modelsPathForTest, JSON.stringify(initialConfig));
+			pinnedRegistry = new ModelRegistry(authStorage, modelsPathForTest, undefined, {
+				automaticRefresh: false,
+			});
+			await authStorage.set(provider, [
+				{
+					type: "oauth",
+					access: "unresolved-pin-oauth-access",
+					refresh: "unresolved-pin-oauth-refresh",
+					expires: Date.now() + 60_000,
+					email: "unresolved-pin@example.com",
+				},
+			]);
+			authStorage.acquireCredentialScope(sessionId);
+			authStorage.setSessionCredentialSelector(sessionId, provider, {
+				kind: "email",
+				value: "unresolved-pin@example.com",
+			});
+
+			candidate = await pinnedRegistry.stageModelsConfigReload({
+				path: modelsPathForTest,
+				text: JSON.stringify({
+					providers: {
+						[provider]: {
+							...initialConfig.providers[provider],
+							apiKeyEnv,
+						},
+					},
+				}),
+				identity: "unresolved-key-env-with-session-pin",
+			});
+
+			expect(candidate.valid).toBe(true);
+			candidate.commit();
+			candidate.finalize();
+			await Bun.write(
+				modelsPathForTest,
+				JSON.stringify({
+					providers: {
+						[provider]: {
+							...initialConfig.providers[provider],
+							apiKeyEnv,
+						},
+					},
+				}),
+			);
+			await pinnedRegistry.refreshStatic();
+			expect(authStorage.hasConfigApiKey(provider, pinnedRegistry.getAuthStorageOwner())).toBe(false);
+			Bun.env[apiKeyEnv] = "late-conflicting-config-key";
+			const controller = new AbortController();
+			controller.abort(new Error("stop after credential refresh check"));
+			await expect(
+				pinnedRegistry.getApiKeyForProvider(provider, sessionId, undefined, { signal: controller.signal }),
+			).rejects.toThrow(/aborted/);
+			expect(authStorage.hasConfigApiKey(provider, pinnedRegistry.getAuthStorageOwner())).toBe(false);
+			await expect(
+				authStorage.peekApiKey(provider, { sessionId, owner: pinnedRegistry.getAuthStorageOwner() }),
+			).resolves.toBe("unresolved-pin-oauth-access");
+			authStorage.releaseCredentialScope(sessionId);
+			await expect(pinnedRegistry.getApiKeyForProvider(provider)).resolves.toBe("late-conflicting-config-key");
+			expect(authStorage.hasConfigApiKey(provider, pinnedRegistry.getAuthStorageOwner())).toBe(true);
+		} finally {
+			candidate?.rollback();
+			authStorage.releaseCredentialScope(sessionId);
+			await pinnedRegistry?.dispose();
+			if (previousApiKey === undefined) delete Bun.env[apiKeyEnv];
+			else Bun.env[apiKeyEnv] = previousApiKey;
+		}
+	});
+
+	test("does not rotate an unresolved apiKeyEnv over a later session pin", async () => {
+		const modelsPathForTest = path.join(tempDir, "rotating-pinned-api-key-env-models.json");
+		const apiKeyEnv = `GJC_TEST_ROTATING_PINNED_KEY_${Snowflake.next()}`;
+		const previousApiKey = Bun.env[apiKeyEnv];
+		delete Bun.env[apiKeyEnv];
+		const provider = "anthropic";
+		const sessionId = "rotating-pinned-api-key-env-session";
+		const initialConfig = {
+			providers: {
+				[provider]: {
+					baseUrl: "https://rotating-pin.example/v1",
+					api: "anthropic-messages",
+					auth: "oauth",
+					apiKeyEnv,
+					models: [{ id: "rotating-pin-model" }],
+				},
+			},
+		};
+		let pinnedRegistry: ModelRegistry | undefined;
+		try {
+			await Bun.write(modelsPathForTest, JSON.stringify(initialConfig));
+			await authStorage.set(provider, [
+				{
+					type: "oauth",
+					access: "rotating-pin-oauth-access",
+					refresh: "rotating-pin-oauth-refresh",
+					expires: Date.now() + 60 * 60_000,
+					email: "rotating-pin@example.com",
+				},
+			]);
+			pinnedRegistry = new ModelRegistry(authStorage, modelsPathForTest, undefined, {
+				automaticRefresh: false,
+			});
+			authStorage.acquireCredentialScope(sessionId);
+			authStorage.setSessionCredentialSelector(sessionId, provider, {
+				kind: "email",
+				value: "rotating-pin@example.com",
+			});
+			expect(authStorage.hasEffectiveCredentialSelector(provider, sessionId)).toBe(true);
+			await expect(authStorage.peekApiKey(provider, { sessionId })).resolves.toBe("rotating-pin-oauth-access");
+			Bun.env[apiKeyEnv] = "late-conflicting-config-key";
+			const controller = new AbortController();
+			controller.abort(new Error("stop after credential refresh check"));
+
+			await expect(
+				pinnedRegistry.getApiKeyForProvider(provider, sessionId, undefined, { signal: controller.signal }),
+			).rejects.toThrow(/aborted/);
+			expect(authStorage.hasConfigApiKey(provider, pinnedRegistry.getAuthStorageOwner())).toBe(false);
+			await expect(
+				authStorage.peekApiKey(provider, { sessionId, owner: pinnedRegistry.getAuthStorageOwner() }),
+			).resolves.toBe("rotating-pin-oauth-access");
+		} finally {
+			authStorage.releaseCredentialScope(sessionId);
+			await pinnedRegistry?.dispose();
+			if (previousApiKey === undefined) delete Bun.env[apiKeyEnv];
+			else Bun.env[apiKeyEnv] = previousApiKey;
+		}
+	});
+
+	test("does not install config keys over an unavailable session pin", async () => {
+		const unavailableModelsPath = path.join(tempDir, "unavailable-pinned-refresh-models.json");
+		const provider = "anthropic";
+		const sessionId = "unavailable-pinned-refresh-session";
+		const initialConfig = {
+			providers: {
+				[provider]: {
+					baseUrl: "https://unavailable-pin.example/v1",
+					api: "anthropic-messages",
+					auth: "oauth",
+					models: [{ id: "unavailable-pin-model" }],
+				},
+			},
+		};
+		let unavailableRegistry: ModelRegistry | undefined;
+		try {
+			await Bun.write(unavailableModelsPath, JSON.stringify(initialConfig));
+			await authStorage.set(provider, [
+				{
+					type: "oauth",
+					access: "unavailable-oauth-access",
+					refresh: "unavailable-oauth-refresh",
+					expires: Date.now() + 60_000,
+					email: "unavailable@example.com",
+				},
+			]);
+			authStorage.acquireCredentialScope(sessionId);
+			authStorage.setSessionCredentialSelector(sessionId, provider, {
+				kind: "email",
+				value: "unavailable@example.com",
+			});
+			authStorage.markSessionCredentialUnavailable(sessionId, provider, {
+				kind: "email",
+				value: "unavailable@example.com",
+			});
+
+			unavailableRegistry = new ModelRegistry(authStorage, unavailableModelsPath, undefined, {
+				automaticRefresh: false,
+			});
+			await Bun.write(
+				unavailableModelsPath,
+				JSON.stringify({
+					providers: {
+						[provider]: {
+							...initialConfig.providers[provider],
+							apiKey: "conflicting-config-key",
+						},
+					},
+				}),
+			);
+			await unavailableRegistry.refreshStatic();
+
+			expect(authStorage.hasConfigApiKey(provider, unavailableRegistry.getAuthStorageOwner())).toBe(false);
+			await expect(
+				authStorage.peekApiKey(provider, { sessionId, owner: unavailableRegistry.getAuthStorageOwner() }),
+			).resolves.toBeUndefined();
+			await expect(
+				authStorage.getApiKey(provider, sessionId, { owner: unavailableRegistry.getAuthStorageOwner() }),
+			).rejects.toThrow(/Selected credential.*unavailable/);
+		} finally {
+			authStorage.releaseCredentialScope(sessionId);
+			await unavailableRegistry?.dispose();
+		}
+	});
+
+	test("rejects malformed snapshots and deletion of an accepted file without changing auth", async () => {
+		const malformed = await registry.stageModelsConfigReload({ path: modelsPath, text: "{", identity: "invalid" });
+		expect(malformed.valid).toBe(false);
+		expect(malformed.diagnostics.valid).toBe(false);
+		malformed.rollback();
+		expect(await authStorage.peekApiKey("reload-proxy")).toBe("old-models-key");
+
+		const deletion = await registry.stageModelsConfigReload({ path: modelsPath, text: null, identity: "deleted" });
+		expect(deletion.valid).toBe(false);
+		deletion.rollback();
+		expect(registry.find("reload-proxy", "old-model")).toBeDefined();
+		expect(await authStorage.peekApiKey("reload-proxy")).toBe("old-models-key");
+	});
+
+	test("publication fences drain consumers, are writer-fair, and release idempotently", async () => {
+		const firstConsumerRelease = await holdConsumer();
+		const order: string[] = [];
+		const publicationFence = registry.acquirePublicationFence().then(release => {
+			order.push("writer");
+			return release;
+		});
+		const waitingConsumer = holdConsumer().then(release => {
+			order.push("consumer");
+			return release;
+		});
+		firstConsumerRelease();
+		firstConsumerRelease();
+
+		const releaseFence = await publicationFence;
+		expect(order).toEqual(["writer"]);
+		releaseFence();
+		releaseFence();
+		const releaseConsumer = await waitingConsumer;
+		expect(order).toEqual(["writer", "consumer"]);
+		releaseConsumer();
+	});
+
+	test("aborted queued publication fences are removed without blocking later consumers", async () => {
+		const releaseConsumer = await holdConsumer();
+		const controller = new AbortController();
+		const waitingFence = registry.acquirePublicationFence(controller.signal);
+		controller.abort(new Error("cancel fence"));
+		await expect(waitingFence).rejects.toThrow("cancel fence");
+		releaseConsumer();
+		const releaseNextConsumer = await holdConsumer();
+		releaseNextConsumer();
+	});
+
+	async function holdConsumer(): Promise<() => void> {
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const completion = registry.withConsumerLease(async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		await Promise.race([entered.promise, completion]);
+		return () => gate.resolve();
+	}
+
+	test("rejects a stale candidate after a direct provider registration", async () => {
+		const candidate = await registry.stageModelsConfigReload({
+			path: modelsPath,
+			text: await Bun.file(modelsPath).text(),
+			identity: "before-registration",
+		});
+		registry.registerProvider("runtime-provider", {
+			baseUrl: "https://runtime.example/v1",
+			api: "openai-responses",
+			apiKey: "runtime-key",
+			models: [
+				{
+					id: "runtime",
+					name: "Runtime",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 8192,
+					maxTokens: 1024,
+				},
+			],
+		});
+		expect(() => candidate.commit()).toThrow("changed during configuration preflight");
+		candidate.rollback();
+		expect(registry.find("runtime-provider", "runtime")).toBeDefined();
+		expect(await registry.getApiKeyForProvider("runtime-provider")).toBe("runtime-key");
+	});
+
+	test("rejects publication from a consumer callback instead of deadlocking", async () => {
+		await registry.withConsumerLease(async () => {
+			await expect(registry.acquirePublicationFence()).rejects.toThrow("holding a model consumer lease");
+		});
+	});
+
+	test("staged credential resolution preserves explicit account selectors", async () => {
+		const config = JSON.parse(await Bun.file(modelsPath).text());
+		delete config.providers["reload-proxy"].apiKey;
+		config.providers["reload-proxy"].auth = "apiKey";
+		await authStorage.set("reload-proxy", [{ type: "api_key", key: "stored-key" }]);
+		const candidate = await registry.stageModelsConfigReload({
+			path: modelsPath,
+			text: JSON.stringify(config),
+			identity: "scoped-auth",
+		});
+		await expect(
+			candidate.registry.getApiKeyForProvider("reload-proxy", undefined, "https://old.example.com/v1", {
+				credentialSelector: { kind: "email", value: "missing@example.com" },
+			}),
+		).rejects.toThrow("No credential found");
+		expect(await candidate.registry.getApiKeyForProvider("reload-proxy")).toBe("stored-key");
+		candidate.rollback();
+	});
+
+	test("causal child consumers finish before a queued writer without deadlocking their parent", async () => {
+		const parentEntered = Promise.withResolvers<void>();
+		const childMayStart = Promise.withResolvers<void>();
+		const events: string[] = [];
+		const parent = registry.withConsumerLease(async () => {
+			parentEntered.resolve();
+			await childMayStart.promise;
+			await registry.withConsumerLease(() => events.push("child"));
+			events.push("parent");
+		});
+		await parentEntered.promise;
+		const writer = registry.acquirePublicationFence().then(release => {
+			events.push("writer");
+			release();
+		});
+		childMayStart.resolve();
+		await Promise.all([parent, writer]);
+		expect(events).toEqual(["child", "parent", "writer"]);
+	});
+
+	test("catalog refresh waits for publication and notifications wait for finalization", async () => {
+		const release = await registry.acquirePublicationFence();
+		let refreshed = false;
+		const refresh = registry.refreshStatic().then(() => {
+			refreshed = true;
+		});
+		await Bun.sleep(5);
+		expect(refreshed).toBe(false);
+		const text = await Bun.file(modelsPath).text();
+		const next = JSON.parse(text);
+		next.providers["reload-proxy"].apiKey = "rotated-key";
+		const candidate = await registry.stageModelsConfigReload({
+			path: modelsPath,
+			text: JSON.stringify(next),
+			identity: "auth-change",
+		});
+		let notifications = 0;
+		const stop = registry.onCatalogChanged(() => {
+			notifications++;
+		});
+		expect(candidate.changed).toBe(true);
+		candidate.commit();
+		expect(notifications).toBe(0);
+		expect(await registry.getApiKeyForProvider("reload-proxy")).toBe("rotated-key");
+		candidate.finalize();
+		expect(notifications).toBe(1);
+		stop();
+		release();
+		await refresh;
+		expect(refreshed).toBe(true);
+	});
+
+	test("removing the only configured key does not reuse accepted credentials during preflight", async () => {
+		const config = JSON.parse(await Bun.file(modelsPath).text());
+		delete config.providers["reload-proxy"].apiKey;
+		config.providers["reload-proxy"].auth = "apiKey";
+		const candidate = await registry.stageModelsConfigReload({
+			path: modelsPath,
+			text: JSON.stringify(config),
+			identity: "removed-key",
+		});
+		expect(await candidate.registry.getApiKeyForProvider("reload-proxy")).toBeUndefined();
+		expect(await registry.getApiKeyForProvider("reload-proxy")).toBe("old-models-key");
+		candidate.rollback();
+		expect(await registry.getApiKeyForProvider("reload-proxy")).toBe("old-models-key");
 	});
 });
 

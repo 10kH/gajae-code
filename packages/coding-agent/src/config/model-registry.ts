@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -5,6 +6,7 @@ import { isDeepStrictEqual } from "node:util";
 import {
 	type Api,
 	type AssistantMessageEventStream,
+	type AuthApiKeyOptions,
 	type AuthCredentialSelector,
 	applyFinalCodexGpt56ContextCap,
 	applyGeneratedModelPolicies,
@@ -52,6 +54,7 @@ import {
 } from "@gajae-code/ai/utils/discovery/openai-compatible";
 // Internal-only: registerFinalizedModelClone is not part of the public @gajae-code/ai surface
 import { registerFinalizedModelClone } from "@gajae-code/ai/utils/trusted-model-clone";
+import { JSONC, YAML } from "bun";
 
 // Sentinels for local-only OAuth tokens — declared inline to avoid loading provider
 // modules at startup. Must match the provider OAuth modules.
@@ -77,13 +80,15 @@ import {
 	projectActiveProviderDescriptors,
 } from "../sdk/providers";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
+import { writeExplicitOwnerOnlyTextSync } from "../session/session-storage";
 import type { ActiveSearchModelContext, WebSearchMode } from "../web/search/types";
 import { type BillingPath, deriveBillingPath } from "./billing-path";
-import { ConfigError, ConfigFile } from "./config-file";
+import { ConfigError, ConfigFile, type LoadResult } from "./config-file";
 import { isAuthenticated, kNoAuth } from "./model-auth";
 import { type ConfiguredModelBindings, ModelBindingsApplier } from "./model-bindings-applier";
 import { ModelDiscoveryManager, type ProviderDiscoveryState } from "./model-discovery-manager";
 import {
+	type AcceptedModelPresetRegistry,
 	loadAcceptedModelPresetProfiles,
 	type ModelPresetRegistryDependencies,
 	type ModelPresetRegistryRefreshResult,
@@ -449,6 +454,20 @@ function assertRequestTransformSupportedForKnownProvider(providerName: string, s
 	}
 }
 
+function assertStreamIdleTimeoutSupportedForKnownProvider(providerName: string, source: string): void {
+	const apis = getKnownProviderApis(providerName);
+	if (apis.size === 0) {
+		throw new Error(
+			`Provider ${providerName}: ${source} requires an OpenAI-compatible "api" when the provider is not built in.`,
+		);
+	}
+	if (![...apis].some(isRequestTransformApi)) {
+		throw new Error(
+			`Provider ${providerName}: ${source} is only supported with openai-completions or openai-responses APIs.`,
+		);
+	}
+}
+
 function assertRequestTransformSupportedForModelApi(
 	providerName: string,
 	modelId: string,
@@ -463,8 +482,54 @@ function assertRequestTransformSupportedForModelApi(
 }
 
 function getKnownProviderModelApi(providerName: string, modelId: string): Api | undefined {
-	return getBundledModels(providerName as Parameters<typeof getBundledModels>[0]).find(model => model.id === modelId)
-		?.api as Api | undefined;
+	return getBundledModels(providerName as Parameters<typeof getBundledModels>[0]).find(
+		model => model.id.toLowerCase() === modelId.toLowerCase(),
+	)?.api as Api | undefined;
+}
+
+function resolveModelApiOverrideFromDiscovery(
+	providerApi: Api,
+	discovery: ProviderDiscovery,
+	modelId: string,
+	entry?: { id?: unknown; owned_by?: unknown },
+	allowModelIdDetection = true,
+): Api | undefined {
+	// Explicit per-prefix routing always wins over model-id detection.
+	const normalizedModelId = modelId.toLowerCase();
+	let matchedPrefixLength = -1;
+	let prefixApi: Api | undefined;
+	for (const [prefix, routedApi] of Object.entries(discovery.apiByModelPrefix ?? {})) {
+		const normalizedPrefix = prefix.toLowerCase();
+		if (normalizedModelId.startsWith(normalizedPrefix) && normalizedPrefix.length > matchedPrefixLength) {
+			prefixApi = routedApi;
+			matchedPrefixLength = normalizedPrefix.length;
+		}
+	}
+	if (prefixApi !== undefined) return prefixApi;
+
+	// An OpenAI-shaped models list can advertise Anthropic models that must use
+	// the Anthropic transport even when the provider's default is OpenAI-family.
+	if (discovery.type === "openai-models-list") {
+		let candidateEntry = entry;
+		if (candidateEntry === undefined && allowModelIdDetection) {
+			candidateEntry = { id: modelId };
+		}
+		const detected = candidateEntry === undefined ? undefined : detectDiscoveredApiFamily(candidateEntry);
+		if (detected === "anthropic-messages") return "anthropic-messages";
+		if (detected === "openai-completions") {
+			return isOpenAIFamilyApi(providerApi) ? providerApi : "openai-completions";
+		}
+	}
+	return undefined;
+}
+
+function resolveModelApiFromDiscovery(
+	providerApi: Api,
+	discovery: ProviderDiscovery,
+	modelId: string,
+	entry?: { id?: unknown; owned_by?: unknown },
+): Api {
+	return resolveModelApiOverrideFromDiscovery(providerApi, discovery, modelId, entry) ?? providerApi;
 }
 
 function isCanonicalOpenAIAffinityBaseUrl(baseUrl: string | undefined): boolean {
@@ -513,6 +578,7 @@ interface ProviderValidationModel {
 	maxTokens?: number;
 	compat?: Model<Api>["compat"];
 	requestTransform?: ModelRequestTransform;
+	streamIdleTimeoutMs?: number;
 }
 
 interface ProviderValidationConfig {
@@ -521,6 +587,7 @@ interface ProviderValidationConfig {
 	apiKey?: string;
 	apiKeyEnv?: string;
 	api?: Api;
+	transport?: Model<Api>["transport"];
 	auth?: ProviderAuthMode;
 	oauthConfigured?: boolean;
 	discovery?: ProviderDiscovery;
@@ -528,6 +595,7 @@ interface ProviderValidationConfig {
 	requestTransform?: ModelRequestTransform;
 	disableStrictTools?: boolean;
 	cacheRetention?: CacheRetention;
+	streamIdleTimeoutMs?: number;
 	openaiCompat?: { baseUrl: string; apiKey?: string; apiKeyEnv?: string };
 	modelOverrides?: Record<string, unknown>;
 	models: ProviderValidationModel[];
@@ -543,7 +611,20 @@ function validateProviderConfiguration(
 	mode: ProviderValidationMode,
 ): void {
 	const hasProviderApi = !!config.api;
+	const configuredApi = config.api ?? (config.openaiCompat ? "openai-completions" : undefined);
 	const models = config.models;
+	if (
+		config.transport === "pi-native" &&
+		(config.streamIdleTimeoutMs !== undefined ||
+			models.some(model => model.streamIdleTimeoutMs !== undefined) ||
+			Object.values(config.modelOverrides ?? {}).some(
+				override => (override as ModelOverride).streamIdleTimeoutMs !== undefined,
+			))
+	) {
+		throw new Error(
+			`Provider ${providerName}: "streamIdleTimeoutMs" is not supported with "transport: pi-native"; configure it on the auth-gateway's upstream model.`,
+		);
+	}
 
 	if (models.length === 0) {
 		if (mode === "models-config") {
@@ -557,12 +638,13 @@ function validateProviderConfiguration(
 				!config.disableStrictTools &&
 				!config.requestTransform &&
 				!config.cacheRetention &&
+				config.streamIdleTimeoutMs === undefined &&
 				!config.openaiCompat &&
 				!hasModelOverrides &&
 				!config.discovery
 			) {
 				throw new Error(
-					`Provider ${providerName}: must specify "baseUrl", "headers", "apiKey", "compat", "requestTransform", "cacheRetention", "disableStrictTools", "modelOverrides", "discovery", "openaiCompat", or "models"`,
+					`Provider ${providerName}: must specify "baseUrl", "headers", "apiKey", "compat", "requestTransform", "cacheRetention", "streamIdleTimeoutMs", "disableStrictTools", "modelOverrides", "discovery", "openaiCompat", or "models"`,
 				);
 			}
 		}
@@ -623,10 +705,55 @@ function validateProviderConfiguration(
 	}
 	for (const [modelId, rawOverride] of Object.entries(config.modelOverrides ?? {})) {
 		const override = rawOverride as ModelOverride;
+		const configuredModel = models.find(model => model.id.toLowerCase() === modelId.toLowerCase());
+		const discoveryProviderApi =
+			(config.api as Api | undefined) ??
+			dominantOpenAIFamilyModelApi(models) ??
+			(config.openaiCompat ? "openai-completions" : undefined);
+		const implicitDiscoveryBaseUrl = config.baseUrl ?? resolveProviderBaseUrlFromEnv(providerName);
+		const implicitDiscovery: ProviderDiscovery | undefined =
+			!config.discovery &&
+			(config.openaiCompat !== undefined ||
+				(providerName !== "vllm" &&
+					providerName !== "sglang" &&
+					discoveryProviderApi !== undefined &&
+					isOpenAIFamilyApi(discoveryProviderApi) &&
+					implicitDiscoveryBaseUrl !== undefined))
+				? { type: "openai-models-list" }
+				: undefined;
+		const effectiveDiscovery = config.discovery ?? implicitDiscovery;
+		const discoveryApi =
+			configuredModel || !effectiveDiscovery || !discoveryProviderApi
+				? undefined
+				: resolveModelApiOverrideFromDiscovery(discoveryProviderApi, effectiveDiscovery, modelId);
+		const discoveryTimeoutApi =
+			configuredModel || !effectiveDiscovery || !discoveryProviderApi
+				? undefined
+				: resolveModelApiOverrideFromDiscovery(discoveryProviderApi, effectiveDiscovery, modelId, undefined, false);
+		const bundledModelApi = getKnownProviderModelApi(providerName, modelId);
+		// An OpenAI models-list row may override both its ID-based family and the
+		// provider default via `owned_by`. Defer ambiguous timeout validation until
+		// discovery supplies that metadata; applying the override validates the
+		// resolved model API before it can take effect.
+		const deferTimeoutValidation =
+			!configuredModel &&
+			effectiveDiscovery?.type === "openai-models-list" &&
+			discoveryTimeoutApi === undefined &&
+			bundledModelApi === undefined;
 		const effectiveApi =
-			models.find(model => model.id === modelId)?.api ??
-			config.api ??
-			getKnownProviderModelApi(providerName, modelId);
+			configuredModel?.api ??
+			(configuredModel ? config.api : undefined) ??
+			discoveryApi ??
+			bundledModelApi ??
+			config.api;
+		const effectiveTimeoutApi =
+			configuredModel?.api ??
+			(configuredModel ? config.api : undefined) ??
+			discoveryTimeoutApi ??
+			bundledModelApi ??
+			(deferTimeoutValidation
+				? undefined
+				: (config.api ?? (config.openaiCompat ? "openai-completions" : undefined)));
 		if (override.compat?.supportsResponsesSessionAffinity !== undefined) {
 			assertResponsesSessionAffinitySupported(
 				providerName,
@@ -634,6 +761,21 @@ function validateProviderConfiguration(
 				config.baseUrl,
 				`modelOverrides ${modelId} "compat.supportsResponsesSessionAffinity"`,
 			);
+		}
+		if (override.streamIdleTimeoutMs !== undefined) {
+			if (effectiveTimeoutApi) {
+				assertRequestTransformSupportedForModelApi(
+					providerName,
+					modelId,
+					effectiveTimeoutApi,
+					'modelOverrides "streamIdleTimeoutMs"',
+				);
+			} else if (!deferTimeoutValidation) {
+				assertRequestTransformSupportedForKnownProvider(
+					providerName,
+					`modelOverrides ${modelId} "streamIdleTimeoutMs"`,
+				);
+			}
 		}
 		if (!override.requestTransform) continue;
 		if (effectiveApi) {
@@ -657,6 +799,54 @@ function validateProviderConfiguration(
 			assertRequestTransformSupportedForKnownProvider(providerName, '"requestTransform"');
 		}
 	}
+	if (config.streamIdleTimeoutMs !== undefined) {
+		const bundledApis = getKnownProviderApis(providerName);
+		const hasCompatibleBundledApi = [...bundledApis].some(isRequestTransformApi);
+		const hasCompatibleModelApi = models.some(model => {
+			const api = model.api ?? config.api;
+			return api !== undefined && isRequestTransformApi(api);
+		});
+		const hasCompatibleDiscoveryApi =
+			config.openaiCompat !== undefined ||
+			(config.discovery !== undefined &&
+				((configuredApi !== undefined && isRequestTransformApi(configuredApi)) ||
+					Object.values(config.discovery.apiByModelPrefix ?? {}).some(isRequestTransformApi)));
+		const implicitDiscoveryApi =
+			(config.api as Api | undefined) ??
+			dominantOpenAIFamilyModelApi(models) ??
+			(config.openaiCompat ? "openai-completions" : undefined);
+		const implicitDiscoveryBaseUrl = config.baseUrl ?? resolveProviderBaseUrlFromEnv(providerName);
+		const hasCompatibleImplicitDiscoveryApi =
+			!config.discovery &&
+			(config.openaiCompat !== undefined ||
+				(providerName !== "vllm" &&
+					providerName !== "sglang" &&
+					implicitDiscoveryApi !== undefined &&
+					isOpenAIFamilyApi(implicitDiscoveryApi) &&
+					implicitDiscoveryBaseUrl !== undefined));
+		const hasCompatibleDiscoveryRoute = hasCompatibleDiscoveryApi || hasCompatibleImplicitDiscoveryApi;
+		if (models.length > 0) {
+			if (!hasCompatibleModelApi && !hasCompatibleBundledApi && !hasCompatibleDiscoveryRoute) {
+				throw new Error(
+					`Provider ${providerName}: "streamIdleTimeoutMs" is only supported with openai-completions or openai-responses APIs.`,
+				);
+			}
+		} else {
+			if (!hasCompatibleBundledApi && !hasCompatibleDiscoveryRoute) {
+				if (bundledApis.size > 0) {
+					assertStreamIdleTimeoutSupportedForKnownProvider(providerName, '"streamIdleTimeoutMs"');
+				} else if (configuredApi) {
+					if (!isRequestTransformApi(configuredApi)) {
+						throw new Error(
+							`Provider ${providerName}: "streamIdleTimeoutMs" is only supported with openai-completions or openai-responses APIs.`,
+						);
+					}
+				} else {
+					assertStreamIdleTimeoutSupportedForKnownProvider(providerName, '"streamIdleTimeoutMs"');
+				}
+			}
+		}
+	}
 
 	for (const modelDef of models) {
 		if (!hasProviderApi && !modelDef.api) {
@@ -670,6 +860,14 @@ function validateProviderConfiguration(
 			throw new Error(`Provider ${providerName}: model missing "id"`);
 		}
 		const effectiveApi = modelDef.api ?? config.api;
+		if (modelDef.streamIdleTimeoutMs !== undefined && effectiveApi) {
+			assertRequestTransformSupportedForModelApi(
+				providerName,
+				modelDef.id,
+				effectiveApi,
+				'model "streamIdleTimeoutMs"',
+			);
+		}
 		const modelCompat = modelDef.compat;
 		if (modelCompat && "supportsResponsesSessionAffinity" in modelCompat) {
 			assertResponsesSessionAffinitySupported(
@@ -706,33 +904,82 @@ function validateProviderConfiguration(
 	}
 }
 
+function validateModelsConfig(config: ModelsConfig): void {
+	for (const [providerName, providerConfig] of Object.entries(config.providers ?? {})) {
+		validateProviderConfiguration(
+			providerName,
+			{
+				baseUrl: providerConfig.baseUrl,
+				headers: providerConfig.headers,
+				apiKey: providerConfig.apiKey,
+				apiKeyEnv: providerConfig.apiKeyEnv,
+				api: providerConfig.api as Api | undefined,
+				transport: providerConfig.transport,
+				auth: (providerConfig.auth ?? "apiKey") as ProviderAuthMode,
+				discovery: providerConfig.discovery as ProviderDiscovery | undefined,
+				compat: providerConfig.compat,
+				requestTransform: providerConfig.requestTransform,
+				disableStrictTools: providerConfig.disableStrictTools,
+				cacheRetention: providerConfig.cacheRetention,
+				streamIdleTimeoutMs: providerConfig.streamIdleTimeoutMs,
+				openaiCompat: providerConfig.openaiCompat,
+				modelOverrides: providerConfig.modelOverrides,
+				models: (providerConfig.models ?? []) as ProviderValidationModel[],
+			},
+			"models-config",
+		);
+	}
+}
+
 export const ModelsConfigFile = new ConfigFile<ModelsConfig>("models", ModelsConfigSchema).withValidation(
 	"models",
-	config => {
-		for (const [providerName, providerConfig] of Object.entries(config.providers ?? {})) {
-			validateProviderConfiguration(
-				providerName,
-				{
-					baseUrl: providerConfig.baseUrl,
-					headers: providerConfig.headers,
-					apiKey: providerConfig.apiKey,
-					apiKeyEnv: providerConfig.apiKeyEnv,
-					api: providerConfig.api as Api | undefined,
-					auth: (providerConfig.auth ?? "apiKey") as ProviderAuthMode,
-					discovery: providerConfig.discovery as ProviderDiscovery | undefined,
-					compat: providerConfig.compat,
-					requestTransform: providerConfig.requestTransform,
-					disableStrictTools: providerConfig.disableStrictTools,
-					cacheRetention: providerConfig.cacheRetention,
-					openaiCompat: providerConfig.openaiCompat,
-					modelOverrides: providerConfig.modelOverrides,
-					models: (providerConfig.models ?? []) as ProviderValidationModel[],
-				},
-				"models-config",
-			);
-		}
-	},
+	validateModelsConfig,
 );
+
+function parseModelsConfigSnapshot(snapshot: { path: string; text: string | null }): LoadResult<ModelsConfig> {
+	if (snapshot.text === null) return { status: "not-found" };
+	try {
+		const content = snapshot.text.trim();
+		let raw: unknown;
+		if (snapshot.path.endsWith(".json") || snapshot.path.endsWith(".jsonc")) {
+			raw = JSONC.parse(content);
+		} else if (snapshot.path.endsWith(".yml") || snapshot.path.endsWith(".yaml")) {
+			raw = YAML.parse(content);
+		} else {
+			throw new Error(`Invalid config file path: ${snapshot.path}`);
+		}
+		const parsed = ModelsConfigSchema.safeParse(raw);
+		if (!parsed.success) {
+			return {
+				status: "error",
+				error: new ConfigError(
+					"models",
+					parsed.error.issues.slice(0, 50).map(issue => ({
+						instancePath: issue.path.length === 0 ? "" : `/${issue.path.map(String).join("/")}`,
+						message: issue.message,
+					})),
+				),
+			};
+		}
+		try {
+			validateModelsConfig(parsed.data);
+		} catch (error) {
+			return {
+				status: "error",
+				error:
+					error instanceof ConfigError
+						? error
+						: new ConfigError("models", undefined, { err: error, stage: "Validate(models)" }),
+			};
+		}
+		return { status: "ok", value: parsed.data };
+	} catch (error) {
+		return {
+			status: "error",
+			error: new ConfigError("models", undefined, { err: error, stage: "Unexpected" }),
+		};
+	}
+}
 
 /** Provider override config (baseUrl, headers, apiKey, compat, transport) without custom models */
 interface ProviderOverride {
@@ -745,6 +992,7 @@ interface ProviderOverride {
 	transport?: Model<Api>["transport"];
 	requestTransform?: ModelRequestTransform;
 	cacheRetention?: CacheRetention;
+	streamIdleTimeoutMs?: number;
 	isOAuth?: boolean;
 }
 
@@ -778,6 +1026,7 @@ function registryModelMetadataWithoutApiSpecificFields(model: Model<Api>): Parti
 		contextWindow: model.contextWindow,
 		maxTokens: model.maxTokens,
 	};
+	if (model.streamIdleTimeoutMs !== undefined) metadata.streamIdleTimeoutMs = model.streamIdleTimeoutMs;
 	if (model.longContextPricing !== undefined) metadata.longContextPricing = model.longContextPricing;
 	if (model.premiumMultiplier !== undefined) metadata.premiumMultiplier = model.premiumMultiplier;
 	if (model.priority !== undefined) metadata.priority = model.priority;
@@ -941,10 +1190,15 @@ export function mergeDiscoveredModel<TApi extends Api>(
 	existing: Model<Api> | undefined,
 	providerOverride?: Pick<
 		ProviderOverride,
-		"baseUrl" | "headers" | "transport" | "requestTransform" | "cacheRetention"
+		"baseUrl" | "headers" | "transport" | "requestTransform" | "cacheRetention" | "streamIdleTimeoutMs"
 	>,
 ): Model<TApi> {
 	if (existing) {
+		const streamIdleTimeoutMs =
+			model.streamIdleTimeoutMs ??
+			(isRequestTransformApi(model.api)
+				? (existing.streamIdleTimeoutMs ?? providerOverride?.streamIdleTimeoutMs)
+				: undefined);
 		return {
 			...model,
 			baseUrl: providerOverride?.baseUrl ?? model.baseUrl ?? existing.baseUrl,
@@ -954,15 +1208,20 @@ export function mergeDiscoveredModel<TApi extends Api>(
 				providerOverride?.requestTransform,
 			),
 			cacheRetention: model.cacheRetention ?? existing.cacheRetention ?? providerOverride?.cacheRetention,
+			...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
 		};
 	}
 	if (providerOverride) {
+		const streamIdleTimeoutMs =
+			model.streamIdleTimeoutMs ??
+			(isRequestTransformApi(model.api) ? providerOverride.streamIdleTimeoutMs : undefined);
 		return {
 			...model,
 			baseUrl: providerOverride.baseUrl ?? model.baseUrl,
 			headers: mergeCaseInsensitiveHeaders(model.headers, providerOverride.headers),
 			...(providerOverride.transport !== undefined ? { transport: providerOverride.transport } : {}),
 			requestTransform: mergeRequestTransform(model.requestTransform, providerOverride.requestTransform),
+			...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
 		};
 	}
 	return model;
@@ -1278,6 +1537,20 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	if (override.input !== undefined) result.input = override.input as ("text" | "image")[];
 	if (override.output !== undefined) result.output = override.output as ("text" | "image")[];
 	if (override.cacheRetention !== undefined) result.cacheRetention = override.cacheRetention;
+	if (override.streamIdleTimeoutMs !== undefined) {
+		if (isRequestTransformApi(model.api)) {
+			result.streamIdleTimeoutMs = override.streamIdleTimeoutMs;
+		} else {
+			// Discovery ownership can reveal an incompatible route after config
+			// validation, including while hydrating a cached model at startup.
+			// Reject only this override so the otherwise-valid model stays usable.
+			logger.warn("model stream idle timeout override ignored for incompatible API", {
+				model: model.id,
+				provider: model.provider,
+				api: model.api,
+			});
+		}
+	}
 	const contextWindowOverride = toPositiveNumberOrUndefined(override.contextWindow);
 	if (contextWindowOverride !== undefined) {
 		result.contextWindow = contextWindowOverride;
@@ -1367,6 +1640,7 @@ interface CustomModelDefinitionLike {
 	wireModelId?: string;
 	requestTransform?: ModelRequestTransform;
 	cacheRetention?: CacheRetention;
+	streamIdleTimeoutMs?: number;
 }
 
 interface CustomModelBuildOptions {
@@ -1394,6 +1668,7 @@ type CustomModelOverlay = {
 	wireModelId?: string;
 	requestTransform?: ModelRequestTransform;
 	cacheRetention?: CacheRetention;
+	streamIdleTimeoutMs?: number;
 	transport?: Model<Api>["transport"];
 	isOAuth?: boolean;
 };
@@ -1508,9 +1783,13 @@ function buildCustomModelOverlay(
 	providerCacheRetention: CacheRetention | undefined,
 	providerTransport: Model<Api>["transport"] | undefined,
 	modelDef: CustomModelDefinitionLike,
+	providerStreamIdleTimeoutMs?: number,
 ): CustomModelOverlay | undefined {
 	const api = modelDef.api ?? providerApi;
 	if (!api) return undefined;
+	const streamIdleTimeoutMs = isRequestTransformApi(api)
+		? (modelDef.streamIdleTimeoutMs ?? providerStreamIdleTimeoutMs)
+		: undefined;
 	return {
 		id: modelDef.id,
 		provider: providerName,
@@ -1535,6 +1814,7 @@ function buildCustomModelOverlay(
 		contextPromotionTarget: modelDef.contextPromotionTarget,
 		premiumMultiplier: modelDef.premiumMultiplier,
 		cacheRetention: modelDef.cacheRetention ?? providerCacheRetention,
+		...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
 		transport: providerTransport,
 		isOAuth: resolveCustomModelIsOAuth(api, providerAuth),
 	};
@@ -1671,6 +1951,9 @@ function finalizeCustomModel(model: CustomModelOverlay, options: CustomModelBuil
 		wireModelId: resolvedModel.wireModelId,
 		requestTransform: resolvedModel.requestTransform,
 		cacheRetention: resolvedModel.cacheRetention ?? reference?.cacheRetention,
+		...(resolvedModel.streamIdleTimeoutMs !== undefined
+			? { streamIdleTimeoutMs: resolvedModel.streamIdleTimeoutMs }
+			: {}),
 		transport: resolvedModel.transport,
 		premiumMultiplier: resolvedModel.premiumMultiplier,
 		isOAuth: resolvedModel.isOAuth,
@@ -1742,6 +2025,201 @@ interface ConfiguredDiscoveryResult {
 
 type ProviderRefreshFence = { providerId: string; generation: number } | { generations: ReadonlyMap<string, number> };
 
+interface StagedConfigApiKey {
+	readonly apiKey: string;
+	readonly envSourced: boolean;
+	// The staged AuthStorage adapter needs only the first two fields; registry-owned entries
+	// also track whether the key came from config, runtime registration, or both.
+	readonly configSourced?: boolean;
+	readonly runtimeSourced?: boolean;
+}
+
+interface StagedAuthStorageState {
+	readonly authStorage: AuthStorage;
+	readonly configApiKeys: Map<object, Map<string, StagedConfigApiKey>>;
+}
+
+function createStagedAuthStorage(base: AuthStorage): StagedAuthStorageState {
+	const configApiKeys = new Map<object, Map<string, StagedConfigApiKey>>();
+	const fallbackResolvers = new Map<object, (provider: string) => string | undefined>();
+	const lookupOwner = {};
+	const getConfigApiKey = (provider: string, owner: object | undefined) =>
+		(owner && configApiKeys.get(owner)?.get(resolveOAuthStorageProvider(provider))) || undefined;
+	const peekApiKey = async (
+		provider: string,
+		options?: AuthApiKeyOptions & { sessionId?: string },
+	): Promise<string | undefined> => {
+		if (base.hasRuntimeApiKey(provider)) return base.peekApiKey(provider, options);
+		const configured = getConfigApiKey(provider, options?.owner);
+		if (
+			configured &&
+			base.resolveEffectiveCredentialSelector(provider, options?.sessionId, options?.credentialSelector)
+		) {
+			throw new Error(
+				`Credential selector cannot be used for ${provider} while a config API key override is active`,
+			);
+		}
+		if (configured && !configured.envSourced) return configured.apiKey;
+		if (configured?.envSourced) {
+			const credentialType = base.getEffectiveCredentialType(provider, options?.sessionId, {
+				owner: lookupOwner,
+				credentialSelector: options?.credentialSelector,
+			});
+			if (credentialType !== "api_key") return configured.apiKey;
+		}
+		const storedKey = await base.peekApiKey(provider, { ...options, owner: lookupOwner });
+		if (storedKey !== undefined) return storedKey;
+		if (configured?.envSourced) return configured.apiKey;
+		return (options?.owner && fallbackResolvers.get(options.owner)?.(provider)) ?? undefined;
+	};
+	const staged = new Proxy(base, {
+		get(target, property) {
+			if (property === "setConfigApiKey") {
+				return (provider: string, apiKey: string, options: { envSourced?: boolean; owner?: object } = {}) => {
+					if (!options.owner) return;
+					const keys = configApiKeys.get(options.owner) ?? new Map<string, StagedConfigApiKey>();
+					keys.set(resolveOAuthStorageProvider(provider), {
+						apiKey,
+						envSourced: options.envSourced === true,
+					});
+					configApiKeys.set(options.owner, keys);
+				};
+			}
+			if (property === "removeConfigApiKey") {
+				return (provider: string, owner?: object) => {
+					if (owner) configApiKeys.get(owner)?.delete(resolveOAuthStorageProvider(provider));
+				};
+			}
+			if (property === "clearConfigApiKeys") {
+				return (owner?: object) => {
+					if (owner) configApiKeys.delete(owner);
+					else configApiKeys.clear();
+				};
+			}
+			if (property === "setFallbackResolver") {
+				return (resolver: (provider: string) => string | undefined, owner?: object) => {
+					if (!owner) return () => {};
+					fallbackResolvers.set(owner, resolver);
+					return () => {
+						if (fallbackResolvers.get(owner) === resolver) fallbackResolvers.delete(owner);
+					};
+				};
+			}
+			if (property === "onGenerationChanged") return () => () => {};
+			if (property === "peekApiKey") return peekApiKey;
+			if (property === "getApiKey")
+				return (provider: string, sessionId?: string, options?: AuthApiKeyOptions) =>
+					peekApiKey(provider, { ...options, sessionId });
+			if (property === "hasConfigApiKey") {
+				return (provider: string, owner?: object) =>
+					getConfigApiKey(provider, owner) !== undefined || base.hasConfigApiKey(provider, lookupOwner);
+			}
+			if (property === "hasAuth") {
+				return (provider: string, sessionId?: string, options?: { owner?: object }) => {
+					const configured = getConfigApiKey(provider, options?.owner);
+					if (configured && base.resolveEffectiveCredentialSelector(provider, sessionId)) return false;
+					return configured !== undefined || base.hasAuth(provider, sessionId, { owner: lookupOwner });
+				};
+			}
+			if (property === "hasUsableAuth") {
+				return (
+					provider: string,
+					options?: { owner?: object; sessionId?: string; credentialSelector?: AuthCredentialSelector },
+				) => {
+					const configured = getConfigApiKey(provider, options?.owner);
+					if (
+						configured &&
+						base.resolveEffectiveCredentialSelector(provider, options?.sessionId, options?.credentialSelector)
+					) {
+						return false;
+					}
+					return (
+						configured !== undefined ||
+						base.hasUsableAuth(provider, {
+							owner: lookupOwner,
+							sessionId: options?.sessionId,
+							credentialSelector: options?.credentialSelector,
+						})
+					);
+				};
+			}
+			if (property === "getEffectiveCredentialType") {
+				return (
+					provider: string,
+					sessionId?: string,
+					options?: { owner?: object; credentialSelector?: AuthCredentialSelector },
+				) => {
+					if (base.hasRuntimeApiKey(provider))
+						return base.getEffectiveCredentialType(provider, sessionId, options);
+					const configured = getConfigApiKey(provider, options?.owner);
+					if (
+						configured &&
+						base.resolveEffectiveCredentialSelector(provider, sessionId, options?.credentialSelector)
+					) {
+						return undefined;
+					}
+					if (
+						configured &&
+						!(configured.envSourced && base.getSessionCredentialType(provider, sessionId) === "api_key")
+					) {
+						return "api_key";
+					}
+					return base.getEffectiveCredentialType(provider, sessionId, {
+						owner: lookupOwner,
+						credentialSelector: options?.credentialSelector,
+					});
+				};
+			}
+			if (property === "getProviderEvidenceGeneration") {
+				return (provider: string, resolvedApiKey?: string, owner?: object) => {
+					const configured = getConfigApiKey(provider, owner);
+					const effectiveApiKey = base.hasRuntimeApiKey(provider)
+						? resolvedApiKey
+						: configured && !configured.envSourced
+							? configured.apiKey
+							: (resolvedApiKey ?? configured?.apiKey);
+					return base.getProviderEvidenceGeneration(
+						provider,
+						effectiveApiKey,
+						lookupOwner,
+						configured ? { apiKey: configured.apiKey } : undefined,
+					);
+				};
+			}
+			const value = Reflect.get(target, property, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}) as AuthStorage;
+	return { authStorage: staged, configApiKeys };
+}
+
+export interface ModelsConfigReloadCandidate {
+	readonly valid: boolean;
+	readonly changed: boolean;
+	readonly diagnostics: { readonly valid: boolean; readonly errors: readonly unknown[] };
+	readonly registry: ModelRegistry;
+	isCurrent(): boolean;
+	commit(): void;
+	rollback(): void;
+	finalize(): void;
+}
+
+interface ModelRegistryInternalOptions {
+	readonly configFile: ConfigFile<ModelsConfig>;
+	readonly configSource: LoadResult<ModelsConfig>;
+	readonly runtimeSource: ModelRegistry;
+	readonly acceptedPresets: AcceptedModelPresetRegistry;
+}
+
+interface RegistryLeaseWaiter {
+	readonly kind: "consumer" | "publication";
+	readonly signal?: AbortSignal;
+	readonly resolve: (release: () => void) => void;
+	readonly reject: (reason: unknown) => void;
+	settled: boolean;
+	abort?: () => void;
+}
+
 /**
  * Model registry - loads and manages models, resolves API keys via AuthStorage.
  */
@@ -1793,9 +2271,14 @@ export class ModelRegistry {
 	#modelProfiles: Map<string, ModelProfileDefinition> = mergeModelProfiles();
 	#configError: ConfigError | undefined = undefined;
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
+	#modelsConfigSource: LoadResult<ModelsConfig> | undefined;
+	#acceptedConfigValue: ModelsConfig | undefined;
+	#acceptedModelsConfigPresent = false;
+	#acceptedPresets: AcceptedModelPresetRegistry | undefined;
 	#settings: Pick<Settings, "get" | "getGlobal">;
 	#ownershipSettings: Pick<Settings, "commitAtomicBatchWithCurrent"> | undefined;
-	readonly #authStorageConfigOwner: object = {};
+	readonly #authStorageConfigOwner: object;
+	#ownedConfigApiKeys = new Map<string, StagedConfigApiKey>();
 	#disposeAuthStorageFallbackResolver: (() => void) | undefined;
 	#lastStaticLoadMtime: number | null = null;
 	#lastStaticLoadEnvironmentFingerprint: string | undefined;
@@ -1837,6 +2320,11 @@ export class ModelRegistry {
 	#configuredApiKeyEnvNames: Set<string> = new Set();
 	#optionalAuthPreflightGenerations = new Map<string, number>();
 	#optionalAuthPreflightEpoch = 0;
+	#stagedReloadCandidate = false;
+	#leaseWaiters: RegistryLeaseWaiter[] = [];
+	#activeConsumerLeases = 0;
+	#publicationFenceHeld = false;
+	#consumerContext = new AsyncLocalStorage<{ active: boolean }>();
 
 	/**
 	 * @param authStorage - Auth storage for API key resolution
@@ -1846,15 +2334,22 @@ export class ModelRegistry {
 		modelsPath?: string,
 		registrySettings?: Pick<Settings, "get" | "getGlobal"> & Partial<Pick<Settings, "commitAtomicBatchWithCurrent">>,
 		modelPresetRegistryDependencies: ModelPresetRegistryDependencies = {},
+		internalOptions?: ModelRegistryInternalOptions,
 	) {
+		this.#authStorageConfigOwner = internalOptions ? internalOptions.runtimeSource.#authStorageConfigOwner : {};
 		this.#settings = registrySettings ?? settings;
-		this.#ownershipSettings = registrySettings
-			? typeof registrySettings.commitAtomicBatchWithCurrent === "function"
-				? (registrySettings as Pick<Settings, "commitAtomicBatchWithCurrent">)
-				: undefined
-			: settings;
+		this.#ownershipSettings = internalOptions
+			? undefined
+			: registrySettings
+				? typeof registrySettings.commitAtomicBatchWithCurrent === "function"
+					? (registrySettings as Pick<Settings, "commitAtomicBatchWithCurrent">)
+					: undefined
+				: settings;
 		const configuredAgentDir = path.resolve(modelPresetRegistryDependencies.agentDir ?? getAgentDir());
-		this.#modelsConfigFile = ModelsConfigFile.relocate(modelsPath);
+		this.#modelsConfigFile = internalOptions?.configFile ?? ModelsConfigFile.relocate(modelsPath);
+		this.#modelsConfigSource = internalOptions?.configSource;
+		this.#acceptedPresets = internalOptions?.acceptedPresets;
+		this.#stagedReloadCandidate = internalOptions !== undefined;
 		this.#modelPresetRegistryAgentDir = modelPresetRegistryDependencies.agentDir
 			? configuredAgentDir
 			: modelsPath && path.isAbsolute(modelsPath)
@@ -1863,6 +2358,10 @@ export class ModelRegistry {
 		const { agentDir: _agentDir, ...registryDependencies } = modelPresetRegistryDependencies;
 		this.#modelPresetRegistryDependencies = registryDependencies;
 		this.#cacheDbPath = modelsPath ? path.join(path.dirname(modelsPath), "models.db") : undefined;
+		if (internalOptions) {
+			this.#copyRuntimeStateFrom(internalOptions.runtimeSource);
+			this.#clearOwnedConfigApiKeys();
+		}
 		// Set up fallback resolver for custom provider API keys
 		this.#disposeAuthStorageFallbackResolver = this.authStorage.setFallbackResolver(provider => {
 			const keyConfig = this.#customProviderApiKeys.get(provider);
@@ -1871,32 +2370,620 @@ export class ModelRegistry {
 		this.#unsubscribeAuthGeneration = this.authStorage.onGenerationChanged(() => this.#invalidateAvailableModels());
 		// Load models synchronously in constructor
 		this.#loadModels();
-		this.#cancelModelPresetRegistryRefresh = refreshModelPresetRegistryInBackground(
+		if (internalOptions) this.#reapplyRuntimeAuthConfiguration();
+		if (!internalOptions) {
+			this.#cancelModelPresetRegistryRefresh = refreshModelPresetRegistryInBackground(
+				{
+					...this.#modelPresetRegistryDependencies,
+					agentDir: this.#modelPresetRegistryAgentDir,
+					knownManifestSha256: this.#loadedModelPresetRegistryManifestSha256,
+				},
+				() => {
+					void this.#enqueueCatalogMutation(() => {
+						if (this.#disposed) return;
+						this.#reloadStaticModels();
+						this.#modelBindingsApplier.apply();
+						this.#notifyCatalogChanged();
+					}).catch(() => undefined);
+				},
+			);
+		}
+	}
+
+	#copyRuntimeStateFrom(source: ModelRegistry): void {
+		this.#sessionCanonicalVariants = new Map(source.#sessionCanonicalVariants);
+		this.#suppressedSelectors = new Map(source.#suppressedSelectors);
+		this.#selectorCircuits = new Map(
+			[...source.#selectorCircuits].map(([selector, circuit]) => [selector, structuredClone(circuit)]),
+		);
+		this.#runtimeModelOverlays = [...source.#runtimeModelOverlays];
+		this.#runtimeProviderApiKeys = new Map(source.#runtimeProviderApiKeys);
+		this.#runtimeProviderResolvedApiKeys = new Map(source.#runtimeProviderResolvedApiKeys);
+		this.#runtimeProviderCredentialInstalled = new Set(source.#runtimeProviderCredentialInstalled);
+		this.#runtimeProviderApiKeyEnvNames = new Map(source.#runtimeProviderApiKeyEnvNames);
+		this.#runtimeProviderOverrides = new Map(source.#runtimeProviderOverrides);
+		this.#runtimeProviderAuthHeaders = new Map(source.#runtimeProviderAuthHeaders);
+		this.#generatedAuthHeaderProviders = new Set(source.#generatedAuthHeaderProviders);
+		this.#runtimeProvidersBySource = new Map(
+			[...source.#runtimeProvidersBySource].map(([id, providers]) => [id, new Set(providers)]),
+		);
+		this.#runtimeProviderSourceByName = new Map(source.#runtimeProviderSourceByName);
+		this.#registeredProviderSources = new Set(source.#registeredProviderSources);
+		this.#descriptorDiscoveryEvidence = new Map(source.#descriptorDiscoveryEvidence);
+		this.#descriptorDiscoveryGenerations = new Map(source.#descriptorDiscoveryGenerations);
+		this.#configuredDiscoveryEvidence = new Map(source.#configuredDiscoveryEvidence);
+		this.#providerEvidenceApiKeys = new Map(source.#providerEvidenceApiKeys);
+		this.#credentiallessAuthFallbackProviders = new Map(source.#credentiallessAuthFallbackProviders);
+		this.#optionalAuthPreflightGenerations = new Map(source.#optionalAuthPreflightGenerations);
+		this.#optionalAuthPreflightEpoch = source.#optionalAuthPreflightEpoch;
+		this.#ownedConfigApiKeys = new Map(source.#ownedConfigApiKeys);
+		this.#acceptedPresets = source.#acceptedPresets;
+		this.#loadedModelPresetRegistryManifestSha256 = source.#loadedModelPresetRegistryManifestSha256;
+	}
+
+	#setOwnedConfigApiKey(
+		provider: string,
+		apiKey: string,
+		envSourced = false,
+		source: "config" | "runtime" = "config",
+	): void {
+		const key = resolveOAuthStorageProvider(provider);
+		const previous = this.#ownedConfigApiKeys.get(key);
+		this.#ownedConfigApiKeys.set(key, {
+			apiKey,
+			envSourced,
+			configSourced: source === "config" || previous?.configSourced === true,
+			runtimeSourced: source === "runtime" || previous?.runtimeSourced === true,
+		});
+		this.authStorage.setConfigApiKey(provider, apiKey, {
+			envSourced,
+			owner: this.#authStorageConfigOwner,
+		});
+	}
+
+	#removeOwnedConfigApiKey(provider: string): void {
+		this.#ownedConfigApiKeys.delete(resolveOAuthStorageProvider(provider));
+		this.authStorage.removeConfigApiKey(provider, this.#authStorageConfigOwner);
+	}
+
+	#clearOwnedConfigApiKeys(): void {
+		this.#ownedConfigApiKeys.clear();
+		this.authStorage.clearConfigApiKeys(this.#authStorageConfigOwner);
+	}
+
+	#reapplyRuntimeAuthConfiguration(): void {
+		for (const [provider, apiKeyConfig] of this.#runtimeProviderApiKeys) {
+			const resolved = this.#runtimeProviderApiKeyEnvNames.has(provider)
+				? $rotatingCredentialEnv(this.#runtimeProviderApiKeyEnvNames.get(provider)!)
+				: resolveApiKeyConfig(apiKeyConfig);
+			if (!resolved) continue;
+			this.#customProviderApiKeys.set(provider, resolved);
+			this.#runtimeProviderResolvedApiKeys.set(provider, resolved);
+			this.#runtimeProviderCredentialInstalled.add(provider);
+			this.#setOwnedConfigApiKey(provider, resolved, false, "runtime");
+		}
+	}
+
+	#swapReloadableState(other: ModelRegistry): void {
+		[this.#models, other.#models] = [other.#models, this.#models];
+		[this.#canonicalIndex, other.#canonicalIndex] = [other.#canonicalIndex, this.#canonicalIndex];
+		[this.#availableModelsCache, other.#availableModelsCache] = [
+			other.#availableModelsCache,
+			this.#availableModelsCache,
+		];
+		[this.#availableModelsDisabledProviders, other.#availableModelsDisabledProviders] = [
+			other.#availableModelsDisabledProviders,
+			this.#availableModelsDisabledProviders,
+		];
+		[this.#availableModelsEnvFingerprint, other.#availableModelsEnvFingerprint] = [
+			other.#availableModelsEnvFingerprint,
+			this.#availableModelsEnvFingerprint,
+		];
+		[this.#customProviderApiKeys, other.#customProviderApiKeys] = [
+			other.#customProviderApiKeys,
+			this.#customProviderApiKeys,
+		];
+		[this.#customProviderApiKeyEnvNames, other.#customProviderApiKeyEnvNames] = [
+			other.#customProviderApiKeyEnvNames,
+			this.#customProviderApiKeyEnvNames,
+		];
+		[this.#customProviderAuthHeaders, other.#customProviderAuthHeaders] = [
+			other.#customProviderAuthHeaders,
+			this.#customProviderAuthHeaders,
+		];
+		[this.#providerWebSearchModes, other.#providerWebSearchModes] = [
+			other.#providerWebSearchModes,
+			this.#providerWebSearchModes,
+		];
+		[this.#keylessProviders, other.#keylessProviders] = [other.#keylessProviders, this.#keylessProviders];
+		[this.#optionalAuthProviders, other.#optionalAuthProviders] = [
+			other.#optionalAuthProviders,
+			this.#optionalAuthProviders,
+		];
+		[this.#credentiallessAuthFallbackProviders, other.#credentiallessAuthFallbackProviders] = [
+			other.#credentiallessAuthFallbackProviders,
+			this.#credentiallessAuthFallbackProviders,
+		];
+		[this.#providerEvidenceApiKeys, other.#providerEvidenceApiKeys] = [
+			other.#providerEvidenceApiKeys,
+			this.#providerEvidenceApiKeys,
+		];
+		[this.#providerActivity, other.#providerActivity] = [other.#providerActivity, this.#providerActivity];
+		[this.#configuredProviderIds, other.#configuredProviderIds] = [
+			other.#configuredProviderIds,
+			this.#configuredProviderIds,
+		];
+		[this.#configuredDiscoveryProviderIds, other.#configuredDiscoveryProviderIds] = [
+			other.#configuredDiscoveryProviderIds,
+			this.#configuredDiscoveryProviderIds,
+		];
+		[this.#descriptorDiscoveryEvidence, other.#descriptorDiscoveryEvidence] = [
+			other.#descriptorDiscoveryEvidence,
+			this.#descriptorDiscoveryEvidence,
+		];
+		[this.#descriptorDiscoveryGenerations, other.#descriptorDiscoveryGenerations] = [
+			other.#descriptorDiscoveryGenerations,
+			this.#descriptorDiscoveryGenerations,
+		];
+		[this.#configuredDiscoveryEvidence, other.#configuredDiscoveryEvidence] = [
+			other.#configuredDiscoveryEvidence,
+			this.#configuredDiscoveryEvidence,
+		];
+		[this.#discoveryManager, other.#discoveryManager] = [other.#discoveryManager, this.#discoveryManager];
+		[this.#customModelOverlays, other.#customModelOverlays] = [other.#customModelOverlays, this.#customModelOverlays];
+		[this.#providerOverrides, other.#providerOverrides] = [other.#providerOverrides, this.#providerOverrides];
+		[this.#modelOverrides, other.#modelOverrides] = [other.#modelOverrides, this.#modelOverrides];
+		[this.#codexContextWindowOverrides, other.#codexContextWindowOverrides] = [
+			other.#codexContextWindowOverrides,
+			this.#codexContextWindowOverrides,
+		];
+		[this.#equivalenceConfig, other.#equivalenceConfig] = [other.#equivalenceConfig, this.#equivalenceConfig];
+		[this.#acceptedPresets, other.#acceptedPresets] = [other.#acceptedPresets, this.#acceptedPresets];
+		[this.#modelProfiles, other.#modelProfiles] = [other.#modelProfiles, this.#modelProfiles];
+		[this.#configError, other.#configError] = [other.#configError, this.#configError];
+		[this.#ownedConfigApiKeys, other.#ownedConfigApiKeys] = [other.#ownedConfigApiKeys, this.#ownedConfigApiKeys];
+		[this.#lastStaticLoadMtime, other.#lastStaticLoadMtime] = [other.#lastStaticLoadMtime, this.#lastStaticLoadMtime];
+		[this.#lastStaticLoadEnvironmentFingerprint, other.#lastStaticLoadEnvironmentFingerprint] = [
+			other.#lastStaticLoadEnvironmentFingerprint,
+			this.#lastStaticLoadEnvironmentFingerprint,
+		];
+		[this.#lastModelPresetRegistryFingerprint, other.#lastModelPresetRegistryFingerprint] = [
+			other.#lastModelPresetRegistryFingerprint,
+			this.#lastModelPresetRegistryFingerprint,
+		];
+		[this.#loadedModelPresetRegistryManifestSha256, other.#loadedModelPresetRegistryManifestSha256] = [
+			other.#loadedModelPresetRegistryManifestSha256,
+			this.#loadedModelPresetRegistryManifestSha256,
+		];
+		[this.#staticModelsLoaded, other.#staticModelsLoaded] = [other.#staticModelsLoaded, this.#staticModelsLoaded];
+		[this.#lastDisabledProviderKey, other.#lastDisabledProviderKey] = [
+			other.#lastDisabledProviderKey,
+			this.#lastDisabledProviderKey,
+		];
+		[this.#runtimeModelOverlays, other.#runtimeModelOverlays] = [
+			other.#runtimeModelOverlays,
+			this.#runtimeModelOverlays,
+		];
+		[this.#runtimeProviderApiKeys, other.#runtimeProviderApiKeys] = [
+			other.#runtimeProviderApiKeys,
+			this.#runtimeProviderApiKeys,
+		];
+		[this.#runtimeProviderResolvedApiKeys, other.#runtimeProviderResolvedApiKeys] = [
+			other.#runtimeProviderResolvedApiKeys,
+			this.#runtimeProviderResolvedApiKeys,
+		];
+		[this.#runtimeProviderCredentialInstalled, other.#runtimeProviderCredentialInstalled] = [
+			other.#runtimeProviderCredentialInstalled,
+			this.#runtimeProviderCredentialInstalled,
+		];
+		[this.#runtimeProviderApiKeyEnvNames, other.#runtimeProviderApiKeyEnvNames] = [
+			other.#runtimeProviderApiKeyEnvNames,
+			this.#runtimeProviderApiKeyEnvNames,
+		];
+		[this.#runtimeProviderOverrides, other.#runtimeProviderOverrides] = [
+			other.#runtimeProviderOverrides,
+			this.#runtimeProviderOverrides,
+		];
+		[this.#runtimeProviderAuthHeaders, other.#runtimeProviderAuthHeaders] = [
+			other.#runtimeProviderAuthHeaders,
+			this.#runtimeProviderAuthHeaders,
+		];
+		[this.#generatedAuthHeaderProviders, other.#generatedAuthHeaderProviders] = [
+			other.#generatedAuthHeaderProviders,
+			this.#generatedAuthHeaderProviders,
+		];
+		[this.#generatedAuthHeaders, other.#generatedAuthHeaders] = [
+			other.#generatedAuthHeaders,
+			this.#generatedAuthHeaders,
+		];
+		[this.#runtimeProvidersBySource, other.#runtimeProvidersBySource] = [
+			other.#runtimeProvidersBySource,
+			this.#runtimeProvidersBySource,
+		];
+		[this.#runtimeProviderSourceByName, other.#runtimeProviderSourceByName] = [
+			other.#runtimeProviderSourceByName,
+			this.#runtimeProviderSourceByName,
+		];
+		[this.#registeredProviderSources, other.#registeredProviderSources] = [
+			other.#registeredProviderSources,
+			this.#registeredProviderSources,
+		];
+		[this.#registryModelKeys, other.#registryModelKeys] = [other.#registryModelKeys, this.#registryModelKeys];
+		[this.#configuredApiKeyEnvNames, other.#configuredApiKeyEnvNames] = [
+			other.#configuredApiKeyEnvNames,
+			this.#configuredApiKeyEnvNames,
+		];
+		[this.#optionalAuthPreflightGenerations, other.#optionalAuthPreflightGenerations] = [
+			other.#optionalAuthPreflightGenerations,
+			this.#optionalAuthPreflightGenerations,
+		];
+		[this.#optionalAuthPreflightEpoch, other.#optionalAuthPreflightEpoch] = [
+			other.#optionalAuthPreflightEpoch,
+			this.#optionalAuthPreflightEpoch,
+		];
+		const previousBindings = this.#modelBindingsApplier.getBindings();
+		this.#modelBindingsApplier.setBindings(other.#modelBindingsApplier.getBindings());
+		other.#modelBindingsApplier.setBindings(previousBindings);
+		this.#modelBindingsApplier.apply();
+		this.#modelsConfigFile.invalidate();
+		this.#availableModelsCache = undefined;
+	}
+
+	#reconcileOwnedConfigApiKeys(
+		configs: ReadonlyMap<string, StagedConfigApiKey>,
+		previousConfigs: ReadonlyMap<string, StagedConfigApiKey>,
+	): void {
+		for (const [provider, previous] of previousConfigs) {
+			const next = configs.get(provider);
+			if (next?.apiKey === previous.apiKey && next.envSourced === previous.envSourced) continue;
+			this.authStorage.removeConfigApiKey(provider, this.#authStorageConfigOwner);
+		}
+		for (const [provider, config] of configs) {
+			const previous = previousConfigs.get(provider);
+			if (previous?.apiKey === config.apiKey && previous.envSourced === config.envSourced) continue;
+			this.authStorage.setConfigApiKey(provider, config.apiKey, {
+				envSourced: config.envSourced,
+				owner: this.#authStorageConfigOwner,
+			});
+		}
+	}
+
+	getModelsConfigPath(): string | undefined {
+		return this.#modelsConfigFile.path();
+	}
+
+	async stageModelsConfigReload(
+		snapshot: {
+			path: string;
+			text: string | null;
+			identity: string;
+		},
+		registrySettings: Pick<Settings, "get" | "getGlobal"> = this.#settings,
+	): Promise<ModelsConfigReloadCandidate> {
+		if (this.#disposed) throw new Error("Model registry is disposed");
+		const pathMatches = path.resolve(snapshot.path) === path.resolve(this.#modelsConfigFile.path());
+		const source = pathMatches
+			? parseModelsConfigSnapshot(snapshot)
+			: {
+					status: "error" as const,
+					error: new ConfigError("models", undefined, {
+						err: new Error("Models config path changed while the watcher was active"),
+						stage: "Snapshot",
+					}),
+				};
+		const accepted = source.status === "ok" || (source.status === "not-found" && !this.#acceptedModelsConfigPresent);
+		const diagnostics = {
+			valid: accepted,
+			errors: accepted
+				? []
+				: [source.status === "error" ? source.error : new Error("Cannot delete an accepted models config")],
+		};
+		const stagedAuthStorage = createStagedAuthStorage(this.authStorage);
+		stagedAuthStorage.configApiKeys.set(this.#authStorageConfigOwner, new Map(this.#ownedConfigApiKeys));
+		const acceptedPresets =
+			this.#acceptedPresets ??
+			loadAcceptedModelPresetProfiles(this.#modelPresetRegistryAgentDir, this.#modelPresetRegistryDependencies);
+		const registry = new ModelRegistry(
+			stagedAuthStorage.authStorage,
+			this.#modelsConfigFile.path(),
+			registrySettings,
+			{ ...this.#modelPresetRegistryDependencies, automaticRefresh: false },
 			{
-				...this.#modelPresetRegistryDependencies,
-				agentDir: this.#modelPresetRegistryAgentDir,
-				knownManifestSha256: this.#loadedModelPresetRegistryManifestSha256,
-			},
-			() => {
-				void this.#enqueueCatalogMutation(() => {
-					if (this.#disposed) return;
-					this.#reloadStaticModels();
-					this.#modelBindingsApplier.apply();
-					this.#notifyCatalogChanged();
-				}).catch(() => undefined);
+				configFile: this.#modelsConfigFile,
+				configSource: source,
+				runtimeSource: this,
+				acceptedPresets,
 			},
 		);
+		if (registry.getError()) {
+			diagnostics.valid = false;
+			diagnostics.errors.push(registry.getError()!);
+		}
+		for (const [provider, apiKey] of registry.#ownedConfigApiKeys) {
+			if (apiKey.runtimeSourced === true && apiKey.configSourced !== true) continue;
+			if (!this.authStorage.hasAnyCredentialPin(provider)) continue;
+			diagnostics.valid = false;
+			diagnostics.errors.push(
+				new Error(
+					`Cannot configure an API key override for ${provider} while a credential pin is active or unavailable`,
+				),
+			);
+		}
+		let committed = false;
+		let finished = false;
+		const previousConfigPresent = this.#acceptedModelsConfigPresent;
+		const previousConfigValue = this.#acceptedConfigValue;
+		const nextConfigValue = source.status === "ok" ? source.value : undefined;
+		const changed = !isDeepStrictEqual(previousConfigValue, nextConfigValue);
+		const unchangedProviders = new Set(
+			[...this.#providerActivity.keys()].filter(
+				provider =>
+					isDeepStrictEqual(previousConfigValue?.providers?.[provider], nextConfigValue?.providers?.[provider]) &&
+					isDeepStrictEqual(this.#providerOverrides.get(provider), registry.#providerOverrides.get(provider)) &&
+					isDeepStrictEqual(this.#modelOverrides.get(provider), registry.#modelOverrides.get(provider)) &&
+					this.#customProviderApiKeys.get(provider) === registry.#customProviderApiKeys.get(provider) &&
+					isDeepStrictEqual(this.#ownedConfigApiKeys.get(provider), registry.#ownedConfigApiKeys.get(provider)),
+			),
+		);
+		const unchangedProviderSnapshots = new Map(
+			[...unchangedProviders].map(provider => [
+				provider,
+				{
+					models: this.#models.filter(model => model.provider === provider),
+					discoveryState: this.#discoveryManager.getState(provider),
+					configuredEvidence: this.#configuredDiscoveryEvidence.get(provider),
+					descriptorEvidence: this.#descriptorDiscoveryEvidence.get(provider),
+					descriptorGeneration: this.#descriptorDiscoveryGenerations.get(provider),
+					providerEvidenceApiKey: this.#providerEvidenceApiKeys.get(provider),
+					credentiallessFallback: this.#credentiallessAuthFallbackProviders.get(provider),
+					optionalAuthPreflightGeneration: this.#optionalAuthPreflightGenerations.get(provider),
+					activity: this.#providerActivity.get(provider),
+				},
+			]),
+		);
+		const copyProviderEntry = <T>(target: Map<string, T>, source: ReadonlyMap<string, T>, provider: string) => {
+			const value = source.get(provider);
+			if (value === undefined) target.delete(provider);
+			else target.set(provider, value);
+		};
+		const stagedModelKeys = new Set(registry.#models.map(model => `${model.provider}/${model.id}`));
+		for (const model of this.#models) {
+			if (!unchangedProviders.has(model.provider) || stagedModelKeys.has(`${model.provider}/${model.id}`)) continue;
+			registry.#models.push(model);
+		}
+		registry.#discoveryManager.retainStatesFrom(this.#discoveryManager, unchangedProviders);
+		const retainedActivity = new Map(registry.#providerActivity);
+		for (const provider of unchangedProviders) {
+			copyProviderEntry(registry.#configuredDiscoveryEvidence, this.#configuredDiscoveryEvidence, provider);
+			copyProviderEntry(registry.#descriptorDiscoveryEvidence, this.#descriptorDiscoveryEvidence, provider);
+			copyProviderEntry(registry.#descriptorDiscoveryGenerations, this.#descriptorDiscoveryGenerations, provider);
+			copyProviderEntry(registry.#providerEvidenceApiKeys, this.#providerEvidenceApiKeys, provider);
+			copyProviderEntry(retainedActivity, this.#providerActivity, provider);
+		}
+		registry.#providerActivity = retainedActivity;
+		registry.#rebuildCanonicalIndex();
+		const rebaseProviderDiscoveryAfterQueuedRefresh = () => {
+			const changedProviders = new Set(
+				[...unchangedProviders].filter(provider => {
+					const snapshot = unchangedProviderSnapshots.get(provider)!;
+					return (
+						!isDeepStrictEqual(
+							snapshot.models,
+							this.#models.filter(model => model.provider === provider),
+						) ||
+						!isDeepStrictEqual(snapshot.discoveryState, this.#discoveryManager.getState(provider)) ||
+						!isDeepStrictEqual(snapshot.configuredEvidence, this.#configuredDiscoveryEvidence.get(provider)) ||
+						!isDeepStrictEqual(snapshot.descriptorEvidence, this.#descriptorDiscoveryEvidence.get(provider)) ||
+						snapshot.descriptorGeneration !== this.#descriptorDiscoveryGenerations.get(provider) ||
+						snapshot.providerEvidenceApiKey !== this.#providerEvidenceApiKeys.get(provider) ||
+						snapshot.credentiallessFallback !== this.#credentiallessAuthFallbackProviders.get(provider) ||
+						snapshot.optionalAuthPreflightGeneration !== this.#optionalAuthPreflightGenerations.get(provider) ||
+						!isDeepStrictEqual(snapshot.activity, this.#providerActivity.get(provider))
+					);
+				}),
+			);
+			if (changedProviders.size === 0) return;
+
+			registry.#models = registry.#models.filter(model => !changedProviders.has(model.provider));
+			registry.#models.push(...this.#models.filter(model => changedProviders.has(model.provider)));
+			for (const provider of changedProviders) registry.#discoveryManager.invalidate(provider);
+			registry.#discoveryManager.retainStatesFrom(this.#discoveryManager, changedProviders);
+			const providerActivity = new Map(registry.#providerActivity);
+			for (const provider of changedProviders) {
+				copyProviderEntry(registry.#configuredDiscoveryEvidence, this.#configuredDiscoveryEvidence, provider);
+				copyProviderEntry(registry.#descriptorDiscoveryEvidence, this.#descriptorDiscoveryEvidence, provider);
+				copyProviderEntry(registry.#descriptorDiscoveryGenerations, this.#descriptorDiscoveryGenerations, provider);
+				copyProviderEntry(registry.#providerEvidenceApiKeys, this.#providerEvidenceApiKeys, provider);
+				copyProviderEntry(
+					registry.#credentiallessAuthFallbackProviders,
+					this.#credentiallessAuthFallbackProviders,
+					provider,
+				);
+				copyProviderEntry(
+					registry.#optionalAuthPreflightGenerations,
+					this.#optionalAuthPreflightGenerations,
+					provider,
+				);
+				copyProviderEntry(providerActivity, this.#providerActivity, provider);
+			}
+			registry.#providerActivity = providerActivity;
+			registry.#rebuildCanonicalIndex();
+		};
+		const expectedGeneration = this.#catalogRefreshGeneration;
+		const isCurrent = () => !this.#disposed && this.#catalogRefreshGeneration === expectedGeneration;
+		const commit = () => {
+			if (finished) throw new Error("Models config reload candidate is no longer active");
+			if (!diagnostics.valid) throw new Error("Cannot commit an invalid models config reload candidate");
+			if (committed) return;
+			if (!isCurrent()) {
+				throw new Error("Model catalog changed during configuration preflight");
+			}
+			for (const [provider, apiKey] of registry.#ownedConfigApiKeys) {
+				if (apiKey.runtimeSourced === true && apiKey.configSourced !== true) continue;
+				if (this.authStorage.hasAnyCredentialPin(provider)) {
+					throw new Error(
+						`Cannot configure an API key override for ${provider} while a credential pin is active or unavailable`,
+					);
+				}
+			}
+			rebaseProviderDiscoveryAfterQueuedRefresh();
+			this.#swapReloadableState(registry);
+			try {
+				this.#reconcileOwnedConfigApiKeys(this.#ownedConfigApiKeys, registry.#ownedConfigApiKeys);
+				this.#acceptedModelsConfigPresent = source.status === "ok";
+				this.#acceptedConfigValue = nextConfigValue;
+				// The captured source may precede the current disk revision.
+				this.#lastStaticLoadMtime = null;
+				committed = true;
+			} catch (error) {
+				this.#swapReloadableState(registry);
+				this.#reconcileOwnedConfigApiKeys(this.#ownedConfigApiKeys, registry.#ownedConfigApiKeys);
+				throw error;
+			}
+		};
+		const rollback = () => {
+			if (finished) return;
+			if (committed) {
+				this.#swapReloadableState(registry);
+				this.#reconcileOwnedConfigApiKeys(this.#ownedConfigApiKeys, registry.#ownedConfigApiKeys);
+				this.#acceptedModelsConfigPresent = previousConfigPresent;
+				this.#acceptedConfigValue = previousConfigValue;
+				committed = false;
+			}
+			finished = true;
+			void registry.dispose();
+		};
+		const finalize = () => {
+			if (finished) return;
+			if (!committed) throw new Error("Cannot finalize an unpublished models configuration");
+			finished = true;
+			this.#catalogRefreshGeneration++;
+			this.#notifyCatalogChanged();
+			void registry.dispose();
+		};
+		return { valid: diagnostics.valid, changed, diagnostics, registry, isCurrent, commit, rollback, finalize };
+	}
+
+	#acquireLease(kind: RegistryLeaseWaiter["kind"], signal?: AbortSignal): Promise<() => void> {
+		if (this.#disposed) return Promise.reject(new Error("Model registry is disposed"));
+		if (signal?.aborted) return Promise.reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+		if (
+			!this.#publicationFenceHeld &&
+			this.#leaseWaiters.length === 0 &&
+			(kind === "consumer" || this.#activeConsumerLeases === 0)
+		) {
+			return Promise.resolve(this.#grantLease(kind));
+		}
+		const { promise, resolve, reject } = Promise.withResolvers<() => void>();
+		const waiter: RegistryLeaseWaiter = { kind, signal, resolve, reject, settled: false };
+		if (signal) {
+			waiter.abort = () => {
+				if (waiter.settled) return;
+				waiter.settled = true;
+				this.#leaseWaiters = this.#leaseWaiters.filter(item => item !== waiter);
+				reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+				this.#drainLeaseWaiters();
+			};
+			signal.addEventListener("abort", waiter.abort, { once: true });
+		}
+		this.#leaseWaiters.push(waiter);
+		this.#drainLeaseWaiters();
+		return promise;
+	}
+
+	#grantLease(kind: RegistryLeaseWaiter["kind"]): () => void {
+		if (kind === "publication") this.#publicationFenceHeld = true;
+		else this.#activeConsumerLeases += 1;
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			if (kind === "publication") this.#publicationFenceHeld = false;
+			else this.#activeConsumerLeases -= 1;
+			this.#drainLeaseWaiters();
+		};
+	}
+
+	#drainLeaseWaiters(): void {
+		if (this.#publicationFenceHeld) return;
+		while (this.#leaseWaiters.length > 0) {
+			const waiter = this.#leaseWaiters[0]!;
+			if (waiter.kind === "publication") {
+				if (this.#activeConsumerLeases > 0) return;
+				this.#leaseWaiters.shift();
+				waiter.settled = true;
+				if (waiter.abort) waiter.signal?.removeEventListener("abort", waiter.abort);
+				waiter.resolve(this.#grantLease("publication"));
+				return;
+			}
+			this.#leaseWaiters.shift();
+			waiter.settled = true;
+			if (waiter.abort) waiter.signal?.removeEventListener("abort", waiter.abort);
+			waiter.resolve(this.#grantLease("consumer"));
+		}
+	}
+
+	async withConsumerLease<T>(body: () => T | Promise<T>, signal?: AbortSignal): Promise<T> {
+		signal?.throwIfAborted();
+		if (this.#consumerContext.getStore()?.active) return await body();
+		const release = await this.#acquireLease("consumer", signal);
+		const owner = { active: true };
+		try {
+			return await this.#consumerContext.run(owner, body);
+		} finally {
+			owner.active = false;
+			release();
+		}
+	}
+
+	async acquirePublicationFence(signal?: AbortSignal): Promise<() => void> {
+		if (this.#consumerContext.getStore()?.active) {
+			throw new Error("Cannot publish configuration while holding a model consumer lease");
+		}
+		const release = await this.#acquireLease("publication", signal);
+		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		const barrier = this.#enqueueCatalogMutation(async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		const cancelled = Promise.withResolvers<void>();
+		const abort = () => cancelled.reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+		signal?.addEventListener("abort", abort, { once: true });
+		try {
+			if (signal?.aborted) abort();
+			await Promise.race([entered.promise, cancelled.promise]);
+			signal?.throwIfAborted();
+		} catch (error) {
+			gate.resolve();
+			void barrier.finally(release);
+			throw error;
+		} finally {
+			signal?.removeEventListener("abort", abort);
+		}
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			gate.resolve();
+			void barrier.finally(release);
+		};
 	}
 
 	dispose(): Promise<void> {
 		if (this.#disposePromise) return this.#disposePromise;
 		this.#disposed = true;
+		for (const waiter of this.#leaseWaiters.splice(0)) {
+			waiter.settled = true;
+			if (waiter.abort) waiter.signal?.removeEventListener("abort", waiter.abort);
+			waiter.reject(new Error("Model registry is disposed"));
+		}
 		this.#catalogRefreshGeneration++;
 		const awaitRefreshDisposal = this.#cancelModelPresetRegistryRefresh?.() ?? Promise.resolve();
 		this.#cancelModelPresetRegistryRefresh = undefined;
 		this.#unsubscribeAuthGeneration?.();
 		this.#unsubscribeAuthGeneration = undefined;
-		this.authStorage.clearConfigApiKeys(this.#authStorageConfigOwner);
+		this.#clearOwnedConfigApiKeys();
 		this.#disposeAuthStorageFallbackResolver?.();
 		this.#disposeAuthStorageFallbackResolver = undefined;
 		this.#catalogChangeListeners.clear();
@@ -2141,6 +3228,11 @@ export class ModelRegistry {
 		);
 		return JSON.stringify({
 			apiKeyEnv: [...this.#configuredApiKeyEnvNames].sort().map(name => [name, Bun.env[name] ?? ""]),
+			credentialPins: this.#stagedReloadCandidate
+				? []
+				: [...this.#configuredProviderIds]
+						.sort()
+						.map(provider => [provider, this.authStorage.hasAnyCredentialPin(provider)]),
 			implicitEndpoints: [
 				["OLLAMA_BASE_URL", Bun.env.OLLAMA_BASE_URL || ""],
 				["LLAMA_CPP_BASE_URL", Bun.env.LLAMA_CPP_BASE_URL || ""],
@@ -2171,7 +3263,7 @@ export class ModelRegistry {
 			environmentFingerprint === this.#lastStaticLoadEnvironmentFingerprint &&
 			modelPresetRegistryFingerprint === this.#lastModelPresetRegistryFingerprint
 		) {
-			// models.json and settings-derived implicit provider state are unchanged.
+			// Config, settings-derived provider state, and effective credential selectors are unchanged.
 			return;
 		}
 		this.#modelsConfigFile.invalidate();
@@ -2189,7 +3281,7 @@ export class ModelRegistry {
 		// Drop config-sourced apiKeys from AuthStorage before reload; entries
 		// removed from models.yml must actually disappear from the resolver, not
 		// linger from the previous parse. The post-load setters below repopulate.
-		this.authStorage.clearConfigApiKeys(this.#authStorageConfigOwner);
+		this.#clearOwnedConfigApiKeys();
 		// Runtime provider keys are reapplied after #loadModels so they retain
 		// registration-time precedence over colliding static provider keys.
 		this.#providerOverrides.clear();
@@ -2202,7 +3294,7 @@ export class ModelRegistry {
 			const resolved = this.#runtimeProviderApiKeyEnvNames.has(provider)
 				? $rotatingCredentialEnv(this.#runtimeProviderApiKeyEnvNames.get(provider)!)
 				: resolveApiKeyConfig(apiKeyConfig);
-			if (!resolved) {
+			if (!resolved || this.authStorage.hasAnyCredentialPin(provider)) {
 				this.#runtimeProviderCredentialInstalled.delete(provider);
 				const authHeader = this.#runtimeProviderAuthHeaders.get(provider);
 				if (authHeader === true) {
@@ -2225,7 +3317,7 @@ export class ModelRegistry {
 			this.#customProviderApiKeys.set(provider, resolved);
 			this.#runtimeProviderResolvedApiKeys.set(provider, resolved);
 			this.#runtimeProviderCredentialInstalled.add(provider);
-			this.authStorage.setConfigApiKey(provider, resolved, { owner: this.#authStorageConfigOwner });
+			this.#setOwnedConfigApiKey(provider, resolved, false, "runtime");
 			const override = this.#runtimeProviderOverrides.get(provider);
 			if (override) this.#runtimeProviderOverrides.set(provider, { ...override, apiKey: resolved });
 			const authHeader = this.#runtimeProviderAuthHeaders.get(provider);
@@ -2258,11 +3350,11 @@ export class ModelRegistry {
 			const resolved = this.#runtimeProviderApiKeyEnvNames.has(provider)
 				? $rotatingCredentialEnv(this.#runtimeProviderApiKeyEnvNames.get(provider)!)
 				: resolveApiKeyConfig(apiKeyConfig);
-			if (!resolved) continue;
+			if (!resolved || this.authStorage.hasAnyCredentialPin(provider)) continue;
 			this.#customProviderApiKeys.set(provider, resolved);
 			this.#runtimeProviderResolvedApiKeys.set(provider, resolved);
 			this.#runtimeProviderCredentialInstalled.add(provider);
-			this.authStorage.setConfigApiKey(provider, resolved, { owner: this.#authStorageConfigOwner });
+			this.#setOwnedConfigApiKey(provider, resolved, false, "runtime");
 		}
 		this.#lastDisabledProviderKey = disabledProviderKey;
 	}
@@ -2298,10 +3390,10 @@ export class ModelRegistry {
 		this.#codexContextWindowOverrides = this.#collectCodexContextWindowOverrides();
 		this.#equivalenceConfig = equivalence;
 		this.#modelBindingsApplier.setBindings(modelBindings);
-		const acceptedPresets = loadAcceptedModelPresetProfiles(
-			this.#modelPresetRegistryAgentDir,
-			this.#modelPresetRegistryDependencies,
-		);
+		const acceptedPresets = this.#stagedReloadCandidate
+			? this.#acceptedPresets!
+			: loadAcceptedModelPresetProfiles(this.#modelPresetRegistryAgentDir, this.#modelPresetRegistryDependencies);
+		this.#acceptedPresets = acceptedPresets;
 		const acceptedRegistryError = acceptedPresets.error
 			? new ConfigError("model-preset-registry", undefined, {
 					err: new Error(acceptedPresets.error),
@@ -2476,6 +3568,9 @@ export class ModelRegistry {
 				const inheritedCompat = explicitTransportMatches
 					? explicitTransport?.compat
 					: commonRegistryTransportCompat(transportTemplates);
+				const streamIdleTimeoutMs = isRequestTransformApi(registryModel.api)
+					? (registryModel.streamIdleTimeoutMs ?? explicitTransport?.streamIdleTimeoutMs)
+					: undefined;
 				const hydratedRegistryModel = {
 					...registryModel,
 					baseUrl: transportSource.baseUrl!,
@@ -2483,6 +3578,7 @@ export class ModelRegistry {
 					transport: transportSource.transport,
 					requestTransform: transportSource.requestTransform,
 					cacheRetention: transportSource.cacheRetention,
+					...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
 					isOAuth: transportSource.isOAuth,
 					compat:
 						inheritedCompat || registryModel.compat || explicitTransport?.compat
@@ -2498,14 +3594,23 @@ export class ModelRegistry {
 				continue;
 			}
 			const existing = merged[existingIndex]!;
+			const { streamIdleTimeoutMs: existingStreamIdleTimeoutMs, ...existingWithoutStreamIdleTimeout } = existing;
 			const effectiveApi = explicitTransport?.api ?? existing.api;
 			const registryApiMatchesEffectiveTransport = registryModel.api === effectiveApi;
 			const registryMetadata = registryApiMatchesEffectiveTransport
 				? registryModel
 				: registryModelMetadataWithoutApiSpecificFields(registryModel);
+			const {
+				streamIdleTimeoutMs: registryMetadataStreamIdleTimeoutMs,
+				...registryMetadataWithoutStreamIdleTimeout
+			} = registryMetadata;
+			const streamIdleTimeoutMs = isRequestTransformApi(effectiveApi)
+				? (registryMetadataStreamIdleTimeoutMs ?? existingStreamIdleTimeoutMs)
+				: undefined;
 			merged[existingIndex] = {
-				...existing,
-				...registryMetadata,
+				...existingWithoutStreamIdleTimeout,
+				...registryMetadataWithoutStreamIdleTimeout,
+				...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
 				api: explicitTransport?.api ?? existing.api,
 				baseUrl: existing.baseUrl,
 				headers: existing.headers,
@@ -2542,9 +3647,14 @@ export class ModelRegistry {
 			const existingIndex = indexByKey.get(key);
 			if (existingIndex !== undefined) {
 				const existingModel = merged[existingIndex];
+				const { streamIdleTimeoutMs: existingStreamIdleTimeoutMs, ...existingModelWithoutStreamIdleTimeout } =
+					existingModel;
 				const referenceModel = resolveCustomModelReference(customModel.id);
+				const streamIdleTimeoutMs = isRequestTransformApi(customModel.api)
+					? (customModel.streamIdleTimeoutMs ?? existingStreamIdleTimeoutMs)
+					: undefined;
 				merged[existingIndex] = enrichModelThinking({
-					...existingModel,
+					...existingModelWithoutStreamIdleTimeout,
 					id: customModel.id,
 					provider: customModel.provider,
 					api: customModel.api,
@@ -2568,6 +3678,7 @@ export class ModelRegistry {
 					wireModelId: customModel.wireModelId,
 					requestTransform: customModel.requestTransform,
 					premiumMultiplier: customModel.premiumMultiplier ?? existingModel.premiumMultiplier,
+					...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
 				} as Model<Api>);
 			} else {
 				merged.push(finalizeCustomModel(customModel, { useDefaults: true }));
@@ -2740,10 +3851,12 @@ export class ModelRegistry {
 		});
 	}
 	#sanitizeDiscoverableModelsForCache(_providerConfig: DiscoveryProviderConfig, models: Model<Api>[]): Model<Api>[] {
-		return this.#stripModelBaseUrlQueries(models).map(model => ({
-			...model,
-			headers: undefined,
-		}));
+		return this.#stripModelBaseUrlQueries(models).map(model => {
+			const cachedModel = { ...model, headers: undefined };
+			// Model idle timeouts come from local config and must be re-derived on cache load.
+			delete cachedModel.streamIdleTimeoutMs;
+			return cachedModel;
+		});
 	}
 	#stripModelBaseUrlQueries(models: readonly Model<Api>[]): Model<Api>[] {
 		return models.map(model => createTrustedStrippedModelClone(model));
@@ -2824,7 +3937,10 @@ export class ModelRegistry {
 
 	#loadCustomModels(): CustomModelsResult {
 		this.#configuredApiKeyEnvNames.clear();
-		const { value, error, status } = this.#modelsConfigFile.tryLoad();
+		const loaded = this.#modelsConfigSource ?? this.#modelsConfigFile.tryLoad();
+		const { value, error, status } = loaded;
+		this.#acceptedConfigValue = status === "ok" ? value : undefined;
+		if (status === "ok") this.#acceptedModelsConfigPresent = true;
 
 		if (status === "error") {
 			return {
@@ -2859,6 +3975,7 @@ export class ModelRegistry {
 		const configuredProviders = new Set(Object.keys(value.providers ?? {}));
 
 		for (const [providerName, providerConfig] of providerEntries) {
+			const credentialPinActive = !this.#stagedReloadCandidate && this.authStorage.hasAnyCredentialPin(providerName);
 			const authMode = (providerConfig.auth ?? "apiKey") as ProviderAuthMode;
 			const isOAuth = resolveCustomModelIsOAuth(
 				(providerConfig.api as Api | undefined) ?? "openai-completions",
@@ -2873,9 +3990,11 @@ export class ModelRegistry {
 			if (providerConfig.openaiCompat?.apiKey)
 				this.#configuredApiKeyEnvNames.add(providerConfig.openaiCompat.apiKey);
 			if (providerConfig.webSearch) this.#providerWebSearchModes.set(providerName, providerConfig.webSearch);
-			const providerApiKeyConfig = providerConfig.apiKey
-				? resolveApiKeyConfig(providerConfig.apiKey)
-				: resolveApiKeyEnvConfig(providerConfig.apiKeyEnv);
+			const providerApiKeyConfig = credentialPinActive
+				? undefined
+				: providerConfig.apiKey
+					? resolveApiKeyConfig(providerConfig.apiKey)
+					: resolveApiKeyEnvConfig(providerConfig.apiKeyEnv);
 			const localOpenAICompat = providerConfig.openaiCompat;
 			const rotatingApiKeyEnv = providerConfig.apiKey
 				? undefined
@@ -2883,18 +4002,21 @@ export class ModelRegistry {
 			if (rotatingApiKeyEnv) this.#customProviderApiKeyEnvNames.set(providerName, rotatingApiKeyEnv);
 			if (providerConfig.authHeader !== undefined)
 				this.#customProviderAuthHeaders.set(providerName, providerConfig.authHeader);
-			const localOpenAICompatApiKeyConfig = localOpenAICompat
-				? localOpenAICompat.apiKey
-					? resolveApiKeyConfig(localOpenAICompat.apiKey)
-					: resolveApiKeyEnvConfig(localOpenAICompat.apiKeyEnv)
-				: undefined;
+			const localOpenAICompatApiKeyConfig =
+				localOpenAICompat && !credentialPinActive
+					? localOpenAICompat.apiKey
+						? resolveApiKeyConfig(localOpenAICompat.apiKey)
+						: resolveApiKeyEnvConfig(localOpenAICompat.apiKeyEnv)
+					: undefined;
 			if (localOpenAICompat) {
 				const localOpenAICompatBaseUrl = normalizeLocalOpenAICompatBaseUrl(localOpenAICompat.baseUrl);
-				const localCompatResolvedKey = localOpenAICompat.apiKey
-					? resolveApiKeyConfig(localOpenAICompat.apiKey)
-					: localOpenAICompat.apiKeyEnv
-						? resolveApiKeyEnvConfig(localOpenAICompat.apiKeyEnv)
-						: undefined;
+				const localCompatResolvedKey = credentialPinActive
+					? undefined
+					: localOpenAICompat.apiKey
+						? resolveApiKeyConfig(localOpenAICompat.apiKey)
+						: localOpenAICompat.apiKeyEnv
+							? resolveApiKeyEnvConfig(localOpenAICompat.apiKeyEnv)
+							: undefined;
 				overrides.set(providerName, {
 					api: "openai-completions",
 					baseUrl: localOpenAICompatBaseUrl,
@@ -2920,10 +4042,7 @@ export class ModelRegistry {
 				});
 				if (localCompatResolvedKey) {
 					this.#customProviderApiKeys.set(providerName, localCompatResolvedKey);
-					this.authStorage.setConfigApiKey(providerName, localCompatResolvedKey, {
-						envSourced: !localOpenAICompat.apiKey,
-						owner: this.#authStorageConfigOwner,
-					});
+					this.#setOwnedConfigApiKey(providerName, localCompatResolvedKey, !localOpenAICompat.apiKey);
 				} else {
 					keylessProviders.add(providerName);
 					this.#optionalAuthProviders.add(providerName);
@@ -2940,10 +4059,11 @@ export class ModelRegistry {
 				providerConfig.disableStrictTools ||
 				providerConfig.requestTransform ||
 				providerConfig.transport ||
-				providerConfig.cacheRetention
+				providerConfig.cacheRetention ||
+				providerConfig.streamIdleTimeoutMs !== undefined
 			) {
 				const disableStrictCompat = providerConfig.disableStrictTools ? { disableStrictTools: true } : undefined;
-				overrides.set(providerName, {
+				const providerOverride: ProviderOverride = {
 					api: providerConfig.api as Api | undefined,
 					baseUrl: providerConfig.baseUrl,
 					headers: providerConfig.headers,
@@ -2953,8 +4073,14 @@ export class ModelRegistry {
 					transport: providerConfig.transport,
 					requestTransform: providerConfig.requestTransform,
 					cacheRetention: providerConfig.cacheRetention,
+					streamIdleTimeoutMs: providerConfig.streamIdleTimeoutMs,
 					isOAuth,
-				});
+				};
+				const existingOverride = overrides.get(providerName);
+				overrides.set(
+					providerName,
+					existingOverride ? this.#mergeProviderOverride(existingOverride, providerOverride) : providerOverride,
+				);
 			}
 
 			if (authMode === "none") {
@@ -3006,22 +4132,20 @@ export class ModelRegistry {
 				});
 			}
 
-			// Store API key for fallback resolver AND register as config override
-			// so it wins over OAuth tokens from the broker — when the user pins a
-			// bearer in models.yml (e.g. for an auth-gateway baseUrl), that bearer
-			// must authenticate the outbound request.
+			// Store API keys for fallback resolution and register config overrides.
+			// A pin in any session suppresses shared config keys so a reload cannot
+			// override another session's selected account.
 			if (providerConfig.apiKey || providerConfig.apiKeyEnv) {
-				const resolved = providerConfig.apiKey
-					? resolveApiKeyConfig(providerConfig.apiKey)
-					: providerConfig.apiKeyEnv
-						? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv)
-						: undefined;
+				const resolved = credentialPinActive
+					? undefined
+					: providerConfig.apiKey
+						? resolveApiKeyConfig(providerConfig.apiKey)
+						: providerConfig.apiKeyEnv
+							? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv)
+							: undefined;
 				if (resolved) this.#customProviderApiKeys.set(providerName, resolved);
 				if (resolved) {
-					this.authStorage.setConfigApiKey(providerName, resolved, {
-						envSourced: !providerConfig.apiKey,
-						owner: this.#authStorageConfigOwner,
-					});
+					this.#setOwnedConfigApiKey(providerName, resolved, !providerConfig.apiKey);
 				}
 			}
 
@@ -3205,8 +4329,15 @@ export class ModelRegistry {
 	}
 
 	async #writeCheckedModelsConfig(config: ModelsConfig): Promise<void> {
-		await fs.mkdir(path.dirname(this.#modelsConfigFile.path()), { recursive: true });
-		await Bun.write(this.#modelsConfigFile.path(), Bun.YAML.stringify(config, null, 2));
+		const configPath = this.#modelsConfigFile.path();
+		const parentPath = path.dirname(configPath);
+		await fs.mkdir(parentPath, { recursive: true, mode: 0o700 });
+		// The owner-only writer rejects a symlink in any path component and rejects
+		// "..". Resolve only the parent so an alias directory and a lexical ".."
+		// still reach the same file. The final name stays lexical, so a symlink
+		// at models.yml is still opened with O_NOFOLLOW.
+		const parent = await fs.realpath(parentPath);
+		writeExplicitOwnerOnlyTextSync(path.join(parent, path.basename(configPath)), Bun.YAML.stringify(config, null, 2));
 		this.#modelsConfigFile.invalidate();
 		this.#reloadStaticModels();
 	}
@@ -4319,36 +5450,7 @@ export class ModelRegistry {
 		modelId: string,
 		entry?: { id?: unknown; owned_by?: unknown },
 	): Api {
-		// 1. Explicit per-prefix routing from models.yml always wins — the user
-		//    stated the transport for these ids, so never second-guess it.
-		let matchedPrefixLength = -1;
-		let prefixApi: Api | undefined;
-		for (const [prefix, routedApi] of Object.entries(providerConfig.discovery.apiByModelPrefix ?? {})) {
-			if (modelId.startsWith(prefix) && prefix.length > matchedPrefixLength) {
-				prefixApi = routedApi;
-				matchedPrefixLength = prefix.length;
-			}
-		}
-		if (prefixApi !== undefined) return prefixApi;
-		// 2. For OpenAI-compatible gateways that can front both OpenAI and
-		//    Anthropic upstreams (e.g. CLIProxyAPI), auto-detect the wire family
-		//    per model from the `/v1/models` `owned_by` owner and the model id.
-		//    A mixed gateway then routes `claude-*` through Anthropic Messages
-		//    with zero manual config. OpenAI-family models keep the provider's
-		//    configured OpenAI transport (e.g. `openai-responses` vs
-		//    `openai-completions`) rather than being forced to chat-completions,
-		//    because a `/v1/models` list cannot reveal which OpenAI API the
-		//    gateway expects. Only override to `openai-completions` when the
-		//    provider default is not itself an OpenAI-family api.
-		if (providerConfig.discovery.type === "openai-models-list") {
-			const detected = detectDiscoveredApiFamily(entry ?? { id: modelId });
-			if (detected === "anthropic-messages") return "anthropic-messages";
-			if (detected === "openai-completions") {
-				return isOpenAIFamilyApi(providerConfig.api) ? providerConfig.api : "openai-completions";
-			}
-		}
-		// 3. Fall back to the provider-level default api.
-		return providerConfig.api;
+		return resolveModelApiFromDiscovery(providerConfig.api, providerConfig.discovery, modelId, entry);
 	}
 
 	async #discoverModelsDevProvider(providerConfig: DiscoveryProviderConfig): Promise<Model<Api>[]> {
@@ -4823,6 +5925,7 @@ export class ModelRegistry {
 			transport: override.transport ?? baseOverride?.transport,
 			requestTransform: mergeRequestTransform(baseOverride?.requestTransform, override.requestTransform),
 			cacheRetention: override.cacheRetention ?? baseOverride?.cacheRetention,
+			streamIdleTimeoutMs: override.streamIdleTimeoutMs ?? baseOverride?.streamIdleTimeoutMs,
 			isOAuth: override.isOAuth ?? baseOverride?.isOAuth,
 		};
 	}
@@ -4838,6 +5941,7 @@ export class ModelRegistry {
 			| "transport"
 			| "requestTransform"
 			| "cacheRetention"
+			| "streamIdleTimeoutMs"
 		>,
 	): T {
 		const overrideHeaders = (
@@ -4872,6 +5976,8 @@ export class ModelRegistry {
 			delete overrideHeaders[GENERATED_AUTH_HEADER];
 		}
 		const headers = mergeAuthHeader(overrideHeaders, canInject, canInject ? override.apiKey : undefined);
+		const streamIdleTimeoutMs =
+			entry.streamIdleTimeoutMs ?? (isRequestTransformApi(entry.api) ? override.streamIdleTimeoutMs : undefined);
 		const result = {
 			...entry,
 			compat: mergeProviderCompat(entry.compat, override.compat),
@@ -4885,6 +5991,7 @@ export class ModelRegistry {
 				override.requestTransform,
 			),
 			cacheRetention: entry.cacheRetention ?? override.cacheRetention,
+			...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
 		};
 		if (!canInject && explicitAuthKey !== undefined) {
 			delete (result.headers as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string })[
@@ -5143,19 +6250,17 @@ export class ModelRegistry {
 		for (const [providerName, providerConfig] of Object.entries(config.providers ?? {})) {
 			const modelDefs = providerConfig.models ?? [];
 			if (modelDefs.length === 0) continue; // Override-only, no custom models
-			if (providerConfig.apiKey || providerConfig.apiKeyEnv) {
-				const resolved = providerConfig.apiKey
+			const credentialPinActive = !this.#stagedReloadCandidate && this.authStorage.hasAnyCredentialPin(providerName);
+			const apiKey = credentialPinActive
+				? undefined
+				: providerConfig.apiKey
 					? resolveApiKeyConfig(providerConfig.apiKey)
 					: providerConfig.apiKeyEnv
 						? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv)
 						: undefined;
-				if (resolved) this.#customProviderApiKeys.set(providerName, resolved);
-				if (resolved) {
-					this.authStorage.setConfigApiKey(providerName, resolved, {
-						envSourced: !providerConfig.apiKey,
-						owner: this.#authStorageConfigOwner,
-					});
-				}
+			if (providerConfig.apiKey || providerConfig.apiKeyEnv) {
+				if (apiKey) this.#customProviderApiKeys.set(providerName, apiKey);
+				if (apiKey) this.#setOwnedConfigApiKey(providerName, apiKey, !providerConfig.apiKey);
 			}
 			for (const modelDef of modelDefs) {
 				const providerCompat = providerConfig.disableStrictTools
@@ -5166,11 +6271,7 @@ export class ModelRegistry {
 					providerConfig.baseUrl!,
 					providerConfig.api as Api | undefined,
 					providerConfig.headers,
-					providerConfig.apiKey
-						? resolveApiKeyConfig(providerConfig.apiKey)
-						: providerConfig.apiKeyEnv
-							? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv)
-							: undefined,
+					apiKey,
 					providerConfig.authHeader,
 					providerCompat,
 					providerConfig.requestTransform,
@@ -5178,6 +6279,7 @@ export class ModelRegistry {
 					providerConfig.cacheRetention,
 					providerConfig.transport,
 					modelDef as CustomModelDefinitionLike,
+					providerConfig.streamIdleTimeoutMs,
 				);
 				if (!model) continue;
 				models.push(model);
@@ -5197,6 +6299,67 @@ export class ModelRegistry {
 	/** Provider ids declared in models.yml, including override-only providers. */
 	getConfiguredProviderIds(): readonly string[] {
 		return [...this.#configuredProviderIds];
+	}
+
+	/** Configured API-key sources in models.yml precedence order, excluding absent environment values. */
+	getProviderConfigApiKeySources(
+		provider: string,
+	): Array<{ kind: "environment"; name: string; provider: string } | { kind: "models-yml"; provider: string }> {
+		const normalizedProvider = resolveOAuthStorageProvider(provider);
+		const configuredProviders = this.#acceptedConfigValue?.providers;
+		const configuredAliases = Object.entries(configuredProviders ?? {}).filter(
+			([configuredProvider]) => resolveOAuthStorageProvider(configuredProvider) === normalizedProvider,
+		);
+		const sources: Array<
+			{ kind: "environment"; name: string; provider: string } | { kind: "models-yml"; provider: string }
+		> = [];
+		const addSource = (
+			configuredProvider: string,
+			apiKey: string | undefined,
+			apiKeyEnv: string | undefined,
+		): void => {
+			if (apiKey) {
+				if (Bun.env[apiKey]) sources.push({ kind: "environment", name: apiKey, provider: configuredProvider });
+				else sources.push({ kind: "models-yml", provider: configuredProvider });
+				return;
+			}
+			if (apiKeyEnv && $rotatingCredentialEnv(apiKeyEnv)) {
+				sources.push({ kind: "environment", name: apiKeyEnv, provider: configuredProvider });
+			}
+		};
+		for (const [configuredProvider, configured] of configuredAliases) {
+			addSource(configuredProvider, configured.apiKey, configured.apiKeyEnv);
+			addSource(configuredProvider, configured.openaiCompat?.apiKey, configured.openaiCompat?.apiKeyEnv);
+		}
+		return sources.filter(
+			(source, index) =>
+				source.kind === "models-yml" ||
+				sources.findIndex(
+					candidate =>
+						candidate.kind === "environment" &&
+						candidate.name === source.name &&
+						candidate.provider === source.provider,
+				) === index,
+		);
+	}
+
+	/** Environment variable name for a provider API key supplied by runtime setup. */
+	getProviderRuntimeApiKeyEnvName(provider: string): string | undefined {
+		const normalizedProvider = resolveOAuthStorageProvider(provider);
+		return (
+			this.#runtimeProviderApiKeyEnvNames.get(provider) ??
+			[...this.#runtimeProviderApiKeyEnvNames].find(
+				([registeredProvider]) => resolveOAuthStorageProvider(registeredProvider) === normalizedProvider,
+			)?.[1]
+		);
+	}
+
+	/** Whether a runtime extension's provider API key is currently installed in AuthStorage. */
+	hasRuntimeProviderApiKey(provider: string): boolean {
+		const normalizedProvider = resolveOAuthStorageProvider(provider);
+		return [...this.#runtimeProviderCredentialInstalled].some(
+			registeredProvider => resolveOAuthStorageProvider(registeredProvider) === normalizedProvider,
+		);
 	}
 
 	/**
@@ -5986,6 +7149,19 @@ export class ModelRegistry {
 		return apiKey;
 	}
 
+	/** Check credential availability without resolving keys or refreshing OAuth tokens. */
+	hasUsableAuthForProvider(provider: string, sessionId?: string): boolean {
+		return this.authStorage.hasUsableAuth(provider, {
+			owner: this.#authStorageConfigOwner,
+			sessionId,
+		});
+	}
+
+	/** @internal Whether this registry is an unpublished staged reload candidate. */
+	isStagedReloadCandidate(): boolean {
+		return this.#stagedReloadCandidate;
+	}
+
 	#refreshRotatingConfigApiKey(provider: string, forceStatic = false): void {
 		const runtimeOwned = !forceStatic && this.#runtimeProviderApiKeys.has(provider);
 		const envName = runtimeOwned
@@ -5993,6 +7169,7 @@ export class ModelRegistry {
 			: this.#customProviderApiKeyEnvNames.get(provider);
 		if (!envName) return;
 		const resolved = $rotatingCredentialEnv(envName);
+		if (resolved !== undefined && this.authStorage.hasAnyCredentialPin(provider)) return;
 		const previous = runtimeOwned
 			? this.#runtimeProviderResolvedApiKeys.get(provider)
 			: this.#customProviderApiKeys.get(provider);
@@ -6006,7 +7183,7 @@ export class ModelRegistry {
 				return;
 			}
 			this.#customProviderApiKeys.delete(provider);
-			this.authStorage.removeConfigApiKey(provider, this.#authStorageConfigOwner);
+			this.#removeOwnedConfigApiKey(provider);
 		} else {
 			this.#customProviderApiKeys.set(provider, resolved);
 			if (runtimeOwned) {
@@ -6014,12 +7191,9 @@ export class ModelRegistry {
 				this.#runtimeProviderCredentialInstalled.add(provider);
 			}
 			if (runtimeOwned) {
-				this.authStorage.setConfigApiKey(provider, resolved, { owner: this.#authStorageConfigOwner });
+				this.#setOwnedConfigApiKey(provider, resolved, false, "runtime");
 			} else {
-				this.authStorage.setConfigApiKey(provider, resolved, {
-					envSourced: true,
-					owner: this.#authStorageConfigOwner,
-				});
+				this.#setOwnedConfigApiKey(provider, resolved, true);
 			}
 		}
 		const authHeader =
@@ -6166,7 +7340,7 @@ export class ModelRegistry {
 		this.#runtimeProviderOverrides.delete(providerName);
 		this.#runtimeProviderAuthHeaders.delete(providerName);
 		this.#runtimeModelOverlays = this.#runtimeModelOverlays.filter(overlay => overlay.provider !== providerName);
-		this.authStorage.removeConfigApiKey(providerName, this.#authStorageConfigOwner);
+		this.#removeOwnedConfigApiKey(providerName);
 		this.#clearDescriptorDiscoveryEvidence(providerName);
 	}
 
@@ -6174,6 +7348,7 @@ export class ModelRegistry {
 	 * Remove custom API/OAuth registrations for a specific extension source.
 	 */
 	clearSourceRegistrations(sourceId: string): void {
+		this.#catalogRefreshGeneration++;
 		unregisterCustomApis(sourceId);
 		unregisterOAuthProviders(sourceId);
 		const sourceProviders = this.#runtimeProvidersBySource.get(sourceId);
@@ -6217,6 +7392,7 @@ export class ModelRegistry {
 	 * If provider has oauth: registers OAuth provider for /login support.
 	 */
 	registerProvider(providerName: string, config: ProviderConfigInput, sourceId?: string): void {
+		this.#catalogRefreshGeneration++;
 		if (config.streamSimple && !config.api) {
 			throw new Error(`Provider ${providerName}: "api" is required when registering streamSimple.`);
 		}
@@ -6304,7 +7480,7 @@ export class ModelRegistry {
 			this.#runtimeProviderResolvedApiKeys.set(providerName, resolved);
 			this.#runtimeProviderCredentialInstalled.add(providerName);
 			if (config.authHeader !== undefined) this.#runtimeProviderAuthHeaders.set(providerName, config.authHeader);
-			this.authStorage.setConfigApiKey(providerName, resolved, { owner: this.#authStorageConfigOwner });
+			this.#setOwnedConfigApiKey(providerName, resolved, false, "runtime");
 		}
 		if (config.oauth && !config.apiKey && this.#runtimeProviderApiKeys.has(providerName)) {
 			const previousApiKey = this.#runtimeProviderResolvedApiKeys.get(providerName);
@@ -6314,7 +7490,7 @@ export class ModelRegistry {
 			this.#runtimeProviderApiKeyEnvNames.delete(providerName);
 			this.#runtimeProviderAuthHeaders.delete(providerName);
 			this.#customProviderApiKeys.delete(providerName);
-			this.authStorage.removeConfigApiKey(providerName, this.#authStorageConfigOwner);
+			this.#removeOwnedConfigApiKey(providerName);
 			this.#runtimeModelOverlays = this.#runtimeModelOverlays.map(overlay => {
 				if (overlay.provider !== providerName) return overlay;
 				const headers = { ...(overlay.headers ?? {}) } as Record<string, string> & {

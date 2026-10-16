@@ -70,6 +70,33 @@ describe("generateFileMentionMessages path resolution", () => {
 		expect(message.files[0]?.content).toContain("case.ts");
 	});
 
+	test("ignores mentions whose letters only appear scattered mid-word in a path", async () => {
+		const cwd = await createTempDir();
+		const nested = path.join(cwd, "gjc-operation-cancel", "packages", "natives", "test");
+		await fs.mkdir(nested, { recursive: true });
+		await Bun.write(path.join(nested, "memory-guard-build-wiring.test.ts"), "unrelated");
+
+		// A chat handle such as "(@pepemewng)" is a plain subsequence of that path
+		// but does not spell any of its segment prefixes.
+		const messages = await generateFileMentionMessages(["pepemewng"], cwd);
+		expect(messages).toHaveLength(0);
+	});
+
+	test("resolves fuzzy match when segment prefixes need backtracking", async () => {
+		const cwd = await createTempDir();
+		await Bun.write(path.join(cwd, "ab-abcde.txt"), "backtracked");
+
+		// Taking "ab" from the first segment leaves "cdetx", which no later segment
+		// starts with; the resolver must skip that segment and take "abcde" + "tx".
+		const messages = await generateFileMentionMessages(["abcdetx"], cwd);
+		expect(messages).toHaveLength(1);
+		const message = messages[0];
+		if (message?.role !== "fileMention") {
+			throw new Error("expected file mention message");
+		}
+		expect(message.files[0]?.path).toBe("ab-abcde.txt");
+	});
+
 	test("returns no message for ambiguous or short fuzzy queries", async () => {
 		const cwd = await createTempDir();
 		await Bun.write(path.join(cwd, "spec-alpha.txt"), "a");

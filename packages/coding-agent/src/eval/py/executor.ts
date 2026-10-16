@@ -912,7 +912,17 @@ async function replaceSessionKernel(
 	const old = session.kernel;
 	const remaining = getRemainingTimeoutMs(options.deadlineMs);
 	const ownerIds = new Set(session.ownerIds);
-	await shutdownOrRetainKernel(old, ownerIds, remaining === undefined ? undefined : Math.max(0, remaining));
+	try {
+		await shutdownOrRetainKernel(old, ownerIds, remaining === undefined ? undefined : Math.max(0, remaining));
+	} catch (error) {
+		// Suppress unconfirmed shutdown error ONLY when we have positive evidence the
+		// process actually exited (exitCode is set). Without that evidence, propagate the error
+		// so we don't start a replacement while the old subprocess is still running.
+		// See https://github.com/yeachan-heo/gajae-code/issues/6569
+		const hasConfirmedExit = old.getExitCode() !== null;
+		if (!hasConfirmedExit || !(error instanceof Error) || error.name !== "PythonKernelShutdownUnconfirmedError")
+			throw error;
+	}
 	throwIfExecutionCancelled(options);
 	if (sessions.get(session.sessionId) !== session) {
 		throw new PythonExecutionCancelledError(false);
@@ -1076,7 +1086,6 @@ export function disposeKernelSessionsByOwner(ownerId: string): Promise<void> {
 	const toShutdown: PythonSession[] = [];
 	const initializersToAbort: InitializingPythonSession[] = [];
 	for (const entry of initializing) {
-		entry.retirementOwnerIds.add(ownerId);
 		let hasOwnerRequest = false;
 		for (const request of entry.requests) {
 			if (request.ownerId === ownerId && !request.signal?.aborted) {
@@ -1089,6 +1098,7 @@ export function disposeKernelSessionsByOwner(ownerId: string): Promise<void> {
 			if (entry.ownerIds.size > 0) removeKernelOwner(entry.kernel, ownerId);
 		}
 		if (![...entry.ownerIds].some(id => id !== ownerId)) {
+			entry.retirementOwnerIds.add(ownerId);
 			entry.cancelled ??= new PythonExecutionCancelledError(false);
 			initializersToAbort.push(entry);
 		}
@@ -1137,10 +1147,10 @@ export function disposeKernelSessionsByOwner(ownerId: string): Promise<void> {
 	return (async () => {
 		await Promise.all([
 			...requests.map(request => request.completion),
-			...initializing.map(entry => entry.promise.catch(() => undefined)),
+			...initializersToAbort.map(entry => entry.promise.catch(() => undefined)),
 		]);
 		const failures: unknown[] = [];
-		for (const entry of initializing)
+		for (const entry of initializersToAbort)
 			if (entry.cleanupFailed) {
 				if (entry.kernel) retainKernelForOwners(entry.kernel, new Set([ownerId]));
 				failures.push(entry.cleanupError);

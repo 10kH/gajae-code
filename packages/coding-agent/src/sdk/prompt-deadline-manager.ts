@@ -103,10 +103,18 @@ export class PromptDeadlineManager {
 	readonly #uncertaintyRecoveryPending = new Set<string>();
 	readonly #expiring = new Set<string>();
 	readonly #deadlineAttempts = new Set<string>();
+	/**
+	 * The next deadline came due while `#expire` was still inside an await
+	 * (tool-boundary grace or the bounded flush). The in-flight pass owns the
+	 * single-flight slot, so the timer callback only records the follow-up and
+	 * `#onDeadline` runs it after this pass returns.
+	 */
+	readonly #deadlineFollowUps = new Set<string>();
 	readonly #pendingTerminalTransitions = new Set<string>();
 	readonly #deadlineDeferredTerminalTransitions = new Set<string>();
 	readonly #deadlineTerminalizationConfirmed = new Set<string>();
 	readonly #terminalPublicationPending = new Map<string, SdkPromptTerminalOutcome>();
+	readonly #toolsStillPendingOnLastCheck = new Set<string>();
 	readonly #deadlineStartCleanup = new Map<string, () => void>();
 	readonly #pendingTerminalFailureReasons = new Map<
 		string,
@@ -187,7 +195,11 @@ export class PromptDeadlineManager {
 	}
 
 	/** Run the durability hook under the shared bound; see `runBoundedDeadlineFlush`. */
-	async #runDeadlineFlush(correlation: InvocationCorrelation, lease: PromptDeadlineLease): Promise<void> {
+	async #runDeadlineFlush(
+		correlation: InvocationCorrelation,
+		lease: PromptDeadlineLease,
+		generation: number,
+	): Promise<void> {
 		const hook = this.#onDeadlineExceeded;
 		if (hook === undefined) return;
 		const key = leaseKey(correlation);
@@ -195,7 +207,9 @@ export class PromptDeadlineManager {
 			signal =>
 				hook(correlation, signal, () => {
 					const current = this.#leases.get(key);
-					return current === lease && this.#now() >= promptDeadlineAt(current);
+					return (
+						current === lease && current.generation === generation && this.#now() >= promptDeadlineAt(current)
+					);
 				}),
 			this.#deadlineFlushTimeoutMs,
 		);
@@ -239,12 +253,24 @@ export class PromptDeadlineManager {
 	}
 
 	async #onDeadline(key: string): Promise<void> {
-		if (this.#deadlineAttempts.has(key)) return;
+		if (this.#deadlineAttempts.has(key)) {
+			this.#deadlineFollowUps.add(key);
+			return;
+		}
 		this.#deadlineAttempts.add(key);
 		try {
-			await this.#expire(key);
+			do {
+				this.#deadlineFollowUps.delete(key);
+				await this.#expire(key);
+			} while (this.#deadlineFollowUps.has(key));
 		} finally {
 			this.#deadlineAttempts.delete(key);
+			if (this.#deadlineFollowUps.has(key)) {
+				this.#deadlineFollowUps.delete(key);
+				queueMicrotask(() => {
+					void this.#onDeadline(key);
+				});
+			}
 		}
 	}
 
@@ -385,7 +411,9 @@ export class PromptDeadlineManager {
 			terminalization =
 				(await this.#onDeadlineTerminalization?.(correlation, () => {
 					const current = this.#leases.get(key);
-					return current === lease && this.#now() >= promptDeadlineAt(current);
+					return (
+						current === lease && current.generation === generation && this.#now() >= promptDeadlineAt(current)
+					);
 				})) ?? "settled";
 		} catch {
 			terminalization = "uncertain";
@@ -410,7 +438,7 @@ export class PromptDeadlineManager {
 		// The claim above remains the durable pending marker throughout both
 		// bounded operations, so restart recovery never reports unsaved work as
 		// finished.
-		await this.#runDeadlineFlush(correlation, lease);
+		await this.#runDeadlineFlush(correlation, lease, generation);
 		// Fence again AFTER the flush (#5623 review round 2): progress can land
 		// while the bounded git operation runs and renews the lease.
 		if (this.#backOffIfSuperseded(key, lease, generation)) return;
@@ -532,14 +560,19 @@ export class PromptDeadlineManager {
 	/**
 	 * After an awaited reconciliation call, verify the captured lease is still
 	 * authoritative. Fresh attributable progress during the await advances the
-	 * lease generation and its deadline; when superseded, cancel this expiry
-	 * instance (release the expiration fence, clear any retry budget, and
-	 * reschedule the deadline) and report it so the caller stops. A cleared or
-	 * re-accepted lease is stale by identity too.
+	 * lease generation and its deadline. A tool-boundary wait or a flush can
+	 * outlive that renewed lease, so a generation mismatch is stale even when
+	 * the new deadline is already due — the time check alone would let this
+	 * pass publish with the generation it captured, the publisher would refuse,
+	 * and uncertainty recovery would refuse to re-anchor the same mismatch.
+	 * Cancel this expiry instance (release the expiration fence, clear any
+	 * retry budget, and reschedule the deadline) and report it so the caller
+	 * stops. The follow-up expiry captures the current generation. A cleared
+	 * or re-accepted lease is stale by identity too.
 	 */
-	#backOffIfSuperseded(key: string, lease: PromptDeadlineLease, _generation: number): boolean {
+	#backOffIfSuperseded(key: string, lease: PromptDeadlineLease, generation: number): boolean {
 		const current = this.#leases.get(key);
-		if (current !== lease || this.#now() < promptDeadlineAt(current)) {
+		if (current !== lease || current.generation !== generation || this.#now() < promptDeadlineAt(current)) {
 			this.#expiring.delete(key);
 			this.#expiryRetries.delete(key);
 			if (current) this.#schedule(key);
@@ -578,11 +611,30 @@ export class PromptDeadlineManager {
 		this.clear(correlation);
 	}
 
-	#scheduleTerminalPublicationRetry(key: string): void {
+	#scheduleTerminalPublicationRetry(key: string, delayMs?: number): void {
 		this.#clearTimer(key);
-		const timer = setTimeout(() => void this.#onDeadline(key), UNCERTAINTY_RETRY_DELAY_MS);
+		// Use immediate retry (0ms) if tools were pending on last check;
+		// otherwise use normal retry delay. This allows quick detection when tools drain.
+		const effectiveDelayMs =
+			delayMs ?? (this.#toolsStillPendingOnLastCheck.has(key) ? 0 : UNCERTAINTY_RETRY_DELAY_MS);
+		const timer = setTimeout(() => void this.#onDeadline(key), effectiveDelayMs);
 		(timer as unknown as { unref?: () => void }).unref?.();
 		this.#timers.set(key, timer);
+	}
+
+	/** Notify about termination check results to adjust retry strategy. */
+	notifyTerminationResult(
+		correlation: InvocationCorrelation,
+		_result: PromptDeadlineTerminalization,
+		reason: string,
+	): void {
+		const key = leaseKey(correlation);
+		if (reason.includes("tools-still-pending")) {
+			this.#toolsStillPendingOnLastCheck.add(key);
+		} else {
+			// Tools have settled or are no longer relevant
+			this.#toolsStillPendingOnLastCheck.delete(key);
+		}
 	}
 
 	#retry(key: string): void {
@@ -817,6 +869,7 @@ export class PromptDeadlineManager {
 		this.#terminalPublicationPending.delete(key);
 		this.#pendingTerminalFailureReasons.delete(key);
 		this.#pendingTerminalEvidence.delete(key);
+		this.#toolsStillPendingOnLastCheck.delete(key);
 	}
 
 	clearAll(): void {
@@ -839,6 +892,7 @@ export class PromptDeadlineManager {
 		this.#terminalPublicationPending.clear();
 		this.#pendingTerminalFailureReasons.clear();
 		this.#pendingTerminalEvidence.clear();
+		this.#toolsStillPendingOnLastCheck.clear();
 	}
 
 	/** For tests: current deadline or undefined if no lease. */

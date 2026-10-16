@@ -3,9 +3,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentTool } from "@gajae-code/agent-core";
 import { logger } from "@gajae-code/utils";
+import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { isAutoresearchAuthorizedResearchPath } from "../autoresearch/git";
 import { expandApplyPatchToEntries } from "../edit/modes/apply-patch";
-import { GJC_SESSION_PREFIX, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
+import {
+	GJC_SESSION_PREFIX,
+	sessionDirName,
+	modeStatePath as sessionModeStatePath,
+} from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
 import { ModeStateSchema } from "../gjc-runtime/state-schema";
 import { workflowEnvelopeChecksumStatus } from "../gjc-runtime/state-writer";
@@ -30,7 +35,7 @@ export const RALPLAN_MUTATION_BLOCK_MESSAGE =
 export const ULTRAGOAL_GOAL_PLANNING_MUTATION_BLOCK_MESSAGE =
 	"Ultragoal goal-planning phase boundary: finish goal planning and record goals through `gjc ultragoal` before editing code. Product-code mutation tools and patch execution are blocked until goal planning completes and execution begins.";
 export const AUTORESEARCH_MUTATION_BLOCK_MESSAGE =
-	"Autoresearch research-only boundary: this workflow produces findings, evidence, and a verdict — never product code. Product-code mutation tools and patch execution are blocked everywhere, on every branch. Mission research artifacts (`autoresearch.sh` at the workdir root and mission state through the sanctioned `gjc autoresearch` CLI) stay writable; run experiments through the `python` tool, or finish the mission and hand off to an approved implementation workflow.";
+	"Autoresearch research-only boundary: this workflow produces findings, evidence, and a verdict — never product code. Product-code mutation tools and patch execution are blocked everywhere, on every branch. Write the root `autoresearch.sh` only with direct file tools; mission state stays writable through the sanctioned `gjc autoresearch` CLI. Run experiments through the `python` tool, or finish the mission and hand off to an approved implementation workflow.";
 
 /** Resolve the phase-boundary block message for the active planning skill. */
 function planningPhaseBlockMessage(skill: CanonicalGjcWorkflowSkill): string {
@@ -40,10 +45,15 @@ function planningPhaseBlockMessage(skill: CanonicalGjcWorkflowSkill): string {
 	return DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE;
 }
 
-/** Tools whose execute path can mutate product state. `github` is included so side-effect ops share this guard. */
-export const WORKFLOW_MUTATION_TOOL_NAMES = ["edit", "write", "ast_edit", "bash", "github"] as const;
+/**
+ * Tools whose execute path can mutate product state. `github` is included so
+ * side-effect ops share this guard. `eval` and `python` run code that can write
+ * files without going through edit, write, or bash.
+ */
+export const WORKFLOW_MUTATION_TOOL_NAMES = ["edit", "write", "ast_edit", "bash", "github", "eval", "python"] as const;
 
 const BLOCKED_TOOL_NAMES = new Set<string>(WORKFLOW_MUTATION_TOOL_NAMES);
+const AUTORESEARCH_HARNESS_FILE_TOOL_NAMES = new Set(["edit", "write"]);
 
 export function isWorkflowMutationTool(name: string): boolean {
 	return BLOCKED_TOOL_NAMES.has(name);
@@ -79,14 +89,15 @@ const BASH_COMMAND_WRAPPER_SOURCE =
  */
 const BASH_COMMAND_POSITION_KEYWORD_RE = /(?:^|[;&|(\n{}])\s*(?:then|else|elif|do|in|\{|!)(?=\s)/gi;
 const BASH_MUTATION_COMMAND_RE = new RegExp(
-	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(?:tee|touch|rm|mkdir|cp|mv|install|truncate)\\b([^;&|()\\n]*)|(?:^|[^<>])(?:>>?|\\d>>?)\\s*([^\\s;&|]+)`,
+	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(?:tee|touch|rm|mkdir|cp|mv|install|truncate|chmod|ln)\\b([^;&|()\\n]*)|(?:^|[^<>])(?:>>?|\\d>>?)\\s*([^\\s;&|]+)`,
 	"gi",
 );
 /** Command-word extractor; must accept the same prefixes as `BASH_MUTATION_COMMAND_RE`. */
 const BASH_MUTATION_COMMAND_NAME_RE = new RegExp(
-	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(tee|touch|rm|mkdir|cp|mv|install|truncate)\\b`,
+	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(tee|touch|rm|mkdir|cp|mv|install|truncate|chmod|ln)\\b`,
 	"i",
 );
+const BASH_CHMOD_MODE_RE = /^(?:[0-7]{1,4}|(?:[ugoa]*[+=-][rwxXstugo]*)(?:,[ugoa]*[+=-][rwxXstugo]*)*)$/;
 const BASH_IN_PLACE_MUTATION_COMMAND_RE = new RegExp(
 	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(?:sed|perl)\\b([^;&|()\\n]*)`,
 	"gi",
@@ -1667,10 +1678,20 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 		targets.explicitMutation = true;
 		const parts = shellWords(match[1] ?? "");
 		const commandName = match[0]?.match(BASH_MUTATION_COMMAND_NAME_RE)?.[1]?.toLowerCase();
-		const targetParts =
-			commandName === "cp" || commandName === "mv" || commandName === "install" || commandName === "truncate"
-				? parts.slice(-1)
-				: parts;
+		const chmodModeIndex =
+			commandName === "chmod" ? parts.findIndex(part => BASH_CHMOD_MODE_RE.test(cleanShellWord(part))) : -1;
+		let targetParts = parts;
+		if (
+			commandName === "cp" ||
+			commandName === "mv" ||
+			commandName === "install" ||
+			commandName === "truncate" ||
+			commandName === "ln"
+		) {
+			targetParts = parts.slice(-1);
+		} else if (commandName === "chmod" && chmodModeIndex >= 0) {
+			targetParts = parts.filter((_part, index) => index !== chmodModeIndex);
+		}
 		let extractedTarget = false;
 		for (const part of targetParts) {
 			const cleaned = cleanShellWord(part);
@@ -1698,12 +1719,315 @@ function extractGithubTargets(args: unknown): ExtractedTargets {
 	return { paths: [], unknown: true, explicitMutation: true };
 }
 
+function simpleLiteral(raw: string): string | null {
+	const trimmed = raw.trim();
+	const quote = trimmed[0];
+	if ((quote !== "'" && quote !== '"') || trimmed.length < 2 || trimmed[trimmed.length - 1] !== quote) return null;
+	const body = trimmed.slice(1, -1);
+	return /[\\\n${]/.test(body) || body.includes(quote) ? null : body;
+}
+
+function skipNoise(code: string, index: number, language: "py" | "js"): number {
+	if (language === "py" && (code.startsWith('"""', index) || code.startsWith("'''", index))) {
+		const quote = code.slice(index, index + 3);
+		const end = code.indexOf(quote, index + 3);
+		return end < 0 ? code.length : end + 3;
+	}
+	const character = code[index] ?? "";
+	if (character === "'" || character === '"') {
+		let cursor = index + 1;
+		while (cursor < code.length && code[cursor] !== character) cursor += code[cursor] === "\\" ? 2 : 1;
+		return Math.min(code.length, cursor + 1);
+	}
+	if (
+		(language === "py" && character === "#") ||
+		(language === "js" && character === "/" && code[index + 1] === "/")
+	) {
+		const end = code.indexOf("\n", index);
+		return end < 0 ? code.length : end;
+	}
+	if (language === "js" && character === "/" && code[index + 1] === "*") {
+		const end = code.indexOf("*/", index + 2);
+		return end < 0 ? code.length : end + 2;
+	}
+	return index;
+}
+
+function readArg(code: string, index: number): { raw: string; end: number } | null {
+	let cursor = index;
+	while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+	if (cursor >= code.length || code[cursor] === ")") return null;
+	const start = cursor;
+	let depth = 0;
+	while (cursor < code.length) {
+		const character = code[cursor];
+		if (character === "(") depth += 1;
+		else if ((character === "," || character === ")") && depth === 0) break;
+		else if (character === ")") depth -= 1;
+		else if (character === "'" || character === '"') {
+			const quote = character;
+			cursor += 1;
+			while (cursor < code.length && code[cursor] !== quote) cursor += code[cursor] === "\\" ? 2 : 1;
+		}
+		cursor += 1;
+	}
+	const raw = code.slice(start, cursor).trim();
+	return raw.length > 0 ? { raw, end: cursor } : null;
+}
+
+/** Omitted mode is Python's default `"r"`. A non-literal mode cannot be proved read-only. */
+function modeWrites(raw: string | undefined): boolean | null {
+	if (raw === undefined) return false;
+	const literal = simpleLiteral(raw);
+	return literal === null ? null : /[wax+]/.test(literal);
+}
+
+const PY_OS_MUTATORS = new Set("remove unlink rename replace rmtree move copy copy2 copyfile".split(" "));
+/** Copy and rename write the destination, not only the source. */
+const TWO_ARG_MUTATORS = new Set("rename replace move copy copy2 copyfile renameSync copyFileSync".split(" "));
+const JS_FS_MUTATORS = new Set(
+	"writeFileSync writeFile appendFileSync appendFile rmSync unlinkSync renameSync copyFileSync mkdirSync openSync".split(
+		" ",
+	),
+);
+
+function nextCallArg(code: string, end: number): { raw: string; end: number } | null {
+	let cursor = end;
+	while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+	if (code[cursor] !== ",") return null;
+	return readArg(code, cursor + 1);
+}
+
+function openModeWrites(code: string, first: { raw: string; end: number }): boolean | null {
+	let cursor = first.end;
+	let positionalIndex = 1;
+	let mode: string | undefined;
+	let unknownMode = false;
+	while (cursor < code.length) {
+		while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+		if (code[cursor] !== ",") break;
+		const argument = readArg(code, cursor + 1);
+		if (!argument) break;
+		const raw = argument.raw.trim();
+		if (raw.startsWith("*") || raw.startsWith("**")) {
+			unknownMode = true;
+		} else {
+			const keyword = /^([A-Za-z_]\w*)\s*=\s*([\s\S]*)$/.exec(raw);
+			if (keyword?.[1] === "mode") {
+				if (mode !== undefined) unknownMode = true;
+				else mode = keyword[2];
+			} else if (!keyword && positionalIndex === 1) {
+				if (mode !== undefined) unknownMode = true;
+				else mode = raw;
+			}
+		}
+		positionalIndex += 1;
+		cursor = argument.end;
+	}
+	if (unknownMode) return null;
+	return modeWrites(mode);
+}
+
+/** Whitespace or a backslash-newline may sit before an attribute (`shutil .copy`). */
+function skipCallGap(code: string, index: number): number {
+	let cursor = index;
+	while (cursor < code.length) {
+		const character = code[cursor] ?? "";
+		if (/\s/.test(character)) {
+			cursor += 1;
+			continue;
+		}
+		if (character === "\\" && code[cursor + 1] === "\n") {
+			cursor += 2;
+			continue;
+		}
+		if (character === "\\" && code[cursor + 1] === "\r" && code[cursor + 2] === "\n") {
+			cursor += 3;
+			continue;
+		}
+		break;
+	}
+	return cursor;
+}
+
+function literalWrite(targets: ExtractedTargets, raw: string | undefined, write: boolean | null): void {
+	if (write === false) return;
+	targets.explicitMutation = true;
+	const literal = raw === undefined ? null : simpleLiteral(raw);
+	if (write === null || literal === null || literal.length === 0) {
+		targets.unknown = true;
+		return;
+	}
+	addPath(targets, literal);
+}
+
+/** Arguments of one Path() call, through its own closing parenthesis. */
+function readPathConstructor(code: string, argAt: number): { parts: string[]; after: number } | null {
+	let cursor = argAt;
+	const parts: string[] = [];
+	while (cursor < code.length) {
+		while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+		if (code[cursor] === ")") return { parts, after: cursor + 1 };
+		const argument = readArg(code, cursor);
+		if (!argument) return null;
+		parts.push(argument.raw);
+		cursor = argument.end;
+		while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+		if (code[cursor] === ",") {
+			cursor += 1;
+			continue;
+		}
+		if (code[cursor] === ")") return { parts, after: cursor + 1 };
+		return null;
+	}
+	return null;
+}
+
+/** pathlib keeps the last absolute segment. A non-literal segment is an unresolved receiver. */
+function literalPathReceiver(parts: string[]): string | null {
+	if (parts.length === 0) return ".";
+	let joined = "";
+	for (const part of parts) {
+		const literal = simpleLiteral(part);
+		if (literal === null) return null;
+		if (path.isAbsolute(literal)) joined = literal;
+		else joined = joined ? path.join(joined, literal) : literal;
+	}
+	return joined.length === 0 ? "." : joined;
+}
+
+/** Calls inside strings or comments are skipped. A non-literal write path fails closed. */
+function scanInterpreterWrites(code: string, language: "py" | "js", targets: ExtractedTargets): void {
+	let index = 0;
+	while (index < code.length) {
+		const trivia = skipNoise(code, index, language);
+		if (trivia !== index) {
+			index = trivia;
+			continue;
+		}
+		const previous = index === 0 ? "" : (code[index - 1] ?? "");
+		if ((index > 0 && /[\w]/.test(previous)) || !/[A-Za-z_]/.test(code[index] ?? "")) {
+			index += 1;
+			continue;
+		}
+		const ident = /^[A-Za-z_]\w*/.exec(code.slice(index));
+		if (!ident) {
+			index += 1;
+			continue;
+		}
+		const name = ident[0];
+		if ((name === "write" || name === "append") && previous === ".") {
+			index += name.length;
+			continue;
+		}
+		let cursor = skipCallGap(code, index + name.length);
+		let dotted = "";
+		if (code[cursor] === ".") {
+			const methodAt = skipCallGap(code, cursor + 1);
+			const dot = /^\w+/.exec(code.slice(methodAt));
+			dotted = dot?.[0] ?? "";
+			cursor = methodAt + dotted.length;
+		}
+		const paren = /^\s*\(/.exec(code.slice(cursor));
+		const helper = (name === "write" || name === "append") && dotted === "";
+		const open = (name === "open" && language === "py") || (name === "openSync" && language === "js");
+		const pathCtor = name === "Path" && dotted === "";
+		const osCall =
+			language === "py" &&
+			((name === "os" && PY_OS_MUTATORS.has(dotted)) || (name === "shutil" && PY_OS_MUTATORS.has(dotted)));
+		const jsCall =
+			language === "js" && ((JS_FS_MUTATORS.has(name) && dotted === "") || (name === "Bun" && dotted === "write"));
+		if (!paren || (!helper && !(open && dotted === "") && !pathCtor && !osCall && !jsCall)) {
+			index += name.length;
+			continue;
+		}
+		const argAt = cursor + paren[0].length;
+		const first = readArg(code, argAt);
+		if (pathCtor) {
+			const ctor = readPathConstructor(code, argAt);
+			if (!ctor) {
+				index += 1;
+				continue;
+			}
+			const method = /^\s*\.\s*(write_text|write_bytes)\b/.exec(code.slice(ctor.after));
+			if (method) {
+				targets.explicitMutation = true;
+				const receiver = literalPathReceiver(ctor.parts);
+				if (receiver === null || receiver.length === 0) targets.unknown = true;
+				else addPath(targets, receiver);
+			}
+			// Extra segments stay in the argument walk so a nested mutator is still recorded.
+			index =
+				ctor.parts.length > 1 ? index + name.length : Math.max(ctor.after + (method?.[0].length ?? 0), index + 1);
+			continue;
+		}
+		if (!first) {
+			literalWrite(targets, undefined, null);
+			index = Math.max(argAt, index + 1);
+			continue;
+		}
+		if (open && dotted === "") {
+			literalWrite(targets, first.raw, openModeWrites(code, first));
+			index = Math.max(first.end, index + 1);
+			continue;
+		}
+		literalWrite(targets, first.raw, true);
+		let end = first.end;
+		if (TWO_ARG_MUTATORS.has(dotted || name)) {
+			const second = nextCallArg(code, first.end);
+			if (!second) literalWrite(targets, undefined, null);
+			else {
+				literalWrite(targets, second.raw, true);
+				end = second.end;
+			}
+		}
+		index = Math.max(end, index + 1);
+	}
+}
+
+function extractCodeToolTargets(toolName: string, args: unknown): ExtractedTargets {
+	const targets: ExtractedTargets = { paths: [], unknown: false };
+	const record = getRecord(args);
+	if (!record) {
+		targets.unknown = true;
+		targets.explicitMutation = true;
+		return targets;
+	}
+	if (toolName === "python") {
+		if ((safeString(record.action) || "execute") === "clear") return targets;
+		if (typeof record.code !== "string" || record.code.trim() === "") return targets;
+		scanInterpreterWrites(record.code, "py", targets);
+		return targets;
+	}
+	if (!Array.isArray(record.cells)) {
+		targets.unknown = true;
+		targets.explicitMutation = true;
+		return targets;
+	}
+	for (const cell of record.cells) {
+		const cellRecord = getRecord(cell);
+		if (typeof cellRecord?.code !== "string") {
+			targets.unknown = true;
+			targets.explicitMutation = true;
+			continue;
+		}
+		if (cellRecord.language === "py") scanInterpreterWrites(cellRecord.code, "py", targets);
+		else if (cellRecord.language === "js") scanInterpreterWrites(cellRecord.code, "js", targets);
+		else {
+			targets.unknown = true;
+			targets.explicitMutation = true;
+		}
+	}
+	return targets;
+}
+
 function extractTargets(tool: ToolWithEditMode, args: unknown): ExtractedTargets {
 	if (tool.name === "write") return extractWriteTargets(args);
 	if (tool.name === "ast_edit") return extractAstEditTargets(args);
 	if (tool.name === "edit") return extractEditTargets(args, tool);
 	if (tool.name === "bash") return extractBashTargets(args);
 	if (tool.name === "github") return extractGithubTargets(args);
+	if (tool.name === "python" || tool.name === "eval") return extractCodeToolTargets(tool.name, args);
 	return { paths: [], unknown: true };
 }
 
@@ -1766,11 +2090,23 @@ function firstBlockedWorkflowStateSkill(cwd: string, targets: ExtractedTargets):
 	return null;
 }
 
-function isAllowlistedPath(cwd: string, rawPath: string): boolean {
+function planningSessionDirName(sessionId: string | null | undefined): string | undefined {
+	const trimmed = sessionId?.trim();
+	if (!trimmed) return undefined;
+	return sessionDirName(trimmed);
+}
+
+/** Specs and plans are planning-writable. A `_session-` directory must be this session's encoded name. */
+function isAllowlistedPath(cwd: string, rawPath: string, sessionId?: string | null): boolean {
 	const segments = relativeGjcSegments(cwd, rawPath);
 	if (segments?.[0] !== ".gjc") return false;
-	const generatedRoot = segments[1]?.startsWith(GJC_SESSION_PREFIX) ? segments[2] : segments[1];
-	return generatedRoot === "specs" || generatedRoot === "plans";
+	const head = segments[1];
+	if (head?.startsWith(GJC_SESSION_PREFIX)) {
+		const bound = planningSessionDirName(sessionId);
+		if (!bound || head !== bound) return false;
+		return segments[2] === "specs" || segments[2] === "plans";
+	}
+	return head === "specs" || head === "plans";
 }
 function isBlockedGjcPath(cwd: string, rawPath: string): boolean {
 	const segments = relativeGjcSegments(cwd, rawPath);
@@ -1781,21 +2117,119 @@ function hasBlockedGjcTarget(cwd: string, targets: ExtractedTargets): boolean {
 	return targets.paths.some(rawPath => isBlockedGjcPath(cwd, rawPath));
 }
 
-function allTargetsAllowlisted(cwd: string, targets: ExtractedTargets): boolean {
+function allTargetsAllowlisted(cwd: string, targets: ExtractedTargets, sessionId?: string | null): boolean {
 	return (
-		!targets.unknown && targets.paths.length > 0 && targets.paths.every(rawPath => isAllowlistedPath(cwd, rawPath))
+		!targets.unknown &&
+		targets.paths.length > 0 &&
+		targets.paths.every(rawPath => isAllowlistedPath(cwd, rawPath, sessionId))
 	);
 }
 
-function neutralTempRoots(): string[] {
+/** POSIX directories that are temp roots even when `TMPDIR` is unset or poisoned. */
+const POSIX_SYSTEM_TEMP_ROOTS = ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"];
+
+/**
+ * `os.tmpdir()` follows `TMPDIR`, and Bun copies `cwd/.env` into the environment
+ * when that variable was unset. A repository can therefore name an arbitrary
+ * directory. Declarations below are not neutral scratch roots.
+ */
+function tempEnvNames(): readonly string[] {
+	return process.platform === "win32" ? ["TEMP", "TMP", "TMPDIR"] : ["TMPDIR"];
+}
+
+const PROJECT_TEMP_DOTENV_MAX_FILE_BYTES = 64 * 1024;
+
+// The snapshot is the cwd at module import, not a directory created later or a chdir before this module is imported.
+const startupTempSnapshot = projectEnvSnapshot(process.cwd(), {
+	maxFileBytes: PROJECT_TEMP_DOTENV_MAX_FILE_BYTES,
+});
+
+function projectTempSnapshots(cwd: string): ProjectEnvSnapshot[] {
+	// Check both the cwd's .env and the startup snapshot (for module-import-time cwd).
+	// The cwd's .env catches project-declared TMPDIR in the current working directory.
+	// The startup snapshot is a fallback for when the cwd's .env is deleted or inaccessible
+	// (e.g., after unlink or chdir), and also handles the case where cwd differs from the
+	// module-import-time cwd. These workspace-controlled files are read as bounded regular files.
+	const snapshots: ProjectEnvSnapshot[] = [
+		projectEnvSnapshot(cwd, { maxFileBytes: PROJECT_TEMP_DOTENV_MAX_FILE_BYTES }),
+		startupTempSnapshot,
+	];
+	return snapshots;
+}
+
+/** macOS account temp directory. `getconf` does not read `TMPDIR`. */
+let darwinUserTempDirCache: string | undefined | null = null;
+function darwinUserTempDir(): string | undefined {
+	if (process.platform !== "darwin") return undefined;
+	if (darwinUserTempDirCache !== null) return darwinUserTempDirCache;
+	darwinUserTempDirCache = undefined;
+	try {
+		const result = Bun.spawnSync({
+			cmd: ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"],
+			env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin", LC_ALL: "C" },
+			stdout: "pipe",
+			stderr: "ignore",
+		});
+		if (result.exitCode !== 0) return undefined;
+		const value = new TextDecoder().decode(result.stdout).trim();
+		if (value) darwinUserTempDirCache = value;
+	} catch {
+		// Fixed `/tmp` roots still cover the POSIX default.
+	}
+	return darwinUserTempDirCache ?? undefined;
+}
+
+function addResolvedTempRoot(roots: Set<string>, value: string | undefined): void {
+	const trimmed = value?.trim();
+	if (trimmed) roots.add(path.resolve(trimmed));
+}
+
+function isPlatformTempPath(resolved: string): boolean {
+	for (const root of POSIX_SYSTEM_TEMP_ROOTS) {
+		const resolvedRoot = path.resolve(root);
+		if (resolved === resolvedRoot || isPathWithin(resolvedRoot, resolved)) return true;
+	}
+	const darwin = darwinUserTempDir();
+	if (!darwin) return false;
+	const resolvedDarwin = path.resolve(darwin);
+	return resolved === resolvedDarwin || isPathWithin(resolvedDarwin, resolved);
+}
+
+/** True when `live` is declared, or cannot be trusted because a dotenv layer was unsafe to read. */
+function projectDeclaresTempPath(snapshots: readonly ProjectEnvSnapshot[], live: string): boolean {
+	const trimmedLive = live.trim();
+	if (!trimmedLive) return false;
+	const resolvedLive = path.resolve(trimmedLive);
+	for (const snapshot of snapshots) {
+		if (snapshot.incomplete && !isPlatformTempPath(resolvedLive)) return true;
+		for (const name of tempEnvNames()) {
+			const key = canonicalEnvKey(name);
+			const declared = snapshot.values[key];
+			if (declared === undefined) continue;
+			if (snapshot.dynamic.has(key)) {
+				// Expansion is not comparable. A dynamic value that landed on a
+				// real system temp dir is already allowed through those roots.
+				if (!isPlatformTempPath(resolvedLive)) return true;
+				continue;
+			}
+			const trimmedDeclared = declared.trim();
+			if (trimmedDeclared && path.resolve(trimmedDeclared) === resolvedLive) return true;
+		}
+	}
+	return false;
+}
+
+function neutralTempRoots(cwd: string): string[] {
 	const roots = new Set<string>();
-	const add = (value: string | undefined): void => {
-		const trimmed = value?.trim();
-		if (trimmed) roots.add(path.resolve(trimmed));
-	};
-	add(os.tmpdir());
-	add(process.env.TMPDIR);
-	for (const fixed of ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"]) add(fixed);
+	for (const fixed of POSIX_SYSTEM_TEMP_ROOTS) addResolvedTempRoot(roots, fixed);
+	addResolvedTempRoot(roots, darwinUserTempDir());
+	const candidates = [os.tmpdir(), process.env.TMPDIR];
+	if (process.platform === "win32") candidates.push(process.env.TEMP, process.env.TMP);
+	const snapshots = projectTempSnapshots(cwd);
+	for (const candidate of candidates) {
+		if (!candidate || projectDeclaresTempPath(snapshots, candidate)) continue;
+		addResolvedTempRoot(roots, candidate);
+	}
 	return [...roots];
 }
 
@@ -1849,18 +2283,27 @@ async function isNeutralTempPath(cwd: string, rawPath: string): Promise<boolean>
 	if (unknown || !absolutePath) return false;
 	const resolvedCwd = path.resolve(cwd);
 	if (isPathWithin(resolvedCwd, absolutePath)) return false;
-	if (!neutralTempRoots().some(root => isPathWithin(root, absolutePath))) return false;
+	const roots = neutralTempRoots(cwd);
+	const realRoots = await Promise.all(roots.map(realpathOrSelf));
+	// Accept both spellings (`/var/folders` and `/private/var/folders`) before the
+	// canonical re-check. The re-check still rejects a temp path whose real
+	// target is inside the project.
+	const lexicalRoots = new Set([...roots, ...realRoots]);
+	if (![...lexicalRoots].some(root => isPathWithin(root, absolutePath))) return false;
 	const realTarget = await canonicalizeForContainment(absolutePath);
 	if (isPathWithin(await realpathOrSelf(resolvedCwd), realTarget)) return false;
-	const realRoots = await Promise.all(neutralTempRoots().map(realpathOrSelf));
 	return realRoots.some(root => isPathWithin(root, realTarget));
 }
 
 /** Targets that remain disallowed during a planning phase (excludes neutral temp scratch). */
-async function planningBlockedTargets(cwd: string, targets: ExtractedTargets): Promise<string[]> {
+async function planningBlockedTargets(
+	cwd: string,
+	targets: ExtractedTargets,
+	sessionId?: string | null,
+): Promise<string[]> {
 	const blocked: string[] = [];
 	for (const rawPath of targets.paths) {
-		if (isAllowlistedPath(cwd, rawPath)) continue;
+		if (isAllowlistedPath(cwd, rawPath, sessionId)) continue;
 		if (!(await isNeutralTempPath(cwd, rawPath))) blocked.push(rawPath);
 	}
 	return blocked;
@@ -1882,12 +2325,15 @@ export async function assertWorkflowMutationRawPathsAllowed(input: {
 		throw new ToolError(`${WORKFLOW_STATE_MUTATION_BLOCK_MESSAGE}\nUse: ${command}`);
 	}
 	if (input.forceOverride) return;
-	const planning = await getActivePlanningSkill(input.cwd, input.sessionId, input.threadId, input.guardContext);
+	const guardContext =
+		input.guardContext ??
+		(await readWorkflowGuardContext(input.cwd, { sessionId: input.sessionId, threadId: input.threadId }));
+	const planning = await getActivePlanningSkill(input.cwd, input.sessionId, input.threadId, guardContext);
 
 	if (!planning) return;
 	const message = planningPhaseBlockMessage(planning.skill);
 	if (input.rawPaths.length === 0) throw new ToolError(message);
-	const blocked = await planningBlockedTargets(input.cwd, targets);
+	const blocked = await planningBlockedTargets(input.cwd, targets, guardContext.sessionId);
 	if (blocked.length > 0) throw new ToolError(message);
 }
 
@@ -1907,7 +2353,10 @@ export async function getWorkflowMutationDecision(
 			command,
 		};
 	}
-	const planning = await getActivePlanningSkill(input.cwd, input.sessionId, input.threadId, input.guardContext);
+	const guardContext =
+		input.guardContext ??
+		(await readWorkflowGuardContext(input.cwd, { sessionId: input.sessionId, threadId: input.threadId }));
+	const planning = await getActivePlanningSkill(input.cwd, input.sessionId, input.threadId, guardContext);
 	if (!planning) {
 		return { blocked: false, targets: [] };
 	}
@@ -1919,12 +2368,20 @@ export async function getWorkflowMutationDecision(
 	// name is not authorization: an `autoresearch/*` branch isolates keep/discard
 	// bookkeeping, it does not turn product edits into research.
 	//
+	// Shell and code-execution tools can run multiple operations before writing,
+	// so checking the harness once cannot protect the later write destination.
+	// Only direct file-mutation tools may use the harness exception.
 	// The allowance requires at least one named target: `every` is vacuously true
 	// for an empty list, so an opaque mutation that resolves to NO target (e.g.
 	// `python3 -c "open('src/product.ts','w').write('x')"`) would otherwise skip
 	// the fail-closed check below and be waved through on a research mission.
+	// Bash is a compound command list, not a write boundary: an earlier `ln` or
+	// `mv` can retarget the harness before a later redirection. Harness changes
+	// must use a single-target file tool so the final path is checked for symlinks
+	// immediately before that write operation.
 	if (
 		planning.skill === "autoresearch" &&
+		AUTORESEARCH_HARNESS_FILE_TOOL_NAMES.has(input.tool.name) &&
 		targets.paths.length > 0 &&
 		!targets.unknown &&
 		targets.paths.every(p => isAutoresearchAuthorizedResearchPath(input.cwd, p))
@@ -1946,7 +2403,7 @@ export async function getWorkflowMutationDecision(
 	// Neutral temp scratch (outside the project tree) stays writable so agents can
 	// stage artifacts and feed their path to the sanctioned `gjc ... --write` CLIs.
 	// Read-only / `gjc` bash extract no targets and fall through to allowed here.
-	const blockedTargets = await planningBlockedTargets(input.cwd, targets);
+	const blockedTargets = await planningBlockedTargets(input.cwd, targets, guardContext.sessionId);
 	if (blockedTargets.length === 0) {
 		return { blocked: false, targets: targets.paths };
 	}
@@ -1954,7 +2411,9 @@ export async function getWorkflowMutationDecision(
 		blocked: true,
 		message,
 		targets: targets.paths,
-		reason: allTargetsAllowlisted(input.cwd, targets) ? "handoff-artifact-tool-target" : "phase-boundary",
+		reason: allTargetsAllowlisted(input.cwd, targets, guardContext.sessionId)
+			? "handoff-artifact-tool-target"
+			: "phase-boundary",
 	};
 }
 

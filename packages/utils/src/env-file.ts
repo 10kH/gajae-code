@@ -142,13 +142,10 @@ export function parseEnvFileContent(content: string): Record<string, string> {
 		if (!isValidEnvName(key)) continue;
 
 		// Strip an unquoted trailing `# comment` the way Bun's dotenv loader
-		// does (`KEY=v#note` loads as `v`); quoted `#` survives.
+		// does (`KEY=v#note` loads as `v`); quoted `#` survives. A quoted value
+		// then ends at the first unescaped closer; Bun drops the suffix.
 		let value = stripInlineDotenvComment(match[2] ?? "").trim();
-
-		// Remove surrounding quotes (" or ')
-		if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-			value = value.slice(1, -1);
-		}
+		value = dotenvQuotedLiteral(value);
 		if (!isSafeEnvValue(value)) continue;
 
 		result[key] = value;
@@ -168,6 +165,13 @@ export function parseEnvFileContent(content: string): Record<string, string> {
 export interface ProjectEnvSnapshot {
 	values: Record<string, string>;
 	dynamic: Set<string>;
+	/** True when at least one project dotenv layer could not be read safely. */
+	incomplete?: boolean;
+}
+
+export interface ProjectEnvSnapshotOptions {
+	/** Maximum bytes read from each dotenv layer; unsafe files mark the snapshot incomplete. */
+	maxFileBytes?: number;
 }
 
 /**
@@ -184,9 +188,9 @@ export function canonicalEnvKey(name: string): string {
 /**
  * Keys whose last declaration is not safe to value-compare.
  *
- * The line parser above strips one plain pair of quotes and an unquoted `#`
- * comment. Classification uses that same comment cut, then refuses a value
- * the line parser would not store the way Bun loaded it. Other backslashes
+ * The line parser drops the suffix after the first unescaped closing quote,
+ * matching Bun, and strips an unquoted `#` comment. Classification refuses a
+ * value that parser would not store the way Bun loaded it. Other backslashes
  * stay in the compared text. The bytes inside the quotes are not decoded.
  */
 function quotedDeclarationKeys(content: string): Set<string> {
@@ -206,15 +210,46 @@ function quotedDeclarationKeys(content: string): Set<string> {
 	return quoted;
 }
 
+/** Index of the first unescaped closer, or -1. A backslash skips the next character. */
+function indexOfUnescapedCloser(value: string, opener: '"' | "'"): number {
+	for (let i = 1; i < value.length; i++) {
+		if (value[i] === "\\") {
+			i++;
+			continue;
+		}
+		if (value[i] === opener) return i;
+	}
+	return -1;
+}
+
+/**
+ * Bun ends a quoted dotenv value at the first unescaped closer and drops the
+ * suffix (`KEY="v" ignored` loads as `v`). Bytes inside the quotes are not decoded.
+ * An unclosed value keeps the previous surrounding-pair cut.
+ */
+function dotenvQuotedLiteral(value: string): string {
+	const opener = value[0];
+	if (opener !== '"' && opener !== "'") return value;
+	const closed = indexOfUnescapedCloser(value, opener);
+	if (closed !== -1) return value.slice(1, closed);
+	if (value.endsWith(opener)) return value.slice(1, -1);
+	return value;
+}
+
 function rawValueDisagreesWithLineParser(raw: string): boolean {
 	const trimmed = raw.trim();
 	const opener = trimmed[0];
-	if ((opener === '"' || opener === "'") && trimmed.length >= 2 && trimmed.endsWith(opener)) {
-		const inner = trimmed.slice(1, -1);
-		if (inner.includes(opener) || inner.includes("`") || inner.includes("\r") || inner.includes("\n")) return true;
-		// Bun turns only `\n` and `\r` into controls inside double quotes.
-		if (opener === '"' && /\\[nr]/.test(inner)) return true;
-		return false;
+	if (opener === '"' || opener === "'") {
+		const closed = indexOfUnescapedCloser(trimmed, opener);
+		if (closed !== -1) {
+			const inner = trimmed.slice(1, closed);
+			if (inner.includes(opener) || inner.includes("`") || inner.includes("\r") || inner.includes("\n")) return true;
+			// Bun turns only `\n` and `\r` into controls inside double quotes.
+			if (opener === '"' && /\\[nr]/.test(inner)) return true;
+			// Provenance trims the snapshot and compares it with Bun's untrimmed runtime value.
+			if (inner !== inner.trim()) return true;
+			return false;
+		}
 	}
 	return /["'`\r]/.test(trimmed);
 }
@@ -235,24 +270,75 @@ function rawValueDisagreesWithLineParser(raw: string): boolean {
  * `.env.local` is deliberately skipped when `NODE_ENV === "test"`, matching the
  * convention that a local override file is not part of a test run.
  */
-export function projectEnvSnapshot(cwd = process.cwd()): ProjectEnvSnapshot {
-	const nodeEnv = process.env.NODE_ENV;
+/** Files Bun overlays for a cwd. Unset NODE_ENV selects the development layer. */
+export function projectEnvLayerFiles(nodeEnv: string | undefined): string[] {
 	const validNodeEnv = nodeEnv && /^[A-Za-z0-9_-]+$/.test(nodeEnv) ? nodeEnv : undefined;
-	const files = [
+	const layer = validNodeEnv ?? (nodeEnv ? undefined : "development");
+	return [
 		".env",
-		...(validNodeEnv ? [`.env.${validNodeEnv}`] : []),
-		...(validNodeEnv !== "test" ? [".env.local"] : []),
-		...(validNodeEnv ? [`.env.${validNodeEnv}.local`] : []),
+		...(layer ? [`.env.${layer}`] : []),
+		...(layer !== "test" ? [".env.local"] : []),
+		...(layer ? [`.env.${layer}.local`] : []),
 	];
+}
+
+function readBoundedEnvFile(filePath: string, maxFileBytes: number): { content?: string; incomplete: boolean } {
+	let fileDescriptor: number | undefined;
+	try {
+		// Non-blocking open lets fstat reject FIFOs and device files before any read.
+		fileDescriptor = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
+		const initialStat = fs.fstatSync(fileDescriptor);
+		if (!initialStat.isFile() || initialStat.size > maxFileBytes) return { incomplete: true };
+
+		const buffer = Buffer.allocUnsafe(maxFileBytes + 1);
+		let bytesRead = 0;
+		while (bytesRead < buffer.byteLength) {
+			const count = fs.readSync(fileDescriptor, buffer, bytesRead, buffer.byteLength - bytesRead, bytesRead);
+			if (count === 0) break;
+			bytesRead += count;
+		}
+		if (bytesRead > maxFileBytes || fs.fstatSync(fileDescriptor).size > maxFileBytes) {
+			return { incomplete: true };
+		}
+		return { content: buffer.subarray(0, bytesRead).toString("utf-8"), incomplete: false };
+	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+			return { incomplete: false };
+		}
+		return { incomplete: true };
+	} finally {
+		if (fileDescriptor !== undefined) fs.closeSync(fileDescriptor);
+	}
+}
+
+export function projectEnvSnapshot(cwd = process.cwd(), options: ProjectEnvSnapshotOptions = {}): ProjectEnvSnapshot {
+	if (
+		options.maxFileBytes !== undefined &&
+		(!Number.isSafeInteger(options.maxFileBytes) || options.maxFileBytes < 0)
+	) {
+		throw new RangeError("maxFileBytes must be a non-negative safe integer");
+	}
+	const files = projectEnvLayerFiles(process.env.NODE_ENV);
 	const values: Record<string, string> = {};
 	const dynamic = new Set<string>();
+	let incomplete = false;
 	for (const file of files) {
 		const filePath = path.join(cwd, file);
 		let content: string;
-		try {
-			content = fs.readFileSync(filePath, "utf-8");
-		} catch {
-			continue;
+		if (options.maxFileBytes === undefined) {
+			try {
+				content = fs.readFileSync(filePath, "utf-8");
+			} catch {
+				continue;
+			}
+		} else {
+			const boundedRead = readBoundedEnvFile(filePath, options.maxFileBytes);
+			if (boundedRead.incomplete) {
+				incomplete = true;
+				continue;
+			}
+			if (boundedRead.content === undefined) continue;
+			content = boundedRead.content;
 		}
 		const quoted = quotedDeclarationKeys(content);
 		const seen = new Set<string>();
@@ -273,5 +359,5 @@ export function projectEnvSnapshot(cwd = process.cwd()): ProjectEnvSnapshot {
 			dynamic.add(key);
 		}
 	}
-	return { values, dynamic };
+	return incomplete ? { values, dynamic, incomplete: true } : { values, dynamic };
 }
