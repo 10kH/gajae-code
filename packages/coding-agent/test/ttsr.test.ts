@@ -13,7 +13,7 @@ import {
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { parseRuleConditionAndScope, type Rule } from "@gajae-code/coding-agent/capability/rule";
 import { buildRuleFromMarkdown } from "@gajae-code/coding-agent/discovery/helpers";
-import { TtsrManager } from "@gajae-code/coding-agent/export/ttsr";
+import { type TtsrInjectionRecord, TtsrManager } from "@gajae-code/coding-agent/export/ttsr";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { EditTool } from "../src/edit";
@@ -1474,10 +1474,14 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 		);
 		const append = session.sessionManager.appendTtsrInjection.bind(session.sessionManager);
 		let failures = 0;
-		session.sessionManager.appendTtsrInjection = ((...args: Parameters<typeof append>) => {
+		session.sessionManager.appendTtsrInjection = (
+			ruleNames: string[],
+			records?: TtsrInjectionRecord[],
+			ttsrMessageCount?: number,
+		) => {
 			if (failures++ === 0) throw new Error("disk full");
-			return append(...args);
-		}) as typeof append;
+			return append(ruleNames, records, ttsrMessageCount);
+		};
 		const delivered: string[] = [];
 		session.subscribe(event => {
 			if (event.type === "message_end" && event.message.role === "toolResult") {
