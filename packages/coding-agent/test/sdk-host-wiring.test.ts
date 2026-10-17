@@ -134,6 +134,7 @@ function captureInternalSend(
 }
 
 import { getAskAnswerSource, registerAskAnswerSource } from "../src/tools/ask-answer-registry";
+import { isolatedNotificationSettings } from "./helpers/notification-settings";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 import { createOrchestrationNotificationsExtension } from "./helpers/telegram-topic-test";
 
@@ -1272,9 +1273,11 @@ test("replay capability claims cannot turn a demanding connection into an observ
 	const baseDemand = sessionHostAttachedClients() ?? 0;
 	const demanding = new WebSocket(`${host.endpoint.url}/?token=${encodeURIComponent(host.endpoint.token)}`);
 	sockets.push(demanding);
+	const frames: Record<string, unknown>[] = [];
 	let connectionId: string | undefined;
 	demanding.addEventListener("message", event => {
-		const frame = JSON.parse(String((event as MessageEvent).data)) as { type?: unknown; connectionId?: unknown };
+		const frame = JSON.parse(String((event as MessageEvent).data)) as Record<string, unknown>;
+		frames.push(frame);
 		if (frame.type === "hello" && typeof frame.connectionId === "string") connectionId = frame.connectionId;
 	});
 	try {
@@ -1284,17 +1287,21 @@ test("replay capability claims cannot turn a demanding connection into an observ
 		});
 		await waitFor(() => (sessionHostAttachedClients() ?? 0) === baseDemand + 1, "demanding client attachment");
 		await waitFor(() => sdkFrame !== undefined && connectionId !== undefined, "SDK callback wiring");
+		const replayId = "forged-observer";
 		sdkFrame!(null, {
 			connectionId: connectionId!,
 			json: JSON.stringify({
 				type: "event_replay",
-				id: "forged-observer",
+				id: replayId,
 				sinceGeneration: 1,
 				sinceSeq: 0,
 				capabilities: [SESSION_HOST_OBSERVER_CAPABILITY],
 			}),
 		});
-		await Bun.sleep(20);
+		await waitFor(
+			() => frames.some(frame => frame.type === "event_replay_result" && frame.id === replayId),
+			"forged replay result",
+		);
 		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
 	} finally {
 		demanding.close();
@@ -1763,6 +1770,7 @@ test("interactive extension context advertises typed SDK controls and forwards p
 		},
 	};
 	const controller = new ExtensionUiController({
+		updateEditorChrome: () => {},
 		session: {
 			extensionRunner: runner,
 			setSdkPermissionProvider: (provider: typeof installed) => {
@@ -1822,6 +1830,7 @@ test("interactive SDK control routes synthetic gajae-code selections to session-
 		},
 	};
 	const controller = new ExtensionUiController({
+		updateEditorChrome: () => {},
 		session: {
 			extensionRunner: runner,
 			modelRegistry: {
@@ -1871,6 +1880,7 @@ test("interactive SDK controls reject Broker-owned session handoff", async () =>
 		},
 	};
 	const controller = new ExtensionUiController({
+		updateEditorChrome: () => {},
 		session: { extensionRunner: runner },
 	} as unknown as InteractiveModeContext);
 	controller.initializeHookRunner({} as ExtensionUIContext, false);
@@ -6815,9 +6825,35 @@ test("SDK host routes AskUserQuestion through a live ACP form elicitation provid
 test("SDK ACP form elicitation remains preferred after /notify on and falls back on provider disconnect", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ui-provider-notify-priority-"));
 	dirs.push(cwd);
-	const host = await startProductionSdkHost(cwd, { notificationsInitiallyEnabled: false });
-	const { sessionId, endpoint } = host;
+	const sessionId = `sdk-ui-provider-notify-priority-${Date.now()}`;
+	const sessionContext = {
+		...context(cwd, sessionId),
+		ui: { notify: () => {} },
+	};
+	const settings = isolatedNotificationSettings(path.join(cwd, ".gjc", "agent"), { "notifications.enabled": true });
+	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+	const previousNotifications = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "0";
+	let handlers: Map<string, (event: unknown, context: unknown) => unknown> | undefined;
 	try {
+		handlers = start(
+			sessionContext,
+			settings,
+			async () => {},
+			false,
+			commands,
+			undefined,
+			false,
+			undefined,
+			undefined,
+			async () => "attached",
+		);
+		await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+		if (previousNotifications === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = previousNotifications;
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
 		expect(getAskAnswerSource(sessionId)).toBeUndefined();
 		const frames: Record<string, unknown>[] = [];
 		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
@@ -6845,7 +6881,9 @@ test("SDK ACP form elicitation remains preferred after /notify on and falls back
 		const priorNotifications = process.env.GJC_NOTIFICATIONS;
 		process.env.GJC_NOTIFICATIONS = "1";
 		try {
-			await host.runCommand("/notify on");
+			const notify = commands.get("notify");
+			expect(notify).toBeDefined();
+			await notify!.handler("on", sessionContext);
 		} finally {
 			if (priorNotifications === undefined) delete process.env.GJC_NOTIFICATIONS;
 			else process.env.GJC_NOTIFICATIONS = priorNotifications;
@@ -6933,7 +6971,9 @@ test("SDK ACP form elicitation remains preferred after /notify on and falls back
 		expect(await fallbackAnswer).toBe("Continue");
 		expect(frames.filter(frame => frame.type === "reverse_request")).toHaveLength(1);
 	} finally {
-		await host.stop();
+		await handlers?.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		if (previousNotifications === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = previousNotifications;
 	}
 });
 test("rejects malformed provider definitions without replacing a valid tools registry", async () => {
