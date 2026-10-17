@@ -26,6 +26,7 @@ import type { ToolSession } from "../tools";
 import { VimTool, vimSchema } from "../tools/vim";
 import { type EditMode, resolveEditMode, resolveForcedEnvEditMode } from "../utils/edit-mode";
 import type { VimToolDetails } from "../vim/types";
+import { normalizeCreateContent } from "./diff";
 import {
 	type ApplyPatchEntry,
 	type ApplyPatchParams,
@@ -421,7 +422,8 @@ export class EditTool implements AgentTool<TInput> {
 						if (!parsed.success) return undefined;
 						const { diff, op, rename } = parsed.data;
 						if (op === "delete" || diff === undefined) continue;
-						add(rename ?? record.path, addedPatchDigest(diff) ?? (op === "create" ? diff : undefined));
+						// A create body is digested exactly as the writer will persist it.
+						add(rename ?? record.path, op === "create" ? normalizeCreateContent(diff) : addedPatchDigest(diff));
 					}
 					break;
 				}

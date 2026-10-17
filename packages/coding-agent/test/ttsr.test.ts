@@ -1194,6 +1194,21 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 		expect(injectedNames(session)).toEqual(["named-exports"]);
 	});
 
+	it("matches a .scss write through the CSS grammar and blocks it under an always interrupt", async () => {
+		const cssContent = "TTSR-CSS-REMINDER: use design tokens.";
+		const { session, triggered, modelMessages } = createSession(
+			[new WriteTool(createToolSession())],
+			[[writeCall("write-1", "theme.scss", ".button { color: red; }\n")]],
+			[makeRule({ name: "css-tokens", content: cssContent, astCondition: ["$P: $V;"] })],
+			{ interruptMode: "always" },
+		);
+		await run(session, "write it");
+
+		expect(triggered).toEqual([["css-tokens"]]);
+		expect(fs.existsSync(path.join(tempDir, "theme.scss"))).toBe(false);
+		expect(JSON.stringify(modelMessages[1])).toContain(cssContent);
+	});
+
 	it.each([
 		"materialized",
 		"deferred",

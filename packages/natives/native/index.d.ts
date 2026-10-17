@@ -812,7 +812,10 @@ export declare function astMatch(options: AstMatchOptions): Promise<AstMatchResu
 export interface AstMatchOptions {
   /** Source code to match against (parsed in memory, never read from disk). */
   source: string
-  /** Language of `source` (required; e.g. "ts", "tsx", "rust", "python"). */
+  /**
+   * Language of `source` (required): an alias ("ts", "rust", "python") or a
+   * file extension ("scss"), resolved like a path's extension.
+   */
   lang: string
   /** ast-grep patterns to search for (OR across patterns). */
   patterns: Array<string>

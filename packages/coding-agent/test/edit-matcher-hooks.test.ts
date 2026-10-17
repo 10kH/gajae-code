@@ -42,6 +42,15 @@ describe("edit matcher hooks", () => {
 		expect(inspect("one\ntwo")).toEqual([{ path: "a.txt", digest: "one\ntwo" }]);
 	});
 
+	test("patch create with mixed prefixed and plain lines digests the content the writer persists", () => {
+		const tool = new EditTool(makeSession(), "patch");
+		// Not every line carries `+`, so the writer keeps the body verbatim.
+		const diff = "+1;\nconsole.log('guarded');";
+		expect(tool.matcherEntries({ path: "a.ts", edits: [{ op: "create", diff }] })).toEqual([
+			{ path: "a.ts", digest: diff },
+		]);
+	});
+
 	// Ported from oh-my-pi crates/pi-edit/src/modes/hashline/mod.rs
 	// `inspect_extracts_paths_and_added_lines_from_partial_input`. Upstream input
 	// `[*** Update File: src/a.ts#ABCD]\nPUT 1.=1:\n+new\n[src/b.ts]\nCUT 2.=2` is

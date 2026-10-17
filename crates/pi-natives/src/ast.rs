@@ -258,7 +258,8 @@ pub struct AstFindResult {
 pub struct AstMatchOptions<'env> {
 	/// Source code to match against (parsed in memory, never read from disk).
 	pub source:       String,
-	/// Language of `source` (required; e.g. "ts", "tsx", "rust", "python").
+	/// Language of `source` (required): an alias ("ts", "rust", "python") or a
+	/// file extension ("scss"), resolved like a path's extension.
 	pub lang:         String,
 	/// ast-grep patterns to search for (OR across patterns).
 	pub patterns:     Vec<String>,
@@ -394,6 +395,16 @@ fn to_u32(value: usize) -> u32 {
 
 fn resolve_supported_lang(value: &str) -> Result<SupportLang> {
 	shared_ops::resolve_supported_lang(value).map_err(|err| Error::from_reason(err.to_string()))
+}
+
+/// Resolve `ast_match`'s `lang`: a language alias, or else a file extension
+/// mapped the same way paths are (e.g. `scss` resolves to CSS), so callers that
+/// only know a file's extension match exactly what a path-based search would.
+fn resolve_match_lang(value: &str) -> Result<SupportLang> {
+	resolve_supported_lang(value).or_else(|err| {
+		let ext = value.trim_start_matches('.');
+		SupportLang::from_path(Path::new(&format!("file.{ext}"))).ok_or(err)
+	})
 }
 
 fn resolve_language(lang: Option<&str>, file_path: &Path) -> Result<SupportLang> {
@@ -926,7 +937,7 @@ pub fn ast_match(options: AstMatchOptions<'_>) -> task::Promise<AstMatchResult> 
 		if lang_str.is_empty() {
 			return Err(Error::from_reason("`lang` is required for ast_match".to_string()));
 		}
-		let language = resolve_supported_lang(lang_str)?;
+		let language = resolve_match_lang(lang_str)?;
 
 		let mut parse_errors = Vec::new();
 		let mut compiled_patterns = Vec::with_capacity(patterns.len());
@@ -1313,6 +1324,10 @@ mod tests {
 		assert_eq!(resolve_supported_lang("c").ok(), Some(SupportLang::C));
 		assert_eq!(resolve_supported_lang("cpp").ok(), Some(SupportLang::Cpp));
 		assert!(resolve_supported_lang("brainfuck").is_err());
+		assert_eq!(resolve_match_lang("scss").ok(), Some(SupportLang::Css));
+		assert_eq!(resolve_match_lang(".scss").ok(), Some(SupportLang::Css));
+		assert_eq!(resolve_match_lang("ts").ok(), Some(SupportLang::TypeScript));
+		assert!(resolve_match_lang("brainfuck").is_err());
 	}
 
 	#[test]
