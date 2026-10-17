@@ -328,6 +328,22 @@ describe("openArchive inflate caps", () => {
 	);
 
 	test(
+		"finds the actual end record when a ZIP comment contains an EOCD-shaped sequence",
+		noted("finds the actual end record when a ZIP comment contains an EOCD-shaped sequence", async () => {
+			const bytes = zipSync({ "commented.txt": new TextEncoder().encode("commented") });
+			const eocdOffset = bytes.byteLength - 22;
+			const bytesWithComment = bytes.slice();
+			zipView(bytesWithComment).setUint16(eocdOffset + 20, 22, true);
+			const comment = new Uint8Array(22);
+			zipView(comment).setUint32(0, 0x06054b50, true);
+			await withFile("commented.zip", concat([bytesWithComment, comment]), async file => {
+				const archive = await openArchive(file);
+				expect(new TextDecoder().decode((await archive.readFile("commented.txt")).bytes)).toBe("commented");
+			});
+		}),
+	);
+
+	test(
 		"rejects a central directory name that disagrees with its local header",
 		noted("rejects a central directory name that disagrees with its local header", async () => {
 			const bytes = zipSync({ "one.txt": new TextEncoder().encode("one") });
