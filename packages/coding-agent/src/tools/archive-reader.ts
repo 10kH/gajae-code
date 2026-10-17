@@ -9,6 +9,15 @@ const MAX_ARCHIVE_PATH_DEPTH = 48;
 // Round each 512-byte header plus up to 511 bytes of data padding to 1 KiB per entry.
 const MAX_TAR_CONTAINER_BYTES = MAX_ARCHIVE_TOTAL_BYTES + MAX_ARCHIVE_ENTRY_COUNT * 1024 + 1024;
 const MAX_GZIP_LAYERS = 24;
+const ZIP_LOCAL_FILE_HEADER_SIGNATURE = 0x04034b50;
+const ZIP_CENTRAL_DIRECTORY_SIGNATURE = 0x02014b50;
+const ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE = 0x06054b50;
+const ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE = 0x06064b50;
+const ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_SIGNATURE = 0x07064b50;
+const ZIP_DATA_DESCRIPTOR_SIGNATURE = 0x08074b50;
+const ZIP_CENTRAL_DIRECTORY_DIGITAL_SIGNATURE = 0x05054b50;
+const ZIP_UINT16_MAX = 0xffff;
+const ZIP_UINT32_MAX = 0xffff_ffff;
 
 let fflateModulePromise: Promise<typeof import("fflate")> | undefined;
 async function loadFflate(): Promise<typeof import("fflate")> {
@@ -319,7 +328,369 @@ async function readTarEntries(bytes: Uint8Array, labeledGzip: boolean): Promise<
 	return entries;
 }
 
+interface ZipDirectoryEntry {
+	name: string;
+	nameBytes: Uint8Array;
+	flags: number;
+	compression: number;
+	crc32: number;
+	compressedSize: number;
+	uncompressedSize: number;
+	localOffset: number;
+}
+
+interface Zip64ExtraNeeds {
+	uncompressedSize: boolean;
+	compressedSize: boolean;
+	localOffset: boolean;
+	diskNumber: boolean;
+}
+
+interface Zip64ExtraValues {
+	uncompressedSize?: number;
+	compressedSize?: number;
+	localOffset?: number;
+	diskNumber?: number;
+}
+
+function invalidZipArchive(): ToolError {
+	return new ToolError("Invalid ZIP archive");
+}
+
+function requireZipRange(view: DataView, offset: number, length: number, end = view.byteLength): void {
+	if (
+		!Number.isSafeInteger(offset) ||
+		!Number.isSafeInteger(length) ||
+		offset < 0 ||
+		length < 0 ||
+		offset + length > end
+	) {
+		throw invalidZipArchive();
+	}
+}
+
+function zipUint64(view: DataView, offset: number, end: number): number {
+	requireZipRange(view, offset, 8, end);
+	const value = view.getBigUint64(offset, true);
+	if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw invalidZipArchive();
+	return Number(value);
+}
+
+function parseZip64Extra(view: DataView, start: number, length: number, needs: Zip64ExtraNeeds): Zip64ExtraValues {
+	const end = start + length;
+	requireZipRange(view, start, length);
+	let zip64Start: number | undefined;
+	let zip64End = 0;
+	for (let offset = start; offset < end; ) {
+		requireZipRange(view, offset, 4, end);
+		const id = view.getUint16(offset, true);
+		const fieldLength = view.getUint16(offset + 2, true);
+		const fieldStart = offset + 4;
+		requireZipRange(view, fieldStart, fieldLength, end);
+		if (id === 0x0001) {
+			if (zip64Start !== undefined) throw invalidZipArchive();
+			zip64Start = fieldStart;
+			zip64End = fieldStart + fieldLength;
+		}
+		offset = fieldStart + fieldLength;
+	}
+
+	const needsZip64 = Object.values(needs).some(Boolean);
+	if (zip64Start === undefined) {
+		if (needsZip64) throw invalidZipArchive();
+		return {};
+	}
+
+	const values: Zip64ExtraValues = {};
+	let offset = zip64Start;
+	if (needs.uncompressedSize) {
+		values.uncompressedSize = zipUint64(view, offset, zip64End);
+		offset += 8;
+	}
+	if (needs.compressedSize) {
+		values.compressedSize = zipUint64(view, offset, zip64End);
+		offset += 8;
+	}
+	if (needs.localOffset) {
+		values.localOffset = zipUint64(view, offset, zip64End);
+		offset += 8;
+	}
+	if (needs.diskNumber) {
+		requireZipRange(view, offset, 4, zip64End);
+		values.diskNumber = view.getUint32(offset, true);
+	}
+	return values;
+}
+
+function decodeZipName(bytes: Uint8Array, flags: number): string {
+	if ((flags & 0x0800) !== 0) return new TextDecoder().decode(bytes);
+	let name = "";
+	for (let offset = 0; offset < bytes.byteLength; offset += 0x4000) {
+		name += String.fromCharCode(...bytes.subarray(offset, offset + 0x4000));
+	}
+	return name;
+}
+
+function zipDescriptorEnd(
+	view: DataView,
+	start: number,
+	end: number,
+	entry: ZipDirectoryEntry,
+	zip64Sizes: boolean,
+): number {
+	const matches = (hasSignature: boolean): number | undefined => {
+		let offset = start;
+		if (hasSignature) {
+			if (offset + 4 > end || view.getUint32(offset, true) !== ZIP_DATA_DESCRIPTOR_SIGNATURE) return undefined;
+			offset += 4;
+		}
+		const sizeLength = zip64Sizes ? 8 : 4;
+		if (offset + 4 + sizeLength * 2 > end) return undefined;
+		if (view.getUint32(offset, true) !== entry.crc32) return undefined;
+		const compressedSize = zip64Sizes
+			? view.getBigUint64(offset + 4, true)
+			: BigInt(view.getUint32(offset + 4, true));
+		const uncompressedSize = zip64Sizes
+			? view.getBigUint64(offset + 4 + sizeLength, true)
+			: BigInt(view.getUint32(offset + 4 + sizeLength, true));
+		if (compressedSize !== BigInt(entry.compressedSize) || uncompressedSize !== BigInt(entry.uncompressedSize)) {
+			return undefined;
+		}
+		return offset + 4 + sizeLength * 2;
+	};
+
+	const withSignature = matches(true);
+	const withoutSignature = matches(false);
+	const descriptorEnd = withSignature ?? withoutSignature;
+	if (descriptorEnd === undefined) throw invalidZipArchive();
+	return descriptorEnd;
+}
+
+function validateZipLocalEntry(
+	view: DataView,
+	bytes: Uint8Array,
+	entry: ZipDirectoryEntry,
+	offsetCorrection: number,
+	centralDirectoryStart: number,
+): { entry: ZipDirectoryEntry; endOffset: number } {
+	const localOffset = entry.localOffset + offsetCorrection;
+	requireZipRange(view, localOffset, 30, centralDirectoryStart);
+	if (view.getUint32(localOffset, true) !== ZIP_LOCAL_FILE_HEADER_SIGNATURE) throw invalidZipArchive();
+	const flags = view.getUint16(localOffset + 6, true);
+	const compression = view.getUint16(localOffset + 8, true);
+	const crc32 = view.getUint32(localOffset + 14, true);
+	const compressedSize32 = view.getUint32(localOffset + 18, true);
+	const uncompressedSize32 = view.getUint32(localOffset + 22, true);
+	const nameLength = view.getUint16(localOffset + 26, true);
+	const extraLength = view.getUint16(localOffset + 28, true);
+	const nameStart = localOffset + 30;
+	const extraStart = nameStart + nameLength;
+	requireZipRange(view, nameStart, nameLength + extraLength, centralDirectoryStart);
+	const localName = bytes.subarray(nameStart, extraStart);
+	if (
+		flags !== entry.flags ||
+		compression !== entry.compression ||
+		localName.byteLength !== entry.nameBytes.byteLength ||
+		localName.some((byte, index) => byte !== entry.nameBytes[index])
+	) {
+		throw invalidZipArchive();
+	}
+
+	const zip64Sizes = compressedSize32 === ZIP_UINT32_MAX || uncompressedSize32 === ZIP_UINT32_MAX;
+	const zip64 = parseZip64Extra(view, extraStart, extraLength, {
+		uncompressedSize: uncompressedSize32 === ZIP_UINT32_MAX,
+		compressedSize: compressedSize32 === ZIP_UINT32_MAX,
+		localOffset: false,
+		diskNumber: false,
+	});
+	const compressedSize = compressedSize32 === ZIP_UINT32_MAX ? zip64.compressedSize : compressedSize32;
+	const uncompressedSize = uncompressedSize32 === ZIP_UINT32_MAX ? zip64.uncompressedSize : uncompressedSize32;
+	if (compressedSize === undefined || uncompressedSize === undefined) throw invalidZipArchive();
+
+	const hasDescriptor = (flags & 0x0008) !== 0;
+	if (hasDescriptor) {
+		if (crc32 !== 0 && crc32 !== entry.crc32) throw invalidZipArchive();
+		if (compressedSize !== 0 && compressedSize !== entry.compressedSize) throw invalidZipArchive();
+		if (uncompressedSize !== 0 && uncompressedSize !== entry.uncompressedSize) throw invalidZipArchive();
+	} else if (
+		crc32 !== entry.crc32 ||
+		compressedSize !== entry.compressedSize ||
+		uncompressedSize !== entry.uncompressedSize
+	) {
+		throw invalidZipArchive();
+	}
+
+	const dataStart = extraStart + extraLength;
+	const dataEnd = dataStart + entry.compressedSize;
+	if (dataEnd > centralDirectoryStart) throw invalidZipArchive();
+	const endOffset = hasDescriptor
+		? zipDescriptorEnd(view, dataEnd, centralDirectoryStart, entry, zip64Sizes)
+		: dataEnd;
+	return { entry: { ...entry, localOffset }, endOffset };
+}
+
+function readZipDirectory(bytes: Uint8Array): ZipDirectoryEntry[] {
+	// fflate's streaming reader emits local records but does not require or validate the ZIP end records.
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	const searchStart = Math.max(0, bytes.byteLength - 22 - ZIP_UINT16_MAX);
+	let endOffset = -1;
+	for (let offset = bytes.byteLength - 22; offset >= searchStart; offset--) {
+		if (view.getUint32(offset, true) !== ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE) continue;
+		const commentLength = view.getUint16(offset + 20, true);
+		if (offset + 22 + commentLength === bytes.byteLength) {
+			endOffset = offset;
+			break;
+		}
+	}
+	if (endOffset < 0) throw invalidZipArchive();
+
+	const diskNumber = view.getUint16(endOffset + 4, true);
+	const centralDiskNumber = view.getUint16(endOffset + 6, true);
+	const entriesOnDisk16 = view.getUint16(endOffset + 8, true);
+	const entryCount16 = view.getUint16(endOffset + 10, true);
+	const centralSize32 = view.getUint32(endOffset + 12, true);
+	const centralOffset32 = view.getUint32(endOffset + 16, true);
+	if (
+		diskNumber !== 0 ||
+		centralDiskNumber !== 0 ||
+		(entriesOnDisk16 !== ZIP_UINT16_MAX && entriesOnDisk16 !== entryCount16)
+	) {
+		throw invalidZipArchive();
+	}
+
+	const needsZip64 =
+		entriesOnDisk16 === ZIP_UINT16_MAX ||
+		entryCount16 === ZIP_UINT16_MAX ||
+		centralSize32 === ZIP_UINT32_MAX ||
+		centralOffset32 === ZIP_UINT32_MAX;
+	const locatorOffset = endOffset - 20;
+	const hasZip64Locator =
+		locatorOffset >= 0 && view.getUint32(locatorOffset, true) === ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_SIGNATURE;
+	if (needsZip64 && !hasZip64Locator) throw invalidZipArchive();
+
+	let entryCount: number;
+	let centralSize: number;
+	let centralOffset: number;
+	let centralDirectoryEnd: number;
+	if (hasZip64Locator) {
+		const locatorDisk = view.getUint32(locatorOffset + 4, true);
+		const zip64EndOffset = zipUint64(view, locatorOffset + 8, locatorOffset + 20);
+		const totalDisks = view.getUint32(locatorOffset + 16, true);
+		if (locatorDisk !== 0 || totalDisks !== 1) throw invalidZipArchive();
+		requireZipRange(view, zip64EndOffset, 56, locatorOffset);
+		if (view.getUint32(zip64EndOffset, true) !== ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE) throw invalidZipArchive();
+		const zip64RecordSize = zipUint64(view, zip64EndOffset + 4, locatorOffset);
+		if (zip64RecordSize < 44 || zip64EndOffset + 12 + zip64RecordSize !== locatorOffset) throw invalidZipArchive();
+		if (view.getUint32(zip64EndOffset + 16, true) !== 0 || view.getUint32(zip64EndOffset + 20, true) !== 0) {
+			throw invalidZipArchive();
+		}
+		const entriesOnDisk = zipUint64(view, zip64EndOffset + 24, locatorOffset);
+		entryCount = zipUint64(view, zip64EndOffset + 32, locatorOffset);
+		centralSize = zipUint64(view, zip64EndOffset + 40, locatorOffset);
+		centralOffset = zipUint64(view, zip64EndOffset + 48, locatorOffset);
+		if (entriesOnDisk !== entryCount) throw invalidZipArchive();
+		if (
+			(entriesOnDisk16 !== ZIP_UINT16_MAX && entriesOnDisk16 !== entriesOnDisk) ||
+			(entryCount16 !== ZIP_UINT16_MAX && entryCount16 !== entryCount) ||
+			(centralSize32 !== ZIP_UINT32_MAX && centralSize32 !== centralSize) ||
+			(centralOffset32 !== ZIP_UINT32_MAX && centralOffset32 !== centralOffset)
+		) {
+			throw invalidZipArchive();
+		}
+		centralDirectoryEnd = zip64EndOffset;
+	} else {
+		entryCount = entryCount16;
+		centralSize = centralSize32;
+		centralOffset = centralOffset32;
+		centralDirectoryEnd = endOffset;
+	}
+	if (entryCount > MAX_ARCHIVE_ENTRY_COUNT) throw archiveLimitError("count");
+	if (centralSize > centralDirectoryEnd) throw invalidZipArchive();
+	const centralDirectoryStart = centralDirectoryEnd - centralSize;
+	const offsetCorrection = centralDirectoryStart - centralOffset;
+	if (offsetCorrection < 0) throw invalidZipArchive();
+
+	const directoryEntries: ZipDirectoryEntry[] = [];
+	let totalUncompressed = 0;
+	let offset = centralDirectoryStart;
+	for (let index = 0; index < entryCount; index++) {
+		requireZipRange(view, offset, 46, centralDirectoryEnd);
+		if (view.getUint32(offset, true) !== ZIP_CENTRAL_DIRECTORY_SIGNATURE) throw invalidZipArchive();
+		const flags = view.getUint16(offset + 8, true);
+		const compression = view.getUint16(offset + 10, true);
+		const crc32 = view.getUint32(offset + 16, true);
+		const compressedSize32 = view.getUint32(offset + 20, true);
+		const uncompressedSize32 = view.getUint32(offset + 24, true);
+		const nameLength = view.getUint16(offset + 28, true);
+		const extraLength = view.getUint16(offset + 30, true);
+		const commentLength = view.getUint16(offset + 32, true);
+		const diskStart16 = view.getUint16(offset + 34, true);
+		const localOffset32 = view.getUint32(offset + 42, true);
+		const nameStart = offset + 46;
+		const extraStart = nameStart + nameLength;
+		const recordLength = 46 + nameLength + extraLength + commentLength;
+		requireZipRange(view, offset, recordLength, centralDirectoryEnd);
+		const zip64 = parseZip64Extra(view, extraStart, extraLength, {
+			uncompressedSize: uncompressedSize32 === ZIP_UINT32_MAX,
+			compressedSize: compressedSize32 === ZIP_UINT32_MAX,
+			localOffset: localOffset32 === ZIP_UINT32_MAX,
+			diskNumber: diskStart16 === ZIP_UINT16_MAX,
+		});
+		const uncompressedSize = uncompressedSize32 === ZIP_UINT32_MAX ? zip64.uncompressedSize : uncompressedSize32;
+		const compressedSize = compressedSize32 === ZIP_UINT32_MAX ? zip64.compressedSize : compressedSize32;
+		const localOffset = localOffset32 === ZIP_UINT32_MAX ? zip64.localOffset : localOffset32;
+		const diskStart = diskStart16 === ZIP_UINT16_MAX ? zip64.diskNumber : diskStart16;
+		if (
+			uncompressedSize === undefined ||
+			compressedSize === undefined ||
+			localOffset === undefined ||
+			diskStart !== 0
+		) {
+			throw invalidZipArchive();
+		}
+		const nameBytes = bytes.subarray(nameStart, extraStart);
+		const name = decodeZipName(nameBytes, flags);
+		if (uncompressedSize > MAX_ARCHIVE_ENTRY_BYTES) throw archiveLimitError("entry", name);
+		totalUncompressed += uncompressedSize;
+		if (totalUncompressed > MAX_ARCHIVE_TOTAL_BYTES) throw archiveLimitError("total");
+		directoryEntries.push({
+			name,
+			nameBytes,
+			flags,
+			compression,
+			crc32,
+			compressedSize,
+			uncompressedSize,
+			localOffset,
+		});
+		offset += recordLength;
+	}
+	if (offset < centralDirectoryEnd) {
+		requireZipRange(view, offset, 6, centralDirectoryEnd);
+		const signatureLength = view.getUint16(offset + 4, true);
+		if (
+			view.getUint32(offset, true) !== ZIP_CENTRAL_DIRECTORY_DIGITAL_SIGNATURE ||
+			offset + 6 + signatureLength !== centralDirectoryEnd
+		) {
+			throw invalidZipArchive();
+		}
+		offset = centralDirectoryEnd;
+	}
+	if (offset !== centralDirectoryEnd) throw invalidZipArchive();
+
+	const localEntries = directoryEntries
+		.map(entry => validateZipLocalEntry(view, bytes, entry, offsetCorrection, centralDirectoryStart))
+		.sort((left, right) => left.entry.localOffset - right.entry.localOffset);
+	for (let index = 1; index < localEntries.length; index++) {
+		const previous = localEntries[index - 1];
+		const current = localEntries[index];
+		if (previous && current && current.entry.localOffset < previous.endOffset) throw invalidZipArchive();
+	}
+	return localEntries.map(item => item.entry);
+}
+
 async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
+	const directoryEntries = readZipDirectory(bytes);
 	const { Inflate, Unzip, UnzipPassThrough } = await loadFflate();
 	// Unzip constructs custom decoders synchronously in file.start; the decoder captures this entry's budget.
 	let activeInflateBudget:
@@ -374,10 +745,20 @@ async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
 	};
 	unzipper.onfile = file => {
 		if (limitError) return halt(file, limitError);
+		const expected = directoryEntries[entryCount];
 		entryCount += 1;
+		if (!expected || file.name !== expected.name || file.compression !== expected.compression) {
+			return halt(file, invalidZipArchive());
+		}
 		const declared = file.originalSize;
 		const normalizedPath = normalizeArchiveEntryPath(file.name);
 		if (entryCount > MAX_ARCHIVE_ENTRY_COUNT) return halt(file, archiveLimitError("count"));
+		if (typeof file.size === "number" && file.size !== expected.compressedSize) {
+			return halt(file, invalidZipArchive());
+		}
+		if (typeof declared === "number" && declared !== expected.uncompressedSize) {
+			return halt(file, invalidZipArchive());
+		}
 		if (archiveEntryDepth(file.name) > MAX_ARCHIVE_PATH_DEPTH)
 			return halt(file, archiveLimitError("depth", file.name));
 		if (typeof declared === "number" && declared > MAX_ARCHIVE_ENTRY_BYTES) {
@@ -400,6 +781,7 @@ async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
 			totalUncompressed += size;
 			if (size > 0 && !isDirectory && data) chunks.push(data);
 			if (!final) return;
+			if (entryBytes !== expected.uncompressedSize) return halt(file, invalidZipArchive());
 			entries.push({
 				path: normalizedPath,
 				isDirectory,
@@ -431,6 +813,7 @@ async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
 		if (!limitError) limitError = new ToolError(error instanceof Error ? error.message : String(error));
 	}
 	if (limitError) throw limitError;
+	if (entryCount !== directoryEntries.length) throw invalidZipArchive();
 	return [
 		...entries.reduce((map, entry) => map.set(entry.path, entry), new Map<string, ArchiveIndexEntry>()).values(),
 	];

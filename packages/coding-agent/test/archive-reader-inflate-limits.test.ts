@@ -169,6 +169,79 @@ function zipUnknownSize(files: Array<{ name: string; data: Uint8Array }>): Uint8
 	return concat(parts);
 }
 
+function zipView(bytes: Uint8Array): DataView {
+	return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+}
+
+function zip64SingleEntry(name: string, data: Uint8Array): Uint8Array {
+	const bytes = zipSync({ [name]: data }, { level: 0 });
+	const view = zipView(bytes);
+	const eocdOffset = bytes.byteLength - 22;
+	const centralOffset = view.getUint32(eocdOffset + 16, true);
+	const localNameLength = view.getUint16(26, true);
+	const localExtraLength = view.getUint16(28, true);
+	const compressedSize = view.getUint32(18, true);
+	const localHeader = bytes.slice(0, 30 + localNameLength);
+	const localHeaderView = zipView(localHeader);
+	localHeaderView.setUint32(18, 0xffff_ffff, true);
+	localHeaderView.setUint32(22, 0xffff_ffff, true);
+	localHeaderView.setUint16(28, 20, true);
+	const localZip64Extra = new Uint8Array(20);
+	const localZip64View = zipView(localZip64Extra);
+	localZip64View.setUint16(0, 0x0001, true);
+	localZip64View.setUint16(2, 16, true);
+	localZip64View.setBigUint64(4, BigInt(data.byteLength), true);
+	localZip64View.setBigUint64(12, BigInt(compressedSize), true);
+	const payloadStart = 30 + localNameLength + localExtraLength;
+	const payload = bytes.subarray(payloadStart, payloadStart + compressedSize);
+	const localRecord = concat([localHeader, localZip64Extra, payload]);
+
+	const centralNameLength = view.getUint16(centralOffset + 28, true);
+	const centralExtraLength = view.getUint16(centralOffset + 30, true);
+	const centralCommentLength = view.getUint16(centralOffset + 32, true);
+	const centralHeader = bytes.slice(centralOffset, centralOffset + 46 + centralNameLength);
+	const centralHeaderView = zipView(centralHeader);
+	centralHeaderView.setUint32(20, 0xffff_ffff, true);
+	centralHeaderView.setUint32(24, 0xffff_ffff, true);
+	centralHeaderView.setUint16(30, 28, true);
+	centralHeaderView.setUint32(42, 0xffff_ffff, true);
+	const centralZip64Extra = new Uint8Array(28);
+	const centralZip64View = zipView(centralZip64Extra);
+	centralZip64View.setUint16(0, 0x0001, true);
+	centralZip64View.setUint16(2, 24, true);
+	centralZip64View.setBigUint64(4, BigInt(data.byteLength), true);
+	centralZip64View.setBigUint64(12, BigInt(compressedSize), true);
+	centralZip64View.setBigUint64(20, 0n, true);
+	const commentStart = centralOffset + 46 + centralNameLength + centralExtraLength;
+	const comment = bytes.subarray(commentStart, commentStart + centralCommentLength);
+	const centralDirectory = concat([centralHeader, centralZip64Extra, comment]);
+
+	const zip64EndOffset = localRecord.byteLength + centralDirectory.byteLength;
+	const zip64End = new Uint8Array(56);
+	const zip64EndView = zipView(zip64End);
+	zip64EndView.setUint32(0, 0x06064b50, true);
+	zip64EndView.setBigUint64(4, 44n, true);
+	zip64EndView.setUint16(12, 45, true);
+	zip64EndView.setUint16(14, 45, true);
+	zip64EndView.setBigUint64(24, 1n, true);
+	zip64EndView.setBigUint64(32, 1n, true);
+	zip64EndView.setBigUint64(40, BigInt(centralDirectory.byteLength), true);
+	zip64EndView.setBigUint64(48, BigInt(localRecord.byteLength), true);
+	const locator = new Uint8Array(20);
+	const locatorView = zipView(locator);
+	locatorView.setUint32(0, 0x07064b50, true);
+	locatorView.setBigUint64(8, BigInt(zip64EndOffset), true);
+	locatorView.setUint32(16, 1, true);
+	const eocd = new Uint8Array(22);
+	const eocdView = zipView(eocd);
+	eocdView.setUint32(0, 0x06054b50, true);
+	eocdView.setUint16(8, 0xffff, true);
+	eocdView.setUint16(10, 0xffff, true);
+	eocdView.setUint32(12, 0xffff_ffff, true);
+	eocdView.setUint32(16, 0xffff_ffff, true);
+	return concat([localRecord, centralDirectory, zip64End, locator, eocd]);
+}
+
 async function withFile(name: string, bytes: Uint8Array, run: (file: string) => Promise<void>): Promise<void> {
 	const dir = await mkdtemp(path.join(tmpdir(), "archive-cap-"));
 	try {
@@ -202,6 +275,81 @@ describe("openArchive inflate caps", () => {
 				const entry = await archive.readFile("src/hello.txt");
 				expect(new TextDecoder().decode(entry.bytes)).toBe("hello");
 				expect(archive.listDirectory("src").map(item => item.name)).toContain("hello.txt");
+			});
+		}),
+	);
+
+	test(
+		"rejects a ZIP ending after a complete local member without an end directory",
+		noted("rejects a ZIP ending after a complete local member without an end directory", async () => {
+			const bytes = zipSync({ "complete.txt": new TextEncoder().encode("complete") }, { level: 0 });
+			const view = zipView(bytes);
+			const localEnd = 30 + view.getUint16(26, true) + view.getUint16(28, true) + view.getUint32(18, true);
+			await withFile("missing-directory.zip", bytes.subarray(0, localEnd), async file => {
+				await expect(openArchive(file)).rejects.toThrow(/Invalid ZIP archive/);
+			});
+		}),
+	);
+
+	test(
+		"rejects a ZIP truncated partway through its central directory",
+		noted("rejects a ZIP truncated partway through its central directory", async () => {
+			const bytes = zipSync(
+				{
+					"first.txt": new TextEncoder().encode("first"),
+					"second.txt": new TextEncoder().encode("second"),
+				},
+				{ level: 0 },
+			);
+			const view = zipView(bytes);
+			const eocdOffset = bytes.byteLength - 22;
+			const centralOffset = view.getUint32(eocdOffset + 16, true);
+			const firstCentralLength =
+				46 + view.getUint16(centralOffset + 28, true) + view.getUint16(centralOffset + 30, true);
+			const partialDirectoryEnd = centralOffset + firstCentralLength + 8;
+			const truncated = concat([bytes.subarray(0, partialDirectoryEnd), bytes.subarray(eocdOffset)]);
+			await withFile("partial-directory.zip", truncated, async file => {
+				await expect(openArchive(file)).rejects.toThrow(/Invalid ZIP archive/);
+			});
+		}),
+	);
+
+	test(
+		"rejects a ZIP whose end record entry count disagrees with its directory",
+		noted("rejects a ZIP whose end record entry count disagrees with its directory", async () => {
+			const bytes = zipSync({ "one.txt": new TextEncoder().encode("one") });
+			const corrupted = bytes.slice();
+			const view = zipView(corrupted);
+			view.setUint16(corrupted.byteLength - 12, 2, true);
+			await withFile("inconsistent-count.zip", corrupted, async file => {
+				await expect(openArchive(file)).rejects.toThrow(/Invalid ZIP archive/);
+			});
+		}),
+	);
+
+	test(
+		"rejects a central directory name that disagrees with its local header",
+		noted("rejects a central directory name that disagrees with its local header", async () => {
+			const bytes = zipSync({ "one.txt": new TextEncoder().encode("one") });
+			const corrupted = bytes.slice();
+			const view = zipView(corrupted);
+			const eocdOffset = corrupted.byteLength - 22;
+			const centralOffset = view.getUint32(eocdOffset + 16, true);
+			corrupted[centralOffset + 46] = (corrupted[centralOffset + 46] ?? 0) ^ 1;
+			await withFile("inconsistent-name.zip", corrupted, async file => {
+				await expect(openArchive(file)).rejects.toThrow(/Invalid ZIP archive/);
+			});
+		}),
+	);
+
+	test(
+		"still allows a ZIP64 archive with matching local and central records",
+		noted("still allows a ZIP64 archive with matching local and central records", async () => {
+			const content = new TextEncoder().encode("zip64 member");
+			const bytes = zip64SingleEntry("zip64.txt", content);
+			await withFile("valid-zip64.zip", bytes, async file => {
+				const archive = await openArchive(file);
+				expect(new TextDecoder().decode((await archive.readFile("zip64.txt")).bytes)).toBe("zip64 member");
 			});
 		}),
 	);
