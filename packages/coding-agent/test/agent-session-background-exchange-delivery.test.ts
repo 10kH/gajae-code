@@ -294,8 +294,10 @@ describe("background IRC exchange delivery", () => {
 			await prompt.catch(() => undefined);
 			expect(ircRecords(harness.agent.snapshotSteering())).toHaveLength(0);
 
-			// The interrupt resumes into the re-armed pair.
+			// The interrupt resumes into the re-armed pair, and the pair reaches one model
+			// step as a unit: the request snapshot only shows that step once it starts.
 			await waitFor(() => ircRecords(harness.agent.state.messages).length === 2);
+			await waitFor(() => harness.requests.some(request => ircRecords(request).length === 2));
 
 			const committed = ircRecords(harness.agent.state.messages);
 			expect(committed.map(record => record.customType)).toEqual(["irc:incoming", "irc:autoreply"]);
@@ -309,8 +311,28 @@ describe("background IRC exchange delivery", () => {
 					expect(next?.role === "custom" && next.customType === "irc:autoreply").toBe(true);
 				}
 			}
-			expect(harness.requests.some(request => ircRecords(request).length === 2)).toBe(true);
 		}
+	});
+
+	it("persists an accepted exchange when the session switches before its boundary", async () => {
+		const harness = createHarness();
+		const prompt = harness.session.prompt("hello");
+		await harness.firstStream;
+
+		await queuePair(harness.session, "switch-away ping");
+		// Admitted into the live run: the pair is steering, not history, yet.
+		expect(ircRecords(harness.agent.snapshotSteering())).toHaveLength(2);
+		expect(ircRecords(harness.agent.state.messages)).toHaveLength(0);
+
+		// A session switch aborts the outgoing turn with the internal cause, whose
+		// disposition drops unconsumed steering (switchSession calls abort() exactly
+		// like this). Admission is not persistence, so the exchange still has to land
+		// in the outgoing session's history.
+		await harness.session.abort();
+		await prompt.catch(() => undefined);
+
+		const committed = ircRecords(harness.agent.state.messages);
+		expect(committed.map(record => record.customType)).toEqual(["irc:incoming", "irc:autoreply"]);
 	});
 
 	it("conserves order, pairs, and count across generated queue schedules", async () => {

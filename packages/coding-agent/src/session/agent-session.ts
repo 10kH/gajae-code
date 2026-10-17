@@ -3431,6 +3431,9 @@ export class AgentSession {
 		// SDK submissions boundedly (#4668 review P1).
 		this.#fireQueuedRemovalHooks(dropped);
 		if (rearmed.length === 0) return;
+		// The follow-up queue owns delivery of a re-armed exchange now, so the pending
+		// fallback must not append it a second time.
+		this.#releaseAdmittedBackgroundExchanges(rearmed);
 		// Re-route as sequential follow-ups of the NEXT turn, ahead of any
 		// follow-up queued after them, preserving submission order. Marking
 		// each as sequential first, then restoring ahead of the existing queue,
@@ -3978,6 +3981,12 @@ export class AgentSession {
 	// Drained into history (via emitExternalEvent) once the recipient becomes idle,
 	// or steered into the live run at its next tool boundary.
 	#pendingBackgroundExchanges: CustomMessage[][] = [];
+	// Exchanges a live run accepted but has not committed yet. Admission is not
+	// persistence: a session switch aborts the outgoing turn with the internal
+	// cause, whose disposition drops unconsumed steering, so a batch only leaves
+	// this list once its records are actually in history. Until then the abort-time
+	// flush can still append them to the outgoing session's transcript.
+	#admittedBackgroundExchanges: CustomMessage[][] = [];
 	// Agent identity + registry for IRC relay forwarding to the main session UI.
 	#agentId: string | undefined;
 	#agentRegistry: AgentRegistry | undefined;
@@ -11087,6 +11096,7 @@ export class AgentSession {
 		// again so disposal cannot return while that late reconciliation still owns a lock.
 		await awaitDisposeStep("unbarriered coordinator persistence", this.#drainUnbarrieredCoordinatorPersists(), true);
 		this.#pendingBackgroundExchanges = [];
+		this.#admittedBackgroundExchanges = [];
 		this.#drainTerminalOwnedYieldEntries();
 
 		this.agent.setOnBeforeYield(undefined);
@@ -18472,6 +18482,7 @@ export class AgentSession {
 			this.#suppressOwnAsyncJobDeliveries();
 			this.yieldQueue.clear();
 			this.#pendingBackgroundExchanges = [];
+			this.#admittedBackgroundExchanges = [];
 			this.#closeAllProviderSessions("context clear");
 			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
 			this.#resetActiveSdkRunOwnership();
@@ -27885,16 +27896,43 @@ export class AgentSession {
 	}
 
 	/**
+	 * Drop admitted batches whose records are committed to history.
+	 *
+	 * Runs before every delivery decision, so a batch the loop committed is never
+	 * appended a second time by the idle path.
+	 */
+	#settleDeliveredBackgroundExchanges(): void {
+		if (this.#admittedBackgroundExchanges.length === 0) return;
+		const committed = new Set<AgentMessage>(this.agent.state.messages);
+		this.#admittedBackgroundExchanges = this.#admittedBackgroundExchanges.filter(
+			batch => !batch.every(record => committed.has(record)),
+		);
+	}
+
+	/** Hand a batch whose records left steering to whoever owns them next. */
+	#releaseAdmittedBackgroundExchanges(messages: readonly AgentMessage[]): void {
+		if (this.#admittedBackgroundExchanges.length === 0) return;
+		const released = new Set(messages);
+		this.#admittedBackgroundExchanges = this.#admittedBackgroundExchanges.filter(
+			batch => !batch.some(record => released.has(record)),
+		);
+	}
+
+	/**
 	 * Deliver queued background exchanges.
 	 *
 	 * An idle session takes them immediately. A busy session steers them into the
 	 * live run instead of waiting for the turn to end: the loop commits steering
 	 * messages at its next tool boundary, while `isStreaming` stays true for the
 	 * whole of a goal-mode turn and used to defer every exchange to its very end.
-	 * Messages no live run can accept stay queued for the next agent event.
+	 * Messages no live run can accept stay queued for the next agent event, and an
+	 * admitted batch stays queued until it is committed, so a run that ends before
+	 * its next boundary (a session switch) still persists the exchange.
 	 */
 	#flushOrSchedulePendingBackgroundExchanges(): void {
-		if (this.#pendingBackgroundExchanges.length === 0 || this.#isDisposed) return;
+		if (this.#isDisposed) return;
+		this.#settleDeliveredBackgroundExchanges();
+		if (this.#pendingBackgroundExchanges.length === 0 && this.#admittedBackgroundExchanges.length === 0) return;
 		if (!this.isStreaming) {
 			this.#flushPendingBackgroundExchanges();
 			return;
@@ -27906,15 +27944,18 @@ export class AgentSession {
 			// The exchange travels as one steering cohort: the incoming question and
 			// the reply this session already sent on the model's behalf must reach the
 			// same model step, or the model acts on an answered question.
-			if (!this.agent.steerCohort(batch).admitted) remaining.push(batch);
+			if (this.agent.steerCohort(batch).admitted) this.#admittedBackgroundExchanges.push(batch);
+			else remaining.push(batch);
 		}
 		this.#pendingBackgroundExchanges = remaining;
 	}
 
 	#flushPendingBackgroundExchanges(): void {
-		if (this.#pendingBackgroundExchanges.length === 0) return;
-		const batches = this.#pendingBackgroundExchanges;
+		this.#settleDeliveredBackgroundExchanges();
+		if (this.#pendingBackgroundExchanges.length === 0 && this.#admittedBackgroundExchanges.length === 0) return;
+		const batches = [...this.#pendingBackgroundExchanges, ...this.#admittedBackgroundExchanges];
 		this.#pendingBackgroundExchanges = [];
+		this.#admittedBackgroundExchanges = [];
 		for (const batch of batches) {
 			for (const msg of batch) {
 				// emitExternalEvent on message_end appends to agent state and dispatches
