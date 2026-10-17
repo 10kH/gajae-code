@@ -26,11 +26,10 @@ describe("direct CLI session-index registration", () => {
 			const logPath = path.join(sessionsDir, "index.jsonl");
 			const lockPath = `${logPath}.lock`;
 
-			await expect(
-				registerDirectSession(SessionManager.inMemory(root), root, undefined, {
-					registerPostmortem: () => () => {},
-				}),
-			).resolves.toBeUndefined();
+			const registration = await registerDirectSession(SessionManager.inMemory(root), root, undefined, {
+				registerPostmortem: () => () => {},
+			});
+			await registration.syncIdentity();
 			expect(await fs.stat(lockPath).catch(() => undefined)).toBeUndefined();
 			expect(await fs.stat(logPath).catch(() => undefined)).toBeUndefined();
 		} finally {
@@ -50,11 +49,10 @@ describe("direct CLI session-index registration", () => {
 				JSON.stringify({ pid: process.pid, start_time: "unknown", timestamp: Date.now() }),
 			);
 
-			await expect(
-				registerDirectSession(SessionManager.inMemory(root), root, undefined, {
-					registerPostmortem: () => () => {},
-				}),
-			).resolves.toBeUndefined();
+			const registration = await registerDirectSession(SessionManager.inMemory(root), root, undefined, {
+				registerPostmortem: () => () => {},
+			});
+			await registration.syncIdentity();
 			expect(await fs.stat(lockPath)).toBeDefined();
 			expect(await fs.stat(logPath).catch(() => undefined)).toBeUndefined();
 		} finally {
@@ -106,6 +104,98 @@ describe("direct CLI session-index registration", () => {
 				}),
 			).rejects.toBeInstanceOf(FileLockAcquireError);
 			expect(await fs.stat(lockPath)).toBeDefined();
+		} finally {
+			await removeTempRoot(root);
+		}
+	});
+
+	test("a /new identity change registers the successor and releases the predecessor", async () => {
+		const root = await makeTempRoot("gjc-direct-identity-switch-");
+		const manager = SessionManager.create(root, SessionManager.explicitDestination(path.join(root, "sessions")));
+		try {
+			manager.appendMessage({ role: "user", content: "first", timestamp: Date.now() });
+			await manager.ensureOnDisk();
+			const registration = await registerDirectSession(manager, root, undefined, {
+				registerPostmortem: () => () => {},
+			});
+			const predecessorId = manager.getSessionId();
+			await manager.newSession();
+			const successorId = manager.getSessionId();
+			expect(successorId).not.toBe(predecessorId);
+
+			await registration.syncIdentity();
+
+			const rows = (await new SessionIndex(root).open()).listSessions().sessions;
+			const live = rows.filter(row => row.live).map(row => row.sessionId);
+			expect(live).toEqual([successorId]);
+			expect(rows.find(row => row.sessionId === predecessorId)?.live).not.toBe(true);
+
+			// Re-syncing an unchanged identity must not append another registration.
+			const before = (await new SessionIndex(root).open()).listSessions().indexSeq;
+			await registration.syncIdentity();
+			expect((await new SessionIndex(root).open()).listSessions().indexSeq).toBe(before);
+		} finally {
+			await manager.close();
+			await removeTempRoot(root);
+		}
+	});
+
+	test("AgentSession.newSession drives the identity sync through the session_switch event", async () => {
+		const root = await makeTempRoot("gjc-direct-identity-e2e-");
+		const authStorage = await AuthStorage.create(":memory:");
+		const manager = SessionManager.create(root, SessionManager.explicitDestination(path.join(root, "sessions")));
+		manager.appendMessage({ role: "user", content: "first", timestamp: Date.now() });
+		await manager.ensureOnDisk();
+		const registration = await registerDirectSession(manager, root, undefined, {
+			registerPostmortem: () => () => {},
+		});
+		const { session } = await createAgentSession({
+			cwd: root,
+			agentDir: root,
+			authStorage,
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			settings: Settings.isolated({ "notifications.enabled": false }),
+			sessionManager: manager,
+			disableExtensionDiscovery: true,
+			extensions: [
+				pi => {
+					pi.on("session_switch", async () => {
+						await registration.syncIdentity();
+					});
+				},
+			],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+		try {
+			const predecessorId = manager.getSessionId();
+			await session.newSession();
+			const successorId = manager.getSessionId();
+			expect(successorId).not.toBe(predecessorId);
+
+			const rows = (await new SessionIndex(root).open()).listSessions().sessions;
+			expect(rows.filter(row => row.live).map(row => row.sessionId)).toEqual([successorId]);
+			expect(rows.find(row => row.sessionId === predecessorId)?.live).not.toBe(true);
+		} finally {
+			await session.dispose();
+			await removeTempRoot(root);
+		}
+	});
+
+	test("identity sync is a no-op for sessions that were never registered", async () => {
+		const root = await makeTempRoot("gjc-direct-identity-noop-");
+		try {
+			const registration = await registerDirectSession(SessionManager.inMemory(root), root, undefined, {
+				registerPostmortem: () => () => {},
+			});
+			await registration.syncIdentity();
+			expect(
+				await fs.stat(path.join(root, "sdk", "sessions", "index.jsonl")).catch(() => undefined),
+			).toBeUndefined();
 		} finally {
 			await removeTempRoot(root);
 		}

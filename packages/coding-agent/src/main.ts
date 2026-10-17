@@ -1663,56 +1663,108 @@ interface DirectSessionRegistrationDependencies {
 	masterRole?: { ownerSessionId: string; attestationEpoch: string };
 }
 
+/**
+ * Handle for a direct CLI session's broker-index registration.
+ *
+ * A direct session registers once at startup, but `/new`, `/resume` and forks
+ * replace the manager's session id inside the same process. The index row is
+ * keyed on that id, so without a follow-up the successor is never indexed and the
+ * predecessor stays live for as long as this pid is alive (the broker keeps
+ * heartbeating a live pid). `syncIdentity` moves the registration to whichever
+ * id the manager currently reports.
+ */
+export interface DirectSessionRegistration {
+	/** Register the manager's current session id and release the one it replaced. */
+	syncIdentity(): Promise<void>;
+}
+
+const NOOP_DIRECT_SESSION_REGISTRATION: DirectSessionRegistration = { syncIdentity: async () => {} };
+
 /** Register a durable direct CLI session while leaving ephemeral sessions lock-free. */
 export async function registerDirectSession(
 	sessionManager: DirectSessionManager | undefined,
 	agentDir: string,
 	lifecycleRequestId: string | undefined,
 	dependencies: DirectSessionRegistrationDependencies = {},
-): Promise<void> {
-	const directSessionId = directSessionRegistrationId(sessionManager, lifecycleRequestId);
-	if (!directSessionId || !sessionManager) return;
+): Promise<DirectSessionRegistration> {
+	const initialSessionId = directSessionRegistrationId(sessionManager, lifecycleRequestId);
+	if (!initialSessionId || !sessionManager) return NOOP_DIRECT_SESSION_REGISTRATION;
 	const sessionIndex = dependencies.createIndex?.(agentDir) ?? new SessionIndex(agentDir);
-	const locator = await resolveSessionLocator(sessionManager.getCwd(), agentDir);
 	const directSessionIncarnation = (dependencies.processIncarnation ?? processIncarnation)(process.pid);
-	await sessionIndex.append({
-		type: "host_registered",
-		sessionId: directSessionId,
-		locator,
-		endpointGeneration: 0,
-		pid: process.pid,
-		...(directSessionIncarnation ? { processIncarnation: directSessionIncarnation } : {}),
-		...(dependencies.masterRole && directSessionIncarnation
-			? {
-					masterRole: {
-						version: 2 as const,
-						ownerSessionId: dependencies.masterRole.ownerSessionId,
-						launchPid: process.pid,
-						launchProcessIncarnation: directSessionIncarnation,
-						role: "master" as const,
-						attestationEpoch: dependencies.masterRole.attestationEpoch,
-					},
-				}
-			: {}),
-	});
-	if (locator.worktreeRoot !== null) {
+	let registeredLocator: Awaited<ReturnType<typeof resolveSessionLocator>> | undefined;
+	let registeredSessionId: string | undefined;
+
+	const register = async (sessionId: string): Promise<void> => {
+		const locator = await resolveSessionLocator(sessionManager.getCwd(), agentDir);
+		await sessionIndex.append({
+			type: "host_registered",
+			sessionId,
+			locator,
+			endpointGeneration: 0,
+			pid: process.pid,
+			...(directSessionIncarnation ? { processIncarnation: directSessionIncarnation } : {}),
+			...(dependencies.masterRole && directSessionIncarnation
+				? {
+						masterRole: {
+							version: 2 as const,
+							ownerSessionId: dependencies.masterRole.ownerSessionId,
+							launchPid: process.pid,
+							launchProcessIncarnation: directSessionIncarnation,
+							role: "master" as const,
+							attestationEpoch: dependencies.masterRole.attestationEpoch,
+						},
+					}
+				: {}),
+		});
+		registeredLocator = locator;
+		registeredSessionId = sessionId;
+	};
+	const unregister = async (
+		sessionId: string,
+		locator: Awaited<ReturnType<typeof resolveSessionLocator>> | undefined,
+	): Promise<void> => {
+		if (!locator) return;
+		await sessionIndex.append({
+			type: "host_unregistered",
+			sessionId,
+			locator,
+			endpointGeneration: 0,
+			pid: process.pid,
+		});
+	};
+
+	await register(initialSessionId);
+	if (registeredLocator?.worktreeRoot != null) {
 		try {
-			await releaseLaunchWorktreeReservationAfterRegistration(agentDir, locator.worktreeRoot);
+			await releaseLaunchWorktreeReservationAfterRegistration(agentDir, registeredLocator.worktreeRoot);
 		} catch (error) {
 			logger.warn("Failed to release launch worktree reservation after host registration", {
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
 	}
+	// Teardown releases whichever id is registered now, not the startup id.
 	(dependencies.registerPostmortem ?? postmortem.register)("direct-session-index", async _reason => {
-		await sessionIndex.append({
-			type: "host_unregistered",
-			sessionId: directSessionId,
-			locator,
-			endpointGeneration: 0,
-			pid: process.pid,
-		});
+		if (registeredSessionId) await unregister(registeredSessionId, registeredLocator);
 	});
+
+	let syncing: Promise<void> = Promise.resolve();
+	return {
+		syncIdentity: () => {
+			// Serialized: a rapid /new /new must register in order and never interleave.
+			const run = syncing.then(async () => {
+				const currentId = sessionManager.getSessionFile() === undefined ? undefined : sessionManager.getSessionId();
+				if (!currentId || currentId === registeredSessionId) return;
+				// The predecessor is released under the locator it was registered with.
+				const predecessorId = registeredSessionId;
+				const predecessorLocator = registeredLocator;
+				await register(currentId);
+				if (predecessorId) await unregister(predecessorId, predecessorLocator);
+			});
+			syncing = run.catch(() => {});
+			return run;
+		},
+	};
 }
 
 export interface ModelRoleOverrides {
@@ -2302,14 +2354,37 @@ export async function runRootCommand(
 	// Register a resumed direct session before constructing the agent: GC holds the
 	// same index lock while deleting artifacts, so startup and deletion are fenced.
 	// Ephemeral sessions have no durable artifacts or liveness authority to fence.
-	await registerDirectSession(sessionManager, settingsInstance.getAgentDir(), process.env.GJC_LIFECYCLE_REQUEST_ID, {
-		masterRole: masterModeContext
-			? {
-					ownerSessionId: masterModeContext.ownerSessionId,
-					attestationEpoch: masterModeContext.attestationEpoch,
+	const directSessionRegistration = await registerDirectSession(
+		sessionManager,
+		settingsInstance.getAgentDir(),
+		process.env.GJC_LIFECYCLE_REQUEST_ID,
+		{
+			masterRole: masterModeContext
+				? {
+						ownerSessionId: masterModeContext.ownerSessionId,
+						attestationEpoch: masterModeContext.attestationEpoch,
+					}
+				: undefined,
+		},
+	);
+	// /new, /resume and forks replace the manager's session id in this same process.
+	// Follow it, or the broker index keeps listing the predecessor as live forever.
+	sessionOptions.extensions = [
+		...(sessionOptions.extensions ?? []),
+		pi => {
+			const sync = async (): Promise<void> => {
+				try {
+					await directSessionRegistration.syncIdentity();
+				} catch (error) {
+					logger.warn("Failed to move direct session registration to the new session id", {
+						error: error instanceof Error ? error.message : String(error),
+					});
 				}
-			: undefined,
-	});
+			};
+			pi.on("session_switch", sync);
+			pi.on("session_branch", sync);
+		},
+	];
 
 	const createAgentSessionImpl = deps.createAgentSession ?? createAgentSession;
 	const createSession: CreateSessionForMain = async (options, context): Promise<CreateAgentSessionResult> => {
