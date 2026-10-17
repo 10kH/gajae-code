@@ -18,7 +18,6 @@ const ZIP_DATA_DESCRIPTOR_SIGNATURE = 0x08074b50;
 const ZIP_CENTRAL_DIRECTORY_DIGITAL_SIGNATURE = 0x05054b50;
 const ZIP_UINT16_MAX = 0xffff;
 const ZIP_UINT32_MAX = 0xffff_ffff;
-const MAX_ZIP_DIRECTORY_CANDIDATES = 16;
 const EMPTY_ZIP_BYTES = new Uint8Array(0);
 
 let fflateModulePromise: Promise<typeof import("fflate")> | undefined;
@@ -552,14 +551,13 @@ function zipEndRecordEntryCount(view: DataView, endOffset: number): number | und
 	return zipUint64(view, zip64EndOffset + 32, locatorOffset);
 }
 
-function readZipDirectories(bytes: Uint8Array, streamedEntryCount: number): ZipDirectoryEntry[][] {
+function readZipDirectory(bytes: Uint8Array, streamedEntries: StreamedZipEntry[]): ZipDirectoryEntry[] {
 	// fflate's streaming reader emits local records but does not require or validate the ZIP end records.
-	// Cap full parses so a comment full of EOCD-like signatures cannot multiply archive work.
 	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 	const searchStart = Math.max(0, bytes.byteLength - 22 - ZIP_UINT16_MAX);
-	const directories: ZipDirectoryEntry[][] = [];
+	const expectedMetadata = zipStreamMetadataBuckets(streamedEntries);
 	let lastError: unknown;
-	for (let offset = bytes.byteLength - 22; offset >= searchStart; offset--) {
+	for (let offset = searchStart; offset <= bytes.byteLength - 22; offset++) {
 		if (view.getUint32(offset, true) !== ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE) continue;
 		const commentLength = view.getUint16(offset + 20, true);
 		if (offset + 22 + commentLength !== bytes.byteLength) continue;
@@ -570,43 +568,26 @@ function readZipDirectories(bytes: Uint8Array, streamedEntryCount: number): ZipD
 			lastError = error;
 			continue;
 		}
-		if (candidateEntryCount !== streamedEntryCount) continue;
+		if (candidateEntryCount !== streamedEntries.length) continue;
 		let directory: ZipDirectoryEntry[];
 		try {
-			directory = parseZipDirectoryAt(bytes, view, offset);
+			directory = parseZipDirectoryAt(bytes, view, offset, expectedMetadata);
 		} catch (error) {
 			lastError = error;
 			continue;
 		}
-		if (directories.some(existing => sameZipDirectory(existing, directory))) continue;
-		if (directories.length >= MAX_ZIP_DIRECTORY_CANDIDATES) throw invalidZipArchive();
-		directories.push(directory);
+		if (zipDirectoryMatchesStream(directory, streamedEntries)) return directory;
 	}
-	if (directories.length > 0) return directories;
 	if (lastError instanceof Error) throw lastError;
 	throw invalidZipArchive();
 }
 
-function sameZipDirectory(left: ZipDirectoryEntry[], right: ZipDirectoryEntry[]): boolean {
-	if (left.length !== right.length) return false;
-	return left.every((entry, index) => {
-		const other = right[index];
-		return (
-			other !== undefined &&
-			entry.name === other.name &&
-			entry.flags === other.flags &&
-			entry.compression === other.compression &&
-			entry.crc32 === other.crc32 &&
-			entry.compressedSize === other.compressedSize &&
-			entry.uncompressedSize === other.uncompressedSize &&
-			entry.localOffset === other.localOffset &&
-			entry.nameBytes.byteLength === other.nameBytes.byteLength &&
-			entry.nameBytes.every((byte, byteIndex) => byte === other.nameBytes[byteIndex])
-		);
-	});
-}
-
-function parseZipDirectoryAt(bytes: Uint8Array, view: DataView, endOffset: number): ZipDirectoryEntry[] {
+function parseZipDirectoryAt(
+	bytes: Uint8Array,
+	view: DataView,
+	endOffset: number,
+	expectedMetadata: Map<string, Map<string, number>>,
+): ZipDirectoryEntry[] {
 	const diskNumber = view.getUint16(endOffset + 4, true);
 	const centralDiskNumber = view.getUint16(endOffset + 6, true);
 	const entriesOnDisk16 = view.getUint16(endOffset + 8, true);
@@ -674,6 +655,7 @@ function parseZipDirectoryAt(bytes: Uint8Array, view: DataView, endOffset: numbe
 	if (offsetCorrection < 0) throw invalidZipArchive();
 
 	const directoryEntries: ZipDirectoryEntry[] = [];
+	const consumedMetadata = new Map<string, Map<string, number>>();
 	let totalUncompressed = 0;
 	let offset = centralDirectoryStart;
 	for (let index = 0; index < entryCount; index++) {
@@ -713,6 +695,16 @@ function parseZipDirectoryAt(bytes: Uint8Array, view: DataView, endOffset: numbe
 		}
 		const nameBytes = bytes.subarray(nameStart, extraStart);
 		const name = decodeZipName(nameBytes, flags);
+		if (
+			!consumeZipStreamMetadata(expectedMetadata, consumedMetadata, {
+				name,
+				compression,
+				compressedSize,
+				uncompressedSize,
+			})
+		) {
+			throw invalidZipArchive();
+		}
 		if (uncompressedSize > MAX_ARCHIVE_ENTRY_BYTES) throw archiveLimitError("entry", name);
 		totalUncompressed += uncompressedSize;
 		if (totalUncompressed > MAX_ARCHIVE_TOTAL_BYTES) throw archiveLimitError("total");
@@ -767,34 +759,104 @@ function zipDirectoryMatchesStream(directory: ZipDirectoryEntry[], streamed: Str
 	});
 }
 
+function zipMetadataKey(name: string, compression: number): string {
+	return `${compression}\0${name}`;
+}
+
+function zipMetadataSizeKey(compressedSize: number | undefined, uncompressedSize: number | undefined): string {
+	return `${compressedSize ?? "*"}\0${uncompressedSize ?? "*"}`;
+}
+
+function zipStreamMetadataBuckets(streamed: StreamedZipEntry[]): Map<string, Map<string, number>> {
+	const buckets = new Map<string, Map<string, number>>();
+	for (const entry of streamed) {
+		const nameKey = zipMetadataKey(entry.name, entry.compression);
+		const sizeKey = zipMetadataSizeKey(entry.compressedSize, entry.declaredSize);
+		let sizes = buckets.get(nameKey);
+		if (!sizes) {
+			sizes = new Map();
+			buckets.set(nameKey, sizes);
+		}
+		sizes.set(sizeKey, (sizes.get(sizeKey) ?? 0) + 1);
+	}
+	return buckets;
+}
+
+function consumeZipStreamMetadata(
+	expected: Map<string, Map<string, number>>,
+	consumed: Map<string, Map<string, number>>,
+	entry: Pick<ZipDirectoryEntry, "name" | "compression" | "compressedSize" | "uncompressedSize">,
+): boolean {
+	const nameKey = zipMetadataKey(entry.name, entry.compression);
+	const expectedSizes = expected.get(nameKey);
+	if (!expectedSizes) return false;
+	const consumedSizes = consumed.get(nameKey);
+	const sizeKeys = [
+		zipMetadataSizeKey(entry.compressedSize, entry.uncompressedSize),
+		zipMetadataSizeKey(entry.compressedSize, undefined),
+		zipMetadataSizeKey(undefined, entry.uncompressedSize),
+		zipMetadataSizeKey(undefined, undefined),
+	];
+	for (const sizeKey of sizeKeys) {
+		const expectedCount = expectedSizes.get(sizeKey);
+		const consumedCount = consumedSizes?.get(sizeKey) ?? 0;
+		if (expectedCount === undefined || consumedCount >= expectedCount) continue;
+		let counts = consumedSizes;
+		if (!counts) {
+			counts = new Map();
+			consumed.set(nameKey, counts);
+		}
+		counts.set(sizeKey, consumedCount + 1);
+		return true;
+	}
+	return false;
+}
+
 async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
 	const { Inflate, Unzip, UnzipPassThrough } = await loadFflate();
-	let streamedEntryCount = 0;
+	const probedEntries: StreamedZipEntry[] = [];
 	let probeError: ToolError | undefined;
+	let probeDecoderEntry: StreamedZipEntry | undefined;
 	const probe = new Unzip();
 	class DiscardZipDecoder {
 		static compression: number = 0;
 		ondata: (error: Error | null, data: Uint8Array, final: boolean) => void = () => {};
-		push(_data: Uint8Array, final: boolean): void {
+		#entry = probeDecoderEntry;
+		#compressedBytes = 0;
+		push(data: Uint8Array, final: boolean): void {
+			this.#compressedBytes += data.byteLength;
+			if (final && this.#entry && this.#entry.compressedSize === undefined) {
+				this.#entry.compressedSize = this.#compressedBytes;
+			}
 			this.ondata(null, EMPTY_ZIP_BYTES, final);
 		}
 	}
 	probe.onfile = file => {
 		if (probeError) return file.terminate();
-		streamedEntryCount += 1;
-		if (streamedEntryCount > MAX_ARCHIVE_ENTRY_COUNT) {
+		if (probedEntries.length >= MAX_ARCHIVE_ENTRY_COUNT) {
 			probeError = archiveLimitError("count");
 			return file.terminate();
 		}
+		const probedEntry: StreamedZipEntry = {
+			name: file.name,
+			compression: file.compression,
+			compressedSize: file.size,
+			declaredSize: file.originalSize,
+			actualSize: undefined,
+		};
+		probedEntries.push(probedEntry);
 		DiscardZipDecoder.compression = file.compression;
 		probe.register(DiscardZipDecoder);
 		file.ondata = error => {
 			if (error) probeError = invalidZipArchive();
 		};
+		probeDecoderEntry = probedEntry;
 		try {
 			file.start();
 		} catch {
 			probeError = invalidZipArchive();
+		} finally {
+			probeDecoderEntry = undefined;
 		}
 	};
 	try {
@@ -808,7 +870,7 @@ async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
 		if (!probeError) probeError = invalidZipArchive();
 	}
 	if (probeError) throw probeError;
-	const directoryCandidates = readZipDirectories(bytes, streamedEntryCount);
+	const directoryEntries = readZipDirectory(bytes, probedEntries);
 	// Unzip constructs custom decoders synchronously in file.start; the decoder captures this entry's budget.
 	let activeInflateBudget:
 		| {
@@ -929,9 +991,7 @@ async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
 		if (!limitError) limitError = new ToolError(error instanceof Error ? error.message : String(error));
 	}
 	if (limitError) throw limitError;
-	if (!directoryCandidates.some(directory => zipDirectoryMatchesStream(directory, streamedEntries))) {
-		throw invalidZipArchive();
-	}
+	if (!zipDirectoryMatchesStream(directoryEntries, streamedEntries)) throw invalidZipArchive();
 	return [
 		...entries.reduce((map, entry) => map.set(entry.path, entry), new Map<string, ArchiveIndexEntry>()).values(),
 	];

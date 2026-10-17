@@ -169,6 +169,10 @@ function zipUnknownSize(files: Array<{ name: string; data: Uint8Array }>): Uint8
 	return concat(parts);
 }
 
+function zipStoredSingle(name: string, data: Uint8Array): Uint8Array {
+	return zipSync({ [name]: data }, { level: 0 });
+}
+
 function zipView(bytes: Uint8Array): DataView {
 	return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 }
@@ -216,6 +220,54 @@ function zipLocalRecordEnd(bytes: Uint8Array): number {
 function zip64EndRecordOffset(bytes: Uint8Array): number {
 	const locatorOffset = bytes.byteLength - 22 - 20;
 	return Number(zipView(bytes).getBigUint64(locatorOffset + 8, true));
+}
+
+function zipWithEmbeddedMemberDirectories(): { bytes: Uint8Array; memberBytes: Uint8Array } {
+	const embeddedFiles: Record<string, Uint8Array> = {};
+	for (let index = 0; index < 16; index++) {
+		embeddedFiles[`embedded-${index}.txt`] = new TextEncoder().encode(`member-${index}`);
+	}
+	const embeddedZip = zipSync(embeddedFiles, { level: 0 });
+	const embeddedView = zipView(embeddedZip);
+	const embeddedEocdOffset = embeddedZip.byteLength - 22;
+	const embeddedDirectoryOffset = embeddedView.getUint32(embeddedEocdOffset + 16, true);
+	const embeddedDirectorySize = embeddedView.getUint32(embeddedEocdOffset + 12, true);
+	const memberBytes = embeddedZip.subarray(0, embeddedDirectoryOffset);
+	const outerZip = zipStoredSingle("outer.bin", memberBytes);
+	const outerView = zipView(outerZip);
+	const outerEocdOffset = outerZip.byteLength - 22;
+	const outerPayloadOffset = 30 + outerView.getUint16(26, true) + outerView.getUint16(28, true);
+	const fakeDirectoryRecords: Uint8Array[] = [];
+	for (let offset = embeddedDirectoryOffset; offset < embeddedDirectoryOffset + embeddedDirectorySize; ) {
+		const nameLength = embeddedView.getUint16(offset + 28, true);
+		const extraLength = embeddedView.getUint16(offset + 30, true);
+		const commentLength = embeddedView.getUint16(offset + 32, true);
+		const recordLength = 46 + nameLength + extraLength + commentLength;
+		const record = embeddedZip.slice(offset, offset + recordLength);
+		const innerLocalOffset = embeddedView.getUint32(offset + 42, true);
+		zipView(record).setUint32(42, outerPayloadOffset + innerLocalOffset, true);
+		fakeDirectoryRecords.push(record);
+		offset += recordLength;
+	}
+
+	const commentLength = fakeDirectoryRecords.reduce((total, record) => total + record.byteLength + 22, 0);
+	const commentParts: Uint8Array[] = [];
+	let commentOffset = 0;
+	for (const record of fakeDirectoryRecords) {
+		const endRecord = new Uint8Array(22);
+		const view = zipView(endRecord);
+		view.setUint32(0, 0x06054b50, true);
+		view.setUint16(8, 1, true);
+		view.setUint16(10, 1, true);
+		view.setUint32(12, record.byteLength, true);
+		view.setUint32(16, outerZip.byteLength + commentOffset, true);
+		view.setUint16(20, commentLength - commentOffset - record.byteLength - endRecord.byteLength, true);
+		commentParts.push(record, endRecord);
+		commentOffset += record.byteLength + endRecord.byteLength;
+	}
+	const eocd = outerZip.slice(outerEocdOffset);
+	zipView(eocd).setUint16(20, commentLength, true);
+	return { bytes: concat([outerZip.subarray(0, outerEocdOffset), eocd, ...commentParts]), memberBytes };
 }
 
 function zip64SingleEntry(name: string, data: Uint8Array, extra?: { id: number; data: Uint8Array }): Uint8Array {
@@ -409,6 +461,17 @@ describe("openArchive inflate caps", () => {
 			await withFile("commented.zip", concat([bytesWithComment, comment]), async file => {
 				const archive = await openArchive(file);
 				expect(new TextDecoder().decode((await archive.readFile("commented.txt")).bytes)).toBe("commented");
+			});
+		}),
+	);
+
+	test(
+		"ignores comment directories that point into a stored member",
+		noted("ignores comment directories that point into a stored member", async () => {
+			const { bytes, memberBytes } = zipWithEmbeddedMemberDirectories();
+			await withFile("embedded-comment-directories.zip", bytes, async file => {
+				const archive = await openArchive(file);
+				expect([...(await archive.readFile("outer.bin")).bytes]).toEqual([...memberBytes]);
 			});
 		}),
 	);
