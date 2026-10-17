@@ -3,12 +3,16 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AuthStorage, getBundledModel } from "@gajae-code/ai";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { parseArgs } from "../src/cli/args";
 import { FileLockAcquireError, withFileLock } from "../src/config/file-lock";
 import { Settings } from "../src/config/settings";
-import { registerDirectSession } from "../src/main";
-import { createAgentSession } from "../src/sdk";
+import { registerDirectSession, runRootCommand } from "../src/main";
+import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "../src/sdk";
 import { SessionIndex } from "../src/sdk/broker/session-index";
+import type { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
+import { EventBus } from "../src/utils/event-bus";
 
 async function makeTempRoot(prefix: string): Promise<string> {
 	return await fs.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -616,6 +620,81 @@ describe("direct CLI session-index registration", () => {
 			}
 		} finally {
 			vi.restoreAllMocks();
+			authStorage.close();
+			await removeTempRoot(root);
+		}
+	});
+
+	test("the wired identity sync reads the manager the live session adopted", async () => {
+		const root = await makeTempRoot("gjc-direct-wired-adoption-");
+		const authStorage = await AuthStorage.create(":memory:");
+		const originalAgentDir = getAgentDir();
+		try {
+			// The registration writes its index under the settings agent dir.
+			setAgentDir(root);
+			const startupManager = SessionManager.create(
+				root,
+				SessionManager.explicitDestination(path.join(root, "sessions")),
+			);
+			startupManager.appendMessage({ role: "user", content: "startup", timestamp: Date.now() });
+			await startupManager.ensureOnDisk();
+			const forkedManager = SessionManager.create(
+				root,
+				SessionManager.explicitDestination(path.join(root, "forked")),
+			);
+			forkedManager.appendMessage({ role: "user", content: "fork", timestamp: Date.now() });
+			await forkedManager.ensureOnDisk();
+
+			let sessionOptions: CreateAgentSessionOptions | undefined;
+			let liveSession: { sessionManager: SessionManager } | undefined;
+			await runRootCommand(parseArgs(["--mode", "text"]), [], {
+				createSessionManager: async () => startupManager,
+				createAgentSession: async options => {
+					sessionOptions = options;
+					const session = {
+						model: { provider: "test", id: "test-model" },
+						sessionManager: startupManager,
+						credentialSessionId: "test-credential",
+						subscribe: () => () => {},
+						dispose: async () => {},
+					};
+					liveSession = session as unknown as { sessionManager: SessionManager };
+					return {
+						session: session as unknown as AgentSession,
+						extensionsResult: {},
+						setToolUIContext: () => {},
+						eventBus: new EventBus(),
+					} as unknown as CreateAgentSessionResult;
+				},
+				discoverAuthStorage: async () => authStorage,
+				settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
+				suppressProcessExit: true,
+				initTheme: async () => {},
+				readPipedInput: async () => undefined,
+				runStartupCredentialAutoImportIfNeeded: async () => undefined,
+				runPrintMode: async () => {},
+				quit: async () => {},
+			});
+
+			// `ExtensionRunner` hands listeners the manager it was constructed with — the
+			// startup one — while a bounded cold-sidecar fork replaces only the session's
+			// own manager before emitting the event. The handler must read the session.
+			const handlers = new Map<string, () => Promise<void>>();
+			const factory = sessionOptions?.extensions?.at(-1);
+			if (!factory) throw new Error("Expected the root command to install the identity-sync extension");
+			factory({
+				on: (event: string, handler: () => Promise<void>) => {
+					handlers.set(event, handler);
+				},
+			} as never);
+			if (!liveSession) throw new Error("Expected the root command to build a session");
+			liveSession.sessionManager = forkedManager;
+			await handlers.get("session_switch")?.();
+
+			const rows = (await new SessionIndex(root).open()).listSessions().sessions;
+			expect(rows.filter(row => row.live).map(row => row.sessionId)).toEqual([forkedManager.getSessionId()]);
+		} finally {
+			setAgentDir(originalAgentDir);
 			authStorage.close();
 			await removeTempRoot(root);
 		}

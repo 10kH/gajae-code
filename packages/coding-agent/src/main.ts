@@ -51,7 +51,7 @@ import { resolveMachineLocalUpdateChannel, type UpdateChannel } from "./config/u
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "./defaults/gjc-grok-cli";
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
-import type { ExtensionContext, ExtensionUIContext } from "./extensibility/extensions/types";
+import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { releaseLaunchWorktreeReservationAfterRegistration } from "./gjc-runtime/launch-worktree-reservation";
 import { persistCoordinatorRuntimeInputReady } from "./gjc-runtime/session-state-sidecar";
 import { assertMasterLaunchArgs, assertMasterLaunchDisposition, createMasterModeContext } from "./master-mode/context";
@@ -1825,7 +1825,7 @@ export async function registerDirectSession(
 				return;
 			} catch (error) {
 				if (attempt >= DIRECT_SESSION_REGISTRATION_ATTEMPTS) throw error;
-				await new Promise(resolve => setTimeout(resolve, 50 * attempt));
+				await Bun.sleep(50 * attempt);
 			}
 		}
 	};
@@ -2500,14 +2500,18 @@ export async function runRootCommand(
 	);
 	// /new, /resume and forks replace the manager's session id in this same process.
 	// Follow it, or the broker index keeps listing the predecessor as live forever.
+	//
+	// The extension context is not a usable source here: `ExtensionRunner` is
+	// constructed with the startup manager and `createContext()` keeps handing that
+	// facade back, while a bounded cold-sidecar fork replaces only the session's own
+	// manager. Read the live session at dispatch time instead.
+	let liveSession: AgentSession | undefined;
 	sessionOptions.extensions = [
 		...(sessionOptions.extensions ?? []),
 		pi => {
-			const sync = async (_event: unknown, ctx: ExtensionContext): Promise<void> => {
+			const sync = async (): Promise<void> => {
 				try {
-					// A cold-sidecar fork adopts its own manager before emitting the event, so
-					// the sync must read that manager rather than the startup one.
-					await directSessionRegistration.syncIdentity(ctx.sessionManager);
+					await directSessionRegistration.syncIdentity(liveSession?.sessionManager);
 				} catch (error) {
 					logger.warn("Failed to move direct session registration to the new session id", {
 						error: error instanceof Error ? error.message : String(error),
@@ -2557,6 +2561,7 @@ export async function runRootCommand(
 			startDeferredMemoryBackend,
 			eventBus,
 		} = await createSession(sessionOptions, { skipPostCreateModelRefresh: hasRootStartupProfile });
+		liveSession = session;
 		applyCliRuntimeApiKeyOverride(authStorage, parsedArgs.apiKey, session.model);
 		// Herdr integration: report gjc lifecycle state when running in a Herdr pane.
 		installHerdrReporter(listener => session.subscribe(listener));
