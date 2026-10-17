@@ -2172,14 +2172,14 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 								}
 							}
 						: undefined;
+				const brokerSettings = await Settings.loadForScope({ cwd: process.cwd(), agentDir });
 				const candidate = new Broker({
 					agentDir,
 					startupAbortSignal: startupAbortController.signal,
 					startupCheckpointDeadline: effectiveCheckpointDeadline,
 					onStartupReady: () => clearTimeout(startupWatchdog),
-					masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
-						"sdk.masterOrphanGraceMs",
-					),
+					masterOrphanGraceMs: brokerSettings.get("sdk.masterOrphanGraceMs"),
+					abandonedGraceMs: brokerSettings.get("sdk.brokerAbandonedGraceMs"),
 					resolveDirectoryMigration: async cwd => {
 						const settings = await Settings.loadForScope({ cwd, agentDir });
 						try {

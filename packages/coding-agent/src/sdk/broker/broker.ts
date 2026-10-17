@@ -165,6 +165,13 @@ export interface BrokerSettings {
 	masterCapabilityVerifier?: MasterCapabilityVerifier;
 	/** Grace before an orphaned spawn child closes; schema-bounded in production. */
 	masterOrphanGraceMs?: number;
+	/**
+	 * Grace before a broker nobody is left to use exits on its own. The clock only
+	 * runs while the index proves no live session host and no open spawn authority,
+	 * so a broker whose client died without closing exits instead of holding its
+	 * port, its publication, and its lock for the life of the machine.
+	 */
+	abandonedGraceMs?: number;
 	/** Host model resolver override for lifecycle tests and embedders. */
 	resolveModelPin?: SdkHostModelResolver;
 	/**
@@ -202,6 +209,7 @@ type ResolvedBrokerSettings = {
 	spawnSubstrateProvider?: SpawnSubstrateProvider;
 	spawnPromptLayer?: SpawnPromptLayer;
 	masterOrphanGraceMs: number;
+	abandonedGraceMs: number;
 	restartRequestId?: string;
 };
 export function resolveBrokerPackageGeneration(): string {
@@ -624,6 +632,7 @@ const SPAWN_HOST_REGISTRATION_TIMEOUT_MS = 10_000;
 const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
 const SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS = 10_000;
 const MASTER_ORPHAN_GRACE_DEFAULT_MS = 120_000;
+const BROKER_ABANDONED_GRACE_DEFAULT_MS = 120_000;
 const MANAGED_CLOSE_WAIT_MS = 10_000;
 
 function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
@@ -1603,6 +1612,7 @@ const brokerLockReclaimHooksForTest = new WeakMap<
 	{ beforeQuarantine?: () => Promise<void>; onContended?: () => void }
 >();
 const livenessGraceOverridesForTest = new WeakMap<Broker, number>();
+const abandonedGraceOverridesForTest = new WeakMap<Broker, number>();
 const heartbeatStallOverridesForTest = new WeakMap<Broker, PromiseWithResolvers<void>>();
 const managedCloseWaitOverridesForTest = new WeakMap<Broker, number>();
 
@@ -1645,6 +1655,8 @@ export class Broker {
 	#publishedAt: bigint | null = null;
 	#startedAt: bigint | null = null;
 	#watchInFlight = false;
+	#abandonedAt: number | null = null;
+	#abandonedReapInFlight = false;
 	#checkpointInFlight = false;
 	#stopping = false;
 	#transport: BrokerTransport | null = null;
@@ -1684,6 +1696,7 @@ export class Broker {
 			spawnSubstrateProvider: settings.spawnSubstrateProvider,
 			spawnPromptLayer: settings.spawnPromptLayer,
 			masterOrphanGraceMs: settings.masterOrphanGraceMs ?? MASTER_ORPHAN_GRACE_DEFAULT_MS,
+			abandonedGraceMs: settings.abandonedGraceMs ?? BROKER_ABANDONED_GRACE_DEFAULT_MS,
 			...(settings.restartRequestId === undefined ? {} : { restartRequestId: settings.restartRequestId }),
 		};
 		this.index = new SessionIndex(settings.agentDir);
@@ -3657,6 +3670,82 @@ export class Broker {
 		await this.#reapSpawnOrphans();
 	}
 
+	/**
+	 * Grace before an idle broker exits. The clock starts only after the index has
+	 * already stopped proving any host live, so this grace is time on top of that
+	 * freshness window, never a substitute for it.
+	 */
+	#abandonedGraceMs(): number {
+		return abandonedGraceOverridesForTest.get(this) ?? this.settings.abandonedGraceMs;
+	}
+
+	/**
+	 * Whether the index still proves a live session host for this agent directory.
+	 * Liveness is judged on read -- fresh checkpoint, live pid, matching incarnation
+	 * -- so a host that died without closing stops proving it without any help from
+	 * this broker. `undefined` means the read itself failed: an unproven observation
+	 * never concludes abandonment.
+	 */
+	async #hasLiveSessionHost(): Promise<boolean | undefined> {
+		try {
+			await this.index.refreshIfChanged();
+		} catch (error) {
+			logger.warn(`sdk broker: abandonment probe could not read the session index: ${String(error)}`);
+			return undefined;
+		}
+		return this.index
+			.listSessionIdentities()
+			.some(row => row.endpointGeneration > 0 && row.live && !row.terminal && !row.terminalUncertain);
+	}
+
+	/** Whether any client currently holds a transport connection to this broker. */
+	#hasAttachedClient(): boolean {
+		return (this.#transport?.clientCount ?? 0) > 0;
+	}
+
+	/** Whether this broker still owns a spawn authority it must keep serving. */
+	#hasOpenSpawnAuthority(): boolean {
+		const store = this.#spawnAuthority;
+		if (!store) return false;
+		for (const claim of store.claims()) {
+			const authority = store.authority(claim.lifecycleIdentity);
+			if (authority && (authority.closeState === "active" || authority.closeState === "close_requested"))
+				return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Ends a broker nobody is left to use. A client that dies without closing leaves
+	 * no live session host behind, and nothing else reaps this process: without this
+	 * pass it would hold its port, its publication, and its lock until the machine
+	 * reboots. The clock is armed only once the index proves the absence and no client
+	 * holds a connection, and any live host, attached client, or open authority
+	 * disarms it, so a slow reattach never races the grace.
+	 */
+	async #reapSelfIfAbandoned(): Promise<void> {
+		if (this.#stopping || this.#completionTask !== null || this.#fenceReason !== null) return;
+		if (this.#abandonedReapInFlight) return;
+		this.#abandonedReapInFlight = true;
+		try {
+			const liveHost = await this.#hasLiveSessionHost();
+			if (liveHost === undefined) return;
+			const now = Date.now();
+			if (liveHost || this.#hasAttachedClient() || this.#hasOpenSpawnAuthority()) {
+				this.#abandonedAt = null;
+				return;
+			}
+			if (this.#abandonedAt === null) {
+				this.#abandonedAt = now;
+				return;
+			}
+			if (now - this.#abandonedAt < this.#abandonedGraceMs()) return;
+			await this.#complete(this.#provenOwnedRoot() ? "owned-root" : "lost-root", "abandoned");
+		} finally {
+			this.#abandonedReapInFlight = false;
+		}
+	}
+
 	async #reapSpawnOrphans(): Promise<void> {
 		if (this.#spawnReapInFlight || this.#stopping) return;
 		this.#spawnReapInFlight = true;
@@ -4179,6 +4268,7 @@ export class Broker {
 			this.#heartbeatTimer = setInterval(() => {
 				void this.#watchPublication();
 				void this.#reapSpawnOrphans();
+				void this.#reapSelfIfAbandoned();
 			}, cadenceMs);
 			if (this.#startupPostPublicationDelayMs > 0) await Bun.sleep(this.#startupPostPublicationDelayMs);
 			// This process is now the independently verified successor: its own
@@ -5604,6 +5694,12 @@ export function setBrokerLockReclaimHooksForTest(
 ): void {
 	if (hooks === undefined) brokerLockReclaimHooksForTest.delete(broker);
 	else brokerLockReclaimHooksForTest.set(broker, hooks);
+}
+
+/** Test-only hook for shortening the bounded abandonment grace. */
+export function setAbandonedGraceForTest(broker: Broker, graceMs: number | undefined): void {
+	if (graceMs === undefined) abandonedGraceOverridesForTest.delete(broker);
+	else abandonedGraceOverridesForTest.set(broker, graceMs);
 }
 
 /** Test-only hook for shortening the bounded liveness deadline. */

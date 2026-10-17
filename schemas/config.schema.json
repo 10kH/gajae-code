@@ -197,6 +197,13 @@
 					"default": 120000,
 					"minimum": 60000,
 					"maximum": 3600000
+				},
+				"brokerAbandonedGraceMs": {
+					"type": "integer",
+					"description": "Grace period before a broker with no live session host and no open spawn authority exits on its own.",
+					"default": 120000,
+					"minimum": 60000,
+					"maximum": 3600000
 				}
 			},
 			"additionalProperties": false
