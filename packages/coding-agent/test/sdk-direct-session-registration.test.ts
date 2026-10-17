@@ -700,6 +700,70 @@ describe("direct CLI session-index registration", () => {
 		}
 	});
 
+	test("publishes the committed branch identity when a transition cleanup fails", async () => {
+		const root = await makeTempRoot("gjc-direct-branch-cleanup-");
+		const authStorage = await AuthStorage.create(":memory:");
+		try {
+			const manager = SessionManager.create(root, SessionManager.explicitDestination(path.join(root, "sessions")));
+			const entryId = manager.appendMessage({ role: "user", content: "branch me", timestamp: Date.now() });
+			await manager.ensureOnDisk();
+			const index = new SessionIndex(root);
+			const registration = await registerDirectSession(manager, root, undefined, {
+				createIndex: () => index,
+				registerPostmortem: () => () => {},
+			});
+			let liveSession: AgentSession | undefined;
+			const { session } = await createAgentSession({
+				cwd: root,
+				agentDir: root,
+				authStorage,
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				settings: Settings.isolated({ "notifications.enabled": false }),
+				sessionManager: manager,
+				disableExtensionDiscovery: true,
+				extensions: [
+					pi => {
+						// Mirrors the root command's wiring: the handler reads the live session.
+						pi.on("session_branch", async () => {
+							await registration.syncIdentity(liveSession?.sessionManager);
+						});
+					},
+				],
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+			});
+			liveSession = session;
+			try {
+				const predecessorId = session.sessionId;
+				// A post-commit integration that fails must not suppress the identity signal:
+				// the branch identity is committed even though the branch call rejects. It fails
+				// once so disposal can still finish.
+				let failOnce = true;
+				session.registerToolSessionTransitionCleanup(() => {
+					if (!failOnce) return;
+					failOnce = false;
+					throw new Error("transition cleanup boom");
+				});
+
+				await expect(session.branch(entryId)).rejects.toThrow("Tool session transition cleanup failed.");
+
+				const successorId = session.sessionId;
+				expect(successorId).not.toBe(predecessorId);
+				const rows = (await new SessionIndex(root).open()).listSessions().sessions;
+				expect(rows.filter(row => row.live).map(row => row.sessionId)).toEqual([successorId]);
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			authStorage.close();
+			await removeTempRoot(root);
+		}
+	});
+
 	test("identity sync is a no-op for sessions that were never registered", async () => {
 		const root = await makeTempRoot("gjc-direct-identity-noop-");
 		try {
