@@ -1355,6 +1355,7 @@ for (const confirmNative of [false, true]) {
 					"replay processed before native confirmation",
 				);
 				expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+				expect(delayedCallbacks.length > 0).toBe(confirmNative);
 				for (const deliver of delayedCallbacks.splice(0)) deliver();
 				if (confirmNative) {
 					await waitFor(() => sessionHostAttachedClients() === baseDemand, "native-confirmed observer");
