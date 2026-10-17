@@ -19,6 +19,7 @@ const ZIP_CENTRAL_DIRECTORY_DIGITAL_SIGNATURE = 0x05054b50;
 const ZIP_UINT16_MAX = 0xffff;
 const ZIP_UINT32_MAX = 0xffff_ffff;
 const MAX_ZIP_DIRECTORY_CANDIDATES = 16;
+const EMPTY_ZIP_BYTES = new Uint8Array(0);
 
 let fflateModulePromise: Promise<typeof import("fflate")> | undefined;
 async function loadFflate(): Promise<typeof import("fflate")> {
@@ -538,7 +539,20 @@ function validateZipLocalEntry(
 	return { entry: { ...entry, localOffset }, endOffset };
 }
 
-function readZipDirectories(bytes: Uint8Array): ZipDirectoryEntry[][] {
+function zipEndRecordEntryCount(view: DataView, endOffset: number): number | undefined {
+	const entryCount16 = view.getUint16(endOffset + 10, true);
+	if (entryCount16 !== ZIP_UINT16_MAX) return entryCount16;
+	const locatorOffset = endOffset - 20;
+	if (locatorOffset < 0 || view.getUint32(locatorOffset, true) !== ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_SIGNATURE) {
+		return undefined;
+	}
+	const zip64EndOffset = zipUint64(view, locatorOffset + 8, locatorOffset + 20);
+	requireZipRange(view, zip64EndOffset, 56, locatorOffset);
+	if (view.getUint32(zip64EndOffset, true) !== ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE) return undefined;
+	return zipUint64(view, zip64EndOffset + 32, locatorOffset);
+}
+
+function readZipDirectories(bytes: Uint8Array, streamedEntryCount: number): ZipDirectoryEntry[][] {
 	// fflate's streaming reader emits local records but does not require or validate the ZIP end records.
 	// Cap full parses so a comment full of EOCD-like signatures cannot multiply archive work.
 	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -549,6 +563,14 @@ function readZipDirectories(bytes: Uint8Array): ZipDirectoryEntry[][] {
 		if (view.getUint32(offset, true) !== ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE) continue;
 		const commentLength = view.getUint16(offset + 20, true);
 		if (offset + 22 + commentLength !== bytes.byteLength) continue;
+		let candidateEntryCount: number | undefined;
+		try {
+			candidateEntryCount = zipEndRecordEntryCount(view, offset);
+		} catch (error) {
+			lastError = error;
+			continue;
+		}
+		if (candidateEntryCount !== streamedEntryCount) continue;
 		let directory: ZipDirectoryEntry[];
 		try {
 			directory = parseZipDirectoryAt(bytes, view, offset);
@@ -556,12 +578,32 @@ function readZipDirectories(bytes: Uint8Array): ZipDirectoryEntry[][] {
 			lastError = error;
 			continue;
 		}
+		if (directories.some(existing => sameZipDirectory(existing, directory))) continue;
 		if (directories.length >= MAX_ZIP_DIRECTORY_CANDIDATES) throw invalidZipArchive();
 		directories.push(directory);
 	}
 	if (directories.length > 0) return directories;
 	if (lastError instanceof Error) throw lastError;
 	throw invalidZipArchive();
+}
+
+function sameZipDirectory(left: ZipDirectoryEntry[], right: ZipDirectoryEntry[]): boolean {
+	if (left.length !== right.length) return false;
+	return left.every((entry, index) => {
+		const other = right[index];
+		return (
+			other !== undefined &&
+			entry.name === other.name &&
+			entry.flags === other.flags &&
+			entry.compression === other.compression &&
+			entry.crc32 === other.crc32 &&
+			entry.compressedSize === other.compressedSize &&
+			entry.uncompressedSize === other.uncompressedSize &&
+			entry.localOffset === other.localOffset &&
+			entry.nameBytes.byteLength === other.nameBytes.byteLength &&
+			entry.nameBytes.every((byte, byteIndex) => byte === other.nameBytes[byteIndex])
+		);
+	});
 }
 
 function parseZipDirectoryAt(bytes: Uint8Array, view: DataView, endOffset: number): ZipDirectoryEntry[] {
@@ -726,8 +768,47 @@ function zipDirectoryMatchesStream(directory: ZipDirectoryEntry[], streamed: Str
 }
 
 async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
-	const directoryCandidates = readZipDirectories(bytes);
 	const { Inflate, Unzip, UnzipPassThrough } = await loadFflate();
+	let streamedEntryCount = 0;
+	let probeError: ToolError | undefined;
+	const probe = new Unzip();
+	class DiscardZipDecoder {
+		static compression: number = 0;
+		ondata: (error: Error | null, data: Uint8Array, final: boolean) => void = () => {};
+		push(_data: Uint8Array, final: boolean): void {
+			this.ondata(null, EMPTY_ZIP_BYTES, final);
+		}
+	}
+	probe.onfile = file => {
+		if (probeError) return file.terminate();
+		streamedEntryCount += 1;
+		if (streamedEntryCount > MAX_ARCHIVE_ENTRY_COUNT) {
+			probeError = archiveLimitError("count");
+			return file.terminate();
+		}
+		DiscardZipDecoder.compression = file.compression;
+		probe.register(DiscardZipDecoder);
+		file.ondata = error => {
+			if (error) probeError = invalidZipArchive();
+		};
+		try {
+			file.start();
+		} catch {
+			probeError = invalidZipArchive();
+		}
+	};
+	try {
+		if (bytes.byteLength === 0) probe.push(bytes, true);
+		for (let offset = 0; offset < bytes.byteLength; offset += 512) {
+			if (probeError) break;
+			const end = Math.min(bytes.byteLength, offset + 512);
+			probe.push(bytes.subarray(offset, end), end === bytes.byteLength);
+		}
+	} catch {
+		if (!probeError) probeError = invalidZipArchive();
+	}
+	if (probeError) throw probeError;
+	const directoryCandidates = readZipDirectories(bytes, streamedEntryCount);
 	// Unzip constructs custom decoders synchronously in file.start; the decoder captures this entry's budget.
 	let activeInflateBudget:
 		| {

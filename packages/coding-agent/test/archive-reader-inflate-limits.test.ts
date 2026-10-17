@@ -391,14 +391,21 @@ describe("openArchive inflate caps", () => {
 	);
 
 	test(
-		"finds the actual end record when a ZIP comment contains an EOCD-shaped sequence",
-		noted("finds the actual end record when a ZIP comment contains an EOCD-shaped sequence", async () => {
+		"finds the actual end record after 16 EOCD-shaped records in a ZIP comment",
+		noted("finds the actual end record after 16 EOCD-shaped records in a ZIP comment", async () => {
 			const bytes = zipSync({ "commented.txt": new TextEncoder().encode("commented") });
 			const eocdOffset = bytes.byteLength - 22;
 			const bytesWithComment = bytes.slice();
-			zipView(bytesWithComment).setUint16(eocdOffset + 20, 22, true);
-			const comment = new Uint8Array(22);
-			zipView(comment).setUint32(0, 0x06054b50, true);
+			const fakeRecordCount = 16;
+			const comment = new Uint8Array(fakeRecordCount * 22);
+			zipView(bytesWithComment).setUint16(eocdOffset + 20, comment.byteLength, true);
+			for (let index = 0; index < fakeRecordCount; index++) {
+				const recordOffset = index * 22;
+				const fakeEndRecord = comment.subarray(recordOffset, recordOffset + 22);
+				const fakeView = zipView(fakeEndRecord);
+				fakeView.setUint32(0, 0x06054b50, true);
+				fakeView.setUint16(20, comment.byteLength - recordOffset - 22, true);
+			}
 			await withFile("commented.zip", concat([bytesWithComment, comment]), async file => {
 				const archive = await openArchive(file);
 				expect(new TextDecoder().decode((await archive.readFile("commented.txt")).bytes)).toBe("commented");
