@@ -1414,6 +1414,26 @@ export class Agent {
 		if (first && messages.length > 1) this.#followUpBatches.set(first, messages.slice());
 	}
 
+	/**
+	 * Delivery cohorts inside `messages`, keyed by every member. A cohort queued
+	 * together through `steer`/`steerCohort` keeps its metadata for the lifetime
+	 * of the message, so a cohort an ended run disowned (and the owner re-routed)
+	 * still reports as one unit here. A cohort counts only while its members are
+	 * still contiguous in the given order.
+	 */
+	steeringCohorts(messages: readonly AgentMessage[]): Map<AgentMessage, readonly AgentMessage[]> {
+		const cohorts = new Map<AgentMessage, readonly AgentMessage[]>();
+		for (let index = 0; index < messages.length; index++) {
+			const message = messages[index];
+			if (!message) continue;
+			const cohort = this.#steeringBatches.get(message);
+			if (!cohort || cohort.length < 2) continue;
+			if (!cohort.every((entry, offset) => messages[index + offset] === entry)) continue;
+			for (const member of cohort) cohorts.set(member, cohort);
+		}
+		return cohorts;
+	}
+
 	clearSteeringQueue() {
 		this.#steeringQueue = [];
 	}

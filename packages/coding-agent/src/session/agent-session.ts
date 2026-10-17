@@ -3421,21 +3421,39 @@ export class AgentSession {
 		this.#scheduleQueuedDelivery();
 	}
 	#markSteeringAsFollowUpPolicy(messages: readonly AgentMessage[]): void {
+		// A cohort queued as one steering unit stays one follow-up unit whatever the
+		// steering mode is: the mode batches arbitrary neighbours, but a cohort may
+		// never be split across follow-ups nor joined by a neighbour queued apart.
+		const cohorts = this.agent.steeringCohorts(messages);
+		const batchAll = this.agent.getSteeringMode() === "all";
 		let batch: AgentMessage[] = [];
+		let batchCohort: readonly AgentMessage[] | undefined;
 		const flushBatch = () => {
 			if (batch.length > 1) {
 				this.agent.markFollowUpBatch(batch);
 				for (const message of batch) this.#deferredFollowUpBatches.set(message, batch.slice());
 			}
 			batch = [];
+			batchCohort = undefined;
 		};
 		for (const message of messages) {
+			const cohort = cohorts.get(message);
+			if (cohort) {
+				if (batchCohort !== cohort) flushBatch();
+				batchCohort = cohort;
+				batch.push(message);
+				// A mark inside a cohort keeps its own delivery preference without
+				// dissolving the cohort: the batch is dequeued before the mark.
+				if (this.#sequentialSteerMessages.has(message)) this.agent.markFollowUpSequential(message);
+				continue;
+			}
 			if (this.#sequentialSteerMessages.has(message)) {
 				flushBatch();
 				this.agent.markFollowUpSequential(message);
-			} else if (this.agent.getSteeringMode() === "all") {
-				batch.push(message);
+				continue;
 			}
+			if (batchCohort) flushBatch();
+			if (batchAll) batch.push(message);
 		}
 		flushBatch();
 		this.#markTrackedFollowUpSequential(messages);

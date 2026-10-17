@@ -87,6 +87,27 @@ describe("Agent steering admission", () => {
 		).toBe(true);
 	});
 
+	it("reports a steering cohort only while its members stay contiguous", async () => {
+		const h = liveRunHarness();
+		const run = h.agent.prompt("go");
+		await h.entered;
+		const head = userMessage("reported head");
+		const tail = userMessage("reported tail");
+		expect(h.agent.steerCohort([head, tail]).admitted).toBe(true);
+
+		const queued = h.agent.snapshotSteering();
+		expect([...h.agent.steeringCohorts(queued).keys()]).toEqual([head, tail]);
+		// A partial or reordered list is no longer the cohort, so a caller that
+		// re-routes one cannot claim an atomic unit it does not have.
+		expect(h.agent.steeringCohorts([tail, head]).size).toBe(0);
+		expect(h.agent.steeringCohorts([head]).size).toBe(0);
+		expect(h.agent.steeringCohorts([tail]).size).toBe(0);
+		expect(h.agent.steeringCohorts([head, userMessage("unrelated")]).size).toBe(0);
+
+		h.release();
+		await run;
+	});
+
 	it("rejects a steer once the live run's signal is aborted", async () => {
 		const h = liveRunHarness();
 		const run = h.agent.prompt("go");

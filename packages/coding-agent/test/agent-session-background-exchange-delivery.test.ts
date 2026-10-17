@@ -29,6 +29,14 @@ function incomingLabels(messages: readonly AgentMessage[]): string[] {
 
 const sessions: AgentSession[] = [];
 
+async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error("Timed out waiting for the re-armed exchange");
+		await Bun.sleep(5);
+	}
+}
+
 afterEach(async () => {
 	for (const session of sessions.splice(0)) await session.dispose();
 });
@@ -255,6 +263,40 @@ describe("background IRC exchange delivery", () => {
 		expect(harness.requests.some(request => ircRecords(request).length === 1)).toBe(true);
 	});
 
+	it("keeps an exchange together when an interrupt re-arms it as a follow-up", async () => {
+		for (const steeringMode of ["one-at-a-time", "all"] as const) {
+			const harness = createHarness({ steeringMode });
+			const prompt = harness.session.prompt("hello");
+			await harness.firstStream;
+
+			await queuePair(harness.session, `${steeringMode} interrupted ping`);
+			expect(ircRecords(harness.agent.snapshotSteering())).toHaveLength(2);
+
+			// Esc while the pair still waits for its boundary: the run disowns the pair
+			// and the session re-arms it as a follow-up of the next turn.
+			await harness.session.abort({ cause: "user_interrupt" });
+			await prompt.catch(() => undefined);
+			expect(ircRecords(harness.agent.snapshotSteering())).toHaveLength(0);
+
+			// The interrupt resumes into the re-armed pair.
+			await waitFor(() => ircRecords(harness.agent.state.messages).length === 2);
+
+			const committed = ircRecords(harness.agent.state.messages);
+			expect(committed.map(record => record.customType)).toEqual(["irc:incoming", "irc:autoreply"]);
+			// The re-armed pair reaches the next turn as one unit: no request carries
+			// the question without the reply this session already sent for it.
+			for (const request of harness.requests) {
+				for (let index = 0; index < request.length; index++) {
+					const record = request[index];
+					if (record?.role !== "custom" || record.customType !== "irc:incoming") continue;
+					const next = request[index + 1];
+					expect(next?.role === "custom" && next.customType === "irc:autoreply").toBe(true);
+				}
+			}
+			expect(harness.requests.some(request => ircRecords(request).length === 2)).toBe(true);
+		}
+	});
+
 	it("conserves order, pairs, and count across generated queue schedules", async () => {
 		const random = mulberry32(0x5eed_1234);
 		for (let iteration = 0; iteration < 12; iteration++) {
@@ -279,7 +321,12 @@ describe("background IRC exchange delivery", () => {
 				queuedRecords += 2;
 			}
 
-			// Phase 2: queued inside the tool pause (no open stream, waits for an event).
+			// Phase 2 boundary: the first step has ended and the run sits inside the tool,
+			// so a record queued here has no open stream to join yet.
+			harness.releaseFirstStream();
+			await harness.toolStarted;
+
+			// Phase 2: queued inside the tool pause (waits for the loop's next event).
 			const singleCount = Math.floor(random() * 3);
 			for (let index = 0; index < singleCount; index++) {
 				const label = `iter${iteration}-pause-${index}`;
@@ -289,8 +336,6 @@ describe("background IRC exchange delivery", () => {
 			}
 
 			// Phase 3: the run streams again, then finishes.
-			harness.releaseFirstStream();
-			await harness.toolStarted;
 			harness.releaseTool();
 			await harness.secondStream;
 			harness.releaseSecondStream();
