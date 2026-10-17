@@ -745,12 +745,18 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const toolPromptNames = new Map<string, string>(toolNames.map(name => [name, tools?.get(name)?.wireName ?? name]));
 	const toolRefs = Object.fromEntries(toolPromptNames.entries());
 	const hasHiddenToolDiscoveryTool = Object.hasOwn(toolRefs, "search_tool_bm25");
-	const toolInfo = toolNames.map(name => ({
-		name: toolPromptNames.get(name) ?? name,
-		internalName: name,
-		label: tools?.get(name)?.label ?? "",
-		description: tools?.get(name)?.description ?? "",
-	}));
+	// The inventory template is compiled with noEscape. Encode tool metadata here so a
+	// tools/list label or description cannot close <inventory> or insert a system block.
+	// The `tools` list stays raw so {{#has}} still matches the call name.
+	const toolInfo = toolNames.map(name => {
+		const meta = tools?.get(name);
+		return {
+			name: escapePromptMetadata(toolPromptNames.get(name) ?? name),
+			internalName: escapePromptMetadata(name),
+			label: escapePromptMetadata(meta?.label ?? ""),
+			description: escapePromptMetadata(meta?.description ?? "", { preserveNewlines: true }),
+		};
+	});
 
 	const effectiveSystemPromptCustomization = dedupePromptSource(systemPromptCustomization, [
 		resolvedCustomPrompt,
