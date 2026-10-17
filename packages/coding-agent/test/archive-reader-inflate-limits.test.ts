@@ -4,7 +4,7 @@ import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { gzipSync } from "node:zlib";
+import { deflateRawSync, gzipSync, constants as zlibConstants } from "node:zlib";
 import { Zip, ZipDeflate, ZipPassThrough, zipSync } from "fflate";
 import { openArchive } from "../src/tools/archive-reader";
 
@@ -373,6 +373,39 @@ const ZIP_FORBIDDEN = new Set<number>([
 	ZIP_DESCRIPTOR_SIG,
 	0x05054b50,
 ]);
+
+function zipDeflateWithDeclaredSize(name: string, compressed: Uint8Array, uncompressedSize: number): Uint8Array {
+	const nameBytes = new TextEncoder().encode(name);
+	const localHeader = new Uint8Array(30);
+	const localView = zipView(localHeader);
+	localView.setUint32(0, ZIP_LOCAL_SIG, true);
+	localView.setUint16(4, 20, true);
+	localView.setUint16(8, 8, true);
+	localView.setUint32(18, compressed.byteLength, true);
+	localView.setUint32(22, uncompressedSize, true);
+	localView.setUint16(26, nameBytes.byteLength, true);
+
+	const centralHeader = new Uint8Array(46);
+	const centralView = zipView(centralHeader);
+	centralView.setUint32(0, ZIP_CENTRAL_SIG, true);
+	centralView.setUint16(4, 20, true);
+	centralView.setUint16(6, 20, true);
+	centralView.setUint16(10, 8, true);
+	centralView.setUint32(20, compressed.byteLength, true);
+	centralView.setUint32(24, uncompressedSize, true);
+	centralView.setUint16(28, nameBytes.byteLength, true);
+	const centralDirectoryOffset = localHeader.byteLength + nameBytes.byteLength + compressed.byteLength;
+	const centralDirectorySize = centralHeader.byteLength + nameBytes.byteLength;
+
+	const eocd = new Uint8Array(22);
+	const eocdView = zipView(eocd);
+	eocdView.setUint32(0, ZIP_EOCD_SIG, true);
+	eocdView.setUint16(8, 1, true);
+	eocdView.setUint16(10, 1, true);
+	eocdView.setUint32(12, centralDirectorySize, true);
+	eocdView.setUint32(16, centralDirectoryOffset, true);
+	return concat([localHeader, nameBytes, compressed, centralHeader, nameBytes, eocd]);
+}
 
 function zipU16(value: number): Uint8Array {
 	return Uint8Array.of(value & 0xff, (value >>> 8) & 0xff);
@@ -954,6 +987,21 @@ describe("openArchive inflate caps", () => {
 		noted("rejects one entry that inflates past the per-entry cap", async () => {
 			const bytes = zipUnknownSize([{ name: "bomb.txt", data: new Uint8Array(ENTRY_LIMIT + 1) }]);
 			await withFile("entry.zip", bytes, async file => {
+				await expect(openArchive(file)).rejects.toThrow(/per-entry limit/);
+			});
+		}),
+		20_000,
+	);
+
+	test(
+		"stops high-ratio deflate inflation at the per-entry cap before a malformed tail",
+		noted("stops high-ratio deflate inflation at the per-entry cap before a malformed tail", async () => {
+			const inflated = new Uint8Array(64 * 1024 * 1024);
+			const deflateStream = deflateRawSync(inflated, { finishFlush: zlibConstants.Z_SYNC_FLUSH });
+			const compressed = concat([deflateStream, Uint8Array.of(0x06)]);
+			expect(compressed.byteLength).toBeGreaterThan(512);
+			const bytes = zipDeflateWithDeclaredSize("bomb.txt", compressed, ENTRY_LIMIT);
+			await withFile("high-ratio.zip", bytes, async file => {
 				await expect(openArchive(file)).rejects.toThrow(/per-entry limit/);
 			});
 		}),

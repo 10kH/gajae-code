@@ -18,6 +18,8 @@ const ZIP_DATA_DESCRIPTOR_SIGNATURE = 0x08074b50;
 const ZIP_CENTRAL_DIRECTORY_DIGITAL_SIGNATURE = 0x05054b50;
 const ZIP_UINT16_MAX = 0xffff;
 const ZIP_UINT32_MAX = 0xffff_ffff;
+// fflate inflates a pushed chunk before invoking ondata, so keep each input chunk small.
+const ZIP_INFLATE_CHUNK_BYTES = 512;
 
 let fflateModulePromise: Promise<typeof import("fflate")> | undefined;
 async function loadFflate(): Promise<typeof import("fflate")> {
@@ -775,7 +777,14 @@ async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
 				else take(data ?? new Uint8Array(0), final);
 			};
 			try {
-				inflator.push(compressed, true);
+				if (compressed.byteLength === 0) {
+					inflator.push(compressed, true);
+				} else {
+					for (let offset = 0; offset < compressed.byteLength && !failed; offset += ZIP_INFLATE_CHUNK_BYTES) {
+						const end = Math.min(offset + ZIP_INFLATE_CHUNK_BYTES, compressed.byteLength);
+						inflator.push(compressed.subarray(offset, end), end === compressed.byteLength);
+					}
+				}
 			} catch (error) {
 				if (!failed) failed = new ToolError(error instanceof Error ? error.message : String(error));
 			} finally {
