@@ -18,7 +18,6 @@ const ZIP_DATA_DESCRIPTOR_SIGNATURE = 0x08074b50;
 const ZIP_CENTRAL_DIRECTORY_DIGITAL_SIGNATURE = 0x05054b50;
 const ZIP_UINT16_MAX = 0xffff;
 const ZIP_UINT32_MAX = 0xffff_ffff;
-const EMPTY_ZIP_BYTES = new Uint8Array(0);
 
 let fflateModulePromise: Promise<typeof import("fflate")> | undefined;
 async function loadFflate(): Promise<typeof import("fflate")> {
@@ -340,14 +339,6 @@ interface ZipDirectoryEntry {
 	localOffset: number;
 }
 
-interface StreamedZipEntry {
-	name: string;
-	compression: number;
-	compressedSize: number | undefined;
-	declaredSize: number | undefined;
-	actualSize: number | undefined;
-}
-
 interface Zip64ExtraNeeds {
 	uncompressedSize: boolean;
 	compressedSize: boolean;
@@ -538,56 +529,25 @@ function validateZipLocalEntry(
 	return { entry: { ...entry, localOffset }, endOffset };
 }
 
-function zipEndRecordEntryCount(view: DataView, endOffset: number): number | undefined {
-	const entryCount16 = view.getUint16(endOffset + 10, true);
-	if (entryCount16 !== ZIP_UINT16_MAX) return entryCount16;
-	const locatorOffset = endOffset - 20;
-	if (locatorOffset < 0 || view.getUint32(locatorOffset, true) !== ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_SIGNATURE) {
-		return undefined;
-	}
-	const zip64EndOffset = zipUint64(view, locatorOffset + 8, locatorOffset + 20);
-	requireZipRange(view, zip64EndOffset, 56, locatorOffset);
-	if (view.getUint32(zip64EndOffset, true) !== ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE) return undefined;
-	return zipUint64(view, zip64EndOffset + 32, locatorOffset);
-}
-
-function readZipDirectory(bytes: Uint8Array, streamedEntries: StreamedZipEntry[]): ZipDirectoryEntry[] {
-	// fflate's streaming reader emits local records but does not require or validate the ZIP end records.
+function readZipDirectory(bytes: Uint8Array): ZipDirectoryEntry[] {
 	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 	const searchStart = Math.max(0, bytes.byteLength - 22 - ZIP_UINT16_MAX);
-	const expectedMetadata = zipStreamMetadataBuckets(streamedEntries);
 	let lastError: unknown;
 	for (let offset = searchStart; offset <= bytes.byteLength - 22; offset++) {
 		if (view.getUint32(offset, true) !== ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE) continue;
 		const commentLength = view.getUint16(offset + 20, true);
 		if (offset + 22 + commentLength !== bytes.byteLength) continue;
-		let candidateEntryCount: number | undefined;
 		try {
-			candidateEntryCount = zipEndRecordEntryCount(view, offset);
+			return parseZipDirectoryAt(bytes, view, offset);
 		} catch (error) {
 			lastError = error;
-			continue;
 		}
-		if (candidateEntryCount !== streamedEntries.length) continue;
-		let directory: ZipDirectoryEntry[];
-		try {
-			directory = parseZipDirectoryAt(bytes, view, offset, expectedMetadata);
-		} catch (error) {
-			lastError = error;
-			continue;
-		}
-		if (zipDirectoryMatchesStream(directory, streamedEntries)) return directory;
 	}
 	if (lastError instanceof Error) throw lastError;
 	throw invalidZipArchive();
 }
 
-function parseZipDirectoryAt(
-	bytes: Uint8Array,
-	view: DataView,
-	endOffset: number,
-	expectedMetadata: Map<string, Map<string, number>>,
-): ZipDirectoryEntry[] {
+function parseZipDirectoryAt(bytes: Uint8Array, view: DataView, endOffset: number): ZipDirectoryEntry[] {
 	const diskNumber = view.getUint16(endOffset + 4, true);
 	const centralDiskNumber = view.getUint16(endOffset + 6, true);
 	const entriesOnDisk16 = view.getUint16(endOffset + 8, true);
@@ -655,7 +615,6 @@ function parseZipDirectoryAt(
 	if (offsetCorrection < 0) throw invalidZipArchive();
 
 	const directoryEntries: ZipDirectoryEntry[] = [];
-	const consumedMetadata = new Map<string, Map<string, number>>();
 	let totalUncompressed = 0;
 	let offset = centralDirectoryStart;
 	for (let index = 0; index < entryCount; index++) {
@@ -695,16 +654,6 @@ function parseZipDirectoryAt(
 		}
 		const nameBytes = bytes.subarray(nameStart, extraStart);
 		const name = decodeZipName(nameBytes, flags);
-		if (
-			!consumeZipStreamMetadata(expectedMetadata, consumedMetadata, {
-				name,
-				compression,
-				compressedSize,
-				uncompressedSize,
-			})
-		) {
-			throw invalidZipArchive();
-		}
 		if (uncompressedSize > MAX_ARCHIVE_ENTRY_BYTES) throw archiveLimitError("entry", name);
 		totalUncompressed += uncompressedSize;
 		if (totalUncompressed > MAX_ARCHIVE_TOTAL_BYTES) throw archiveLimitError("total");
@@ -744,134 +693,10 @@ function parseZipDirectoryAt(
 	return localEntries.map(item => item.entry);
 }
 
-function zipDirectoryMatchesStream(directory: ZipDirectoryEntry[], streamed: StreamedZipEntry[]): boolean {
-	if (directory.length !== streamed.length) return false;
-	return directory.every((entry, index) => {
-		const member = streamed[index];
-		return (
-			member !== undefined &&
-			entry.name === member.name &&
-			entry.compression === member.compression &&
-			(member.compressedSize === undefined || entry.compressedSize === member.compressedSize) &&
-			(member.declaredSize === undefined || entry.uncompressedSize === member.declaredSize) &&
-			(member.actualSize === undefined || entry.uncompressedSize === member.actualSize)
-		);
-	});
-}
-
-function zipMetadataKey(name: string, compression: number): string {
-	return `${compression}\0${name}`;
-}
-
-function zipMetadataSizeKey(compressedSize: number | undefined, uncompressedSize: number | undefined): string {
-	return `${compressedSize ?? "*"}\0${uncompressedSize ?? "*"}`;
-}
-
-function zipStreamMetadataBuckets(streamed: StreamedZipEntry[]): Map<string, Map<string, number>> {
-	const buckets = new Map<string, Map<string, number>>();
-	for (const entry of streamed) {
-		const nameKey = zipMetadataKey(entry.name, entry.compression);
-		const sizeKey = zipMetadataSizeKey(entry.compressedSize, entry.declaredSize);
-		let sizes = buckets.get(nameKey);
-		if (!sizes) {
-			sizes = new Map();
-			buckets.set(nameKey, sizes);
-		}
-		sizes.set(sizeKey, (sizes.get(sizeKey) ?? 0) + 1);
-	}
-	return buckets;
-}
-
-function consumeZipStreamMetadata(
-	expected: Map<string, Map<string, number>>,
-	consumed: Map<string, Map<string, number>>,
-	entry: Pick<ZipDirectoryEntry, "name" | "compression" | "compressedSize" | "uncompressedSize">,
-): boolean {
-	const nameKey = zipMetadataKey(entry.name, entry.compression);
-	const expectedSizes = expected.get(nameKey);
-	if (!expectedSizes) return false;
-	const consumedSizes = consumed.get(nameKey);
-	const sizeKeys = [
-		zipMetadataSizeKey(entry.compressedSize, entry.uncompressedSize),
-		zipMetadataSizeKey(entry.compressedSize, undefined),
-		zipMetadataSizeKey(undefined, entry.uncompressedSize),
-		zipMetadataSizeKey(undefined, undefined),
-	];
-	for (const sizeKey of sizeKeys) {
-		const expectedCount = expectedSizes.get(sizeKey);
-		const consumedCount = consumedSizes?.get(sizeKey) ?? 0;
-		if (expectedCount === undefined || consumedCount >= expectedCount) continue;
-		let counts = consumedSizes;
-		if (!counts) {
-			counts = new Map();
-			consumed.set(nameKey, counts);
-		}
-		counts.set(sizeKey, consumedCount + 1);
-		return true;
-	}
-	return false;
-}
-
 async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
-	const { Inflate, Unzip, UnzipPassThrough } = await loadFflate();
-	const probedEntries: StreamedZipEntry[] = [];
-	let probeError: ToolError | undefined;
-	let probeDecoderEntry: StreamedZipEntry | undefined;
-	const probe = new Unzip();
-	class DiscardZipDecoder {
-		static compression: number = 0;
-		ondata: (error: Error | null, data: Uint8Array, final: boolean) => void = () => {};
-		#entry = probeDecoderEntry;
-		#compressedBytes = 0;
-		push(data: Uint8Array, final: boolean): void {
-			this.#compressedBytes += data.byteLength;
-			if (final && this.#entry && this.#entry.compressedSize === undefined) {
-				this.#entry.compressedSize = this.#compressedBytes;
-			}
-			this.ondata(null, EMPTY_ZIP_BYTES, final);
-		}
-	}
-	probe.onfile = file => {
-		if (probeError) return file.terminate();
-		if (probedEntries.length >= MAX_ARCHIVE_ENTRY_COUNT) {
-			probeError = archiveLimitError("count");
-			return file.terminate();
-		}
-		const probedEntry: StreamedZipEntry = {
-			name: file.name,
-			compression: file.compression,
-			compressedSize: file.size,
-			declaredSize: file.originalSize,
-			actualSize: undefined,
-		};
-		probedEntries.push(probedEntry);
-		DiscardZipDecoder.compression = file.compression;
-		probe.register(DiscardZipDecoder);
-		file.ondata = error => {
-			if (error) probeError = invalidZipArchive();
-		};
-		probeDecoderEntry = probedEntry;
-		try {
-			file.start();
-		} catch {
-			probeError = invalidZipArchive();
-		} finally {
-			probeDecoderEntry = undefined;
-		}
-	};
-	try {
-		if (bytes.byteLength === 0) probe.push(bytes, true);
-		for (let offset = 0; offset < bytes.byteLength; offset += 512) {
-			if (probeError) break;
-			const end = Math.min(bytes.byteLength, offset + 512);
-			probe.push(bytes.subarray(offset, end), end === bytes.byteLength);
-		}
-	} catch {
-		if (!probeError) probeError = invalidZipArchive();
-	}
-	if (probeError) throw probeError;
-	const directoryEntries = readZipDirectory(bytes, probedEntries);
-	// Unzip constructs custom decoders synchronously in file.start; the decoder captures this entry's budget.
+	const directoryEntries = readZipDirectory(bytes);
+	const { Inflate } = await loadFflate();
+	// Feed validated member ranges directly so descriptor signatures cannot truncate stored or deflate data.
 	let activeInflateBudget:
 		| {
 				entryBytes: number;
@@ -912,86 +737,62 @@ async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
 		}
 	}
 	const entries: ArchiveIndexEntry[] = [];
-	const streamedEntries: StreamedZipEntry[] = [];
 	let totalUncompressed = 0;
-	let entryCount = 0;
-	let limitError: ToolError | undefined;
-	const unzipper = new Unzip();
-	unzipper.register(CappedZipInflate);
-	unzipper.register(UnzipPassThrough);
-	const halt = (file: { terminate: () => void }, error: ToolError) => {
-		limitError = error;
-		file.terminate();
-	};
-	unzipper.onfile = file => {
-		if (limitError) return halt(file, limitError);
-		entryCount += 1;
-		const streamedEntry: StreamedZipEntry = {
-			name: file.name,
-			compression: file.compression,
-			compressedSize: file.size,
-			declaredSize: file.originalSize,
-			actualSize: undefined,
-		};
-		streamedEntries.push(streamedEntry);
-		const declared = file.originalSize;
-		const normalizedPath = normalizeArchiveEntryPath(file.name);
-		if (entryCount > MAX_ARCHIVE_ENTRY_COUNT) return halt(file, archiveLimitError("count"));
-		if (archiveEntryDepth(file.name) > MAX_ARCHIVE_PATH_DEPTH)
-			return halt(file, archiveLimitError("depth", file.name));
-		if (typeof declared === "number" && declared > MAX_ARCHIVE_ENTRY_BYTES) {
-			return halt(file, archiveLimitError("entry", file.name));
-		}
-		if (typeof declared === "number" && totalUncompressed + declared > MAX_ARCHIVE_TOTAL_BYTES) {
-			return halt(file, archiveLimitError("total"));
-		}
-		if (!normalizedPath) return file.terminate();
-		const isDirectory = isArchiveDirectoryName(file.name);
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	for (const expected of directoryEntries) {
+		const normalizedPath = normalizeArchiveEntryPath(expected.name);
+		if (!normalizedPath) continue;
+		if (archiveEntryDepth(expected.name) > MAX_ARCHIVE_PATH_DEPTH) throw archiveLimitError("depth", expected.name);
+		const isDirectory = isArchiveDirectoryName(expected.name);
+		const nameLength = view.getUint16(expected.localOffset + 26, true);
+		const extraLength = view.getUint16(expected.localOffset + 28, true);
+		const dataStart = expected.localOffset + 30 + nameLength + extraLength;
+		const dataEnd = dataStart + expected.compressedSize;
+		if (dataEnd > bytes.byteLength) throw invalidZipArchive();
+		const compressed = bytes.subarray(dataStart, dataEnd);
 		const chunks: Uint8Array[] = [];
 		let entryBytes = 0;
-		file.ondata = (error, data, final) => {
-			if (limitError) return;
-			if (error) return halt(file, new ToolError(error.message));
-			const size = data?.byteLength ?? 0;
-			if (entryBytes + size > MAX_ARCHIVE_ENTRY_BYTES) return halt(file, archiveLimitError("entry", normalizedPath));
-			if (totalUncompressed + size > MAX_ARCHIVE_TOTAL_BYTES) return halt(file, archiveLimitError("total"));
-			entryBytes += size;
-			totalUncompressed += size;
-			if (size > 0 && !isDirectory && data) chunks.push(data);
-			if (!final) return;
-			streamedEntry.actualSize = entryBytes;
-			entries.push({
-				path: normalizedPath,
-				isDirectory,
-				size: isDirectory ? 0 : entryBytes,
-				storage: isDirectory ? undefined : { type: "zip", bytes: concatBytes(chunks, entryBytes) },
-			});
+		let failed: ToolError | undefined;
+		const take = (data: Uint8Array, final: boolean) => {
+			if (failed) return;
+			const size = data.byteLength;
+			if (entryBytes + size > MAX_ARCHIVE_ENTRY_BYTES) failed = archiveLimitError("entry", normalizedPath);
+			else if (totalUncompressed + size > MAX_ARCHIVE_TOTAL_BYTES) failed = archiveLimitError("total");
+			else {
+				entryBytes += size;
+				totalUncompressed += size;
+				if (size > 0 && !isDirectory) chunks.push(data);
+			}
+			if (final && !failed && entryBytes !== expected.uncompressedSize) failed = invalidZipArchive();
 		};
-		activeInflateBudget = {
-			entryBytes: 0,
-			fileName: normalizedPath,
-		};
-		try {
-			file.start();
-		} catch (error) {
-			if (!limitError) limitError = new ToolError(error instanceof Error ? error.message : String(error));
-		} finally {
-			activeInflateBudget = undefined;
+		if (expected.compression === 0) take(compressed, true);
+		else if (expected.compression !== 8) throw invalidZipArchive();
+		else {
+			activeInflateBudget = { entryBytes: 0, fileName: normalizedPath };
+			const inflator = new CappedZipInflate();
+			inflator.ondata = (error, data, final) => {
+				if (error) failed = new ToolError(error.message);
+				else take(data ?? new Uint8Array(0), final);
+			};
+			try {
+				inflator.push(compressed, true);
+			} catch (error) {
+				if (!failed) failed = new ToolError(error instanceof Error ? error.message : String(error));
+			} finally {
+				activeInflateBudget = undefined;
+			}
 		}
-	};
-
-	try {
-		if (bytes.byteLength === 0) unzipper.push(bytes, true);
-		for (let offset = 0; offset < bytes.byteLength; offset += 512) {
-			if (limitError) break;
-			const end = Math.min(bytes.byteLength, offset + 512);
-			unzipper.push(bytes.subarray(offset, end), end === bytes.byteLength);
-		}
-	} catch (error) {
-		if (!limitError) limitError = new ToolError(error instanceof Error ? error.message : String(error));
+		if (failed) throw failed;
+		entries.push({
+			path: normalizedPath,
+			isDirectory,
+			size: isDirectory ? 0 : entryBytes,
+			storage: isDirectory
+				? undefined
+				: { type: "zip", bytes: expected.compression === 0 ? compressed : concatBytes(chunks, entryBytes) },
+		});
 	}
-	if (limitError) throw limitError;
-	if (!zipDirectoryMatchesStream(directoryEntries, streamedEntries)) throw invalidZipArchive();
+
 	return [
 		...entries.reduce((map, entry) => map.set(entry.path, entry), new Map<string, ArchiveIndexEntry>()).values(),
 	];
