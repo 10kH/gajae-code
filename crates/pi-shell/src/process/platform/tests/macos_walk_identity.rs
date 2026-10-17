@@ -1,4 +1,4 @@
-use super::{super::DescendantBaseline, Process, WalkIdentity, WALK_IDENTITY_SCRIPT};
+use super::{super::DescendantBaseline, Process, WALK_IDENTITY_SCRIPT, WalkIdentity};
 
 #[test]
 fn unreadable_identity_stays_unknown() {
@@ -14,7 +14,10 @@ fn unreadable_identity_stays_unknown() {
 	WALK_IDENTITY_SCRIPT.with(|script| {
 		*script.borrow_mut() = vec![WalkIdentity::Unreadable; 3];
 	});
-	assert!(!DescendantBaseline::capture().observed(), "unreadable identity confirmed an empty baseline");
+	assert!(
+		!DescendantBaseline::capture().observed(),
+		"unreadable identity confirmed an empty baseline"
+	);
 }
 
 struct ClearScript;

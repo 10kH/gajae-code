@@ -770,7 +770,10 @@ mod platform {
 				return WalkIdentity::Unreadable;
 			}
 			match info {
-				Some(info) if info.start_tvsec == self.start_tvsec && info.start_tvusec == self.start_tvusec => {
+				Some(info)
+					if info.start_tvsec == self.start_tvsec
+						&& info.start_tvusec == self.start_tvusec =>
+				{
 					WalkIdentity::Same
 				},
 				_ => WalkIdentity::ConfirmedGone,
@@ -1006,7 +1009,11 @@ mod platform {
 	}
 
 	#[derive(Clone, Copy)]
-	enum WalkIdentity { Same, ConfirmedGone, Unreadable }
+	enum WalkIdentity {
+		Same,
+		ConfirmedGone,
+		Unreadable,
+	}
 
 	thread_local! {
 		static BSD_LOOKUP_UNREADABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1021,7 +1028,11 @@ mod platform {
 	fn take_scripted_walk_identity() -> Option<WalkIdentity> {
 		WALK_IDENTITY_SCRIPT.with(|script| {
 			let mut queued = script.borrow_mut();
-			if queued.is_empty() { None } else { Some(queued.remove(0)) }
+			if queued.is_empty() {
+				None
+			} else {
+				Some(queued.remove(0))
+			}
 		})
 	}
 
@@ -1179,7 +1190,11 @@ mod platform {
 		let live = Process::from_pid(self_pid).expect("live self");
 		let mut visible = false;
 		for _ in 0..40 {
-			if live.descendants().iter().any(|descendant| descendant.pid() == child_pid) {
+			if live
+				.descendants()
+				.iter()
+				.any(|descendant| descendant.pid() == child_pid)
+			{
 				visible = true;
 				break;
 			}
@@ -1192,7 +1207,9 @@ mod platform {
 		assert!(visible, "child pid {child_pid} never appeared under the live process");
 		assert_ne!(live.incarnation(), stale.incarnation());
 		assert!(
-			observed.iter().all(|descendant| descendant.pid() != child_pid),
+			observed
+				.iter()
+				.all(|descendant| descendant.pid() != child_pid),
 			"recycled pid handle adopted child {child_pid}"
 		);
 	}
