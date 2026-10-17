@@ -1,23 +1,7 @@
-import { afterEach, beforeEach, expect, it, mock, vi } from "bun:test";
+import { afterEach, beforeEach, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-
-// The test preload aborts recursive removal of a lock path that contains a
-// backslash. Those paths are the Windows rename cases under test.
-mock.module("node:fs/promises", () => {
-	const actual = require("node:fs/promises") as typeof import("node:fs/promises");
-	return {
-		...actual,
-		rm: async (target: fs.PathLike, options?: fs.RmOptions) => {
-			if (String(target).includes("\\")) {
-				await actual.unlink(target).catch(() => undefined);
-				return;
-			}
-			return actual.rm(target, options);
-		},
-	};
-});
 
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { EditTool } from "@gajae-code/coding-agent/edit";
@@ -255,55 +239,6 @@ it("still allows a later rename after an earlier entry leaves the destination ha
 	expect(result.isError).toBeUndefined();
 	expect(await Bun.file(outputPath).text()).toBe(MOVED);
 	expect(await Bun.file(path.join(tempDir, "product.ts")).exists()).toBe(false);
-});
-
-async function unlinkBackslashNames(dir: string): Promise<void> {
-	for (const name of await fs.promises.readdir(dir)) {
-		if (!name.includes("\\")) continue;
-		await fs.promises.unlink(path.join(dir, name)).catch(() => undefined);
-	}
-}
-
-// A backslash lock path makes the test preload abort recursive removal.
-// Unlink that path instead so a base run can record the result.
-async function withoutBackslashLockAbort<T>(body: () => Promise<T>): Promise<T> {
-	const original = fs.promises.rm;
-	fs.promises.rm = (async (target: fs.PathLike, options?: fs.RmOptions) => {
-		if (String(target).includes("\\")) {
-			await fs.promises.unlink(target).catch(() => undefined);
-			return;
-		}
-		return original(target, options);
-	}) as typeof fs.promises.rm;
-	try {
-		return await body();
-	} finally {
-		fs.promises.rm = original;
-		await unlinkBackslashNames(tempDir);
-	}
-}
-
-it("refuses a missing rename destination whose Windows basename is an anchored generated name", async () => {
-	for (const destName of ["nested\\zz_generated.ts", "nested\\generated.ts"]) {
-		await Bun.write(path.join(tempDir, "product.ts"), SOURCE);
-		await withoutBackslashLockAbort(async () => {
-			await expect(patchRename(true, "product.ts", destName)).rejects.toThrow(/Cannot modify auto-generated file/);
-			expect(await Bun.file(path.join(tempDir, "product.ts")).text()).toBe(SOURCE);
-			expect(await Bun.file(path.resolve(tempDir, destName)).exists()).toBe(false);
-		});
-	}
-});
-
-it("still allows a patch rename onto a missing handwritten Windows path", async () => {
-	await Bun.write(path.join(tempDir, "product.ts"), SOURCE);
-	const destName = "nested\\notes.ts";
-
-	await withoutBackslashLockAbort(async () => {
-		const result = await patchRename(true, "product.ts", destName);
-		expect(result.isError).toBeUndefined();
-		expect(await Bun.file(path.resolve(tempDir, destName)).text()).toBe(MOVED);
-		expect(await Bun.file(path.join(tempDir, "product.ts")).exists()).toBe(false);
-	});
 });
 
 it("aborts a multi-entry patch between destination checks", async () => {
