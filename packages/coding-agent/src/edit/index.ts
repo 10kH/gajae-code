@@ -3,6 +3,7 @@ import { prompt } from "@gajae-code/utils";
 import type * as z from "zod/v4";
 import {
 	executeHashlineSingle,
+	type HashlineEdit,
 	HashlineMismatchError,
 	type HashlineParams,
 	hashlineEditParamsSchema,
@@ -437,7 +438,7 @@ export class EditTool implements AgentTool<TInput> {
 						// A section still streaming (e.g. a trailing op with no anchor yet)
 						// does not parse; it contributes nothing, but earlier complete
 						// sections keep their entries (as pi-edit's hashline inspect does).
-						let edits: ReturnType<typeof parseHashline>;
+						let edits: HashlineEdit[];
 						try {
 							edits = parseHashline(section.diff);
 						} catch {
