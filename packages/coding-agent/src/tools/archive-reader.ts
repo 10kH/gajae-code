@@ -211,16 +211,20 @@ function paxOverrides(data: Uint8Array): { path?: string; size?: number } {
 	const raw = Buffer.from(data).toString("latin1");
 	for (let index = 0; index < raw.length; ) {
 		const space = raw.indexOf(" ", index);
-		const length = Number.parseInt(raw.slice(index, space), 10);
-		if (space < index || !Number.isSafeInteger(length) || index + length > raw.length)
+		const token = space < 0 ? "" : raw.slice(index, space);
+		const length = /^\d+$/.test(token) ? Number(token) : 0;
+		const end = index + length;
+		const eq = space < 0 ? -1 : raw.indexOf("=", space);
+		if (length < 1 || !Number.isSafeInteger(length) || end > raw.length)
 			throw new ToolError("Unsupported tar pax header");
-		const eq = raw.indexOf("=", space);
+		if (space >= end || eq < 0 || eq >= end || raw[end - 1] !== "\n")
+			throw new ToolError("Unsupported tar pax header");
 		const key = raw.slice(space + 1, eq);
-		const value = new TextDecoder().decode(data.subarray(eq + 1, index + length - 1));
+		const value = new TextDecoder().decode(data.subarray(eq + 1, end - 1));
 		if (key === "path") out.path = value;
 		else if (key === "size" && /^\d+$/.test(value) && Number.isSafeInteger(Number(value))) out.size = Number(value);
 		else if (key === "size") throw new ToolError("Unsupported tar size encoding");
-		index += length;
+		index = end;
 	}
 	return out;
 }

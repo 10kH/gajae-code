@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -83,6 +83,38 @@ function paxRecords(records: Array<[string, string]>): Uint8Array {
 		body += `${size}${suffix}`;
 	}
 	return new TextEncoder().encode(body);
+}
+
+function openInChild(archivePath: string): Promise<{ timedOut: boolean; output: string }> {
+	const reader = path.join(import.meta.dir, "../src/tools/archive-reader.ts");
+	const script = `
+		import { openArchive } from ${JSON.stringify(reader)};
+		try {
+			await openArchive(${JSON.stringify(archivePath)});
+			console.log("OPENED");
+		} catch {
+			console.log("REJECTED");
+		}
+	`;
+	return new Promise(resolve => {
+		const child = spawn(process.execPath, ["-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+		let output = "";
+		let settled = false;
+		const finish = (timedOut: boolean) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			resolve({ timedOut, output });
+		};
+		const timer = setTimeout(() => {
+			child.kill("SIGKILL");
+			finish(true);
+		}, 3000);
+		child.stdout.on("data", chunk => {
+			output += String(chunk);
+		});
+		child.on("exit", () => finish(false));
+	});
 }
 
 function zipUnknownSize(files: Array<{ name: string; data: Uint8Array }>): Uint8Array {
@@ -525,6 +557,30 @@ describe("openArchive inflate caps", () => {
 			}
 		}),
 		60_000,
+	);
+
+	test(
+		"rejects a malformed pax record",
+		noted("rejects a malformed pax record", async () => {
+			const bodies = ["0 path=x\n", "-1 path=\n", "1a path=\n", "4 a\n=x\n", "8 path=x"];
+			for (const body of bodies) {
+				const dir = await mkdtemp(path.join(tmpdir(), "archive-badpax-"));
+				try {
+					const archivePath = path.join(dir, "bad.tar");
+					const bytes = new TextEncoder().encode(body);
+					await writeUstar(archivePath, async push => {
+						await push(ustarHeader("paxheader", bytes.byteLength, "x"));
+						await push(pad512(bytes));
+					});
+					const result = await openInChild(archivePath);
+					expect(result.timedOut).toBe(false);
+					expect(result.output).toContain("REJECTED");
+				} finally {
+					await rm(dir, { recursive: true, force: true });
+				}
+			}
+		}),
+		20_000,
 	);
 
 	test(
