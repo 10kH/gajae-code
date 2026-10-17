@@ -102,15 +102,24 @@ function concatBytes(chunks: Uint8Array[], total: number): Uint8Array {
 
 function archiveLimitError(kind: "entry" | "total" | "count" | "depth", detail = ""): ToolError {
 	const preview = detail.length > 120 ? `${detail.slice(0, 119)}…` : detail;
-	const text =
-		kind === "count"
-			? `Archive has too many entries (limit ${MAX_ARCHIVE_ENTRY_COUNT}). Extract a subset with a dedicated tool.`
-			: kind === "total"
-				? `Archive expands past the total limit (${MAX_ARCHIVE_TOTAL_BYTES} bytes). Extract a subset with a dedicated tool.`
-				: kind === "depth"
-					? `Archive entry '${preview}' is nested too deeply (limit ${MAX_ARCHIVE_PATH_DEPTH}). Extract a subset with a dedicated tool.`
-					: `Archive entry '${preview}' expands past the per-entry limit (${MAX_ARCHIVE_ENTRY_BYTES} bytes). Extract a subset with a dedicated tool.`;
-	return new ToolError(text);
+	switch (kind) {
+		case "count":
+			return new ToolError(
+				`Archive has too many entries (limit ${MAX_ARCHIVE_ENTRY_COUNT}). Extract a subset with a dedicated tool.`,
+			);
+		case "total":
+			return new ToolError(
+				`Archive expands past the total limit (${MAX_ARCHIVE_TOTAL_BYTES} bytes). Extract a subset with a dedicated tool.`,
+			);
+		case "depth":
+			return new ToolError(
+				`Archive entry '${preview}' is nested too deeply (limit ${MAX_ARCHIVE_PATH_DEPTH}). Extract a subset with a dedicated tool.`,
+			);
+		case "entry":
+			return new ToolError(
+				`Archive entry '${preview}' expands past the per-entry limit (${MAX_ARCHIVE_ENTRY_BYTES} bytes). Extract a subset with a dedicated tool.`,
+			);
+	}
 }
 
 function upsertArchiveEntry(map: Map<string, ArchiveIndexEntry>, entry: ArchiveIndexEntry): void {
