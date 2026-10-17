@@ -860,6 +860,47 @@ describe("openArchive inflate caps", () => {
 	);
 
 	test(
+		"empty global PAX values clear inherited path and size",
+		noted("empty global PAX values clear inherited path and size", async () => {
+			const chunks: Uint8Array[] = [];
+			appendPaxHeader(
+				chunks,
+				[
+					["path", "inherited.bin"],
+					["size", "1"],
+				],
+				"g",
+			);
+			appendTarFile(chunks, "first-header.bin", Uint8Array.of(0x11));
+			appendPaxHeader(
+				chunks,
+				[
+					["path", ""],
+					["size", ""],
+				],
+				"g",
+			);
+			const fallbackBytes = Uint8Array.of(0x22, 0x33);
+			appendTarFile(chunks, "fallback.bin", fallbackBytes);
+
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-pax-global-reset-"));
+			try {
+				const archivePath = path.join(dir, "global-reset.tar");
+				await writeUstarBytes(archivePath, chunks);
+				const archive = await openArchive(archivePath);
+				const inherited = await archive.readFile("inherited.bin");
+				const fallback = await archive.readFile("fallback.bin");
+				expect(inherited.bytes).toEqual(Uint8Array.of(0x11));
+				expect(fallback.path).toBe("fallback.bin");
+				expect(fallback.size).toBe(fallbackBytes.byteLength);
+				expect(fallback.bytes).toEqual(fallbackBytes);
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+	);
+
+	test(
 		"fixed-seed generated malformed PAX boundaries terminate with rejection",
 		noted("fixed-seed generated malformed PAX boundaries terminate with rejection", async () => {
 			const random = seededRandom(0x6847_2027);

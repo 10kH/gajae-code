@@ -221,8 +221,10 @@ function tarEntryName(header: Uint8Array): string {
 	return prefix ? `${prefix}/${name}` : name;
 }
 
-function paxOverrides(data: Uint8Array): { path?: string; size?: number } {
-	const out: { path?: string; size?: number } = {};
+type PaxOverrides = { path?: string | null; size?: number | null };
+
+function paxOverrides(data: Uint8Array, global = false): PaxOverrides {
+	const out: PaxOverrides = {};
 	const raw = Buffer.from(data).toString("latin1");
 	for (let index = 0; index < raw.length; ) {
 		const space = raw.indexOf(" ", index);
@@ -236,7 +238,8 @@ function paxOverrides(data: Uint8Array): { path?: string; size?: number } {
 			throw new ToolError("Unsupported tar pax header");
 		const key = raw.slice(space + 1, eq);
 		const value = new TextDecoder().decode(data.subarray(eq + 1, end - 1));
-		if (key === "path") out.path = value;
+		if (key === "path") out.path = global && value === "" ? null : value;
+		else if (key === "size" && global && value === "") out.size = null;
 		else if (key === "size" && /^\d+$/.test(value) && Number.isSafeInteger(Number(value))) out.size = Number(value);
 		else if (key === "size") throw new ToolError("Unsupported tar size encoding");
 		index = end;
@@ -252,7 +255,7 @@ async function readTarEntries(bytes: Uint8Array, labeledGzip: boolean): Promise<
 	let memberBytes = 0;
 	let offset = 0;
 	let longName: string | undefined;
-	let pendingPax: { path?: string; size?: number } | undefined;
+	let pendingPax: PaxOverrides | undefined;
 	const globalPax: { path?: string; size?: number } = {};
 	while (offset + 512 <= payload.byteLength) {
 		const header = payload.subarray(offset, offset + 512);
@@ -284,8 +287,13 @@ async function readTarEntries(bytes: Uint8Array, labeledGzip: boolean): Promise<
 		const data = payload.subarray(offset + 512, dataEnd);
 		offset += 512 + Math.ceil(size / 512) * 512;
 		if (typeFlag === 120 || typeFlag === 103) {
-			if (typeFlag === 103) Object.assign(globalPax, paxOverrides(data));
-			else pendingPax = paxOverrides(data);
+			if (typeFlag === 103) {
+				const overrides = paxOverrides(data, true);
+				if (overrides.path === null) delete globalPax.path;
+				else if (overrides.path !== undefined) globalPax.path = overrides.path;
+				if (overrides.size === null) delete globalPax.size;
+				else if (overrides.size !== undefined) globalPax.size = overrides.size;
+			} else pendingPax = paxOverrides(data);
 			continue;
 		}
 		if (typeFlag === 76) {
