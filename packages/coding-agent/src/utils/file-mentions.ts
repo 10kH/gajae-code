@@ -324,7 +324,7 @@ export function isCanonicalWindowsPathWithin(root: string, candidate: string): b
 	const canonicalCandidate = path.win32.resolve(candidate);
 	const rootParts = path.win32.parse(canonicalRoot);
 	const candidateParts = path.win32.parse(canonicalCandidate);
-	if (rootParts.root !== candidateParts.root) return false;
+	if (rootParts.root.toLowerCase() !== candidateParts.root.toLowerCase()) return false;
 
 	const rootSegments = canonicalRoot.slice(rootParts.root.length).split(path.win32.sep).filter(Boolean);
 	const candidateSegments = canonicalCandidate.slice(candidateParts.root.length).split(path.win32.sep).filter(Boolean);
