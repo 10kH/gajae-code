@@ -1071,7 +1071,7 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 		(model.api === "anthropic-messages" || model.api === "bedrock-converse-stream") &&
 		semverGte(parsedModel.version, "4.6")
 	) {
-		if (parsedModel.kind === "haiku" && semverGte(parsedModel.version, "5.5")) {
+		if (parsedModel.kind === "haiku" && semverGte(parsedModel.version, "5.5") && model.api === "anthropic-messages") {
 			return ANTHROPIC_HAIKU_5_5_EFFORTS;
 		}
 		if (parsedModel.kind === "fable") {
