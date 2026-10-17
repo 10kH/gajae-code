@@ -208,7 +208,7 @@ function tarEntryName(header: Uint8Array): string {
 
 function paxOverrides(data: Uint8Array): { path?: string; size?: number } {
 	const out: { path?: string; size?: number } = {};
-	const raw = new TextDecoder("latin1").decode(data);
+	const raw = Buffer.from(data).toString("latin1");
 	for (let index = 0; index < raw.length; ) {
 		const space = raw.indexOf(" ", index);
 		const length = Number.parseInt(raw.slice(index, space), 10);
