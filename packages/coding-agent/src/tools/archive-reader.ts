@@ -706,7 +706,6 @@ async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
 		  }
 		| undefined;
 	class CappedZipInflate {
-		static compression = 8;
 		ondata: (error: Error | null, data: Uint8Array, final: boolean) => void = () => {};
 		#failed = false;
 		#inflater: InstanceType<typeof Inflate>;
@@ -733,9 +732,6 @@ async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
 				this.#failed = true;
 				this.ondata(error instanceof Error ? error : new Error(String(error)), new Uint8Array(0), true);
 			}
-		}
-		terminate(): void {
-			this.#failed = true;
 		}
 	}
 	const entries: ArchiveIndexEntry[] = [];
