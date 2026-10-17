@@ -64,6 +64,29 @@ describe("Agent steering admission", () => {
 		expect(h.agent.hasQueuedSteering()).toBe(false);
 	});
 
+	it("commits a steering cohort in one step under the default one-at-a-time mode", async () => {
+		const h = liveRunHarness();
+		const run = h.agent.prompt("go");
+		await h.entered;
+
+		const head = userMessage("cohort head");
+		const tail = userMessage("cohort tail");
+		expect(h.agent.steerCohort([head, tail]).admitted).toBe(true);
+		expect(h.agent.snapshotSteering()).toEqual([head, tail]);
+
+		h.release();
+		await run;
+
+		// The cohort is committed as one unit: both messages reach the same request
+		// even though the default mode takes one steering record per step.
+		const index = h.agent.state.messages.indexOf(head);
+		expect(index).toBeGreaterThanOrEqual(0);
+		expect(h.agent.state.messages[index + 1]).toBe(tail);
+		expect(
+			h.mock.calls.some(call => call.context.messages.includes(head) && call.context.messages.includes(tail)),
+		).toBe(true);
+	});
+
 	it("rejects a steer once the live run's signal is aborted", async () => {
 		const h = liveRunHarness();
 		const run = h.agent.prompt("go");

@@ -27820,16 +27820,16 @@ export class AgentSession {
 			this.#flushPendingBackgroundExchanges();
 			return;
 		}
-		// `Agent.steer()` admits only into a live, non-aborted run whose stream is
-		// open; outside that window the batch keeps waiting for the next event.
-		if (!this.agent.state.isStreaming) return;
-		const remaining: CustomMessage[] = [];
+		// A cohort is admitted only into a live, non-aborted run whose stream is open;
+		// outside that window the batch keeps waiting for the next agent event.
+		const remaining: CustomMessage[][] = [];
 		for (const batch of this.#pendingBackgroundExchanges) {
-			for (const msg of batch) {
-				if (!this.agent.steer(msg).admitted) remaining.push(msg);
-			}
+			// The exchange travels as one steering cohort: the incoming question and
+			// the reply this session already sent on the model's behalf must reach the
+			// same model step, or the model acts on an answered question.
+			if (!this.agent.steerCohort(batch).admitted) remaining.push(batch);
 		}
-		this.#pendingBackgroundExchanges = remaining.length > 0 ? [remaining] : [];
+		this.#pendingBackgroundExchanges = remaining;
 	}
 
 	#flushPendingBackgroundExchanges(): void {
