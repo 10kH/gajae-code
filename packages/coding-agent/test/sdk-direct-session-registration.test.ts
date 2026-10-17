@@ -452,6 +452,175 @@ describe("direct CLI session-index registration", () => {
 		}
 	});
 
+	test("follows the manager the session adopted instead of the startup one", async () => {
+		const root = await makeTempRoot("gjc-direct-adopted-manager-");
+		try {
+			const startupManager = SessionManager.create(
+				root,
+				SessionManager.explicitDestination(path.join(root, "sessions")),
+			);
+			startupManager.appendMessage({ role: "user", content: "first", timestamp: Date.now() });
+			await startupManager.ensureOnDisk();
+			const index = new SessionIndex(root);
+			const registration = await registerDirectSession(startupManager, root, undefined, {
+				createIndex: () => index,
+				registerPostmortem: () => () => {},
+			});
+			const startupId = startupManager.getSessionId();
+
+			// A bounded cold-sidecar fork adopts its own manager before it emits
+			// `session_switch`, so the sync has to be pointed at that manager.
+			const forkedManager = SessionManager.create(
+				root,
+				SessionManager.explicitDestination(path.join(root, "forked-sessions")),
+			);
+			forkedManager.appendMessage({ role: "user", content: "fork", timestamp: Date.now() });
+			await forkedManager.ensureOnDisk();
+			const forkedId = forkedManager.getSessionId();
+			expect(forkedId).not.toBe(startupId);
+
+			await registration.syncIdentity(forkedManager);
+
+			const rows = (await new SessionIndex(root).open()).listSessions().sessions;
+			expect(rows.filter(row => row.live).map(row => row.sessionId)).toEqual([forkedId]);
+		} finally {
+			await removeTempRoot(root);
+		}
+	});
+
+	test("retries a successor registration that never landed", async () => {
+		const root = await makeTempRoot("gjc-direct-successor-retry-");
+		const authStorage = await AuthStorage.create(":memory:");
+		try {
+			const manager = SessionManager.create(root, SessionManager.explicitDestination(path.join(root, "sessions")));
+			manager.appendMessage({ role: "user", content: "first", timestamp: Date.now() });
+			await manager.ensureOnDisk();
+			const index = new SessionIndex(root);
+			let failRegistrations = false;
+			const appendEntry = index.append.bind(index);
+			vi.spyOn(index, "append").mockImplementation(async entry => {
+				if (entry.type === "host_registered" && failRegistrations) {
+					throw new Error("index append unavailable");
+				}
+				return await appendEntry(entry);
+			});
+			const registration = await registerDirectSession(manager, root, undefined, {
+				createIndex: () => index,
+				registerPostmortem: () => () => {},
+			});
+			const firstId = manager.getSessionId();
+			const { session } = await createAgentSession({
+				cwd: root,
+				agentDir: root,
+				authStorage,
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				settings: Settings.isolated({ "notifications.enabled": false }),
+				sessionManager: manager,
+				disableExtensionDiscovery: true,
+				extensions: [],
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+			});
+			try {
+				await session.newSession();
+				const successorId = manager.getSessionId();
+				expect(successorId).not.toBe(firstId);
+
+				failRegistrations = true;
+				await expect(registration.syncIdentity()).rejects.toThrow("index append unavailable");
+
+				// The predecessor stays registered and the successor is still missing, so
+				// the next boundary can retry it instead of leaving it unindexed.
+				let rows = (await new SessionIndex(root).open()).listSessions().sessions;
+				expect(rows.filter(row => row.live).map(row => row.sessionId)).toEqual([firstId]);
+
+				failRegistrations = false;
+				await registration.syncIdentity();
+
+				rows = (await new SessionIndex(root).open()).listSessions().sessions;
+				expect(rows.filter(row => row.live).map(row => row.sessionId)).toEqual([successorId]);
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			vi.restoreAllMocks();
+			authStorage.close();
+			await removeTempRoot(root);
+		}
+	});
+
+	test("registers the successor during teardown after a failed switch", async () => {
+		const root = await makeTempRoot("gjc-direct-teardown-successor-");
+		const authStorage = await AuthStorage.create(":memory:");
+		try {
+			const manager = SessionManager.create(root, SessionManager.explicitDestination(path.join(root, "sessions")));
+			manager.appendMessage({ role: "user", content: "first", timestamp: Date.now() });
+			await manager.ensureOnDisk();
+			const index = new SessionIndex(root);
+			let failRegistrations = false;
+			const appendEntry = index.append.bind(index);
+			vi.spyOn(index, "append").mockImplementation(async entry => {
+				if (entry.type === "host_registered" && failRegistrations) {
+					throw new Error("index append unavailable");
+				}
+				return await appendEntry(entry);
+			});
+			let runTeardown: (() => Promise<void>) | undefined;
+			const registration = await registerDirectSession(manager, root, undefined, {
+				createIndex: () => index,
+				registerPostmortem: (_id, callback) => {
+					runTeardown = async () => {
+						await callback("test-cleanup" as never);
+					};
+					return () => {};
+				},
+			});
+			const firstId = manager.getSessionId();
+			const { session } = await createAgentSession({
+				cwd: root,
+				agentDir: root,
+				authStorage,
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				settings: Settings.isolated({ "notifications.enabled": false }),
+				sessionManager: manager,
+				disableExtensionDiscovery: true,
+				extensions: [],
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+			});
+			try {
+				await session.newSession();
+				const successorId = manager.getSessionId();
+				failRegistrations = true;
+				await registration.syncIdentity().catch(() => undefined);
+				failRegistrations = false;
+				if (!runTeardown) throw new Error("Expected the registration to arm a teardown handler");
+				await runTeardown();
+
+				// The active transcript was registered before the process released it,
+				// instead of shutdown leaving the successor unindexed forever.
+				const rows = (await new SessionIndex(root).open()).listSessions().sessions;
+				expect(rows.some(row => row.sessionId === successorId)).toBe(true);
+				expect(rows.filter(row => row.live)).toHaveLength(0);
+				expect(rows.some(row => row.sessionId === firstId)).toBe(true);
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			vi.restoreAllMocks();
+			authStorage.close();
+			await removeTempRoot(root);
+		}
+	});
+
 	test("identity sync is a no-op for sessions that were never registered", async () => {
 		const root = await makeTempRoot("gjc-direct-identity-noop-");
 		try {

@@ -51,7 +51,7 @@ import { resolveMachineLocalUpdateChannel, type UpdateChannel } from "./config/u
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "./defaults/gjc-grok-cli";
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
-import type { ExtensionUIContext } from "./extensibility/extensions/types";
+import type { ExtensionContext, ExtensionUIContext } from "./extensibility/extensions/types";
 import { releaseLaunchWorktreeReservationAfterRegistration } from "./gjc-runtime/launch-worktree-reservation";
 import { persistCoordinatorRuntimeInputReady } from "./gjc-runtime/session-state-sidecar";
 import { assertMasterLaunchArgs, assertMasterLaunchDisposition, createMasterModeContext } from "./master-mode/context";
@@ -1676,14 +1676,28 @@ interface DirectSessionRegistrationDependencies {
  * keyed on that id, so without a follow-up the successor is never indexed and the
  * predecessor stays live for as long as this pid is alive (the broker keeps
  * heartbeating a live pid). `syncIdentity` moves the registration to whichever
- * id the manager currently reports.
+ * id the manager the session has adopted currently reports.
  */
 export interface DirectSessionRegistration {
-	/** Register the manager's current session id and release the one it replaced. */
-	syncIdentity(): Promise<void>;
+	/**
+	 * Register the current manager's session id and release the one it replaced.
+	 *
+	 * `adoptedManager` rebinds the registration to the manager the session now
+	 * owns: a bounded cold-sidecar fork adopts its own forked manager before it
+	 * emits `session_switch`, so the wired handler must hand that manager over or
+	 * the sync keeps reading the startup manager's predecessor id.
+	 */
+	syncIdentity(adoptedManager?: DirectSessionManager): Promise<void>;
 }
 
 const NOOP_DIRECT_SESSION_REGISTRATION: DirectSessionRegistration = { syncIdentity: async () => {} };
+
+/**
+ * Appends allowed for one successor registration before the switch gives up and
+ * keeps the predecessor registered. `SessionIndex.append` takes the shared index
+ * lock independently per append, so a peer holding it is a transient failure.
+ */
+const DIRECT_SESSION_REGISTRATION_ATTEMPTS = 3;
 
 /** Register a durable direct CLI session while leaving ephemeral sessions lock-free. */
 export async function registerDirectSession(
@@ -1696,6 +1710,9 @@ export async function registerDirectSession(
 	if (!initialSessionId || !sessionManager) return NOOP_DIRECT_SESSION_REGISTRATION;
 	const sessionIndex = dependencies.createIndex?.(agentDir) ?? new SessionIndex(agentDir);
 	const directSessionIncarnation = (dependencies.processIncarnation ?? processIncarnation)(process.pid);
+	// The session can adopt a different manager mid-process (bounded cold-sidecar
+	// fork), so every read goes through the manager that is current now.
+	let activeManager = sessionManager;
 	let registeredLocator: SessionLocatorV2 | undefined;
 	let registeredSessionId: string | undefined;
 	// Predecessors whose `host_unregistered` append has not succeeded yet. Once the
@@ -1711,7 +1728,7 @@ export async function registerDirectSession(
 	};
 
 	const register = async (sessionId: string): Promise<void> => {
-		const locator = await resolveSessionLocator(sessionManager.getCwd(), agentDir);
+		const locator = await resolveSessionLocator(activeManager.getCwd(), agentDir);
 		try {
 			await sessionIndex.append({
 				type: "host_registered",
@@ -1796,6 +1813,50 @@ export async function registerDirectSession(
 		}
 	};
 
+	/**
+	 * Register `sessionId`, retrying a bounded number of times so a transient
+	 * index-lock loss self-heals instead of leaving the successor unregistered
+	 * until the next identity change.
+	 */
+	const registerWithRetry = async (sessionId: string): Promise<void> => {
+		for (let attempt = 1; ; attempt++) {
+			try {
+				await register(sessionId);
+				return;
+			} catch (error) {
+				if (attempt >= DIRECT_SESSION_REGISTRATION_ATTEMPTS) throw error;
+				await new Promise(resolve => setTimeout(resolve, 50 * attempt));
+			}
+		}
+	};
+
+	/**
+	 * Move the registration to the id `activeManager` currently reports.
+	 *
+	 * A successor append that cannot land after its bounded retries keeps the
+	 * predecessor registered and the successor unregistered, so every later call
+	 * (any session event, or teardown) retries the successor instead of leaving it
+	 * unindexed for the life of the process.
+	 */
+	const syncToActiveManager = async (): Promise<void> => {
+		const currentId = activeManager.getSessionFile() === undefined ? undefined : activeManager.getSessionId();
+		// A predecessor left over from a failed release is retried here even when
+		// the identity itself did not change.
+		if (!currentId || currentId === registeredSessionId) {
+			await releasePendingPredecessors();
+			return;
+		}
+		// The predecessor is released under the locator it was registered with, and
+		// only after the successor's own append succeeded.
+		const predecessorId = registeredSessionId;
+		const predecessorLocator = registeredLocator;
+		await registerWithRetry(currentId);
+		if (predecessorId) {
+			pendingPredecessorReleases.push({ sessionId: predecessorId, locator: predecessorLocator });
+			await releasePendingPredecessors();
+		}
+	};
+
 	await register(initialSessionId);
 	if (registeredLocator?.worktreeRoot != null) {
 		try {
@@ -1806,33 +1867,30 @@ export async function registerDirectSession(
 			});
 		}
 	}
-	// Teardown releases whichever id is registered now, not the startup id, and any
-	// predecessor whose release failed earlier in the process.
+	// Teardown registers the id the session is on now — a post-switch append that
+	// failed would otherwise leave the active transcript unindexed — then releases
+	// everything this process still holds.
 	(dependencies.registerPostmortem ?? postmortem.register)("direct-session-index", async _reason => {
+		try {
+			await syncToActiveManager();
+		} catch (error) {
+			logger.warn("Failed to register the active direct session during teardown", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 		if (registeredSessionId) await unregister(registeredSessionId, registeredLocator);
 		await releasePendingPredecessors();
 	});
 
 	let syncing: Promise<void> = Promise.resolve();
 	return {
-		syncIdentity: () => {
+		syncIdentity: adoptedManager => {
 			// Serialized: a rapid /new /new must register in order and never interleave.
 			const run = syncing.then(async () => {
-				const currentId = sessionManager.getSessionFile() === undefined ? undefined : sessionManager.getSessionId();
-				// A predecessor left over from a failed release is retried here even when
-				// the identity itself did not change.
-				if (!currentId || currentId === registeredSessionId) {
-					await releasePendingPredecessors();
-					return;
-				}
-				// The predecessor is released under the locator it was registered with.
-				const predecessorId = registeredSessionId;
-				const predecessorLocator = registeredLocator;
-				await register(currentId);
-				if (predecessorId) {
-					pendingPredecessorReleases.push({ sessionId: predecessorId, locator: predecessorLocator });
-					await releasePendingPredecessors();
-				}
+				// An ephemeral manager owns nothing the index could fence, so the tracked
+				// manager survives an adoption that has no durable transcript.
+				if (adoptedManager?.getSessionFile() !== undefined) activeManager = adoptedManager;
+				await syncToActiveManager();
 			});
 			syncing = run.catch(() => {});
 			return run;
@@ -2445,9 +2503,11 @@ export async function runRootCommand(
 	sessionOptions.extensions = [
 		...(sessionOptions.extensions ?? []),
 		pi => {
-			const sync = async (): Promise<void> => {
+			const sync = async (_event: unknown, ctx: ExtensionContext): Promise<void> => {
 				try {
-					await directSessionRegistration.syncIdentity();
+					// A cold-sidecar fork adopts its own manager before emitting the event, so
+					// the sync must read that manager rather than the startup one.
+					await directSessionRegistration.syncIdentity(ctx.sessionManager);
 				} catch (error) {
 					logger.warn("Failed to move direct session registration to the new session id", {
 						error: error instanceof Error ? error.message : String(error),
@@ -2456,6 +2516,9 @@ export async function runRootCommand(
 			};
 			pi.on("session_switch", sync);
 			pi.on("session_branch", sync);
+			// A transition whose append failed is retried at the next turn boundary, not
+			// only on another identity change.
+			pi.on("agent_end", sync);
 		},
 	];
 
