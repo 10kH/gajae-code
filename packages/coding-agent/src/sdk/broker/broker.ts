@@ -117,7 +117,7 @@ import {
 } from "./managed-task-dag";
 import { reconcileRunningManagedVerification, verifyManagedTaskAttempt } from "./managed-task-verification";
 import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
-import { isProcessIncarnation } from "./process-incarnation";
+import { isProcessIncarnation, processIncarnation } from "./process-incarnation";
 import { sdkInternalRuntimeImage } from "./runtime";
 import {
 	type IndexedSession,
@@ -172,6 +172,14 @@ export interface BrokerSettings {
 	 * port, its publication, and its lock for the life of the machine.
 	 */
 	abandonedGraceMs?: number;
+	/**
+	 * Whether this broker may end itself once nobody is left to use it. Only the
+	 * detached autostart entry point enables this: an operator-supervised
+	 * `gjc sdk broker run` service owns its own lifetime, and its supervisor reads an
+	 * owned-root completion as a clean exit, so self-reaping would quietly retire a
+	 * service that was meant to keep serving.
+	 */
+	reapWhenAbandoned?: boolean;
 	/** Host model resolver override for lifecycle tests and embedders. */
 	resolveModelPin?: SdkHostModelResolver;
 	/**
@@ -210,6 +218,7 @@ type ResolvedBrokerSettings = {
 	spawnPromptLayer?: SpawnPromptLayer;
 	masterOrphanGraceMs: number;
 	abandonedGraceMs: number;
+	reapWhenAbandoned: boolean;
 	restartRequestId?: string;
 };
 export function resolveBrokerPackageGeneration(): string {
@@ -1697,6 +1706,7 @@ export class Broker {
 			spawnPromptLayer: settings.spawnPromptLayer,
 			masterOrphanGraceMs: settings.masterOrphanGraceMs ?? MASTER_ORPHAN_GRACE_DEFAULT_MS,
 			abandonedGraceMs: settings.abandonedGraceMs ?? BROKER_ABANDONED_GRACE_DEFAULT_MS,
+			reapWhenAbandoned: settings.reapWhenAbandoned === true,
 			...(settings.restartRequestId === undefined ? {} : { restartRequestId: settings.restartRequestId }),
 		};
 		this.index = new SessionIndex(settings.agentDir);
@@ -3680,22 +3690,36 @@ export class Broker {
 	}
 
 	/**
-	 * Whether the index still proves a live session host for this agent directory.
-	 * Liveness is judged on read -- fresh checkpoint, live pid, matching incarnation
-	 * -- so a host that died without closing stops proving it without any help from
-	 * this broker. `undefined` means the read itself failed: an unproven observation
-	 * never concludes abandonment.
+	 * What the index proves about the hosts using this agent directory. Liveness is
+	 * judged on read -- fresh checkpoint, live pid, matching incarnation -- so a host
+	 * that died without closing stops proving it without help. A row that is not live
+	 * is absence only once its process is provably gone: a live pid whose recorded
+	 * incarnation cannot be matched (because it is a legacy row, because the pid was
+	 * reused, or because the probe could not tell) is undecided, and an undecided
+	 * reading never concludes abandonment.
 	 */
-	async #hasLiveSessionHost(): Promise<boolean | undefined> {
+	async #sessionHostLiveness(): Promise<"live" | "absent" | "unknown"> {
 		try {
 			await this.index.refreshIfChanged();
 		} catch (error) {
 			logger.warn(`sdk broker: abandonment probe could not read the session index: ${String(error)}`);
-			return undefined;
+			return "unknown";
 		}
-		return this.index
-			.listSessionIdentities()
-			.some(row => row.endpointGeneration > 0 && row.live && !row.terminal && !row.terminalUncertain);
+		for (const row of this.index.listSessionIdentities()) {
+			if (row.endpointGeneration <= 0) continue;
+			if (row.live) return "live";
+			// A dead pid is proven gone. A live one still has to be ruled out as the
+			// host that registered: its incarnation decides, and reading it is only worth
+			// the probe once a recorded incarnation exists to compare against.
+			if (!isPidAlive(row.pid)) continue;
+			const recorded = row.hostIncarnation ?? row.processIncarnation;
+			if (recorded === undefined) return "unknown";
+			const current = processIncarnation(row.pid);
+			if (current === undefined) return "unknown";
+			if (current === recorded) return "live";
+			// The pid belongs to another process now: the host that registered it is gone.
+		}
+		return "absent";
 	}
 
 	/** Whether any client currently holds a transport connection to this broker. */
@@ -3719,19 +3743,20 @@ export class Broker {
 	 * Ends a broker nobody is left to use. A client that dies without closing leaves
 	 * no live session host behind, and nothing else reaps this process: without this
 	 * pass it would hold its port, its publication, and its lock until the machine
-	 * reboots. The clock is armed only once the index proves the absence and no client
-	 * holds a connection, and any live host, attached client, or open authority
-	 * disarms it, so a slow reattach never races the grace.
+	 * reboots. The clock only runs while absence is confirmed and no client holds a
+	 * connection, and any live host, attached client, open authority, or undecided
+	 * reading disarms it, so a slow reattach never races the grace. Brokers an
+	 * operator supervises never reap themselves at all.
 	 */
 	async #reapSelfIfAbandoned(): Promise<void> {
+		if (!this.settings.reapWhenAbandoned) return;
 		if (this.#stopping || this.#completionTask !== null || this.#fenceReason !== null) return;
 		if (this.#abandonedReapInFlight) return;
 		this.#abandonedReapInFlight = true;
 		try {
-			const liveHost = await this.#hasLiveSessionHost();
-			if (liveHost === undefined) return;
+			const liveness = await this.#sessionHostLiveness();
 			const now = Date.now();
-			if (liveHost || this.#hasAttachedClient() || this.#hasOpenSpawnAuthority()) {
+			if (liveness !== "absent" || this.#hasAttachedClient() || this.#hasOpenSpawnAuthority()) {
 				this.#abandonedAt = null;
 				return;
 			}

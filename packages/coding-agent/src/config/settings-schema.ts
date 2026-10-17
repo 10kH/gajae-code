@@ -509,7 +509,7 @@ export const SETTINGS_SCHEMA = {
 		type: "number",
 		default: 120_000,
 		description:
-			"Grace period before a broker with no live session host and no open spawn authority exits on its own.",
+			"Grace before a detached broker with no client connection, no live session host, and no open spawn authority exits on its own. A supervised `gjc sdk broker run` service never reaps itself.",
 		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 3_600_000,
 	},
 

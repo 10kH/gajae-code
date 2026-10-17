@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Broker, setAbandonedGraceForTest } from "../src/sdk/broker/broker";
 import { readBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { SdkClient } from "../src/sdk/client/client";
 
@@ -16,15 +17,44 @@ const ABSENT_PID = 999_999;
 
 const brokers: Broker[] = [];
 const roots: string[] = [];
+const children: Bun.Subprocess<"ignore", "ignore", "ignore">[] = [];
 
-async function startBroker(graceMs: number): Promise<Broker> {
+/**
+ * Starts a broker on a private agent directory. Only the detached autostart entry
+ * point enables self-reaping, so the default here mirrors that entry point.
+ */
+async function startBroker(graceMs: number, reapWhenAbandoned = true): Promise<Broker> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-abandoned-"));
 	roots.push(root);
-	const broker = new Broker({ agentDir: path.join(root, "agent"), heartbeatTtlMs: HEARTBEAT_TTL_MS });
+	const broker = new Broker({
+		agentDir: path.join(root, "agent"),
+		heartbeatTtlMs: HEARTBEAT_TTL_MS,
+		reapWhenAbandoned,
+	});
 	brokers.push(broker);
 	setAbandonedGraceForTest(broker, graceMs);
 	await broker.start();
 	return broker;
+}
+
+/**
+ * Starts a real process to register as a session host, so the test can take that
+ * pid away and still leave a registration carrying a valid recorded incarnation.
+ */
+async function liveHostProcess(): Promise<{ pid: number; incarnation: string; end: () => Promise<void> }> {
+	const child = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+	children.push(child);
+	const incarnation = processIncarnation(child.pid);
+	if (incarnation === undefined) throw new Error("Could not read the host process incarnation.");
+	return {
+		pid: child.pid,
+		incarnation,
+		end: async () => {
+			child.kill();
+			// Awaiting the exit is what removes the pid: a zombie still answers a liveness probe.
+			await child.exited;
+		},
+	};
 }
 
 /**
@@ -56,6 +86,8 @@ function completedWithin(broker: Broker, ms: number): Promise<boolean> {
 }
 
 afterEach(async () => {
+	for (const child of children) child.kill();
+	children.length = 0;
 	for (const broker of brokers) {
 		setAbandonedGraceForTest(broker, undefined);
 		await broker.stop().catch(() => {});
@@ -81,12 +113,56 @@ test("a live session host keeps the broker running", async () => {
 	expect(broker.terminalExit).toBeNull();
 }, 20_000);
 
-test("a host that died without closing lets the broker exit", async () => {
+test("a registration whose host process died lets the broker exit", async () => {
+	const broker = await startBroker(CADENCE_MS * 3);
+	// A real process registers with the incarnation it actually carries, so the row is
+	// provably live -- a recorded incarnation the index can match -- until the pid goes.
+	const host = await liveHostProcess();
+	await registerHost(broker, "killed-client", host.pid, host.incarnation);
+	if (await completedWithin(broker, 1_000)) throw new Error("Broker abandoned a live session host.");
+	await host.end();
+	if (!(await completedWithin(broker, 4_000))) throw new Error("Broker did not reap itself as abandoned.");
+	expect(broker.terminalExit).toMatchObject({ reason: "abandoned" });
+}, 30_000);
+
+test("a registration with a dead pid and no recorded incarnation lets the broker exit", async () => {
 	const broker = await startBroker(CADENCE_MS * 3);
 	// The registration outlives its process exactly as a killed client leaves it.
 	await registerHost(broker, "killed-client", ABSENT_PID);
 	if (!(await completedWithin(broker, 4_000))) throw new Error("Broker did not reap itself as abandoned.");
 	expect(broker.terminalExit).toMatchObject({ reason: "abandoned" });
+}, 20_000);
+
+test("an undecided host reading pauses the clock instead of aging it", async () => {
+	const graceMs = CADENCE_MS * 6;
+	const broker = await startBroker(graceMs);
+	// Confirmed absence arms the clock.
+	await registerHost(broker, "gone", ABSENT_PID);
+	await Bun.sleep(CADENCE_MS * 2);
+	// A live pid carrying no recorded incarnation is undecided: the broker cannot tell
+	// whether that process is the host that registered, so it must not keep the armed
+	// clock running while it cannot see.
+	const host = await liveHostProcess();
+	await registerHost(broker, "undecided", host.pid);
+	await Bun.sleep(graceMs);
+	// The process that made the reading undecided is gone, so the reading is decidable
+	// again. The clock has to start over here: an instance that let it age through the
+	// undecided interval would reap on this very tick.
+	await host.end();
+	if (await completedWithin(broker, CADENCE_MS * 2))
+		throw new Error("The undecided interval let an older clock reap the broker.");
+	// It still reaps the broker once its own grace of confirmed absence has passed.
+	if (!(await completedWithin(broker, graceMs + CADENCE_MS * 10)))
+		throw new Error("Broker never armed a fresh clock after the reading became decided.");
+	expect(broker.terminalExit).toMatchObject({ reason: "abandoned" });
+}, 30_000);
+
+test("a supervised service is never reaped, however long it idles", async () => {
+	// `gjc sdk broker run` is owned by the operator's process manager, which reads an
+	// owned-root completion as a clean exit and would not restart the service.
+	const broker = await startBroker(CADENCE_MS * 2, false);
+	if (await completedWithin(broker, CADENCE_MS * 12)) throw new Error("A supervised broker reaped itself.");
+	expect(broker.terminalExit).toBeNull();
 }, 20_000);
 
 test("a connected client keeps the broker running, and losing it lets the broker exit", async () => {
