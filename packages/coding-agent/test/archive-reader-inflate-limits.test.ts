@@ -13,6 +13,7 @@ const ENTRY_LIMIT = 16 * 1024 * 1024;
 const TOTAL_LIMIT = 64 * 1024 * 1024;
 const COUNT_LIMIT = 8192;
 const DEPTH_LIMIT = 48;
+const TAR_CONTAINER_LIMIT = TOTAL_LIMIT + COUNT_LIMIT * 1024 + 1024;
 
 function ustarHeader(name: string, size: number, typeFlag = "0"): Uint8Array {
 	const header = new Uint8Array(512);
@@ -83,6 +84,42 @@ function paxRecords(records: Array<[string, string]>): Uint8Array {
 		body += `${size}${suffix}`;
 	}
 	return new TextEncoder().encode(body);
+}
+
+function appendPaxHeader(chunks: Uint8Array[], records: Array<[string, string]>, typeFlag: "g" | "x" = "x"): void {
+	const body = paxRecords(records);
+	chunks.push(ustarHeader(typeFlag === "g" ? "global" : "paxheader", body.byteLength, typeFlag), pad512(body));
+}
+
+function appendTarFile(chunks: Uint8Array[], name: string, body: Uint8Array): void {
+	chunks.push(ustarHeader(name, body.byteLength), pad512(body));
+}
+
+function seededRandom(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+		return state / 0x1_0000_0000;
+	};
+}
+
+function randomInteger(random: () => number, min: number, max: number): number {
+	return min + Math.floor(random() * (max - min + 1));
+}
+
+function randomAscii(random: () => number, length: number): string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+	let value = "";
+	for (let index = 0; index < length; index++) {
+		value += alphabet[randomInteger(random, 0, alphabet.length - 1)];
+	}
+	return value;
+}
+
+function randomBytes(random: () => number, length: number): Uint8Array {
+	const bytes = new Uint8Array(length);
+	for (let index = 0; index < length; index++) bytes[index] = randomInteger(random, 0, 255);
+	return bytes;
 }
 
 function openInChild(archivePath: string): Promise<{ timedOut: boolean; output: string }> {
@@ -699,5 +736,200 @@ describe("openArchive inflate caps", () => {
 			});
 		}),
 		60_000,
+	);
+
+	test(
+		"accepts tar members at the advertised byte limit with block padding",
+		noted("accepts tar members at the advertised byte limit with block padding", async () => {
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-tar-padding-"));
+			try {
+				const archivePath = path.join(dir, "padding.tar");
+				const shortBody = new Uint8Array(8191);
+				const longBody = new Uint8Array(8193);
+				await writeUstar(archivePath, async push => {
+					for (let index = 0; index < COUNT_LIMIT; index++) {
+						const body = index % 2 === 0 ? shortBody : longBody;
+						await push(ustarHeader(`f${index}.bin`, body.byteLength));
+						await push(body);
+						await push(new Uint8Array(index % 2 === 0 ? 1 : 511));
+					}
+				});
+
+				expect(Bun.file(archivePath).size).toBe(70 * 1024 * 1024 + 1024);
+				const archive = await openArchive(archivePath);
+				expect(archive.listDirectory()).toHaveLength(COUNT_LIMIT);
+				expect((await archive.readFile("f0.bin")).bytes.byteLength).toBe(8191);
+				expect((await archive.readFile("f8191.bin")).bytes.byteLength).toBe(8193);
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+		60_000,
+	);
+
+	test(
+		"stops gzip output at the TAR container ceiling",
+		noted("stops gzip output at the TAR container ceiling", async () => {
+			const overLimit = gzipSync(new Uint8Array(TAR_CONTAINER_LIMIT + 1));
+			await withFile("over-limit.tar.gz", overLimit, async file => {
+				await expect(openArchive(file)).rejects.toThrow(/total limit/);
+			});
+		}),
+		60_000,
+	);
+
+	test(
+		"bounds cumulative output across nested gzip layers",
+		noted("bounds cumulative output across nested gzip layers", async () => {
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-gzip-cumulative-"));
+			try {
+				const rawPath = path.join(dir, "inner.tar");
+				const member = new Uint8Array(15 * 1024 * 1024);
+				await writeUstar(rawPath, async push => {
+					for (let index = 0; index < 2; index++) {
+						await push(ustarHeader(`part-${index}.bin`, member.byteLength));
+						await push(member);
+					}
+				});
+
+				const innerGzip = gzipSync(await Bun.file(rawPath).bytes());
+				const intermediate = new Uint8Array(45 * 1024 * 1024);
+				intermediate.set(innerGzip);
+				const outerGzip = gzipSync(intermediate);
+				const archivePath = path.join(dir, "nested.tar.gz");
+				await writeFile(archivePath, outerGzip);
+				await expect(openArchive(archivePath)).rejects.toThrow(/total limit/);
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+		60_000,
+	);
+
+	test(
+		"fixed-seed generated PAX metadata preserves paths, sizes, and member bytes",
+		noted("fixed-seed generated PAX metadata preserves paths, sizes, and member bytes", async () => {
+			const random = seededRandom(0x6847_2026);
+			const boundaryCommentLengths = [86, 87, 88, 986, 987, 988];
+			const chunks: Uint8Array[] = [];
+			const expected: Array<{ path: string; bytes: Uint8Array }> = [];
+			const makePath = (kind: string, index: number): string => {
+				const depth = randomInteger(random, 1, DEPTH_LIMIT);
+				const parts = Array.from({ length: depth - 1 }, (_, part) => `d${index}-${part}`);
+				parts.push(`${kind}-${index}-${randomAscii(random, 8)}.bin`);
+				return parts.join("/");
+			};
+			const addOverriddenFile = (kind: string, index: number, global: boolean, commentLength: number) => {
+				const archivePath = makePath(kind, index);
+				const body = randomBytes(random, randomInteger(random, 0, 512));
+				appendPaxHeader(
+					chunks,
+					[
+						["comment", randomAscii(random, commentLength)],
+						["path", archivePath],
+						["size", String(body.byteLength)],
+					],
+					global ? "g" : "x",
+				);
+				appendTarFile(chunks, `base-${kind}-${index}`, body);
+				expected.push({ path: archivePath, bytes: body });
+			};
+
+			for (let index = 0; index < 24; index++) {
+				const boundaryLength = boundaryCommentLengths[index % boundaryCommentLengths.length];
+				addOverriddenFile("global", index, true, boundaryLength ?? 0);
+				addOverriddenFile("local", index, false, randomInteger(random, 0, 256));
+				addOverriddenFile("global-next", index, true, randomInteger(random, 0, 256));
+			}
+
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-pax-properties-"));
+			try {
+				const archivePath = path.join(dir, "generated.tar");
+				await writeUstarBytes(archivePath, chunks);
+				const archive = await openArchive(archivePath);
+				for (const entry of expected) {
+					const actual = await archive.readFile(entry.path);
+					expect(actual.path).toBe(entry.path);
+					expect(actual.size).toBe(entry.bytes.byteLength);
+					expect(actual.bytes).toEqual(entry.bytes);
+				}
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+	);
+
+	test(
+		"fixed-seed generated malformed PAX boundaries terminate with rejection",
+		noted("fixed-seed generated malformed PAX boundaries terminate with rejection", async () => {
+			const random = seededRandom(0x6847_2027);
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-pax-malformed-properties-"));
+			try {
+				for (let index = 0; index < 32; index++) {
+					const pathValue = `p${index}-${randomAscii(random, randomInteger(random, 1, 120))}`;
+					const validRecord = paxRecords([["path", pathValue]]);
+					const separator = validRecord.indexOf(32);
+					const validLength = Number(new TextDecoder().decode(validRecord.subarray(0, separator)));
+					const suffix = new TextDecoder().decode(validRecord.subarray(separator));
+					const wrongLength = validLength + (index % 2 === 0 ? -1 : 1);
+					const malformedRecord = new TextEncoder().encode(`${wrongLength}${suffix}`);
+					const chunks = [ustarHeader("paxheader", malformedRecord.byteLength, "x"), pad512(malformedRecord)];
+					const archivePath = path.join(dir, `malformed-${index}.tar`);
+					await writeUstarBytes(archivePath, chunks);
+					await expect(openArchive(archivePath)).rejects.toThrow(/Unsupported tar pax header/);
+				}
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+	);
+
+	test(
+		"fixed-seed generated PAX overrides cannot bypass effective size or path limits",
+		noted("fixed-seed generated PAX overrides cannot bypass effective size or path limits", async () => {
+			const random = seededRandom(0x6847_2028);
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-pax-limit-properties-"));
+			try {
+				for (let index = 0; index < 16; index++) {
+					const chunks: Uint8Array[] = [];
+					const overriddenSize = ENTRY_LIMIT + 1 + randomInteger(random, 0, 1024);
+					appendPaxHeader(chunks, [
+						["path", `large-${index}-${randomAscii(random, 8)}.bin`],
+						["size", String(overriddenSize)],
+					]);
+					appendTarFile(chunks, `small-header-${index}.bin`, new Uint8Array(0));
+					const archivePath = path.join(dir, `oversized-${index}.tar`);
+					await writeUstarBytes(archivePath, chunks);
+					await expect(openArchive(archivePath)).rejects.toThrow(/per-entry limit/);
+				}
+
+				for (let index = 0; index < 8; index++) {
+					const depth = randomInteger(random, DEPTH_LIMIT + 1, DEPTH_LIMIT + 16);
+					const longPath = Array.from({ length: depth }, (_, part) => `${part}-${randomAscii(random, 128)}`).join(
+						"/",
+					);
+					const chunks: Uint8Array[] = [];
+					appendPaxHeader(chunks, [
+						["path", longPath],
+						["size", "0"],
+					]);
+					appendTarFile(chunks, `depth-${index}.bin`, new Uint8Array(0));
+					const archivePath = path.join(dir, `deep-${index}.tar`);
+					await writeUstarBytes(archivePath, chunks);
+					let rejection: unknown;
+					try {
+						await openArchive(archivePath);
+					} catch (error) {
+						rejection = error;
+					}
+					expect(rejection).toBeInstanceOf(Error);
+					if (!(rejection instanceof Error)) throw new Error("expected depth-limit rejection");
+					expect(rejection.message).toMatch(/nested too deeply/);
+					expect(rejection.message.length).toBeLessThan(300);
+				}
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
 	);
 });

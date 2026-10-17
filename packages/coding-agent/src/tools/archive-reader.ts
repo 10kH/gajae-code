@@ -1,4 +1,4 @@
-import { gunzipSync, inflateRawSync } from "node:zlib";
+import { gunzipSync } from "node:zlib";
 import { ToolError } from "./tool-errors";
 
 const MAX_ARCHIVE_BYTES = 256 * 1024 * 1024;
@@ -6,7 +6,8 @@ const MAX_ARCHIVE_ENTRY_BYTES = 16 * 1024 * 1024;
 const MAX_ARCHIVE_TOTAL_BYTES = 64 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRY_COUNT = 8192;
 const MAX_ARCHIVE_PATH_DEPTH = 48;
-const MAX_TAR_CONTAINER_BYTES = MAX_ARCHIVE_TOTAL_BYTES + MAX_ARCHIVE_ENTRY_COUNT * 512 + 1024;
+// Round each 512-byte header plus up to 511 bytes of data padding to 1 KiB per entry.
+const MAX_TAR_CONTAINER_BYTES = MAX_ARCHIVE_TOTAL_BYTES + MAX_ARCHIVE_ENTRY_COUNT * 1024 + 1024;
 const MAX_GZIP_LAYERS = 24;
 
 let fflateModulePromise: Promise<typeof import("fflate")> | undefined;
@@ -100,14 +101,15 @@ function concatBytes(chunks: Uint8Array[], total: number): Uint8Array {
 }
 
 function archiveLimitError(kind: "entry" | "total" | "count" | "depth", detail = ""): ToolError {
+	const preview = detail.length > 120 ? `${detail.slice(0, 119)}…` : detail;
 	const text =
 		kind === "count"
 			? `Archive has too many entries (limit ${MAX_ARCHIVE_ENTRY_COUNT}). Extract a subset with a dedicated tool.`
 			: kind === "total"
 				? `Archive expands past the total limit (${MAX_ARCHIVE_TOTAL_BYTES} bytes). Extract a subset with a dedicated tool.`
 				: kind === "depth"
-					? `Archive entry '${detail}' is nested too deeply (limit ${MAX_ARCHIVE_PATH_DEPTH}). Extract a subset with a dedicated tool.`
-					: `Archive entry '${detail}' expands past the per-entry limit (${MAX_ARCHIVE_ENTRY_BYTES} bytes). Extract a subset with a dedicated tool.`;
+					? `Archive entry '${preview}' is nested too deeply (limit ${MAX_ARCHIVE_PATH_DEPTH}). Extract a subset with a dedicated tool.`
+					: `Archive entry '${preview}' expands past the per-entry limit (${MAX_ARCHIVE_ENTRY_BYTES} bytes). Extract a subset with a dedicated tool.`;
 	return new ToolError(text);
 }
 
@@ -159,9 +161,9 @@ function getArchiveFormatFromPath(filePath: string): ArchiveFormat | undefined {
 	return undefined;
 }
 
-function gunzipBounded(bytes: Uint8Array): Uint8Array {
+function gunzipBounded(bytes: Uint8Array, maxOutputLength: number): Uint8Array {
 	try {
-		return gunzipSync(bytes, { maxOutputLength: MAX_TAR_CONTAINER_BYTES });
+		return gunzipSync(bytes, { maxOutputLength });
 	} catch (error) {
 		const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
 		if (code === "ERR_BUFFER_TOO_LARGE") throw archiveLimitError("total");
@@ -176,11 +178,15 @@ function isGzipBytes(bytes: Uint8Array): boolean {
 function inflateToTar(bytes: Uint8Array, labeledGzip: boolean): Uint8Array {
 	let payload = bytes;
 	let layers = 0;
+	let totalInflatedBytes = 0;
 	let sawGzip = labeledGzip || isGzipBytes(payload);
 	while (sawGzip) {
 		layers += 1;
 		if (layers > MAX_GZIP_LAYERS) throw archiveLimitError("total");
-		payload = gunzipBounded(payload);
+		const remaining = MAX_TAR_CONTAINER_BYTES - totalInflatedBytes;
+		if (remaining <= 0) throw archiveLimitError("total");
+		payload = gunzipBounded(payload, remaining);
+		totalInflatedBytes += payload.byteLength;
 		sawGzip = isGzipBytes(payload);
 	}
 	return payload;
@@ -297,38 +303,45 @@ async function readTarEntries(bytes: Uint8Array, labeledGzip: boolean): Promise<
 }
 
 async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
-	const { Unzip, UnzipPassThrough } = await loadFflate();
-	const outputBudget = () => Math.min(MAX_ARCHIVE_ENTRY_BYTES, MAX_ARCHIVE_TOTAL_BYTES - totalUncompressed);
+	const { Inflate, Unzip, UnzipPassThrough } = await loadFflate();
+	// Unzip constructs custom decoders synchronously in file.start; the decoder captures this entry's budget.
+	let activeInflateBudget:
+		| {
+				entryBytes: number;
+				fileName: string;
+		  }
+		| undefined;
 	class CappedZipInflate {
 		static compression = 8;
 		ondata: (error: Error | null, data: Uint8Array, final: boolean) => void = () => {};
-		#parts: Uint8Array[] = [];
-		#length = 0;
+		#failed = false;
+		#inflater: InstanceType<typeof Inflate>;
+		constructor() {
+			const budget = activeInflateBudget;
+			if (!budget) throw new ToolError("Missing ZIP inflate budget");
+			// Inflate consumes compressed chunks incrementally, avoiding a member-sized compressed copy.
+			this.#inflater = new Inflate((data, final) => {
+				const entryRemaining = MAX_ARCHIVE_ENTRY_BYTES - budget.entryBytes;
+				const totalRemaining = MAX_ARCHIVE_TOTAL_BYTES - totalUncompressed;
+				if (data.byteLength > Math.min(entryRemaining, totalRemaining)) {
+					this.#failed = true;
+					throw archiveLimitError(entryRemaining <= totalRemaining ? "entry" : "total", budget.fileName);
+				}
+				budget.entryBytes += data.byteLength;
+				this.ondata(null, data, final);
+			});
+		}
 		push(data: Uint8Array, final: boolean): void {
-			if (data.byteLength > 0) {
-				this.#parts.push(data);
-				this.#length += data.byteLength;
-			}
-			if (!final) return;
-			const remaining = Math.max(0, outputBudget());
-			const tooBig = () => archiveLimitError(remaining >= MAX_ARCHIVE_ENTRY_BYTES ? "entry" : "total");
+			if (this.#failed) return;
 			try {
-				const out = inflateRawSync(concatBytes(this.#parts, this.#length), {
-					maxOutputLength: Math.max(1, remaining),
-				});
-				if (out.byteLength > remaining) {
-					this.ondata(tooBig(), new Uint8Array(0), true);
-					return;
-				}
-				this.ondata(null, out, true);
+				this.#inflater.push(data, final);
 			} catch (error) {
-				const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
-				if (code === "ERR_BUFFER_TOO_LARGE") {
-					this.ondata(tooBig(), new Uint8Array(0), true);
-					return;
-				}
+				this.#failed = true;
 				this.ondata(error instanceof Error ? error : new Error(String(error)), new Uint8Array(0), true);
 			}
+		}
+		terminate(): void {
+			this.#failed = true;
 		}
 	}
 	const entries: ArchiveIndexEntry[] = [];
@@ -377,10 +390,16 @@ async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
 				storage: isDirectory ? undefined : { type: "zip", bytes: concatBytes(chunks, entryBytes) },
 			});
 		};
+		activeInflateBudget = {
+			entryBytes: 0,
+			fileName: normalizedPath,
+		};
 		try {
 			file.start();
 		} catch (error) {
 			if (!limitError) limitError = new ToolError(error instanceof Error ? error.message : String(error));
+		} finally {
+			activeInflateBudget = undefined;
 		}
 	};
 
