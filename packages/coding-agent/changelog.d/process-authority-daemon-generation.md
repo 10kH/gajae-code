@@ -1,3 +1,3 @@
 ### Changed
 
-- Raise Telegram, Discord, and Slack daemon generations after the native process descendant walk stops adopting children of a recycled PID.
+- Raise daemon generations for incarnation-verified process-tree authority and Linux PTY cleanup that reaps adopted descendants.

@@ -19,8 +19,9 @@ if ($pid == 0) {
 	my $child = fork();
 	die "fork2: $!\n" unless defined $child;
 	if ($child == 0) {
+		my $original_ppid = getppid();
 		open my $fh, ">", $pidfile or die "open: $!\n";
-		print $fh "$$\n";
+		print $fh "$$ $original_ppid\n";
 		close $fh;
 		sleep 60;
 		exit 0;
@@ -50,26 +51,29 @@ fn grandchild_ppid(pid: i32) -> Option<i32> {
 	pi_shell::process::Process::from_pid(pid).and_then(|process| process.ppid())
 }
 
+fn child_identity(contents: &str) -> Option<(i32, i32)> {
+	let mut fields = contents.split_whitespace();
+	Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+}
+
 fn wait_until_reparented(pid_path: &std::path::Path) -> i32 {
 	let deadline = Instant::now() + Duration::from_secs(8);
-	let mut pid = None;
-	let mut birth_ppid = None;
+	let mut grandchild_identity = None;
 	while Instant::now() < deadline {
-		if pid.is_none()
+		if grandchild_identity.is_none()
 			&& let Ok(text) = fs::read_to_string(pid_path)
-			&& let Ok(parsed) = text.trim().parse::<i32>()
+			&& let Some(identity) = child_identity(&text)
 		{
-			pid = Some(parsed);
-			birth_ppid = grandchild_ppid(parsed);
+			grandchild_identity = Some(identity);
 		}
-		if let Some(parsed) = pid
-			&& grandchild_ppid(parsed) != birth_ppid
+		if let Some((pid, original_ppid)) = grandchild_identity
+			&& grandchild_ppid(pid).is_some_and(|ppid| ppid != original_ppid)
 		{
-			return parsed;
+			return pid;
 		}
 		std::thread::sleep(Duration::from_millis(20));
 	}
-	panic!("setsid grandchild was not reparented; pid={pid:?} birth_ppid={birth_ppid:?}");
+	panic!("setsid grandchild was not reparented; child={grandchild_identity:?}");
 }
 
 struct KillPid(i32);
@@ -112,6 +116,10 @@ fn unrelated_process_survives_pty_cancel() {
 
 #[test]
 fn cancel_reaps_reparented_setsid_grandchild() {
+	run_cancel_reap_case(None);
+}
+
+fn run_cancel_reap_case(expected_reaper_pid: Option<i32>) {
 	let _guard = PTY_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 	let script = write_escape_script("cancel-escape.pl");
 	let pid_path = test_path("cancel-escape.pid");
@@ -121,6 +129,13 @@ fn cancel_reaps_reparented_setsid_grandchild() {
 	let (_tx, rx) = std::sync::mpsc::channel();
 	let handle = std::thread::spawn(move || run_pty_sync(config, None, rx, ct));
 	let grandchild = wait_until_reparented(&pid_path);
+	if let Some(expected_pid) = expected_reaper_pid {
+		assert_eq!(
+			grandchild_ppid(grandchild),
+			Some(expected_pid),
+			"subreaper must adopt the setsid grandchild"
+		);
+	}
 	let _kill_grandchild = KillPid(grandchild);
 	abort.abort(task::AbortReason::Signal);
 	let result = handle
@@ -136,6 +151,36 @@ fn cancel_reaps_reparented_setsid_grandchild() {
 	let _ = fs::remove_file(&pid_path);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn cancel_reaps_adopted_setsid_grandchild_for_subreaper() {
+	const CHILD_MODE: &str = "PI_NATIVES_TEST_SUBREAPER_CHILD";
+	if std::env::var_os(CHILD_MODE).is_some() {
+		// Isolate the process-wide subreaper setting from the rest of the test
+		// harness, then exercise the same orphan-adoption path as namespace PID 1.
+		// SAFETY: PR_SET_CHILD_SUBREAPER changes only this test process's setting.
+		let result = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+		assert_eq!(result, 0, "enable child subreaper");
+		let self_pid = i32::try_from(std::process::id()).expect("test pid fits i32");
+		run_cancel_reap_case(Some(self_pid));
+		return;
+	}
+
+	let current_thread = std::thread::current();
+	let test_name = current_thread.name().expect("test thread has a name");
+	let output = Command::new(std::env::current_exe().expect("test executable path"))
+		.args(["--exact", test_name])
+		.env(CHILD_MODE, "1")
+		.output()
+		.expect("start isolated subreaper test process");
+	assert!(
+		output.status.success(),
+		"subreaper regression subprocess failed\nstdout:\n{}\nstderr:\n{}",
+		String::from_utf8_lossy(&output.stdout),
+		String::from_utf8_lossy(&output.stderr),
+	);
+}
+
 #[test]
 fn timeout_reaps_reparented_setsid_grandchild() {
 	let _guard = PTY_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
@@ -148,9 +193,11 @@ fn timeout_reaps_reparented_setsid_grandchild() {
 	assert!(result.timed_out, "PTY run should time out");
 	let grandchild: i32 = fs::read_to_string(&pid_path)
 		.expect("grandchild pid file should be written before timeout")
-		.trim()
+		.split_whitespace()
+		.next()
+		.expect("pid file should contain a pid")
 		.parse()
-		.expect("pid file should contain a pid");
+		.expect("pid file should contain a numeric pid");
 	let _kill_grandchild = KillPid(grandchild);
 	assert!(
 		wait_for_process_exit(grandchild, Duration::from_secs(3)),

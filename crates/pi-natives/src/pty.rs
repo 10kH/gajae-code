@@ -309,6 +309,12 @@ fn reap_terminated_child(
 		std::thread::sleep(Duration::from_millis(10));
 	}
 }
+
+#[cfg(target_os = "linux")]
+fn reap_pty_descendants(targets: &ps::TerminationTargets, child_pid: Option<i32>) {
+	targets.reap_adopted_descendants(child_pid, TERMINATED_REAP_TIMEOUT);
+}
+
 /// Owned PTY pieces handed back when the setup guard is disarmed:
 /// `(child, master, writer, child_pid, process_group_id)`.
 type DisarmedPty = (
@@ -395,8 +401,14 @@ impl Drop for PostSpawnSetupGuard {
 		}
 		drop(self.writer.take());
 		if let Some(child) = self.child.as_mut() {
-			terminate_pty_processes(child, self.child_pid, self.process_group_id, None);
+			let mut observed = ps::TerminationTargets::new();
+			if let Some(pid) = self.child_pid {
+				observed.add_pid(pid);
+			}
+			terminate_pty_processes(child, self.child_pid, self.process_group_id, Some(&mut observed));
 			let _ = reap_terminated_child(child, Instant::now() + TERMINATED_REAP_TIMEOUT);
+			#[cfg(target_os = "linux")]
+			reap_pty_descendants(&observed, self.child_pid);
 		}
 		drop(self.master.take());
 	}
@@ -901,6 +913,10 @@ fn run_pty_sync(
 			}
 		}
 	}
+	#[cfg(target_os = "linux")]
+	if terminate_requested {
+		reap_pty_descendants(&observed, child_pid);
+	}
 	// --- Teardown ---
 
 	// Step 1: Close the ConPTY input pipe first.
@@ -915,6 +931,8 @@ fn run_pty_sync(
 	// On Windows, use a generous timeout to accommodate ConPTY's async teardown.
 	if exit_code.is_some() && !terminate_requested && !reader_done {
 		terminate_pty_processes(&mut child, child_pid, process_group_id, Some(&mut observed));
+		#[cfg(target_os = "linux")]
+		reap_pty_descendants(&observed, child_pid);
 	}
 	if !reader_done {
 		#[cfg(windows)]
