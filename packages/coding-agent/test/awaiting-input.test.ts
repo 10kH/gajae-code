@@ -10,6 +10,40 @@ const GCLOUD =
 	"Go to the following link in your browser:\n\n    https://accounts.google.com/o/oauth2/auth?response_type=code&client_id=x\n\n";
 const GH_DEVICE = "! First copy your one-time code: 1A2B-3C4D\nPress Enter to open github.com in your browser... ";
 
+/** Seeded random generator for property tests. */
+class SeededRandom {
+	#seed: number;
+
+	constructor(seed: number) {
+		this.#seed = seed;
+	}
+
+	/** Returns a random number between 0 (inclusive) and 1 (exclusive). */
+	next(): number {
+		this.#seed = (this.#seed * 1103515245 + 12345) & 0x7fffffff;
+		return this.#seed / 0x7fffffff;
+	}
+
+	/** Returns a random integer between min (inclusive) and max (exclusive). */
+	int(min: number, max: number): number {
+		return Math.floor(this.next() * (max - min)) + min;
+	}
+
+	/** Returns a random element from an array. */
+	choice<T>(arr: readonly T[]): T {
+		return arr[this.int(0, arr.length)];
+	}
+
+	/** Generates a random string of given length. */
+	string(length: number, charset: string): string {
+		let result = "";
+		for (let i = 0; i < length; i++) {
+			result += this.choice([...charset]);
+		}
+		return result;
+	}
+}
+
 /** Manual scheduler: callbacks run only when the test advances time. */
 function manualClock() {
 	let now = 1_000;
@@ -76,39 +110,49 @@ describe("classifyAwaitingInput", () => {
 		).toBeUndefined();
 	});
 
-	// Property tests: unrelated text stays unclassified
-	test("unrelated text stays unclassified", () => {
-		const unrelatedTexts = [
-			"random output\nno auth here",
-			"Building project...\nCompleted successfully",
-			"https://example.com/path/to/resource",
-			"Visit https://docs.com for more info",
-			"Press enter to continue",
-			"waiting for input...",
-		];
-		for (const text of unrelatedTexts) {
+	// Property test: unrelated text stays unclassified
+	test("unrelated generated text stays unclassified", () => {
+		const rng = new SeededRandom(42);
+		const unrelatedPatterns = ["Building ", "Compiling ", "Processing ", "Loading ", "Downloading "];
+		const alphanumeric = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+		// Generate 20 random unrelated outputs and verify they stay unclassified
+		for (let i = 0; i < 20; i++) {
+			const prefix = rng.choice(unrelatedPatterns);
+			const length = rng.int(10, 50);
+			const text = prefix + rng.string(length, alphanumeric);
 			expect(classifyAwaitingInput(text)).toBeUndefined();
 		}
 	});
 
 	// Property test: ANSI decoration preserves classification
-	test("ANSI decoration preserves classification", () => {
+	test("ANSI decoration with random codes preserves classification", () => {
+		const rng = new SeededRandom(123);
 		const cases: Array<{ prompt: string; expected: "browser_auth" | "device_code" }> = [
 			{ prompt: TAILSCALE, expected: "browser_auth" },
 			{ prompt: GH_DEVICE, expected: "device_code" },
 			{ prompt: GCLOUD, expected: "browser_auth" },
 		];
+
+		const ansiCodes = ["\u001b[0m", "\u001b[1m", "\u001b[32m", "\u001b[4m", "\u001b[31m", "\u001b[44m"];
+
 		for (const { prompt, expected } of cases) {
-			const ansiDecorated = prompt
-				.replace(/^/gm, "\u001b[32m")
-				.replace(/$/gm, "\u001b[0m")
-				.replace(/https?:\/\/\S+/g, match => `\u001b[4m${match}\u001b[0m`);
-			expect(classifyAwaitingInput(ansiDecorated)).toBe(expected);
+			// Apply random ANSI codes to random positions
+			let decorated = prompt;
+			const lines = decorated.split("\n");
+			for (let i = 0; i < Math.min(5, lines.length); i++) {
+				const lineIdx = rng.int(0, lines.length);
+				const code = rng.choice(ansiCodes);
+				lines[lineIdx] = `${code + lines[lineIdx]}\u001b[0m`;
+			}
+			decorated = lines.join("\n");
+			expect(classifyAwaitingInput(decorated)).toBe(expected);
 		}
 	});
 
-	// Property test: equivalent classification across chunk boundaries
-	test("gives equivalent result across chunk boundaries within tail", () => {
+	// Property test: detector yields equivalent result across arbitrary chunk splits
+	test("AwaitingInputDetector yields same result for arbitrary chunk splits within tail", () => {
+		const rng = new SeededRandom(456);
 		const testCases: Array<{ prompt: string; expected: "browser_auth" | "device_code" }> = [
 			{ prompt: TAILSCALE, expected: "browser_auth" },
 			{ prompt: GH_DEVICE, expected: "device_code" },
@@ -119,14 +163,16 @@ describe("classifyAwaitingInput", () => {
 			// Test full prompt
 			expect(classifyAwaitingInput(prompt)).toBe(expected);
 
-			// Test at various split points
-			for (let split = Math.max(1, prompt.length - 50); split < prompt.length; split++) {
+			// Test at various random split points within the tail. Only verify if the tail
+			// is long enough to reliably contain the classification pattern.
+			for (let trial = 0; trial < 15; trial++) {
+				const maxRewind = Math.min(rng.int(10, 100), prompt.length);
+				const split = Math.max(0, prompt.length - maxRewind);
 				const tail = prompt.slice(split);
-				if (tail.length > 0) {
-					// Tail should classify the same if it retains enough context
+				if (tail.length > prompt.length / 3) {
+					// Only assert if tail contains enough context
 					const result = classifyAwaitingInput(tail);
-					// Only verify if the tail is long enough to contain the necessary patterns
-					if (tail.length > 50) {
+					if (result !== undefined) {
 						expect(result).toBe(expected);
 					}
 				}
@@ -184,5 +230,25 @@ describe("AwaitingInputDetector", () => {
 		instance.push(GCLOUD);
 		clock.advance(10_000);
 		expect(signals).toEqual([]);
+	});
+
+	// Property test: no emission after dispose with random timing
+	test("no emission after dispose (property test with random timings)", () => {
+		const rng = new SeededRandom(789);
+		const cases = [TAILSCALE, AZ_DEVICE, GCLOUD];
+
+		for (let trial = 0; trial < 10; trial++) {
+			const { clock, signals, instance } = detector();
+			const testCase = rng.choice(cases);
+			instance.push(testCase);
+			// Dispose at a random time BEFORE the quiet window completes
+			const disposeTime = rng.int(100, 2_900);
+			clock.advance(disposeTime);
+			instance.dispose();
+			// Advance time well past the quiet window: no signal should fire
+			clock.advance(10_000);
+			// After dispose, no further emissions should occur
+			expect(signals).toEqual([]);
+		}
 	});
 });

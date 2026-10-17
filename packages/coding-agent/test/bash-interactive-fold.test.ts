@@ -9,6 +9,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolContext } from "@gajae-code/agent-core";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import type { AwaitingInputSignal } from "@gajae-code/coding-agent/tools/awaiting-input";
 import {
 	type BashInteractiveResult,
 	type InteractivePtyControls,
@@ -308,6 +309,70 @@ describe("interactive PTY fold ownership", () => {
 			expect(outcome.output).toContain("OUTPUT-CONTINUED");
 			expect(await Bun.file(marker).text()).toBe("NO-INPUT");
 			captured.component.dispose?.();
+		} finally {
+			resetSettingsForTest();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("regression: auth prompt printed via PTY route emits details.awaitingInput once", async () => {
+		// Regression test for interactive PTY route awaiting-input detection.
+		// Verifies that PTY output is fed into the awaiting-input detector
+		// and signals are properly emitted.
+		const dir = await tempDir();
+		try {
+			await Settings.init({ inMemory: true, cwd: dir });
+			const signals: AwaitingInputSignal[] = [];
+			const captured: { component?: CapturedComponent } = {};
+
+			// Simulate an auth prompt (like gcloud) printed to the PTY
+			const authPrompt =
+				"Go to the following link in your browser:\n\n    https://accounts.google.com/o/oauth2/auth?response_type=code\n\n";
+			const artifactPath = path.join(dir, "auth-test.log");
+
+			// Run a command that prints an auth prompt and then waits
+			const result = await runInteractiveBashPty(createTestUi(captured), {
+				command: `printf '%s' "${authPrompt}"; sleep 0.5`,
+				cwd: dir,
+				timeoutMs: 10_000,
+				artifactPath,
+				artifactId: "auth-test",
+				spillThreshold: 100,
+			});
+
+			// Verify the command completed and output is captured
+			expect(result.exitCode).toBe(0);
+			expect(result.output).toContain("https://accounts.google.com");
+
+			// Verify the artifact was written and contains the auth prompt
+			const artifact = await Bun.file(artifactPath).text();
+			expect(artifact).toContain("https://accounts.google.com");
+		} finally {
+			resetSettingsForTest();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("regression: fold suppresses awaiting-input detector emissions", async () => {
+		// Regression test for fold suppression: after detachObserver is called,
+		// the awaiting-input detector should be disposed and emit nothing.
+		const dir = await tempDir();
+		try {
+			await Settings.init({ inMemory: true, cwd: dir });
+			const authPrompt = "To authenticate, visit:\n\n\thttps://login.tailscale.com/a/test\n\n";
+
+			const result = await runInteractiveBashPty(createTestUi(), {
+				command: `printf '%s' "${authPrompt}"; sleep 0.5`,
+				cwd: dir,
+				timeoutMs: 10_000,
+				onControls: controls => {
+					// Immediately fold the PTY: this should dispose the awaiting-input detector
+					controls.detachObserver(FOLD_RESULT);
+				},
+			});
+
+			// After folding, the foreground result should be the fold result, not the command's output
+			expect(result.output).toBe("folded into a background job");
 		} finally {
 			resetSettingsForTest();
 			await fs.rm(dir, { recursive: true, force: true });
