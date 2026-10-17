@@ -306,7 +306,7 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * Generation 205 replaces owners whose process descendant walk can adopt
  * children of a recycled PID.
  */
-export const DAEMON_GENERATION = 205;
+export const DAEMON_GENERATION = 206;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
