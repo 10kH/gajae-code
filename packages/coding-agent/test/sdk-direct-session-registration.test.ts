@@ -317,6 +317,141 @@ describe("direct CLI session-index registration", () => {
 		}
 	});
 
+	test("does not replay a retained release against a reactivated session", async () => {
+		const root = await makeTempRoot("gjc-direct-reactivated-");
+		const authStorage = await AuthStorage.create(":memory:");
+		try {
+			const manager = SessionManager.create(root, SessionManager.explicitDestination(path.join(root, "sessions")));
+			manager.appendMessage({ role: "user", content: "first", timestamp: Date.now() });
+			await manager.ensureOnDisk();
+			const index = new SessionIndex(root);
+			let failNextRelease = true;
+			const appendEntry = index.append.bind(index);
+			vi.spyOn(index, "append").mockImplementation(async entry => {
+				if (entry.type === "host_unregistered" && failNextRelease) {
+					failNextRelease = false;
+					throw new Error("transient index append failure");
+				}
+				return await appendEntry(entry);
+			});
+			const registration = await registerDirectSession(manager, root, undefined, {
+				createIndex: () => index,
+				registerPostmortem: () => () => {},
+			});
+			const firstId = manager.getSessionId();
+			const firstFile = manager.getSessionFile();
+			if (!firstFile) throw new Error("Expected the first session to be on disk");
+			const { session } = await createAgentSession({
+				cwd: root,
+				agentDir: root,
+				authStorage,
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				settings: Settings.isolated({ "notifications.enabled": false }),
+				sessionManager: manager,
+				disableExtensionDiscovery: true,
+				extensions: [],
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+			});
+			try {
+				await session.newSession();
+				expect(manager.getSessionId()).not.toBe(firstId);
+				// The successor registers and the first session's release fails once, so
+				// its release stays queued.
+				await registration.syncIdentity();
+
+				// Resume the first session: the queued release is stale the moment that id
+				// is current again.
+				await session.switchSession(firstFile);
+				expect(manager.getSessionId()).toBe(firstId);
+				await registration.syncIdentity();
+
+				const afterResume = (await new SessionIndex(root).open()).listSessions().sessions;
+				expect(afterResume.filter(row => row.live).map(row => row.sessionId)).toEqual([firstId]);
+
+				// A repeated unchanged-identity sync must not retire it either.
+				await registration.syncIdentity();
+				const afterRepeatedSync = (await new SessionIndex(root).open()).listSessions().sessions;
+				expect(afterRepeatedSync.filter(row => row.live).map(row => row.sessionId)).toEqual([firstId]);
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			vi.restoreAllMocks();
+			authStorage.close();
+			await removeTempRoot(root);
+		}
+	});
+
+	test("adopts a registration whose append failed after its row was durable", async () => {
+		const root = await makeTempRoot("gjc-direct-ambiguous-append-");
+		const authStorage = await AuthStorage.create(":memory:");
+		try {
+			const manager = SessionManager.create(root, SessionManager.explicitDestination(path.join(root, "sessions")));
+			manager.appendMessage({ role: "user", content: "first", timestamp: Date.now() });
+			await manager.ensureOnDisk();
+			const index = new SessionIndex(root);
+			let failNextRegistration = true;
+			const appendEntry = index.append.bind(index);
+			vi.spyOn(index, "append").mockImplementation(async entry => {
+				if (entry.type === "host_registered" && failNextRegistration) {
+					failNextRegistration = false;
+					// The row lands and then awaited post-append maintenance rejects, so the
+					// rejection does not prove the registration is missing.
+					await appendEntry(entry);
+					throw new Error("post-append maintenance failure");
+				}
+				return await appendEntry(entry);
+			});
+			const registration = await registerDirectSession(manager, root, undefined, {
+				createIndex: () => index,
+				registerPostmortem: () => () => {},
+			});
+			const firstId = manager.getSessionId();
+			const firstFile = manager.getSessionFile();
+			if (!firstFile) throw new Error("Expected the first session to be on disk");
+			const { session } = await createAgentSession({
+				cwd: root,
+				agentDir: root,
+				authStorage,
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				settings: Settings.isolated({ "notifications.enabled": false }),
+				sessionManager: manager,
+				disableExtensionDiscovery: true,
+				extensions: [],
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+			});
+			try {
+				await session.newSession();
+				const secondId = manager.getSessionId();
+				expect(secondId).not.toBe(firstId);
+				// The successor's registration is durable even though its append rejects.
+				await registration.syncIdentity();
+
+				await session.switchSession(firstFile);
+				await registration.syncIdentity();
+
+				const rows = (await new SessionIndex(root).open()).listSessions().sessions;
+				expect(rows.filter(row => row.live).map(row => row.sessionId)).toEqual([firstId]);
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			vi.restoreAllMocks();
+			authStorage.close();
+			await removeTempRoot(root);
+		}
+	});
+
 	test("identity sync is a no-op for sessions that were never registered", async () => {
 		const root = await makeTempRoot("gjc-direct-identity-noop-");
 		try {

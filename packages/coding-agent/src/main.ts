@@ -1701,33 +1701,62 @@ export async function registerDirectSession(
 	// Predecessors whose `host_unregistered` append has not succeeded yet. Once the
 	// successor is registered the old id is no longer `registeredSessionId`, so a
 	// release that failed here would otherwise be lost and keep the predecessor live
-	// in the index for the rest of the process.
+	// in the index for the rest of the process. An entry is dropped as soon as its id
+	// is current again: replaying it would retire a session this process reactivated.
 	const pendingPredecessorReleases: Array<{ sessionId: string; locator: SessionLocatorV2 | undefined }> = [];
+	const forgetPendingRelease = (sessionId: string): void => {
+		for (let index = pendingPredecessorReleases.length - 1; index >= 0; index--) {
+			if (pendingPredecessorReleases[index]?.sessionId === sessionId) pendingPredecessorReleases.splice(index, 1);
+		}
+	};
 
 	const register = async (sessionId: string): Promise<void> => {
 		const locator = await resolveSessionLocator(sessionManager.getCwd(), agentDir);
-		await sessionIndex.append({
-			type: "host_registered",
-			sessionId,
-			locator,
-			endpointGeneration: 0,
-			pid: process.pid,
-			...(directSessionIncarnation ? { processIncarnation: directSessionIncarnation } : {}),
-			...(dependencies.masterRole && directSessionIncarnation
-				? {
-						masterRole: {
-							version: 2 as const,
-							ownerSessionId: dependencies.masterRole.ownerSessionId,
-							launchPid: process.pid,
-							launchProcessIncarnation: directSessionIncarnation,
-							role: "master" as const,
-							attestationEpoch: dependencies.masterRole.attestationEpoch,
-						},
-					}
-				: {}),
-		});
+		try {
+			await sessionIndex.append({
+				type: "host_registered",
+				sessionId,
+				locator,
+				endpointGeneration: 0,
+				pid: process.pid,
+				...(directSessionIncarnation ? { processIncarnation: directSessionIncarnation } : {}),
+				...(dependencies.masterRole && directSessionIncarnation
+					? {
+							masterRole: {
+								version: 2 as const,
+								ownerSessionId: dependencies.masterRole.ownerSessionId,
+								launchPid: process.pid,
+								launchProcessIncarnation: directSessionIncarnation,
+								role: "master" as const,
+								attestationEpoch: dependencies.masterRole.attestationEpoch,
+							},
+						}
+					: {}),
+			});
+		} catch (error) {
+			// `SessionIndex.append` can reject after its row is already durable (awaited
+			// post-append maintenance), so a rejection does not prove the registration is
+			// missing. Adopt the id when this process already owns a live row for it, so a
+			// later switch still releases it; otherwise the switch keeps failing and the
+			// previous identity stays registered.
+			if (!isRegisteredLive(sessionId)) throw error;
+			logger.warn("Direct session registration append failed after its row was durable", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		// This id is current again: any queued release for it is stale.
+		forgetPendingRelease(sessionId);
 		registeredLocator = locator;
 		registeredSessionId = sessionId;
+	};
+	const isRegisteredLive = (sessionId: string): boolean => {
+		try {
+			return sessionIndex
+				.listSessions()
+				.sessions.some(row => row.sessionId === sessionId && row.pid === process.pid && row.live === true);
+		} catch {
+			return false;
+		}
 	};
 	const unregister = async (sessionId: string, locator: SessionLocatorV2 | undefined): Promise<void> => {
 		if (!locator) return;
@@ -1749,6 +1778,12 @@ export async function registerDirectSession(
 	const releasePendingPredecessors = async (): Promise<void> => {
 		while (pendingPredecessorReleases.length > 0) {
 			const predecessor = pendingPredecessorReleases[0]!;
+			// Defence in depth for the reactivation order: never retire the id this
+			// process currently publishes as its own.
+			if (predecessor.sessionId === registeredSessionId) {
+				pendingPredecessorReleases.shift();
+				continue;
+			}
 			try {
 				await unregister(predecessor.sessionId, predecessor.locator);
 			} catch (error) {
