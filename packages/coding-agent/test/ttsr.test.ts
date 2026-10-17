@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -14,6 +14,7 @@ import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { parseRuleConditionAndScope, type Rule } from "@gajae-code/coding-agent/capability/rule";
 import { buildRuleFromMarkdown } from "@gajae-code/coding-agent/discovery/helpers";
 import { type TtsrInjectionRecord, TtsrManager } from "@gajae-code/coding-agent/export/ttsr";
+import { logger } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { EditTool } from "../src/edit";
@@ -724,6 +725,59 @@ describe("TtsrManager.checkAstSnapshot", () => {
 		);
 	});
 
+	it("reports an invalid CSS astCondition once per rule and language", async () => {
+		const warning = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const manager = new TtsrManager();
+			const rule = defaultExportRule({ name: "css-important", astCondition: ["$P: $V !important"] });
+			manager.addRule(rule);
+
+			expect(
+				await manager.checkAstSnapshot(".button { color: red; }", toolContext("theme.scss", "write", "first")),
+			).toEqual([]);
+			expect(
+				await manager.checkAstSnapshot(".button { color: blue; }", toolContext("other.scss", "write", "second")),
+			).toEqual([]);
+			expect(
+				await manager.checkAstSnapshot(".button { color: red; }", toolContext("theme.css", "write", "third")),
+			).toEqual([]);
+
+			const parseWarnings = warning.mock.calls.filter(
+				([message]) => message === "TTSR astCondition pattern is invalid for target language",
+			);
+			expect(parseWarnings).toHaveLength(2);
+			expect(parseWarnings.map(([, context]) => context?.lang)).toEqual(["scss", "css"]);
+			const diagnostics = manager.getAstConditionDiagnostics();
+			expect(diagnostics.map(({ ruleName, lang, patterns }) => ({ ruleName, lang, patterns }))).toEqual([
+				{ ruleName: "css-important", lang: "scss", patterns: ["$P: $V !important"] },
+				{ ruleName: "css-important", lang: "css", patterns: ["$P: $V !important"] },
+			]);
+			expect(diagnostics[0]?.parseErrors[0]).toContain("pattern is not valid css on its own");
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
+	it("still matches a standalone CSS !important astCondition", async () => {
+		const manager = new TtsrManager();
+		const rule = defaultExportRule({ name: "css-important", astCondition: ["!important"] });
+		manager.addRule(rule);
+
+		expect(await manager.checkAstSnapshot(".button { color: red !important; }", toolContext("theme.scss"))).toEqual([
+			rule,
+		]);
+		expect(manager.getAstConditionDiagnostics()).toEqual([]);
+	});
+
+	it("does not report a target source parse error as an invalid pattern", async () => {
+		const manager = new TtsrManager();
+		const rule = defaultExportRule({ name: "css-declaration", astCondition: ["$P: $V;"] });
+		manager.addRule(rule);
+
+		expect(await manager.checkAstSnapshot(".button { color: red;", toolContext("theme.scss"))).toEqual([rule]);
+		expect(manager.getAstConditionDiagnostics()).toEqual([]);
+	});
+
 	it("does not match unsupported or missing file extensions", async () => {
 		const manager = new TtsrManager();
 		manager.addRule(defaultExportRule());
@@ -1207,6 +1261,30 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 		expect(triggered).toEqual([["css-tokens"]]);
 		expect(fs.existsSync(path.join(tempDir, "theme.scss"))).toBe(false);
 		expect(JSON.stringify(modelMessages[1])).toContain(cssContent);
+	});
+
+	it("allows a .scss write to proceed when its astCondition pattern is invalid", async () => {
+		const warning = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const { session, triggered, ttsrManager } = createSession(
+				[new WriteTool(createToolSession())],
+				[[writeCall("write-1", "theme.scss", ".button { color: red; }\n")]],
+				[makeRule({ name: "css-important", content: RULE_CONTENT, astCondition: ["$P: $V !important"] })],
+				{ interruptMode: "always" },
+			);
+			await run(session, "write it");
+
+			expect(fs.existsSync(path.join(tempDir, "theme.scss"))).toBe(true);
+			expect(triggered).toEqual([]);
+			expect(ttsrManager.getAstConditionDiagnostics()).toHaveLength(1);
+			expect(
+				warning.mock.calls.filter(
+					([message]) => message === "TTSR astCondition pattern is invalid for target language",
+				),
+			).toHaveLength(1);
+		} finally {
+			warning.mockRestore();
+		}
 	});
 
 	it.each([
