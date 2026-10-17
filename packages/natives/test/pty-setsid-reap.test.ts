@@ -11,10 +11,11 @@ die "fork: $!\\n" unless defined $pid;
 if ($pid == 0) {
 	POSIX::setsid() == -1 and die "setsid: $!\\n";
 	my $child = fork();
-	die "fork2: $!\\n" unless defined $child;
+	die "fork2: $!\n" unless defined $child;
 	if ($child == 0) {
-		open my $fh, ">", $pidfile or die "open: $!\\n";
-		print $fh "$$\\n";
+		my $original_ppid = getppid();
+		open my $fh, ">", $pidfile or die "open: $!\n";
+		print $fh "$$ $original_ppid\n";
 		close $fh;
 		sleep 60;
 		exit 0;
@@ -43,13 +44,23 @@ async function waitUntil(predicate: () => boolean, timeoutMs: number): Promise<b
 	return predicate();
 }
 
-function readPid(path: string): number | undefined {
+type ChildIdentity = { pid: number; originalPpid: number };
+
+function readChildIdentity(path: string): ChildIdentity | undefined {
 	try {
-		const pid = Number(readFileSync(path, "utf8").trim());
-		return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+		const [pidText, ppidText] = readFileSync(path, "utf8").trim().split(/\s+/);
+		const pid = Number(pidText);
+		const originalPpid = Number(ppidText);
+		return Number.isInteger(pid) && pid > 0 && Number.isInteger(originalPpid) && originalPpid > 0
+			? { pid, originalPpid }
+			: undefined;
 	} catch {
 		return undefined;
 	}
+}
+
+function readPid(path: string): number | undefined {
+	return readChildIdentity(path)?.pid;
 }
 
 function escapeFiles(): { dir: string; script: string; pid: string } {
@@ -61,33 +72,19 @@ function escapeFiles(): { dir: string; script: string; pid: string } {
 }
 
 async function waitReparented(pidPath: string): Promise<number> {
-	let pid: number | undefined;
-	let birthPpid: number | undefined;
+	let child: ChildIdentity | undefined;
 	const found = await waitUntil(() => {
-		if (pid === undefined) {
-			pid = readPid(pidPath);
-			if (pid !== undefined) {
-				try {
-					birthPpid = Number(
-						Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(pid)])
-							.stdout.toString()
-							.trim(),
-					);
-				} catch {
-					birthPpid = undefined;
-				}
-			}
-		}
-		if (pid === undefined) return false;
+		child ??= readChildIdentity(pidPath);
+		if (child === undefined) return false;
 		const ppid = Number(
-			Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(pid)])
+			Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(child.pid)])
 				.stdout.toString()
 				.trim(),
 		);
-		return Number.isInteger(ppid) && ppid !== birthPpid;
+		return Number.isInteger(ppid) && ppid !== child.originalPpid;
 	}, 8_000);
-	if (!found || pid === undefined) throw new Error("setsid grandchild was not reparented");
-	return pid;
+	if (!found || child === undefined) throw new Error("setsid grandchild was not reparented");
+	return child.pid;
 }
 
 test.skipIf(process.platform === "win32")(
