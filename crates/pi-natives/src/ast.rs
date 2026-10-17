@@ -119,14 +119,14 @@ pub struct AstFindMatch {
 
 #[derive(Clone, Eq, PartialEq)]
 struct AstFindOrderKey {
-	path: String,
-	start_line: u32,
+	path:         String,
+	start_line:   u32,
 	start_column: u32,
-	end_line: u32,
-	end_column: u32,
-	byte_start: u32,
-	byte_end: u32,
-	sequence: u64,
+	end_line:     u32,
+	end_column:   u32,
+	byte_start:   u32,
+	byte_end:     u32,
+	sequence:     u64,
 }
 
 impl Ord for AstFindOrderKey {
@@ -152,8 +152,8 @@ impl PartialOrd for AstFindOrderKey {
 
 #[derive(Eq, PartialEq)]
 struct RetainedAstFindMatch {
-	key: AstFindOrderKey,
-	text: String,
+	key:            AstFindOrderKey,
+	text:           String,
 	meta_variables: Option<HashMap<String, String>>,
 }
 
@@ -257,38 +257,38 @@ pub struct AstFindResult {
 #[napi(object)]
 pub struct AstMatchOptions<'env> {
 	/// Source code to match against (parsed in memory, never read from disk).
-	pub source: String,
+	pub source:       String,
 	/// Language of `source` (required; e.g. "ts", "tsx", "rust", "python").
-	pub lang: String,
+	pub lang:         String,
 	/// ast-grep patterns to search for (OR across patterns).
-	pub patterns: Vec<String>,
+	pub patterns:     Vec<String>,
 	/// Rule selector for multi-rule ast-grep configurations.
-	pub selector: Option<String>,
+	pub selector:     Option<String>,
 	/// Pattern strictness; defaults to smart matching when omitted.
-	pub strictness: Option<AstMatchStrictness>,
+	pub strictness:   Option<AstMatchStrictness>,
 	/// Maximum matches to return after `offset` (default applies when omitted).
-	pub limit: Option<u32>,
+	pub limit:        Option<u32>,
 	/// Number of leading matches to skip before applying `limit`.
-	pub offset: Option<u32>,
+	pub offset:       Option<u32>,
 	/// When true, include meta-variable bindings per match.
 	pub include_meta: Option<bool>,
 	/// Optional cancellation handle (library-specific).
-	pub signal: Option<Unknown<'env>>,
+	pub signal:       Option<Unknown<'env>>,
 	/// Wall-clock timeout for the worker task in milliseconds.
-	pub timeout_ms: Option<u32>,
+	pub timeout_ms:   Option<u32>,
 }
 
 /// Result of an in-memory `astMatch` run.
 #[napi(object)]
 pub struct AstMatchResult {
 	/// Page of matches after sort, offset, and limit.
-	pub matches: Vec<AstFindMatch>,
+	pub matches:       Vec<AstFindMatch>,
 	/// Total matches found before paging (can exceed `matches.length`).
 	pub total_matches: u32,
 	/// True when results were truncated by `limit`.
 	pub limit_reached: bool,
 	/// Non-fatal parse or pattern-compile errors collected during the run.
-	pub parse_errors: Option<Vec<String>>,
+	pub parse_errors:  Option<Vec<String>>,
 }
 
 /// Options for `astEdit`: rewrite rules, scan scope, safety limits, and
@@ -959,14 +959,14 @@ pub fn ast_match(options: AstMatchOptions<'_>) -> task::Promise<AstMatchResult> 
 					let start = matched.start_pos();
 					let end = matched.end_pos();
 					let key = AstFindOrderKey {
-						path: String::new(),
-						start_line: to_u32(start.line().saturating_add(1)),
+						path:         String::new(),
+						start_line:   to_u32(start.line().saturating_add(1)),
 						start_column: to_u32(start.column(matched.get_node()).saturating_add(1)),
-						end_line: to_u32(end.line().saturating_add(1)),
-						end_column: to_u32(end.column(matched.get_node()).saturating_add(1)),
-						byte_start: to_u32(range.start),
-						byte_end: to_u32(range.end),
-						sequence: match_sequence,
+						end_line:     to_u32(end.line().saturating_add(1)),
+						end_column:   to_u32(end.column(matched.get_node()).saturating_add(1)),
+						byte_start:   to_u32(range.start),
+						byte_end:     to_u32(range.end),
+						sequence:     match_sequence,
 					};
 					match_sequence = match_sequence.saturating_add(1);
 					if should_retain_match(&retained_matches, retained_capacity, &key) {
