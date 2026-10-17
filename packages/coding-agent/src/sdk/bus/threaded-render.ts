@@ -265,13 +265,20 @@ export function renderThreadedFrame(frame: ThreadedFrame): ThreadedSend | undefi
 		case "awaiting_input": {
 			const toolCallId = str(frame.toolCallId);
 			if (!toolCallId) return undefined;
-			const text =
-				frame.kind === "browser_auth"
-					? "⏳ A running command is waiting for browser sign-in. Finish it on the host; the agent continues when the command does."
-					: frame.kind === "device_code"
-						? "⏳ A running command is waiting for a device-code sign-in. Finish it on the host; the agent continues when the command does."
-						: undefined;
-			return text ? { method: "sendMessage", lane: "ask", text, coalesceKey: `awaiting:${toolCallId}` } : undefined;
+			let text: string;
+			switch (frame.kind) {
+				case "browser_auth":
+					text =
+						"⏳ A running command is waiting for browser sign-in. Finish it on the host; the agent continues when the command does.";
+					break;
+				case "device_code":
+					text =
+						"⏳ A running command is waiting for a device-code sign-in. Finish it on the host; the agent continues when the command does.";
+					break;
+				default:
+					return undefined;
+			}
+			return { method: "sendMessage", lane: "ask", text, coalesceKey: `awaiting:${toolCallId}` };
 		}
 		case "reasoning_summary": {
 			const text = str(frame.text);
