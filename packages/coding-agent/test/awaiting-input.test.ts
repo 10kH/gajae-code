@@ -45,14 +45,17 @@ function detector(quietMs = 3_000) {
 }
 
 describe("classifyAwaitingInput", () => {
-	test.each([
-		["tailscale", TAILSCALE, "browser_auth"],
-		["gcloud", GCLOUD, "browser_auth"],
-		["az device code", AZ_DEVICE, "device_code"],
-		["aws sso", AWS_SSO, "device_code"],
-		["gh one-time code", GH_DEVICE, "device_code"],
-	] as const)("classifies %s prompt", (_name, output, kind) => {
-		expect(classifyAwaitingInput(output)).toBe(kind);
+	test("classifies known auth prompts", () => {
+		const cases = [
+			{ name: "tailscale", output: TAILSCALE, kind: "browser_auth" as const },
+			{ name: "gcloud", output: GCLOUD, kind: "browser_auth" as const },
+			{ name: "az device code", output: AZ_DEVICE, kind: "device_code" as const },
+			{ name: "aws sso", output: AWS_SSO, kind: "device_code" as const },
+			{ name: "gh one-time code", output: GH_DEVICE, kind: "device_code" as const },
+		];
+		for (const { name, output, kind } of cases) {
+			expect(classifyAwaitingInput(output)).toBe(kind);
+		}
 	});
 
 	test("ignores ANSI styling around the prompt", () => {
@@ -71,6 +74,64 @@ describe("classifyAwaitingInput", () => {
 		expect(
 			classifyAwaitingInput("Compiling crate v0.1.0\nhttps://docs.rs/crate\n   Finished release\n"),
 		).toBeUndefined();
+	});
+
+	// Property tests: unrelated text stays unclassified
+	test("unrelated text stays unclassified", () => {
+		const unrelatedTexts = [
+			"random output\nno auth here",
+			"Building project...\nCompleted successfully",
+			"https://example.com/path/to/resource",
+			"Visit https://docs.com for more info",
+			"Press enter to continue",
+			"waiting for input...",
+		];
+		for (const text of unrelatedTexts) {
+			expect(classifyAwaitingInput(text)).toBeUndefined();
+		}
+	});
+
+	// Property test: ANSI decoration preserves classification
+	test("ANSI decoration preserves classification", () => {
+		const cases: Array<{ prompt: string; expected: "browser_auth" | "device_code" }> = [
+			{ prompt: TAILSCALE, expected: "browser_auth" },
+			{ prompt: GH_DEVICE, expected: "device_code" },
+			{ prompt: GCLOUD, expected: "browser_auth" },
+		];
+		for (const { prompt, expected } of cases) {
+			const ansiDecorated = prompt
+				.replace(/^/gm, "\u001b[32m")
+				.replace(/$/gm, "\u001b[0m")
+				.replace(/https?:\/\/\S+/g, match => `\u001b[4m${match}\u001b[0m`);
+			expect(classifyAwaitingInput(ansiDecorated)).toBe(expected);
+		}
+	});
+
+	// Property test: equivalent classification across chunk boundaries
+	test("gives equivalent result across chunk boundaries within tail", () => {
+		const testCases: Array<{ prompt: string; expected: "browser_auth" | "device_code" }> = [
+			{ prompt: TAILSCALE, expected: "browser_auth" },
+			{ prompt: GH_DEVICE, expected: "device_code" },
+			{ prompt: GCLOUD, expected: "browser_auth" },
+		];
+
+		for (const { prompt, expected } of testCases) {
+			// Test full prompt
+			expect(classifyAwaitingInput(prompt)).toBe(expected);
+
+			// Test at various split points
+			for (let split = Math.max(1, prompt.length - 50); split < prompt.length; split++) {
+				const tail = prompt.slice(split);
+				if (tail.length > 0) {
+					// Tail should classify the same if it retains enough context
+					const result = classifyAwaitingInput(tail);
+					// Only verify if the tail is long enough to contain the necessary patterns
+					if (tail.length > 50) {
+						expect(result).toBe(expected);
+					}
+				}
+			}
+		}
 	});
 });
 

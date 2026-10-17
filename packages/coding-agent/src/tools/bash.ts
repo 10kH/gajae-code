@@ -2799,7 +2799,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								});
 							},
 						);
-						void controls.terminalCompletion.finally(unregisterPtyOwnerCleanup);
+						void controls.terminalCompletion.finally(() => {
+							awaitingInput.dispose();
+							unregisterPtyOwnerCleanup();
+						});
 						const ptyStartedAt = Date.now();
 						const ptyFoldAdapter: FoldAdapter = {
 							kind: "bash-pty",
@@ -2818,26 +2821,27 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								const current = ptyManager.getJob(ptyJobId);
 								return current?.generation === ptyGeneration ? current : undefined;
 							},
-							detachObserver: receipt => {
-								// Output-only continuation: stdin forwarding ends here and the
-								// process is never killed or restarted by folding.
-								const started = this.#buildBackgroundStartResult(ptyJobId, ptyLabel, "", timeoutSec, {
-									requestedTimeoutSec,
-									notices: pendingNotices,
-									foldReason: receipt.reason,
-									activity,
-								});
-								const outcome = controls.detachObserver(
-									interactiveResultFromText(this.#extractTextResult(started)),
-								);
-								if (outcome === "resolved") {
-									controls.detachForegroundCancellation();
-									ptyBackgrounded = true;
-									ptyManager.markBackgrounded(ptyJobId, ptyGeneration, receipt.reason);
-									ptyFoldResult = started;
-								}
-								return outcome;
-							},
+						detachObserver: receipt => {
+							// Output-only continuation: stdin forwarding ends here and the
+							// process is never killed or restarted by folding.
+							awaitingInput.dispose();
+						const started = this.#buildBackgroundStartResult(ptyJobId, ptyLabel, "", timeoutSec, {
+							requestedTimeoutSec,
+							notices: pendingNotices,
+							foldReason: receipt.reason,
+							activity,
+						});
+							const outcome = controls.detachObserver(
+								interactiveResultFromText(this.#extractTextResult(started)),
+							);
+							if (outcome === "resolved") {
+								controls.detachForegroundCancellation();
+								ptyBackgrounded = true;
+								ptyManager.markBackgrounded(ptyJobId, ptyGeneration, receipt.reason);
+								ptyFoldResult = started;
+							}
+							return outcome;
+						},
 							resolveForegroundObserver: () => "already-settled",
 						};
 						const unregisterPtyFold = this.session.registerForegroundFoldParticipant?.(ptyFoldAdapter);
@@ -2866,6 +2870,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					onOutput: chunk => {
 						ptyOutputSeen = true;
 						if (ptyJobId) ownedManager?.appendOutput(ptyJobId, chunk);
+						awaitingInput.push(chunk);
 					},
 				}).catch(error => {
 					if (ptyAdmission) ownedManager?.releaseCapacity(ptyAdmission);
