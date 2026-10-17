@@ -74,7 +74,12 @@ import {
 	discoverAuthStorage,
 } from "./sdk";
 import { processIncarnation } from "./sdk/broker/process-incarnation";
-import { newMasterAttestationEpoch, resolveSessionLocator, SessionIndex } from "./sdk/broker/session-index";
+import {
+	newMasterAttestationEpoch,
+	resolveSessionLocator,
+	SessionIndex,
+	type SessionLocatorV2,
+} from "./sdk/broker/session-index";
 import type { AgentSession } from "./session/agent-session";
 import { ManagedAppendIdentityMismatchError } from "./session/internal/managed-session-storage";
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
@@ -1691,8 +1696,13 @@ export async function registerDirectSession(
 	if (!initialSessionId || !sessionManager) return NOOP_DIRECT_SESSION_REGISTRATION;
 	const sessionIndex = dependencies.createIndex?.(agentDir) ?? new SessionIndex(agentDir);
 	const directSessionIncarnation = (dependencies.processIncarnation ?? processIncarnation)(process.pid);
-	let registeredLocator: Awaited<ReturnType<typeof resolveSessionLocator>> | undefined;
+	let registeredLocator: SessionLocatorV2 | undefined;
 	let registeredSessionId: string | undefined;
+	// Predecessors whose `host_unregistered` append has not succeeded yet. Once the
+	// successor is registered the old id is no longer `registeredSessionId`, so a
+	// release that failed here would otherwise be lost and keep the predecessor live
+	// in the index for the rest of the process.
+	const pendingPredecessorReleases: Array<{ sessionId: string; locator: SessionLocatorV2 | undefined }> = [];
 
 	const register = async (sessionId: string): Promise<void> => {
 		const locator = await resolveSessionLocator(sessionManager.getCwd(), agentDir);
@@ -1719,10 +1729,7 @@ export async function registerDirectSession(
 		registeredLocator = locator;
 		registeredSessionId = sessionId;
 	};
-	const unregister = async (
-		sessionId: string,
-		locator: Awaited<ReturnType<typeof resolveSessionLocator>> | undefined,
-	): Promise<void> => {
+	const unregister = async (sessionId: string, locator: SessionLocatorV2 | undefined): Promise<void> => {
 		if (!locator) return;
 		await sessionIndex.append({
 			type: "host_unregistered",
@@ -1731,6 +1738,27 @@ export async function registerDirectSession(
 			endpointGeneration: 0,
 			pid: process.pid,
 		});
+	};
+
+	/**
+	 * Release queued predecessors in order. A failed append keeps its entry, so the
+	 * next sync or the teardown handler retries it; the failure itself is a warning
+	 * rather than a failed identity switch, matching the best-effort release of the
+	 * launch worktree reservation below.
+	 */
+	const releasePendingPredecessors = async (): Promise<void> => {
+		while (pendingPredecessorReleases.length > 0) {
+			const predecessor = pendingPredecessorReleases[0]!;
+			try {
+				await unregister(predecessor.sessionId, predecessor.locator);
+			} catch (error) {
+				logger.warn("Failed to release a superseded session registration", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return;
+			}
+			pendingPredecessorReleases.shift();
+		}
 	};
 
 	await register(initialSessionId);
@@ -1743,9 +1771,11 @@ export async function registerDirectSession(
 			});
 		}
 	}
-	// Teardown releases whichever id is registered now, not the startup id.
+	// Teardown releases whichever id is registered now, not the startup id, and any
+	// predecessor whose release failed earlier in the process.
 	(dependencies.registerPostmortem ?? postmortem.register)("direct-session-index", async _reason => {
 		if (registeredSessionId) await unregister(registeredSessionId, registeredLocator);
+		await releasePendingPredecessors();
 	});
 
 	let syncing: Promise<void> = Promise.resolve();
@@ -1754,12 +1784,20 @@ export async function registerDirectSession(
 			// Serialized: a rapid /new /new must register in order and never interleave.
 			const run = syncing.then(async () => {
 				const currentId = sessionManager.getSessionFile() === undefined ? undefined : sessionManager.getSessionId();
-				if (!currentId || currentId === registeredSessionId) return;
+				// A predecessor left over from a failed release is retried here even when
+				// the identity itself did not change.
+				if (!currentId || currentId === registeredSessionId) {
+					await releasePendingPredecessors();
+					return;
+				}
 				// The predecessor is released under the locator it was registered with.
 				const predecessorId = registeredSessionId;
 				const predecessorLocator = registeredLocator;
 				await register(currentId);
-				if (predecessorId) await unregister(predecessorId, predecessorLocator);
+				if (predecessorId) {
+					pendingPredecessorReleases.push({ sessionId: predecessorId, locator: predecessorLocator });
+					await releasePendingPredecessors();
+				}
 			});
 			syncing = run.catch(() => {});
 			return run;

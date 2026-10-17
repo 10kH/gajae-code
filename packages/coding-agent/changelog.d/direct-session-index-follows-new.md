@@ -1,3 +1,3 @@
 ### Fixed
 
-- Move the direct CLI session broker-index registration to the successor session id after `/new`, `/resume` and forks, and release the predecessor, so the new session is listed and the old one no longer stays live under the same pid.
+- Move the direct CLI session broker-index registration to the successor session id after `/new`, `/resume` and forks, and release the predecessor, so the new session is listed and the old one no longer stays live under the same pid. A predecessor release that fails is retained and retried on the next identity sync and during teardown instead of being forgotten when the successor is already registered.
