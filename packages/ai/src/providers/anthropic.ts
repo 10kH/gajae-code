@@ -3618,13 +3618,21 @@ function createClient(
  * request drops `thinking`/`output_config`. Reports whether the forced-choice branch
  * applied so the caller can keep the replayed history consistent with it.
  */
-function disableThinkingIfToolChoiceForced(params: MessageCreateParamsStreaming): boolean {
+function disableThinkingIfToolChoiceForced(params: MessageCreateParamsStreaming, modelId: string): boolean {
 	const toolChoice = params.tool_choice;
 	if (!toolChoice) return false;
 	if (toolChoice.type !== "any" && toolChoice.type !== "tool") return false;
-	// An explicit `disabled` is compatible with forced tool use. Keep it: for
-	// models that enable adaptive thinking when the field is omitted (Haiku 5+),
-	// deleting it would silently turn thinking back on.
+	if (requiresAnthropicThinkingDisableWhenOff(modelId)) {
+		// Haiku 5+ enables adaptive thinking when `thinking` is omitted, which a forced tool
+		// choice rejects, and applies `output_config.effort` to all response tokens including
+		// tool-call arguments. Send an explicit `disabled` and keep the selected effort;
+		// effort is capped at `high` while thinking is disabled.
+		params.thinking = { type: "disabled" };
+		const effort = params.output_config?.effort;
+		if (effort === "xhigh" || effort === "max") params.output_config = { ...params.output_config, effort: "high" };
+		return true;
+	}
+	// An explicit `disabled` is compatible with forced tool use and is kept.
 	if (params.thinking?.type !== "disabled") delete params.thinking;
 	delete params.output_config;
 	return true;
@@ -4052,7 +4060,7 @@ function buildParams(
 	// that pair with `thinking`/`redacted_thinking` blocks "cannot be modified", so the
 	// replay has to degrade in the same rebuild. Runs before the billing/system payload
 	// snapshot so the attribution hash covers the messages actually sent.
-	if (disableThinkingIfToolChoiceForced(params) && hasNativeThinkingBlocks(params.messages)) {
+	if (disableThinkingIfToolChoiceForced(params, model.id) && hasNativeThinkingBlocks(params.messages)) {
 		params.messages = convertAnthropicMessages(context.messages, model, isOAuthToken, {
 			...thinkingRepair,
 			repairAllAssistantThinking: true,

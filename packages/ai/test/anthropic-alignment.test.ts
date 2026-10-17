@@ -1264,6 +1264,41 @@ describe("Anthropic request fingerprint alignment", () => {
 		}
 	});
 
+	it("keeps the selected effort on forced-tool Haiku 5.5 requests with thinking disabled", async () => {
+		const model = getBundledModel<"anthropic-messages">("anthropic", "claude-haiku-5-5");
+		if (!model) throw new Error("Expected bundled Anthropic Haiku 5.5 model");
+		const context: Context = {
+			systemPrompt: ["Stay concise."],
+			messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			tools: [{ name: "resolve", description: "Resolve", parameters: { type: "object", properties: {} } as never }],
+		};
+		type Forced = {
+			tool_choice?: { type?: string };
+			thinking?: { type?: string };
+			output_config?: { effort?: string };
+		};
+		for (const [reasoning, expected] of [
+			[Effort.Medium, "medium"],
+			[Effort.High, "high"],
+			[Effort.XHigh, "high"],
+			[Effort.Max, "high"],
+		] as const) {
+			const payload = (await captureAnthropicPayload(model, context, {
+				thinkingEnabled: true,
+				reasoning,
+				toolChoice: { type: "tool", name: "resolve" },
+			})) as Forced;
+			expect(payload.tool_choice?.type).toBe("tool");
+			expect(payload.thinking).toEqual({ type: "disabled" });
+			expect(payload.output_config).toEqual({ effort: expected });
+		}
+		const off = (await captureAnthropicPayload(model, context, {
+			thinkingEnabled: false,
+			toolChoice: { type: "tool", name: "resolve" },
+		})) as Forced;
+		expect(off.thinking).toEqual({ type: "disabled" });
+	});
+
 	it("preserves sampling params for Haiku 4.5", async () => {
 		const model = getBundledModel<"anthropic-messages">("anthropic", "claude-haiku-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic Haiku 4.5 model");
