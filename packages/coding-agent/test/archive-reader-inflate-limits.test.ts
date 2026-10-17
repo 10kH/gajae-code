@@ -66,6 +66,25 @@ function concat(parts: Uint8Array[]): Uint8Array {
 	return out;
 }
 
+function pad512(data: Uint8Array): Uint8Array {
+	const pad = (512 - (data.byteLength % 512)) % 512;
+	if (pad === 0) return data;
+	const out = new Uint8Array(data.byteLength + pad);
+	out.set(data, 0);
+	return out;
+}
+
+function paxRecords(records: Array<[string, string]>): Uint8Array {
+	let body = "";
+	for (const [key, value] of records) {
+		const suffix = ` ${key}=${value}\n`;
+		let size = suffix.length;
+		while (String(size).length + suffix.length !== size) size = String(size).length + suffix.length;
+		body += `${size}${suffix}`;
+	}
+	return new TextEncoder().encode(body);
+}
+
 function zipUnknownSize(files: Array<{ name: string; data: Uint8Array }>): Uint8Array {
 	const parts: Uint8Array[] = [];
 	const zip = new Zip((error, chunk) => {
@@ -504,6 +523,124 @@ describe("openArchive inflate caps", () => {
 			} finally {
 				await rm(dir, { recursive: true, force: true });
 			}
+		}),
+		60_000,
+	);
+
+	test(
+		"still allows a pax long path",
+		noted("still allows a pax long path", async () => {
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-pax-"));
+			try {
+				const archivePath = path.join(dir, "long.tar");
+				const name = `${"a".repeat(120)}.txt`;
+				const records = paxRecords([["path", name]]);
+				const hello = new TextEncoder().encode("hello");
+				await writeUstar(archivePath, async push => {
+					await push(ustarHeader("paxheader", records.byteLength, "x"));
+					await push(pad512(records));
+					await push(ustarHeader(name.slice(0, 100), hello.byteLength));
+					await push(pad512(hello));
+				});
+				const archive = await openArchive(archivePath);
+				expect(archive.listDirectory().map(item => item.name)).toContain(name);
+				expect(new TextDecoder().decode((await archive.readFile(name)).bytes)).toBe("hello");
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+	);
+
+	test(
+		"rejects a pax path nested past the depth cap",
+		noted("rejects a pax path nested past the depth cap", async () => {
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-paxdeep-"));
+			try {
+				const archivePath = path.join(dir, "deep.tar");
+				const name = `${"d/".repeat(DEPTH_LIMIT)}f.txt`;
+				const records = paxRecords([["path", name]]);
+				await writeUstar(archivePath, async push => {
+					await push(ustarHeader("paxheader", records.byteLength, "x"));
+					await push(pad512(records));
+					await push(ustarHeader("f.txt", 1));
+					await push(pad512(new Uint8Array([65])));
+				});
+				await expect(openArchive(archivePath)).rejects.toThrow(/nested too deeply/);
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+	);
+
+	test(
+		"still allows the last zip member when names repeat",
+		noted("still allows the last zip member when names repeat", async () => {
+			const bytes = zipUnknownSize([
+				{ name: "a.txt", data: new TextEncoder().encode("old") },
+				{ name: "a.txt", data: new TextEncoder().encode("newer") },
+			]);
+			await withFile("dup.zip", bytes, async file => {
+				const archive = await openArchive(file);
+				const entry = await archive.readFile("a.txt");
+				expect(new TextDecoder().decode(entry.bytes)).toBe("newer");
+				expect(entry.bytes.byteLength).toBe(5);
+			});
+		}),
+	);
+
+	test(
+		"rejects duplicate zip names past the total cap",
+		noted("rejects duplicate zip names past the total cap", async () => {
+			const part = new Uint8Array(15 * 1024 * 1024);
+			const bytes = zipUnknownSize(Array.from({ length: 5 }, () => ({ name: "a.bin", data: part })));
+			expect(part.byteLength).toBeLessThan(ENTRY_LIMIT);
+			expect(part.byteLength * 5).toBeGreaterThan(TOTAL_LIMIT);
+			await withFile("dup-total.zip", bytes, async file => {
+				await expect(openArchive(file)).rejects.toThrow(/total limit/);
+			});
+		}),
+		20_000,
+	);
+
+	test(
+		"rejects duplicate zip names past the count cap",
+		noted("rejects duplicate zip names past the count cap", async () => {
+			const files = Array.from({ length: COUNT_LIMIT + 1 }, () => ({ name: "a.txt", data: new Uint8Array(0) }));
+			await withFile("dup-count.zip", zipUnknownSize(files), async file => {
+				await expect(openArchive(file)).rejects.toThrow(/too many entries/);
+			});
+		}),
+		20_000,
+	);
+
+	test(
+		"still allows an empty deflate member at the total cap",
+		noted("still allows an empty deflate member at the total cap", async () => {
+			const part = new Uint8Array(ENTRY_LIMIT);
+			const bytes = zipUnknownSize([
+				...Array.from({ length: 4 }, (_, index) => ({ name: `p${index}.bin`, data: part })),
+				{ name: "empty.txt", data: new Uint8Array(0) },
+			]);
+			await withFile("exact.zip", bytes, async file => {
+				const archive = await openArchive(file);
+				expect((await archive.readFile("empty.txt")).bytes.byteLength).toBe(0);
+				expect((await archive.readFile("p3.bin")).bytes.byteLength).toBe(ENTRY_LIMIT);
+			});
+		}),
+		60_000,
+	);
+
+	test(
+		"rejects one byte after the total cap",
+		noted("rejects one byte after the total cap", async () => {
+			const part = new Uint8Array(ENTRY_LIMIT);
+			const bytes = zipUnknownSize([
+				...Array.from({ length: 4 }, (_, index) => ({ name: `p${index}.bin`, data: part })),
+				{ name: "extra.txt", data: new Uint8Array([1]) },
+			]);
+			await withFile("over.zip", bytes, async file => {
+				await expect(openArchive(file)).rejects.toThrow(/total limit/);
+			});
 		}),
 		60_000,
 	);

@@ -206,6 +206,25 @@ function tarEntryName(header: Uint8Array): string {
 	return prefix ? `${prefix}/${name}` : name;
 }
 
+function paxOverrides(data: Uint8Array): { path?: string; size?: number } {
+	const out: { path?: string; size?: number } = {};
+	const raw = new TextDecoder("latin1").decode(data);
+	for (let index = 0; index < raw.length; ) {
+		const space = raw.indexOf(" ", index);
+		const length = Number.parseInt(raw.slice(index, space), 10);
+		if (space < index || !Number.isSafeInteger(length) || index + length > raw.length)
+			throw new ToolError("Unsupported tar pax header");
+		const eq = raw.indexOf("=", space);
+		const key = raw.slice(space + 1, eq);
+		const value = new TextDecoder().decode(data.subarray(eq + 1, index + length - 1));
+		if (key === "path") out.path = value;
+		else if (key === "size" && /^\d+$/.test(value) && Number.isSafeInteger(Number(value))) out.size = Number(value);
+		else if (key === "size") throw new ToolError("Unsupported tar size encoding");
+		index += length;
+	}
+	return out;
+}
+
 async function readTarEntries(bytes: Uint8Array, labeledGzip: boolean): Promise<ArchiveIndexEntry[]> {
 	const payload = inflateToTar(bytes, labeledGzip);
 	if (payload.byteLength > MAX_TAR_CONTAINER_BYTES) throw archiveLimitError("total");
@@ -214,17 +233,26 @@ async function readTarEntries(bytes: Uint8Array, labeledGzip: boolean): Promise<
 	let memberBytes = 0;
 	let offset = 0;
 	let longName: string | undefined;
+	let pendingPax: { path?: string; size?: number } | undefined;
+	const globalPax: { path?: string; size?: number } = {};
 	while (offset + 512 <= payload.byteLength) {
 		const header = payload.subarray(offset, offset + 512);
 		if (header.every(byte => byte === 0)) break;
-		const size = tarOctal(header, 124, 12);
-		if (!Number.isSafeInteger(size) || size < 0) throw new ToolError("Unsupported tar size encoding");
+		const headerSize = tarOctal(header, 124, 12);
+		if (!Number.isSafeInteger(headerSize) || headerSize < 0) throw new ToolError("Unsupported tar size encoding");
 		const typeFlag = header[156] ?? 0;
 		const headerName = tarEntryName(header);
-		const rawName = typeFlag === 76 ? headerName : (longName ?? headerName);
+		let size = headerSize;
+		let rawName = typeFlag === 76 ? headerName : (longName ?? headerName);
+		if (typeFlag !== 120 && typeFlag !== 103 && typeFlag !== 76) {
+			rawName = pendingPax?.path ?? globalPax.path ?? rawName;
+			size = pendingPax?.size ?? globalPax.size ?? size;
+			pendingPax = undefined;
+		}
 		entryCount += 1;
 		if (entryCount > MAX_ARCHIVE_ENTRY_COUNT) throw archiveLimitError("count");
-		if (archiveEntryDepth(rawName) > MAX_ARCHIVE_PATH_DEPTH) throw archiveLimitError("depth", rawName);
+		if (typeFlag < 100 && archiveEntryDepth(rawName) > MAX_ARCHIVE_PATH_DEPTH)
+			throw archiveLimitError("depth", rawName);
 		if (size > MAX_ARCHIVE_TOTAL_BYTES) throw archiveLimitError("total");
 		if (size > MAX_ARCHIVE_ENTRY_BYTES) throw archiveLimitError("entry", rawName);
 		const isRegular = typeFlag === 0 || typeFlag === 48;
@@ -236,6 +264,11 @@ async function readTarEntries(bytes: Uint8Array, labeledGzip: boolean): Promise<
 		if (dataEnd > payload.byteLength) throw new ToolError("Truncated tar entry");
 		const data = payload.subarray(offset + 512, dataEnd);
 		offset += 512 + Math.ceil(size / 512) * 512;
+		if (typeFlag === 120 || typeFlag === 103) {
+			if (typeFlag === 103) Object.assign(globalPax, paxOverrides(data));
+			else pendingPax = paxOverrides(data);
+			continue;
+		}
 		if (typeFlag === 76) {
 			longName = new TextDecoder().decode(data).replace(/\0+$/, "");
 			continue;
@@ -273,18 +306,21 @@ async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
 				this.#length += data.byteLength;
 			}
 			if (!final) return;
-			const limit = Math.max(0, outputBudget());
+			const remaining = Math.max(0, outputBudget());
+			const tooBig = () => archiveLimitError(remaining >= MAX_ARCHIVE_ENTRY_BYTES ? "entry" : "total");
 			try {
-				const out = inflateRawSync(concatBytes(this.#parts, this.#length), { maxOutputLength: limit });
+				const out = inflateRawSync(concatBytes(this.#parts, this.#length), {
+					maxOutputLength: Math.max(1, remaining),
+				});
+				if (out.byteLength > remaining) {
+					this.ondata(tooBig(), new Uint8Array(0), true);
+					return;
+				}
 				this.ondata(null, out, true);
 			} catch (error) {
 				const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
 				if (code === "ERR_BUFFER_TOO_LARGE") {
-					this.ondata(
-						archiveLimitError(limit >= MAX_ARCHIVE_ENTRY_BYTES ? "entry" : "total"),
-						new Uint8Array(0),
-						true,
-					);
+					this.ondata(tooBig(), new Uint8Array(0), true);
 					return;
 				}
 				this.ondata(error instanceof Error ? error : new Error(String(error)), new Uint8Array(0), true);
@@ -355,7 +391,9 @@ async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
 		if (!limitError) limitError = new ToolError(error instanceof Error ? error.message : String(error));
 	}
 	if (limitError) throw limitError;
-	return entries;
+	return [
+		...entries.reduce((map, entry) => map.set(entry.path, entry), new Map<string, ArchiveIndexEntry>()).values(),
+	];
 }
 
 export function parseArchivePathCandidates(filePath: string): ArchivePathCandidate[] {
