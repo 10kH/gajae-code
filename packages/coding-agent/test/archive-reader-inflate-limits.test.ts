@@ -173,7 +173,52 @@ function zipView(bytes: Uint8Array): DataView {
 	return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 }
 
-function zip64SingleEntry(name: string, data: Uint8Array): Uint8Array {
+function zipExtraField(id: number, data: Uint8Array): Uint8Array {
+	const field = new Uint8Array(4 + data.byteLength);
+	const fieldView = zipView(field);
+	fieldView.setUint16(0, id, true);
+	fieldView.setUint16(2, data.byteLength, true);
+	field.set(data, 4);
+	return field;
+}
+
+function addZipExtraField(bytes: Uint8Array, id: number, data: Uint8Array): Uint8Array {
+	const view = zipView(bytes);
+	const eocdOffset = bytes.byteLength - 22;
+	const centralOffset = view.getUint32(eocdOffset + 16, true);
+	const localNameLength = view.getUint16(26, true);
+	const localExtraLength = view.getUint16(28, true);
+	const centralNameLength = view.getUint16(centralOffset + 28, true);
+	const centralExtraLength = view.getUint16(centralOffset + 30, true);
+	const field = zipExtraField(id, data);
+
+	const localHeaderEnd = 30 + localNameLength;
+	const localHeader = bytes.slice(0, localHeaderEnd);
+	zipView(localHeader).setUint16(28, localExtraLength + field.byteLength, true);
+	const localPart = concat([localHeader, field, bytes.subarray(localHeaderEnd, centralOffset)]);
+
+	const centralNameEnd = centralOffset + 46 + centralNameLength;
+	const centralHeader = bytes.slice(centralOffset, centralNameEnd);
+	zipView(centralHeader).setUint16(30, centralExtraLength + field.byteLength, true);
+	const centralDirectory = concat([centralHeader, field, bytes.subarray(centralNameEnd, eocdOffset)]);
+	const eocd = bytes.slice(eocdOffset);
+	const eocdView = zipView(eocd);
+	eocdView.setUint32(12, view.getUint32(eocdOffset + 12, true) + field.byteLength, true);
+	eocdView.setUint32(16, centralOffset + field.byteLength, true);
+	return concat([localPart, centralDirectory, eocd]);
+}
+
+function zipLocalRecordEnd(bytes: Uint8Array): number {
+	const view = zipView(bytes);
+	return 30 + view.getUint16(26, true) + view.getUint16(28, true) + view.getUint32(18, true);
+}
+
+function zip64EndRecordOffset(bytes: Uint8Array): number {
+	const locatorOffset = bytes.byteLength - 22 - 20;
+	return Number(zipView(bytes).getBigUint64(locatorOffset + 8, true));
+}
+
+function zip64SingleEntry(name: string, data: Uint8Array, extra?: { id: number; data: Uint8Array }): Uint8Array {
 	const bytes = zipSync({ [name]: data }, { level: 0 });
 	const view = zipView(bytes);
 	const eocdOffset = bytes.byteLength - 22;
@@ -192,9 +237,11 @@ function zip64SingleEntry(name: string, data: Uint8Array): Uint8Array {
 	localZip64View.setUint16(2, 16, true);
 	localZip64View.setBigUint64(4, BigInt(data.byteLength), true);
 	localZip64View.setBigUint64(12, BigInt(compressedSize), true);
+	const localExtra = extra ? concat([zipExtraField(extra.id, extra.data), localZip64Extra]) : localZip64Extra;
+	localHeaderView.setUint16(28, localExtra.byteLength, true);
 	const payloadStart = 30 + localNameLength + localExtraLength;
 	const payload = bytes.subarray(payloadStart, payloadStart + compressedSize);
-	const localRecord = concat([localHeader, localZip64Extra, payload]);
+	const localRecord = concat([localHeader, localExtra, payload]);
 
 	const centralNameLength = view.getUint16(centralOffset + 28, true);
 	const centralExtraLength = view.getUint16(centralOffset + 30, true);
@@ -212,9 +259,11 @@ function zip64SingleEntry(name: string, data: Uint8Array): Uint8Array {
 	centralZip64View.setBigUint64(4, BigInt(data.byteLength), true);
 	centralZip64View.setBigUint64(12, BigInt(compressedSize), true);
 	centralZip64View.setBigUint64(20, 0n, true);
+	const centralExtra = extra ? concat([zipExtraField(extra.id, extra.data), centralZip64Extra]) : centralZip64Extra;
+	centralHeaderView.setUint16(30, centralExtra.byteLength, true);
 	const commentStart = centralOffset + 46 + centralNameLength + centralExtraLength;
 	const comment = bytes.subarray(commentStart, commentStart + centralCommentLength);
-	const centralDirectory = concat([centralHeader, centralZip64Extra, comment]);
+	const centralDirectory = concat([centralHeader, centralExtra, comment]);
 
 	const zip64EndOffset = localRecord.byteLength + centralDirectory.byteLength;
 	const zip64End = new Uint8Array(56);
@@ -263,6 +312,20 @@ function noted(name: string, run: () => Promise<void>): () => Promise<void> {
 			throw error;
 		}
 	};
+}
+
+async function expectZipMember(name: string, bytes: Uint8Array, expected: Uint8Array): Promise<void> {
+	await withFile("generated.zip", bytes, async file => {
+		const archive = await openArchive(file);
+		expect(archive.getNode(name)?.path).toBe(name);
+		expect([...(await archive.readFile(name)).bytes]).toEqual([...expected]);
+	});
+}
+
+async function expectInvalidZip(bytes: Uint8Array): Promise<void> {
+	await withFile("generated-invalid.zip", bytes, async file => {
+		await expect(openArchive(file)).rejects.toThrow(/Invalid ZIP archive/);
+	});
 }
 
 describe("openArchive inflate caps", () => {
@@ -368,6 +431,97 @@ describe("openArchive inflate caps", () => {
 				expect(new TextDecoder().decode((await archive.readFile("zip64.txt")).bytes)).toBe("zip64 member");
 			});
 		}),
+	);
+
+	test(
+		"holds fixed-seed generated ZIP and ZIP64 directory properties (seed 0x6847d17b)",
+		noted("holds fixed-seed generated ZIP and ZIP64 directory properties (seed 0x6847d17b)", async () => {
+			const random = seededRandom(0x6847d17b);
+			for (let caseIndex = 0; caseIndex < 8; caseIndex++) {
+				const name = `member-${caseIndex}-${randomAscii(random, 6)}.bin`;
+				const payload = randomBytes(random, randomInteger(random, 1, 64));
+				const plain = zipSync({ [name]: payload }, { level: caseIndex % 2 === 0 ? 0 : 6 });
+				const descriptor = zipUnknownSize([{ name, data: payload }]);
+				const plainExtra = addZipExtraField(
+					plain,
+					0xcafe + caseIndex,
+					randomBytes(random, randomInteger(random, 0, 8)),
+				);
+				const descriptorExtra = addZipExtraField(
+					descriptor,
+					0xbeef - caseIndex,
+					randomBytes(random, randomInteger(random, 0, 8)),
+				);
+				const zip64 = zip64SingleEntry(name, payload, {
+					id: 0xd000 + caseIndex,
+					data: randomBytes(random, randomInteger(random, 0, 8)),
+				});
+				const zip64Plain = zip64SingleEntry(name, payload);
+
+				for (const valid of [plain, descriptor, plainExtra, descriptorExtra, zip64]) {
+					await expectZipMember(name, valid, payload);
+				}
+
+				const plainView = zipView(plain);
+				const eocdOffset = plain.byteLength - 22;
+				const centralOffset = plainView.getUint32(eocdOffset + 16, true);
+				const centralRecordLength =
+					46 +
+					plainView.getUint16(centralOffset + 28, true) +
+					plainView.getUint16(centralOffset + 30, true) +
+					plainView.getUint16(centralOffset + 32, true);
+				const partialCentralEnd = centralOffset + Math.floor(centralRecordLength / 2);
+				const truncatedCentral = concat([plain.subarray(0, partialCentralEnd), plain.subarray(eocdOffset)]);
+				const wrongCount = plain.slice();
+				zipView(wrongCount).setUint16(eocdOffset + 10, 2, true);
+				const wrongCentralOffset = plain.slice();
+				zipView(wrongCentralOffset).setUint32(eocdOffset + 16, centralOffset + 1, true);
+				const wrongCentralLength = plain.slice();
+				zipView(wrongCentralLength).setUint16(
+					centralOffset + 30,
+					plainView.getUint16(centralOffset + 30, true) + 1,
+					true,
+				);
+				const wrongLocalNameLength = plain.slice();
+				zipView(wrongLocalNameLength).setUint16(26, plainView.getUint16(26, true) + 1, true);
+				const wrongLocalSize = plain.slice();
+				zipView(wrongLocalSize).setUint32(18, plainView.getUint32(18, true) + 1, true);
+
+				const descriptorView = zipView(descriptor);
+				const descriptorEocdOffset = descriptor.byteLength - 22;
+				const descriptorCentralOffset = descriptorView.getUint32(descriptorEocdOffset + 16, true);
+				const wrongDescriptor = descriptor.slice();
+				wrongDescriptor[descriptorCentralOffset - 1] = (wrongDescriptor[descriptorCentralOffset - 1] ?? 0) ^ 1;
+
+				const zip64View = zipView(zip64Plain);
+				const zip64EndOffset = zip64EndRecordOffset(zip64Plain);
+				const zip64CentralOffset = Number(zip64View.getBigUint64(zip64EndOffset + 48, true));
+				const zip64NameLength = zip64View.getUint16(zip64CentralOffset + 28, true);
+				const zip64ExtraStart = zip64CentralOffset + 46 + zip64NameLength;
+				const wrongZip64Offset = zip64Plain.slice();
+				zipView(wrongZip64Offset).setBigUint64(zip64ExtraStart + 4 + 16, 1n, true);
+				const wrongZip64Count = zip64Plain.slice();
+				zipView(wrongZip64Count).setBigUint64(zip64EndOffset + 32, 2n, true);
+				const truncatedZip64 = zip64Plain.subarray(0, zip64CentralOffset);
+
+				for (const invalid of [
+					plain.subarray(0, zipLocalRecordEnd(plain)),
+					truncatedCentral,
+					wrongCount,
+					wrongCentralOffset,
+					wrongCentralLength,
+					wrongLocalNameLength,
+					wrongLocalSize,
+					wrongDescriptor,
+					wrongZip64Offset,
+					wrongZip64Count,
+					truncatedZip64,
+				]) {
+					await expectInvalidZip(invalid);
+				}
+			}
+		}),
+		20_000,
 	);
 
 	test(
