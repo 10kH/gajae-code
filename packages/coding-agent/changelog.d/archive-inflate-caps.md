@@ -1,3 +1,3 @@
 ### Fixed
 
-- Opening a zip, tar, or tar.gz archive now stops during inflate when one entry, the member bytes, the entry count, or the path depth exceeds its cap, including gzip bytes opened under a .tar name.
+- Archive readers enforce per-entry, total member, count, and depth caps while accounting for TAR framing, bounding cumulative gzip output, streaming ZIP deflate input, and truncating long archive-controlled paths.
