@@ -15,6 +15,7 @@ import {
 import {
 	countUltragoalNudges,
 	createUltragoalPlan,
+	getUltragoalRunCompletionState,
 	getUltragoalStatus,
 	readUltragoalLedger,
 	readUltragoalPlan,
@@ -24,6 +25,8 @@ import {
 	resolveUltragoalNudgeBudget,
 	selectUltragoalNudgeTarget,
 	type UltragoalNudgeSurface,
+	type UltragoalNudgeTarget,
+	type UltragoalPlan,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 import {
 	ULTRAGOAL_SUCCESSION_FENCE_SCHEMA,
@@ -59,6 +62,28 @@ const DEFAULT_OBJECTIVE_GOAL = {
 	objective: DEFAULT_ULTRAGOAL_OBJECTIVE,
 	status: "active",
 };
+const NUDGE_TARGET_STATUSES = ["active", "pending", "failed"] as const;
+const NUDGE_TARGET_STATUS_SET = new Set<string>(NUDGE_TARGET_STATUSES);
+const GENERATED_GOAL_STATUSES = [
+	"pending",
+	"active",
+	"complete",
+	"failed",
+	"blocked",
+	"review_blocked",
+	"superseded",
+] as const;
+
+function mulberry32(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (state + 0x6d2b79f5) >>> 0;
+		let value = state;
+		value = Math.imul(value ^ (value >>> 15), value | 1);
+		value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+		return ((value ^ (value >>> 14)) >>> 0) / 4_294_967_296;
+	};
+}
 
 /** Hand off `goalIds` to a successor run by planting the source's ownership fence on disk. */
 async function plantFence(cwd: string, goalIds: string[]): Promise<void> {
@@ -91,6 +116,128 @@ afterEach(async () => {
 	if (ORIGINAL_GJC_CONFIG_DIR === undefined) delete process.env.GJC_CONFIG_DIR;
 	else process.env.GJC_CONFIG_DIR = ORIGINAL_GJC_CONFIG_DIR;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
+});
+
+describe("selectUltragoalNudgeTarget seeded properties", () => {
+	it("excludes fenced targets and preserves objective, status, and final-receipt priority", () => {
+		const seed = 0x6807_2026;
+		const random = mulberry32(seed);
+		let sawStoryTarget = false;
+		let sawFinalAggregateTarget = false;
+		let sawObjectivePriority = false;
+		let sawStatusPriority = false;
+
+		for (let caseIndex = 0; caseIndex < 128; caseIndex += 1) {
+			const forcedPriorityCase = caseIndex === 1 || caseIndex === 2 || caseIndex === 4;
+			const goalCount = forcedPriorityCase ? 3 : 1 + Math.floor(random() * 5);
+			const forcedStatuses =
+				caseIndex === 0 || caseIndex === 3
+					? Array.from({ length: goalCount }, () => "complete" as const)
+					: caseIndex === 1 || caseIndex === 2
+						? (["active", "pending", "failed"] as const)
+						: caseIndex === 4
+							? (["pending", "active", "failed"] as const)
+							: undefined;
+			const goals = Array.from({ length: goalCount }, (_, index) => ({
+				id: `G${String(index + 1).padStart(3, "0")}`,
+				title: `Generated goal ${index + 1}`,
+				objective: `Generated objective ${index + 1}`,
+				status:
+					forcedStatuses?.[index] ??
+					GENERATED_GOAL_STATUSES[Math.floor(random() * GENERATED_GOAL_STATUSES.length)] ??
+					"pending",
+				createdAt: "2026-01-01T00:00:00.000Z",
+				updatedAt: "2026-01-01T00:00:00.000Z",
+			}));
+			const plan: UltragoalPlan = {
+				version: 1,
+				brief: `Seeded generated plan ${caseIndex}`,
+				gjcGoalMode: "aggregate",
+				gjcObjective: DEFAULT_ULTRAGOAL_OBJECTIVE,
+				goals,
+				createdAt: "2026-01-01T00:00:00.000Z",
+				updatedAt: "2026-01-01T00:00:00.000Z",
+			};
+			const lastGoal = goals[goals.length - 1];
+			const excludedGoalIds =
+				caseIndex === 0 || caseIndex === 2 || caseIndex === 4
+					? []
+					: caseIndex === 1
+						? [goals[0]?.id ?? ""]
+						: caseIndex === 3
+							? lastGoal
+								? [lastGoal.id]
+								: []
+							: goals.filter(() => random() < 0.35).map(goal => goal.id);
+			const excluded = new Set(excludedGoalIds);
+			const currentGoalObjective =
+				caseIndex === 2
+					? `${goals[1]?.objective ?? ""} `
+					: caseIndex === 1 || caseIndex === 4 || caseIndex === 0 || caseIndex === 3
+						? undefined
+						: random() < 0.5
+							? goals[Math.floor(random() * goals.length)]?.objective
+							: undefined;
+			const retryFailed = caseIndex === 1 || caseIndex === 2 || caseIndex === 4 ? false : random() < 0.5;
+			const target = selectUltragoalNudgeTarget(plan, {
+				currentGoalObjective,
+				retryFailed,
+				excludedGoalIds,
+			});
+
+			expect(target === null || !excluded.has(target.goalId)).toBe(true);
+			expect(selectUltragoalNudgeTarget(plan, { currentGoalObjective, retryFailed, excludedGoalIds: [] })).toEqual(
+				selectUltragoalNudgeTarget(plan, { currentGoalObjective, retryFailed }),
+			);
+
+			const matchingObjectiveGoal = goals.find(
+				goal =>
+					goal.objective.trim() === currentGoalObjective?.trim() &&
+					NUDGE_TARGET_STATUS_SET.has(goal.status) &&
+					!excluded.has(goal.id),
+			);
+			const eligibleStatuses = retryFailed ? NUDGE_TARGET_STATUSES : NUDGE_TARGET_STATUSES.slice(0, 2);
+			const firstEligibleStatus = eligibleStatuses.find(status =>
+				goals.some(goal => goal.status === status && !excluded.has(goal.id)),
+			);
+			const firstEligibleGoal = firstEligibleStatus
+				? goals.find(goal => goal.status === firstEligibleStatus && !excluded.has(goal.id))
+				: undefined;
+			let expected: UltragoalNudgeTarget | null = null;
+			if (matchingObjectiveGoal) {
+				expected = { goalId: matchingObjectiveGoal.id, targetKind: "story" };
+				if (
+					goals.some(
+						goal => goal.status === "active" && goal.id !== matchingObjectiveGoal.id && !excluded.has(goal.id),
+					)
+				) {
+					sawObjectivePriority = true;
+				}
+			} else if (firstEligibleGoal) {
+				expected = { goalId: firstEligibleGoal.id, targetKind: "story" };
+				if (
+					firstEligibleStatus === "active" &&
+					goals.some(goal => goal.status === "pending" && !excluded.has(goal.id))
+				) {
+					sawStatusPriority = true;
+				}
+			} else {
+				const completion = getUltragoalRunCompletionState(plan, { retryFailed });
+				const finalGoal = completion.needsFinalAggregateReceipt ? completion.requiredGoals.at(-1) : undefined;
+				if (finalGoal && !excluded.has(finalGoal.id)) {
+					expected = { goalId: finalGoal.id, targetKind: "final_aggregate_receipt" };
+				}
+			}
+			expect(target).toEqual(expected);
+			if (target?.targetKind === "story") sawStoryTarget = true;
+			if (target?.targetKind === "final_aggregate_receipt") sawFinalAggregateTarget = true;
+		}
+
+		expect(sawStoryTarget).toBe(true);
+		expect(sawFinalAggregateTarget).toBe(true);
+		expect(sawObjectivePriority).toBe(true);
+		expect(sawStatusPriority).toBe(true);
+	});
 });
 
 describe("ultragoal nudge guard", () => {
