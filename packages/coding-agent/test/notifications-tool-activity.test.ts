@@ -46,6 +46,7 @@ interface SetupResult {
 interface SetupOptions {
 	settingsOverrides?: Record<string, unknown>;
 	ensureTelegramDaemon?: (input: { settings: Settings }) => Promise<EnsureDaemonResult>;
+	capabilities?: string[];
 }
 
 async function setup(
@@ -103,7 +104,9 @@ async function setup(
 		ws.addEventListener("open", () => resolve());
 		ws.addEventListener("error", () => reject(new Error("websocket error")));
 	});
-	ws.send(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: ["tool_activity_v2"] }));
+	ws.send(
+		JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: options.capabilities ?? ["tool_activity_v2"] }),
+	);
 	await sleep(50);
 	await sleep(250);
 	return { handlers, ctx, frames, ws, url, sessionId, token, settings, controller };
@@ -130,6 +133,10 @@ async function setConfig(
 
 function activityFrames(frames: Frame[]): Frame[] {
 	return frames.filter(frame => frame.type === "tool_activity");
+}
+
+function awaitingFrames(frames: Frame[]): Frame[] {
+	return frames.filter(frame => frame.type === "awaiting_input");
 }
 
 function reasoningFrames(frames: Frame[]): Frame[] {
@@ -370,6 +377,61 @@ test("extension handlers emit lean tool activity without summaries or reasoning"
 			expect(frame.resultSummary).toBeUndefined();
 		}
 		expect(reasoningFrames(result.frames)).toHaveLength(0);
+	});
+}, 30000);
+
+test("bash awaiting-input updates emit one content-free notice per call, also under redact", async () => {
+	await withNotifications(async () => {
+		const result = await setup({}, { capabilities: ["tool_activity_v2", "awaiting_input_v1"] });
+		await setConfig(result, { redact: true });
+		const update = (toolCallId: string, details: unknown) =>
+			result.handlers.get("tool_execution_update")!(
+				{
+					type: "tool_execution_update",
+					toolCallId,
+					toolName: "bash",
+					args: { command: "tailscale up" },
+					partialResult: {
+						content: [{ type: "text", text: "To authenticate, visit: https://login.tailscale.com/a/secret" }],
+						details,
+					},
+				} as never,
+				result.ctx,
+			);
+		await update("plain-call", {});
+		await update("auth-call", { awaitingInput: { kind: "browser_auth", detectedAt: 1 } });
+		await update("auth-call", { awaitingInput: { kind: "browser_auth", detectedAt: 2 } });
+		await update("bogus-call", { awaitingInput: { kind: "password" } });
+		await waitFor(() => awaitingFrames(result.frames).length === 1, "awaiting_input frame");
+		await sleep(100);
+		expect(awaitingFrames(result.frames)).toEqual([
+			{
+				type: "awaiting_input",
+				sessionId: result.sessionId,
+				toolCallId: "auth-call",
+				toolName: "bash",
+				kind: "browser_auth",
+			},
+		]);
+		expect(JSON.stringify(result.frames)).not.toContain("login.tailscale.com");
+	});
+}, 30000);
+
+test("awaiting_input is withheld from clients that did not advertise awaiting_input_v1", async () => {
+	await withNotifications(async () => {
+		const result = await setup();
+		await result.handlers.get("tool_execution_update")!(
+			{
+				type: "tool_execution_update",
+				toolCallId: "auth-call",
+				toolName: "bash",
+				args: {},
+				partialResult: { content: [], details: { awaitingInput: { kind: "device_code", detectedAt: 1 } } },
+			} as never,
+			result.ctx,
+		);
+		await sleep(200);
+		expect(awaitingFrames(result.frames)).toHaveLength(0);
 	});
 }, 30000);
 

@@ -102,6 +102,7 @@ import {
 	registerAskAnswerSource,
 	registerWorkflowGateEmitterListener,
 } from "../../tools/ask-answer-registry";
+import type { AwaitingInputKind } from "../../tools/awaiting-input";
 import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
@@ -1422,6 +1423,8 @@ interface SessionRuntime {
 		string,
 		{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
 	>;
+	/** Tool calls already announced as awaiting human input; one notification per call. */
+	awaitingInputNotified: Set<string>;
 	/** Cancels the postmortem cleanup that emits `session_closed` on process teardown. */
 	cancelPostmortemCleanup: () => void;
 	/** Disposes side-turn resources when their owning logical session becomes unavailable. */
@@ -1431,6 +1434,17 @@ interface SessionRuntime {
 const SENSITIVE_MODEL_LABEL =
 	/(?:\b(?:https?|wss?):\/\/|\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|\b(?:api[-_ ]?key|access[-_ ]?token|bearer|secret|password|account(?:\s*id)?|email|exception|stack trace)\b|\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,}\b)/i;
 const TOOL_SUMMARY_MAX = 280;
+
+/** The `awaitingInput` signal a running bash update carries, validated at the extension boundary. */
+function readAwaitingInput(partialResult: unknown): { kind: AwaitingInputKind } | undefined {
+	if (!partialResult || typeof partialResult !== "object") return undefined;
+	const details = (partialResult as { details?: unknown }).details;
+	if (!details || typeof details !== "object") return undefined;
+	const signal = (details as { awaitingInput?: unknown }).awaitingInput;
+	if (!signal || typeof signal !== "object") return undefined;
+	const kind = (signal as { kind?: unknown }).kind;
+	return kind === "browser_auth" || kind === "device_code" ? { kind } : undefined;
+}
 
 /** Stable projection of the tool-owned safe-display seam (never the full Tool surface). */
 type SafeSummaryTool = Pick<Tool, "safeSummary" | "safeSummaryFields">;
@@ -8353,6 +8367,7 @@ export function createNotificationsExtension(
 				string,
 				{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
 			>(),
+			awaitingInputNotified: new Set<string>(),
 			deferredInboundControls: [],
 		};
 		const initializedRuntime = runtime;
@@ -10424,8 +10439,27 @@ export function createNotificationsExtension(
 	});
 
 	api.on("tool_execution_update", (event, ctx) => {
-		const rt = runtimes.get(sessionId(ctx));
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
 		rt?.emitPromptEvent(event);
+		if (!rt) return;
+		const awaitingInput = readAwaitingInput(event.partialResult);
+		if (!awaitingInput || rt.awaitingInputNotified.has(event.toolCallId)) return;
+		rt.awaitingInputNotified.add(event.toolCallId);
+		// Notify-only and content-free (prompt kind only, never the URL or code), so
+		// it is delivered under redaction exactly like the idle marker.
+		if (!rt.notificationsActive || rt.policySuspended) return;
+		try {
+			pushSessionFrame(rt, {
+				type: "awaiting_input",
+				sessionId: id,
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				kind: awaitingInput.kind,
+			});
+		} catch (e) {
+			logger.warn(`notifications: awaiting_input failed: ${String(e)}`);
+		}
 	});
 
 	api.on("tool_execution_end", (event, ctx) => {
@@ -10433,6 +10467,7 @@ export function createNotificationsExtension(
 		const rt = runtimes.get(id);
 		if (!rt) return;
 		rt.emitPromptEvent(event);
+		rt.awaitingInputNotified.delete(event.toolCallId);
 		const inFlight = rt.inFlightTools.get(event.toolCallId);
 		if (!inFlight) return;
 		if (!rt.notificationsActive) {
