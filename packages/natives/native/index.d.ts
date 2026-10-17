@@ -794,6 +794,56 @@ export interface AstFindResult {
  */
 export declare function astGrep(options: AstFindOptions): Promise<AstFindResult>
 
+/**
+ * Match ast-grep patterns against an in-memory source string; returns a
+ * promise resolved on a worker thread.
+ *
+ * This is the file-free counterpart to [`ast_grep`]: callers that already hold
+ * the source (streaming buffers, generated code, editor contents) avoid a
+ * temp-file round trip. `lang` is required since there is no path to infer it
+ * from.
+ */
+export declare function astMatch(options: AstMatchOptions): Promise<AstMatchResult>
+
+/**
+ * Options for `astMatch`: run ast-grep patterns against an in-memory source
+ * string instead of files on disk.
+ */
+export interface AstMatchOptions {
+  /** Source code to match against (parsed in memory, never read from disk). */
+  source: string
+  /** Language of `source` (required; e.g. "ts", "tsx", "rust", "python"). */
+  lang: string
+  /** ast-grep patterns to search for (OR across patterns). */
+  patterns: Array<string>
+  /** Rule selector for multi-rule ast-grep configurations. */
+  selector?: string
+  /** Pattern strictness; defaults to smart matching when omitted. */
+  strictness?: AstMatchStrictness
+  /** Maximum matches to return after `offset` (default applies when omitted). */
+  limit?: number
+  /** Number of leading matches to skip before applying `limit`. */
+  offset?: number
+  /** When true, include meta-variable bindings per match. */
+  includeMeta?: boolean
+  /** Optional cancellation handle (library-specific). */
+  signal?: unknown
+  /** Wall-clock timeout for the worker task in milliseconds. */
+  timeoutMs?: number
+}
+
+/** Result of an in-memory `astMatch` run. */
+export interface AstMatchResult {
+  /** Page of matches after sort, offset, and limit. */
+  matches: Array<AstFindMatch>
+  /** Total matches found before paging (can exceed `matches.length`). */
+  totalMatches: number
+  /** True when results were truncated by `limit`. */
+  limitReached: boolean
+  /** Non-fatal parse or pattern-compile errors collected during the run. */
+  parseErrors?: Array<string>
+}
+
 /** ast-grep pattern strictness (controls how patterns match syntax). */
 export declare enum AstMatchStrictness {
   /** Match at the concrete syntax tree level. */
@@ -1238,10 +1288,9 @@ export declare function exactReplacePath(sourcePath: string, destinationPath: st
  * single-link ownership; hard-linked or symlinked source/destination are
  * rejected) before anything is mutated. On Windows a pre-mutation
  * `STATUS_SHARING_VIOLATION` on the destination open is reported as a
- * distinct `sharing_violation` code, while `STATUS_ACCESS_DENIED` on a
- * retained open or rename is reported as `access_denied`. Pre-mutation
- * failures include the original `windows_error_code`; only known-safe rename
- * operations retry transient access-denied or sharing-violation statuses.
+ * distinct `sharing_violation` code with `windows_error_code` set -- exactly
+ * as [`exact_replace_path`] already reports it -- and is always surfaced
+ * before any rename, so it is never mistaken for a post-effect failure.
  */
 export declare function exactReplaceRetained(sourcePath: string, destinationPath: string, backupName: string, expectedSource: NativeExactFileIdentity, expectedDestination: NativeExactFileIdentity): NativeExactUnlinkResult
 
@@ -2579,7 +2628,6 @@ export declare function ptyTimeoutCount(): bigint
 
 /**
  * Rasterize bounded SVG/SVGZ bytes into a PNG without resolving local files.
- *
  * DTD/entity declarations and SVG image elements are rejected rather than
  * allowing unbounded expansion or silently returning an incomplete preview.
  *
