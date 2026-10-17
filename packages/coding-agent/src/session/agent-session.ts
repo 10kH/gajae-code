@@ -3904,9 +3904,9 @@ export class AgentSession {
 	#evalExecutionDisposing = false;
 
 	// Background-channel IRC exchanges queued while the recipient was streaming.
-	// Drained into history (via emitExternalEvent) once the recipient becomes idle.
+	// Drained into history (via emitExternalEvent) once the recipient becomes idle,
+	// or steered into the live run at its next tool boundary.
 	#pendingBackgroundExchanges: CustomMessage[][] = [];
-	#scheduledBackgroundExchangeFlush = false;
 	// Agent identity + registry for IRC relay forwarding to the main session UI.
 	#agentId: string | undefined;
 	#agentRegistry: AgentRegistry | undefined;
@@ -7719,6 +7719,10 @@ export class AgentSession {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
 		const terminalSdkOwnership =
 			event.type === "agent_end" ? this.#captureSdkContinuationOwnership(attemptScope) : undefined;
+		// A background exchange queued while this session was busy retries on every
+		// event: a live run accepts it as steer as soon as its stream is open, and
+		// an idle session appends it here once the turn is over.
+		this.#flushOrSchedulePendingBackgroundExchanges();
 
 		// These lifecycle boundaries can be delivered without awaiting this listener.
 		// Revoke streaming-edit cache generations before any admission, spill, or
@@ -27220,7 +27224,8 @@ export class AgentSession {
 	 * the reply is generated, both the incoming question and the auto-reply are
 	 * queued for injection into the recipient's persisted history so the model
 	 * sees the exchange on its next turn.  Injection happens immediately when the
-	 * session is idle, otherwise it is deferred until streaming ends.
+	 * session is idle; a busy session steers the exchange into the live run, which
+	 * commits it at its next tool boundary.
 	 */
 	async respondAsBackground(args: {
 		from: string;
@@ -27800,35 +27805,31 @@ export class AgentSession {
 		if (!options?.deferFlush) this.#flushOrSchedulePendingBackgroundExchanges();
 	}
 
+	/**
+	 * Deliver queued background exchanges.
+	 *
+	 * An idle session takes them immediately. A busy session steers them into the
+	 * live run instead of waiting for the turn to end: the loop commits steering
+	 * messages at its next tool boundary, while `isStreaming` stays true for the
+	 * whole of a goal-mode turn and used to defer every exchange to its very end.
+	 * Messages no live run can accept stay queued for the next agent event.
+	 */
 	#flushOrSchedulePendingBackgroundExchanges(): void {
+		if (this.#pendingBackgroundExchanges.length === 0 || this.#isDisposed) return;
 		if (!this.isStreaming) {
 			this.#flushPendingBackgroundExchanges();
 			return;
 		}
-		this.#scheduleBackgroundExchangeFlush();
-	}
-
-	#scheduleBackgroundExchangeFlush(): void {
-		if (this.#scheduledBackgroundExchangeFlush) return;
-		this.#scheduledBackgroundExchangeFlush = true;
-		const attempt = (): void => {
-			if (this.#pendingBackgroundExchanges.length === 0 || this.#isDisposed) {
-				this.#pendingBackgroundExchanges = [];
-				this.#scheduledBackgroundExchangeFlush = false;
-				return;
+		// `Agent.steer()` admits only into a live, non-aborted run whose stream is
+		// open; outside that window the batch keeps waiting for the next event.
+		if (!this.agent.state.isStreaming) return;
+		const remaining: CustomMessage[] = [];
+		for (const batch of this.#pendingBackgroundExchanges) {
+			for (const msg of batch) {
+				if (!this.agent.steer(msg).admitted) remaining.push(msg);
 			}
-			if (this.isStreaming) {
-				// Re-poll while streaming, but do not let this housekeeping timer
-				// keep the event loop alive on its own (CPU-7).
-				const pollTimer = setTimeout(attempt, 50);
-				pollTimer.unref?.();
-				return;
-			}
-			this.#scheduledBackgroundExchangeFlush = false;
-			this.#flushPendingBackgroundExchanges();
-		};
-		const kickoff = setTimeout(attempt, 0);
-		kickoff.unref?.();
+		}
+		this.#pendingBackgroundExchanges = remaining.length > 0 ? [remaining] : [];
 	}
 
 	#flushPendingBackgroundExchanges(): void {
