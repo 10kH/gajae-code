@@ -691,7 +691,7 @@ function readZipDirectory(bytes: Uint8Array): ZipDirectoryEntry[] {
 
 async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
 	const directoryEntries = readZipDirectory(bytes);
-	const { Inflate, Unzip, UnzipPassThrough } = await loadFflate();
+	const { Inflate } = await loadFflate();
 	// Unzip constructs custom decoders synchronously in file.start; the decoder captures this entry's budget.
 	let activeInflateBudget:
 		| {
@@ -734,86 +734,60 @@ async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
 	}
 	const entries: ArchiveIndexEntry[] = [];
 	let totalUncompressed = 0;
-	let entryCount = 0;
-	let limitError: ToolError | undefined;
-	const unzipper = new Unzip();
-	unzipper.register(CappedZipInflate);
-	unzipper.register(UnzipPassThrough);
-	const halt = (file: { terminate: () => void }, error: ToolError) => {
-		limitError = error;
-		file.terminate();
-	};
-	unzipper.onfile = file => {
-		if (limitError) return halt(file, limitError);
-		const expected = directoryEntries[entryCount];
-		entryCount += 1;
-		if (!expected || file.name !== expected.name || file.compression !== expected.compression) {
-			return halt(file, invalidZipArchive());
-		}
-		const declared = file.originalSize;
-		const normalizedPath = normalizeArchiveEntryPath(file.name);
-		if (entryCount > MAX_ARCHIVE_ENTRY_COUNT) return halt(file, archiveLimitError("count"));
-		if (typeof file.size === "number" && file.size !== expected.compressedSize) {
-			return halt(file, invalidZipArchive());
-		}
-		if (typeof declared === "number" && declared !== expected.uncompressedSize) {
-			return halt(file, invalidZipArchive());
-		}
-		if (archiveEntryDepth(file.name) > MAX_ARCHIVE_PATH_DEPTH)
-			return halt(file, archiveLimitError("depth", file.name));
-		if (typeof declared === "number" && declared > MAX_ARCHIVE_ENTRY_BYTES) {
-			return halt(file, archiveLimitError("entry", file.name));
-		}
-		if (typeof declared === "number" && totalUncompressed + declared > MAX_ARCHIVE_TOTAL_BYTES) {
-			return halt(file, archiveLimitError("total"));
-		}
-		if (!normalizedPath) return file.terminate();
-		const isDirectory = isArchiveDirectoryName(file.name);
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	for (const expected of directoryEntries) {
+		const normalizedPath = normalizeArchiveEntryPath(expected.name);
+		if (!normalizedPath) continue;
+		if (archiveEntryDepth(expected.name) > MAX_ARCHIVE_PATH_DEPTH) throw archiveLimitError("depth", expected.name);
+		const isDirectory = isArchiveDirectoryName(expected.name);
+		const nameLength = view.getUint16(expected.localOffset + 26, true);
+		const extraLength = view.getUint16(expected.localOffset + 28, true);
+		const dataStart = expected.localOffset + 30 + nameLength + extraLength;
+		const dataEnd = dataStart + expected.compressedSize;
+		if (dataEnd > bytes.byteLength) throw invalidZipArchive();
+		const compressed = bytes.subarray(dataStart, dataEnd);
 		const chunks: Uint8Array[] = [];
 		let entryBytes = 0;
-		file.ondata = (error, data, final) => {
-			if (limitError) return;
-			if (error) return halt(file, new ToolError(error.message));
-			const size = data?.byteLength ?? 0;
-			if (entryBytes + size > MAX_ARCHIVE_ENTRY_BYTES) return halt(file, archiveLimitError("entry", normalizedPath));
-			if (totalUncompressed + size > MAX_ARCHIVE_TOTAL_BYTES) return halt(file, archiveLimitError("total"));
-			entryBytes += size;
-			totalUncompressed += size;
-			if (size > 0 && !isDirectory && data) chunks.push(data);
-			if (!final) return;
-			if (entryBytes !== expected.uncompressedSize) return halt(file, invalidZipArchive());
-			entries.push({
-				path: normalizedPath,
-				isDirectory,
-				size: isDirectory ? 0 : entryBytes,
-				storage: isDirectory ? undefined : { type: "zip", bytes: concatBytes(chunks, entryBytes) },
-			});
+		let failed: ToolError | undefined;
+		const take = (data: Uint8Array, final: boolean) => {
+			if (failed) return;
+			const size = data.byteLength;
+			if (entryBytes + size > MAX_ARCHIVE_ENTRY_BYTES) failed = archiveLimitError("entry", normalizedPath);
+			else if (totalUncompressed + size > MAX_ARCHIVE_TOTAL_BYTES) failed = archiveLimitError("total");
+			else {
+				entryBytes += size;
+				totalUncompressed += size;
+				if (size > 0 && !isDirectory) chunks.push(data);
+			}
+			if (final && !failed && entryBytes !== expected.uncompressedSize) failed = invalidZipArchive();
 		};
-		activeInflateBudget = {
-			entryBytes: 0,
-			fileName: normalizedPath,
-		};
-		try {
-			file.start();
-		} catch (error) {
-			if (!limitError) limitError = new ToolError(error instanceof Error ? error.message : String(error));
-		} finally {
-			activeInflateBudget = undefined;
+		if (expected.compression === 0) take(compressed, true);
+		else if (expected.compression !== 8) throw invalidZipArchive();
+		else {
+			activeInflateBudget = { entryBytes: 0, fileName: normalizedPath };
+			const inflator = new CappedZipInflate();
+			inflator.ondata = (error, data, final) => {
+				if (error) failed = new ToolError(error.message);
+				else take(data ?? new Uint8Array(0), final);
+			};
+			try {
+				inflator.push(compressed, true);
+			} catch (error) {
+				if (!failed) failed = new ToolError(error instanceof Error ? error.message : String(error));
+			} finally {
+				activeInflateBudget = undefined;
+			}
 		}
-	};
-
-	try {
-		if (bytes.byteLength === 0) unzipper.push(bytes, true);
-		for (let offset = 0; offset < bytes.byteLength; offset += 512) {
-			if (limitError) break;
-			const end = Math.min(bytes.byteLength, offset + 512);
-			unzipper.push(bytes.subarray(offset, end), end === bytes.byteLength);
-		}
-	} catch (error) {
-		if (!limitError) limitError = new ToolError(error instanceof Error ? error.message : String(error));
+		if (failed) throw failed;
+		entries.push({
+			path: normalizedPath,
+			isDirectory,
+			size: isDirectory ? 0 : entryBytes,
+			storage: isDirectory
+				? undefined
+				: { type: "zip", bytes: expected.compression === 0 ? compressed : concatBytes(chunks, entryBytes) },
+		});
 	}
-	if (limitError) throw limitError;
-	if (entryCount !== directoryEntries.length) throw invalidZipArchive();
 	return [
 		...entries.reduce((map, entry) => map.set(entry.path, entry), new Map<string, ArchiveIndexEntry>()).values(),
 	];
