@@ -21,10 +21,26 @@ function ircRecords(messages: readonly AgentMessage[]): IrcRecord[] {
 	);
 }
 
+/**
+ * The question carried by an `irc:incoming` record. Inbound peer text is framed as
+ * untrusted data (`frameUntrustedIrcInbound`), so the payload is the JSON envelope
+ * on the last line; an unframed record keeps its bare last line.
+ */
+function incomingLabel(record: IrcRecord): string {
+	const lastLine = String(record.content).split("\n").at(-1) ?? "";
+	try {
+		const parsed = JSON.parse(lastLine) as { message?: unknown };
+		if (typeof parsed.message === "string") return parsed.message;
+	} catch {
+		// Not framed: the last line is the label itself.
+	}
+	return lastLine;
+}
+
 function incomingLabels(messages: readonly AgentMessage[]): string[] {
 	return ircRecords(messages)
 		.filter(record => record.customType === "irc:incoming")
-		.map(record => String(record.content).split("\n").at(-1) ?? "");
+		.map(record => incomingLabel(record));
 }
 
 const sessions: AgentSession[] = [];
@@ -353,7 +369,7 @@ describe("background IRC exchange delivery", () => {
 			for (let index = 0; index < committed.length; index++) {
 				const record = committed[index];
 				if (record?.customType !== "irc:incoming") continue;
-				const label = String(record.content).split("\n").at(-1) ?? "";
+				const label = incomingLabel(record);
 				if (!queuedPairs.has(label)) continue;
 				expect(committed[index + 1]?.customType).toBe("irc:autoreply");
 				index += 1;
@@ -363,7 +379,7 @@ describe("background IRC exchange delivery", () => {
 				for (let index = 0; index < request.length; index++) {
 					const record = request[index];
 					if (record?.role !== "custom" || record.customType !== "irc:incoming") continue;
-					const label = String(record.content).split("\n").at(-1) ?? "";
+					const label = incomingLabel(record as IrcRecord);
 					if (!queuedPairs.has(label)) continue;
 					const next = request[index + 1];
 					expect(next?.role === "custom" && next.customType === "irc:autoreply").toBe(true);
