@@ -4095,6 +4095,11 @@ export class Broker {
 		this.#ownedLockIncarnation = undefined;
 		this.#watchInFlight = false;
 		this.#checkpointInFlight = false;
+		// A restarted instance is a new generation: it holds none of the state the
+		// previous one stopped with, so the abandonment clock it armed (and any reap
+		// still unwinding) must not survive into the generation clients reconnect to.
+		this.#abandonedAt = null;
+		this.#abandonedReapInFlight = false;
 		this.#throwIfStartupAborted();
 		await Promise.all([this.ledger.assertSupportedStateVersions(), readBrokerDiscovery(this.settings.agentDir)]);
 		this.#throwIfStartupAborted();

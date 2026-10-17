@@ -104,6 +104,26 @@ test("a connected client keeps the broker running, and losing it lets the broker
 	expect(broker.terminalExit).toMatchObject({ reason: "abandoned" });
 }, 30_000);
 
+test("a restarted broker gets a full grace instead of the clock its last generation stopped with", async () => {
+	const graceMs = CADENCE_MS * 8;
+	const broker = await startBroker(graceMs);
+	// One maintenance tick arms the clock on an empty broker, and the stop lands
+	// well before that armed clock would have expired.
+	await Bun.sleep(CADENCE_MS * 2);
+	await broker.stop();
+	// Wait past the grace the first generation stopped with: an instance that
+	// carried its clock across the restart would complete on its first tick here.
+	await Bun.sleep(graceMs);
+	await broker.start();
+	if (await completedWithin(broker, CADENCE_MS * 4))
+		throw new Error("Restarted broker inherited the abandonment clock it stopped with.");
+	// The new generation still owns a clock of its own: it reaps itself once its
+	// own grace runs out, rather than never arming again.
+	if (!(await completedWithin(broker, graceMs + CADENCE_MS * 10)))
+		throw new Error("Restarted broker never armed its own abandonment clock.");
+	expect(broker.terminalExit).toMatchObject({ reason: "abandoned" });
+}, 30_000);
+
 test("a host whose pid was reused lets the broker exit", async () => {
 	const broker = await startBroker(CADENCE_MS * 3);
 	await registerHost(broker, "held-then-reused", process.pid);
