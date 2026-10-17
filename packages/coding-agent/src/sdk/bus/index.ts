@@ -1423,8 +1423,12 @@ interface SessionRuntime {
 		string,
 		{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
 	>;
-	/** Tool calls already announced as awaiting human input; one notification per call. */
-	awaitingInputNotified: Set<string>;
+	/**
+	 * Running tool calls that reported an awaiting-input signal, keyed by tool call
+	 * id. An entry stays undelivered while notifications are inactive or policy is
+	 * provisional, and is dropped when the call ends; one notification per call.
+	 */
+	awaitingInput: Map<string, { toolName: string; kind: AwaitingInputKind; delivered: boolean }>;
 	/** Cancels the postmortem cleanup that emits `session_closed` on process teardown. */
 	cancelPostmortemCleanup: () => void;
 	/** Disposes side-turn resources when their owning logical session becomes unavailable. */
@@ -1444,6 +1448,37 @@ function readAwaitingInput(partialResult: unknown): { kind: AwaitingInputKind } 
 	if (!signal || typeof signal !== "object") return undefined;
 	const kind = (signal as { kind?: unknown }).kind;
 	return kind === "browser_auth" || kind === "device_code" ? { kind } : undefined;
+}
+
+/**
+ * Deliver every undelivered awaiting-input notice once stable policy admits it.
+ * The notice describes the present ("a command is waiting now"), so it goes out
+ * on the live native leg only and never enters the replay ring: a client that
+ * reconnects after the command exited must not receive it. The native server
+ * still withholds it from connections without `awaiting_input_v1`.
+ */
+function deliverAwaitingInput(
+	runtime: Pick<SessionRuntime, "server" | "awaitingInput" | "notificationsActive" | "policySuspended">,
+	sessionId: string,
+): void {
+	if (!runtime.notificationsActive || runtime.policySuspended) return;
+	for (const [toolCallId, entry] of runtime.awaitingInput) {
+		if (entry.delivered) continue;
+		entry.delivered = true;
+		try {
+			runtime.server.pushFrame(
+				JSON.stringify({
+					type: "awaiting_input",
+					sessionId,
+					toolCallId,
+					toolName: entry.toolName,
+					kind: entry.kind,
+				}),
+			);
+		} catch (e) {
+			logger.warn(`notifications: awaiting_input failed: ${String(e)}`);
+		}
+	}
 }
 
 /** Stable projection of the tool-owned safe-display seam (never the full Tool surface). */
@@ -8367,7 +8402,7 @@ export function createNotificationsExtension(
 				string,
 				{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
 			>(),
-			awaitingInputNotified: new Set<string>(),
+			awaitingInput: new Map(),
 			deferredInboundControls: [],
 		};
 		const initializedRuntime = runtime;
@@ -9538,6 +9573,7 @@ export function createNotificationsExtension(
 			runtime.gatePresentations?.activateDeferred(runtime.workflowGatePublicationEpoch);
 			flushPendingFinal(runtime, runtime.id);
 			flushPendingSettled(runtime, runtime.id);
+			deliverAwaitingInput(runtime, runtime.id);
 			for (const processControl of runtime.deferredInboundControls.splice(0)) processControl();
 		},
 		reproveOwnership: async binding => {
@@ -10444,22 +10480,13 @@ export function createNotificationsExtension(
 		rt?.emitPromptEvent(event);
 		if (!rt) return;
 		const awaitingInput = readAwaitingInput(event.partialResult);
-		if (!awaitingInput || rt.awaitingInputNotified.has(event.toolCallId)) return;
-		rt.awaitingInputNotified.add(event.toolCallId);
+		if (!awaitingInput || rt.awaitingInput.has(event.toolCallId)) return;
 		// Notify-only and content-free (prompt kind only, never the URL or code), so
-		// it is delivered under redaction exactly like the idle marker.
-		if (!rt.notificationsActive || rt.policySuspended) return;
-		try {
-			pushSessionFrame(rt, {
-				type: "awaiting_input",
-				sessionId: id,
-				toolCallId: event.toolCallId,
-				toolName: event.toolName,
-				kind: awaitingInput.kind,
-			});
-		} catch (e) {
-			logger.warn(`notifications: awaiting_input failed: ${String(e)}`);
-		}
+		// it is delivered under redaction exactly like the idle marker. While policy
+		// is provisional it stays pending; activation delivers it if the call is
+		// still running.
+		rt.awaitingInput.set(event.toolCallId, { toolName: event.toolName, kind: awaitingInput.kind, delivered: false });
+		deliverAwaitingInput(rt, id);
 	});
 
 	api.on("tool_execution_end", (event, ctx) => {
@@ -10467,7 +10494,7 @@ export function createNotificationsExtension(
 		const rt = runtimes.get(id);
 		if (!rt) return;
 		rt.emitPromptEvent(event);
-		rt.awaitingInputNotified.delete(event.toolCallId);
+		rt.awaitingInput.delete(event.toolCallId);
 		const inFlight = rt.inFlightTools.get(event.toolCallId);
 		if (!inFlight) return;
 		if (!rt.notificationsActive) {

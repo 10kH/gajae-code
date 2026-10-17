@@ -5,7 +5,7 @@ import * as path from "node:path";
 import type { Settings } from "../src/config/settings";
 import { getNotificationConfig } from "../src/sdk/bus/config";
 import { createNotificationsExtension, projectToolSummary } from "../src/sdk/bus/index";
-import { NotificationSessionController } from "../src/sdk/bus/session-control";
+import { NotificationSessionController, type NotificationSessionRuntime } from "../src/sdk/bus/session-control";
 import type { EnsureDaemonResult } from "../src/sdk/bus/telegram-daemon";
 import { SessionSdkHost } from "../src/sdk/host";
 import { isolatedNotificationSettings } from "./helpers/notification-settings";
@@ -52,7 +52,13 @@ interface SetupOptions {
 async function setup(
 	tool: { safeSummary?: (kind: "args" | "result", value: unknown) => string } = {},
 	options: SetupOptions = {},
-): Promise<SetupResult & { settings?: Settings; controller?: NotificationSessionController }> {
+): Promise<
+	SetupResult & {
+		settings?: Settings;
+		controller?: NotificationSessionController;
+		runtime?: NotificationSessionRuntime;
+	}
+> {
 	const handlers = new Map<string, Handler>();
 	const api = {
 		on: (event: string, handler: Handler) => handlers.set(event, handler),
@@ -73,6 +79,14 @@ async function setup(
 					eligible: true,
 					getConfig: () => getNotificationConfig(settings),
 				});
+	let runtime: NotificationSessionRuntime | undefined;
+	if (controller) {
+		const attach = controller.attachRuntime.bind(controller);
+		controller.attachRuntime = attached => {
+			runtime = attached as unknown as NotificationSessionRuntime;
+			return attach(attached);
+		};
+	}
 	withTelegramOrchestrationProvenance(() =>
 		createNotificationsExtension(api, {
 			...(settings ? { settings, controller } : {}),
@@ -109,7 +123,7 @@ async function setup(
 	);
 	await sleep(50);
 	await sleep(250);
-	return { handlers, ctx, frames, ws, url, sessionId, token, settings, controller };
+	return { handlers, ctx, frames, ws, url, sessionId, token, settings, controller, runtime };
 }
 
 async function setConfig(
@@ -414,6 +428,113 @@ test("bash awaiting-input updates emit one content-free notice per call, also un
 			},
 		]);
 		expect(JSON.stringify(result.frames)).not.toContain("login.tailscale.com");
+	});
+}, 30000);
+
+function awaitingUpdate(result: SetupResult, toolCallId: string) {
+	return result.handlers.get("tool_execution_update")!(
+		{
+			type: "tool_execution_update",
+			toolCallId,
+			toolName: "bash",
+			args: {},
+			partialResult: { content: [], details: { awaitingInput: { kind: "browser_auth", detectedAt: 1 } } },
+		} as never,
+		result.ctx,
+	);
+}
+
+function toolEnd(result: SetupResult, toolCallId: string) {
+	return result.handlers.get("tool_execution_end")!(
+		{ type: "tool_execution_end", toolCallId, toolName: "bash", result: {}, isError: false } as never,
+		result.ctx,
+	);
+}
+
+test("awaiting_input is live-only: a client replaying after the command exits never receives it", async () => {
+	await withNotifications(async () => {
+		const result = await setup({}, { capabilities: ["tool_activity_v2", "awaiting_input_v1"] });
+		await awaitingUpdate(result, "auth-call");
+		await waitFor(() => awaitingFrames(result.frames).length === 1, "live awaiting_input frame");
+		await toolEnd(result, "auth-call");
+
+		const lateFrames: Frame[] = [];
+		const late = new WebSocket(`${result.url}/?token=${encodeURIComponent(result.token)}`);
+		sockets.push(late);
+		late.addEventListener("message", event => lateFrames.push(JSON.parse(String((event as MessageEvent).data))));
+		await new Promise<void>((resolve, reject) => {
+			late.addEventListener("open", () => resolve());
+			late.addEventListener("error", () => reject(new Error("websocket error")));
+		});
+		late.send(
+			JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: ["tool_activity_v2", "awaiting_input_v1"] }),
+		);
+		await sleep(50);
+		late.send(JSON.stringify({ type: "event_replay", id: "late", sinceSeq: 0 }));
+		result.ws.send(JSON.stringify({ type: "event_replay", id: "reconnect", sinceSeq: 0 }));
+		await waitFor(
+			() => lateFrames.some(frame => frame.type === "event_replay_result" && frame.id === "late"),
+			"late replay",
+		);
+		await waitFor(
+			() => result.frames.some(frame => frame.type === "event_replay_result" && frame.id === "reconnect"),
+			"reconnect replay",
+		);
+		for (const replay of [
+			lateFrames.find(frame => frame.id === "late")!,
+			result.frames.find(frame => frame.id === "reconnect")!,
+		]) {
+			expect((replay.events as Frame[]).map(event => event.kind)).not.toContain("awaiting_input");
+		}
+		expect(lateFrames.filter(frame => frame.type === "awaiting_input" || frame.kind === "awaiting_input")).toEqual(
+			[],
+		);
+		expect(result.frames.filter(frame => frame.kind === "awaiting_input")).toEqual([]);
+	});
+}, 30000);
+
+test("awaiting_input detected under provisional policy is delivered on activation only while the call runs", async () => {
+	await withNotifications(async () => {
+		const result = await setup(
+			{},
+			{
+				capabilities: ["tool_activity_v2", "awaiting_input_v1"],
+				settingsOverrides: {
+					"notifications.enabled": true,
+					"notifications.telegram.botToken": "123456:secret-token",
+					"notifications.telegram.chatId": "42",
+				},
+				ensureTelegramDaemon: async () => "attached",
+			},
+		);
+		if (!result.controller || !result.runtime?.refreshPolicy) throw new Error("Expected configured runtime.");
+		const binding = result.controller.bind(result.ctx as never);
+		try {
+			result.runtime.refreshPolicy(binding, { redact: true, verbosity: "lean", stream: false, mode: "provisional" });
+			await awaitingUpdate(result, "still-waiting");
+			await awaitingUpdate(result, "ended-while-suspended");
+			await toolEnd(result, "ended-while-suspended");
+			await sleep(200);
+			expect(awaitingFrames(result.frames)).toEqual([]);
+
+			await result.controller.reconcileCurrentSession(result.ctx as never);
+			await waitFor(() => awaitingFrames(result.frames).length === 1, "awaiting_input after activation");
+			// A later update for the same call and a second activation must not repeat it.
+			await awaitingUpdate(result, "still-waiting");
+			await result.controller.reconcileCurrentSession(result.ctx as never);
+			await sleep(200);
+			expect(awaitingFrames(result.frames)).toEqual([
+				{
+					type: "awaiting_input",
+					sessionId: result.sessionId,
+					toolCallId: "still-waiting",
+					toolName: "bash",
+					kind: "browser_auth",
+				},
+			]);
+		} finally {
+			binding.unbind();
+		}
 	});
 }, 30000);
 

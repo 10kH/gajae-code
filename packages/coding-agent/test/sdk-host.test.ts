@@ -21,7 +21,10 @@ describe("session SDK event stream", () => {
 });
 
 describe("SessionSdkHost", () => {
-	test("awaiting_input replay requires its own capability rather than tool activity or frame claims", async () => {
+	// The notifications bus delivers awaiting_input live-only and never retains it;
+	// this pins the host gate so a retained one could still not leak to clients
+	// that lack the dedicated capability.
+	test("a retained awaiting_input event requires its own capability rather than tool activity or frame claims", async () => {
 		let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
 		const sent: Array<{ connectionId: string; frame: Record<string, unknown> }> = [];
 		const host = new SessionSdkHost({
