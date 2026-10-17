@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import type { AgentToolResult } from "@gajae-code/agent-core";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { EditTool } from "@gajae-code/coding-agent/edit";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
@@ -192,10 +193,7 @@ it("still allows a patch rename onto an auto-generated file when the setting is 
 	expect(await Bun.file(path.join(tempDir, "product.ts")).exists()).toBe(false);
 });
 
-function applyPatchRenameAfterUpdate(
-	firstDiff: string,
-	moveTo: string,
-): Promise<Awaited<ReturnType<EditTool["execute"]>>> {
+function applyPatchRenameAfterUpdate(firstDiff: string, moveTo: string): Promise<AgentToolResult<unknown>> {
 	const tool = new EditTool(makeSession(tempDir, true), "apply_patch");
 	const input = [
 		"*** Begin Patch",
