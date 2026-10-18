@@ -13,7 +13,21 @@ import { SdkClient } from "../src/sdk/client/client";
 const HEARTBEAT_TTL_MS = 300;
 const CADENCE_MS = HEARTBEAT_TTL_MS / 3;
 /** A pid no platform running this suite can have handed out. */
-const ABSENT_PID = 999_999;
+/**
+ * A pid this machine is not using, verified rather than assumed: a fixed
+ * six-digit pid is not guaranteed absent on Linux, where the fixture would then
+ * be registered as live and the test would time out instead of reaping.
+ */
+function absentPid(): number {
+	for (let pid = 999_000; pid < 999_100; pid += 1) {
+		try {
+			process.kill(pid, 0);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") return pid;
+		}
+	}
+	throw new Error("Could not find an absent pid for the fixture.");
+}
 
 const brokers: Broker[] = [];
 const roots: string[] = [];
@@ -128,7 +142,7 @@ test("a registration whose host process died lets the broker exit", async () => 
 test("a registration with a dead pid and no recorded incarnation lets the broker exit", async () => {
 	const broker = await startBroker(CADENCE_MS * 3);
 	// The registration outlives its process exactly as a killed client leaves it.
-	await registerHost(broker, "killed-client", ABSENT_PID);
+	await registerHost(broker, "killed-client", absentPid());
 	if (!(await completedWithin(broker, 4_000))) throw new Error("Broker did not reap itself as abandoned.");
 	expect(broker.terminalExit).toMatchObject({ reason: "abandoned" });
 }, 20_000);
@@ -137,7 +151,7 @@ test("an undecided host reading pauses the clock instead of aging it", async () 
 	const graceMs = CADENCE_MS * 6;
 	const broker = await startBroker(graceMs);
 	// Confirmed absence arms the clock.
-	await registerHost(broker, "gone", ABSENT_PID);
+	await registerHost(broker, "gone", absentPid());
 	await Bun.sleep(CADENCE_MS * 2);
 	// A live pid carrying no recorded incarnation is undecided: the broker cannot tell
 	// whether that process is the host that registered, so it must not keep the armed

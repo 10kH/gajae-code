@@ -117,7 +117,7 @@ import {
 } from "./managed-task-dag";
 import { reconcileRunningManagedVerification, verifyManagedTaskAttempt } from "./managed-task-verification";
 import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
-import { isProcessIncarnation, processIncarnation } from "./process-incarnation";
+import { isProcessIncarnation, observeProcessIncarnation } from "./process-incarnation";
 import { sdkInternalRuntimeImage } from "./runtime";
 import {
 	type IndexedSession,
@@ -3693,10 +3693,9 @@ export class Broker {
 	 * What the index proves about the hosts using this agent directory. Liveness is
 	 * judged on read -- fresh checkpoint, live pid, matching incarnation -- so a host
 	 * that died without closing stops proving it without help. A row that is not live
-	 * is absence only once its process is provably gone: a live pid whose recorded
-	 * incarnation cannot be matched (because it is a legacy row, because the pid was
-	 * reused, or because the probe could not tell) is undecided, and an undecided
-	 * reading never concludes abandonment.
+	 * is absence only once the OS confirms the process is gone: an inconclusive
+	 * reading is never death proof on any platform, and a pid that still exists but
+	 * cannot be matched to the recorded incarnation leaves the host undecided.
 	 */
 	async #sessionHostLiveness(): Promise<"live" | "absent" | "unknown"> {
 		try {
@@ -3708,16 +3707,16 @@ export class Broker {
 		for (const row of this.index.listSessionIdentities()) {
 			if (row.endpointGeneration <= 0) continue;
 			if (row.live) return "live";
-			// A dead pid is proven gone. A live one still has to be ruled out as the
-			// host that registered: its incarnation decides, and reading it is only worth
-			// the probe once a recorded incarnation exists to compare against.
-			if (!isPidAlive(row.pid)) continue;
+			// The tri-state observer keeps positive absence separate from every
+			// inconclusive outcome, which is the difference between reaping a broker and
+			// killing one out from under a host this platform simply cannot confirm.
+			const observed = observeProcessIncarnation(row.pid);
+			if (observed.status === "unknown") return "unknown";
+			if (observed.status === "absent") continue;
 			const recorded = row.hostIncarnation ?? row.processIncarnation;
 			if (recorded === undefined) return "unknown";
-			const current = processIncarnation(row.pid);
-			if (current === undefined) return "unknown";
-			if (current === recorded) return "live";
-			// The pid belongs to another process now: the host that registered it is gone.
+			if (observed.incarnation === recorded) return "live";
+			// The pid names another process now: the host that registered it is gone.
 		}
 		return "absent";
 	}
