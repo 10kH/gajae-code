@@ -2760,6 +2760,7 @@ export interface AgentSessionProfileInstalledOverrideState {
 	manualModelRoles: ReadonlySet<string>;
 	manualAgentModelOverrides: ReadonlySet<string>;
 	configuredAgentModelOverrides: ReadonlySet<string>;
+	configuredDefaultChain?: readonly string[];
 	preProfileModel: Model | undefined;
 }
 
@@ -2931,6 +2932,7 @@ export class AgentSession {
 	#scopedModels: ScopedModelSelection[];
 	#thinkingLevel: ThinkingLevel | undefined;
 	#activeModelProfile: string | undefined;
+	#activatedModelProfile: string | undefined;
 	#unavailableModelProfile: string | undefined;
 	#activeProfileInstalledRoles = new Map<string, ModelSelectorValue | undefined>();
 	#activeProfileInstalledAgentOverrides = new Map<string, ModelSelectorValue | undefined>();
@@ -3803,6 +3805,7 @@ export class AgentSession {
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
 	#defaultFallbackController: FallbackChainController | undefined;
+	#activeProfileConfiguredDefaultChain: readonly string[] | undefined;
 	#startupRecoveryBindingsRequired = false;
 	#fallbackTransitionGeneration = 0;
 	/** Managed escaped-non-ASCII retries issued for the current logical run. Bounded so a deterministic escaper cannot loop forever through un-charged fallback retries. */
@@ -4125,6 +4128,12 @@ export class AgentSession {
 	#selectedDiscoveredToolNames = new Set<string>();
 	#baselineDiscoveredBuiltinToolNames = new Set<string>();
 	#discoverableToolAllowedNames: ReadonlySet<string> | undefined;
+	/**
+	 * Tracks tools activated in-history (for cache-prefix stability).
+	 * These tools are mentioned in a developer message but not in the request tools array.
+	 * This preserves the provider's prompt cache prefix mid-session.
+	 */
+	#toolsActivatedInHistory = new Set<string>();
 	#gjcSubskillToolNames = new Set<string>();
 	#gjcSubskillToolSignature: string | undefined;
 	#defaultSelectedMCPServerNames = new Set<string>();
@@ -12249,11 +12258,72 @@ export class AgentSession {
 			}
 		}
 		if (activated.length > 0) {
-			await this.#applyActiveToolsByName(nextActiveToolNames, {
-				previousSelectedMCPToolNames,
-				previousSelectedDiscoveredBuiltinToolNames,
-				nextSelectedDiscoveredBuiltinToolNames: [...nextSelectedDiscoveredBuiltinToolNames],
-			});
+			// Check if this is mid-session (cache-prefix-stable mode)
+			const isMidSession = this.agent.state.messages.length > 0;
+
+			if (isMidSession) {
+				// Cache-prefix-stable activation: append message instead of rebuilding
+				// This preserves the provider's prompt cache prefix (tools + system + messages)
+				const toolMetadata = activated
+					.map(name => this.#toolRegistry.get(name))
+					.filter((tool): tool is AgentTool => tool != null)
+					.map(tool => ({
+						name: tool.name,
+						label: tool.label,
+						description: tool.description,
+						parameters: tool.parameters,
+					}));
+
+				// Mark tools as activated in history
+				for (const name of activated) {
+					this.#toolsActivatedInHistory.add(name);
+				}
+
+				// Append metadata message to history
+				const metadataMessage = `The following tools have been discovered and activated:\n\n${
+					toolMetadata
+						.map(tool => JSON.stringify(tool))
+						.join(",\n")
+				}\n\nYou can invoke these by name.`;
+
+				this.agent.appendMessage({
+					role: "developer",
+					content: [{ type: "text", text: metadataMessage }],
+					attribution: "agent",
+				});
+
+				// Update selected tools in state
+				this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
+				// Also update MCP selections for any MCP tools that were activated
+				const nextSelectedMCPToolNames = new Set(previousSelectedMCPToolNames);
+				for (const name of activated) {
+					if (this.#discoverableMCPTools.has(name)) {
+						nextSelectedMCPToolNames.add(name);
+					}
+				}
+				this.#selectedMCPToolNames = nextSelectedMCPToolNames;
+
+				// Add tools to the active tools list (for tracking) but skip system prompt rebuild
+				// This preserves the system prompt portion of the cache prefix
+				const activeTools = nextActiveToolNames
+					.map(name => this.#toolRegistry.get(name))
+					.filter((tool): tool is AgentTool => tool != null);
+				this.#setGuardedAgentTools(activeTools);
+				this.#invalidateDiscoveryCaches();
+
+				// Persist the selection
+				this.#persistSelectedMCPToolNamesIfChanged(
+					Array.from(previousSelectedMCPToolNames),
+					previousSelectedDiscoveredBuiltinToolNames,
+				);
+			} else {
+				// Initial activation: use traditional approach
+				await this.#applyActiveToolsByName(nextActiveToolNames, {
+					previousSelectedMCPToolNames,
+					previousSelectedDiscoveredBuiltinToolNames,
+					nextSelectedDiscoveredBuiltinToolNames: [...nextSelectedDiscoveredBuiltinToolNames],
+				});
+			}
 		}
 		return activated;
 	}
@@ -18395,9 +18465,10 @@ export class AgentSession {
 		// The successor session must not inherit the predecessor's profile marker
 		// or its runtime role overrides; a durable `modelProfile.default` is
 		// reapplied by the startup policy on a fresh launch instead.
+		const activeProfile = this.getActiveModelProfile();
 		const droppingSessionOnlyProfile =
-			this.getActiveModelProfile() !== undefined &&
-			this.settings.get("modelProfile.default") !== this.getActiveModelProfile();
+			activeProfile !== undefined &&
+			!this.#modelProfileNamesMatch(this.settings.get("modelProfile.default"), activeProfile);
 		const preProfileModel = this.#preProfileModel;
 		this.#resetSessionScopedModelProfileState();
 		// A dropped session-only profile must not leak its concrete model into
@@ -18757,12 +18828,14 @@ export class AgentSession {
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
-	setActiveModelProfile(name: string | undefined): void {
+	/** History may restore the identity without proving this process activated the profile. */
+	setActiveModelProfile(name: string | undefined, activatedByThisProcess = false): void {
 		if (name !== this.#activeModelProfile) {
 			this.#activeProfileManualModelRoles.clear();
 			this.#activeProfileManualAgentModelOverrides.clear();
 		}
 		this.#activeModelProfile = name;
+		this.#activatedModelProfile = activatedByThisProcess ? name : undefined;
 		if (name !== undefined) {
 			this.#unavailableModelProfile = undefined;
 		}
@@ -18776,6 +18849,11 @@ export class AgentSession {
 
 	getActiveModelProfile(): string | undefined {
 		return this.#activeModelProfile;
+	}
+
+	/** A restored profile identity is not eligible for role-only materialization until activation succeeds. */
+	getActivatedModelProfile(): string | undefined {
+		return this.#activatedModelProfile === this.#activeModelProfile ? this.#activeModelProfile : undefined;
 	}
 
 	setUnavailableModelProfile(name: string | undefined): void {
@@ -19473,9 +19551,19 @@ export class AgentSession {
 	 * configured `modelBindings` (also installed into these two override slots
 	 * once at startup) are not profile-owned and must survive the transition.
 	 */
+	#modelProfileNamesMatch(left: string | undefined, right: string | undefined): boolean {
+		if (left === undefined || right === undefined) return left === right;
+		const profiles = this.#modelRegistry.getModelProfiles?.() ?? new Map<string, unknown>();
+		return resolveModelProfileName(left, profiles) === resolveModelProfileName(right, profiles);
+	}
+
 	#resetSessionScopedModelProfileState(options?: { preserveDefaultConfiguredChain?: boolean; force?: boolean }): void {
 		const persistedProfile = this.settings.get("modelProfile.default");
-		if (!options?.force && persistedProfile !== undefined && persistedProfile === this.getActiveModelProfile())
+		if (
+			!options?.force &&
+			persistedProfile !== undefined &&
+			this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile())
+		)
 			return;
 		const hadInstalledKeys =
 			this.#activeProfileInstalledRoles.size > 0 || this.#activeProfileInstalledAgentOverrides.size > 0;
@@ -19524,6 +19612,7 @@ export class AgentSession {
 			this.setConfiguredModelChain("default", [], "user-selection");
 		}
 		this.setActiveModelProfile(undefined);
+		this.#activeProfileConfiguredDefaultChain = undefined;
 		this.#preProfileModel = undefined;
 	}
 
@@ -19541,6 +19630,7 @@ export class AgentSession {
 			agentModelOverrides: Readonly<Record<string, ModelSelectorValue>>;
 		},
 		manual?: { modelRoles: readonly string[]; agentModelOverrides: readonly string[] },
+		configuredDefaultChain?: readonly string[],
 	): void {
 		const bindings = this.#modelRegistry.getConfiguredModelBindings?.();
 		if (this.#preProfileModel === undefined) this.#preProfileModel = preProfileModel;
@@ -19597,6 +19687,16 @@ export class AgentSession {
 		}
 		this.#activeProfileManualModelRoles = new Set(manual?.modelRoles ?? []);
 		this.#activeProfileManualAgentModelOverrides = new Set(manual?.agentModelOverrides ?? []);
+		const activeDefaultChain = this.getConfiguredModelChainState("default");
+		const effectiveDefaultChain =
+			configuredDefaultChain ??
+			(activeDefaultChain?.origin === "profile-activation" &&
+			activeDefaultChain.identity === this.getActiveModelProfile()
+				? activeDefaultChain.entries
+				: undefined);
+		this.#activeProfileConfiguredDefaultChain = effectiveDefaultChain?.length
+			? [...effectiveDefaultChain]
+			: undefined;
 	}
 
 	getProfileInstalledOverrideState(): AgentSessionProfileInstalledOverrideState {
@@ -19608,6 +19708,9 @@ export class AgentSession {
 			manualModelRoles: new Set(this.#activeProfileManualModelRoles),
 			manualAgentModelOverrides: new Set(this.#activeProfileManualAgentModelOverrides),
 			configuredAgentModelOverrides: new Set(this.#activeProfileConfiguredAgentModelOverrides),
+			configuredDefaultChain: this.#activeProfileConfiguredDefaultChain
+				? [...this.#activeProfileConfiguredDefaultChain]
+				: undefined,
 			preProfileModel: this.#preProfileModel,
 		};
 	}
@@ -19620,6 +19723,9 @@ export class AgentSession {
 		this.#activeProfileManualModelRoles = new Set(state.manualModelRoles);
 		this.#activeProfileManualAgentModelOverrides = new Set(state.manualAgentModelOverrides);
 		this.#activeProfileConfiguredAgentModelOverrides = new Set(state.configuredAgentModelOverrides);
+		this.#activeProfileConfiguredDefaultChain = state.configuredDefaultChain
+			? [...state.configuredDefaultChain]
+			: undefined;
 		this.#preProfileModel = state.preProfileModel;
 	}
 
@@ -19632,6 +19738,7 @@ export class AgentSession {
 		this.#activeProfileManualModelRoles.clear();
 		this.#activeProfileManualAgentModelOverrides.clear();
 		this.#activeProfileConfiguredAgentModelOverrides.clear();
+		this.#activeProfileConfiguredDefaultChain = undefined;
 	}
 
 	/** Current profile-installed override keys, for deriving the activation base. */
@@ -19672,7 +19779,8 @@ export class AgentSession {
 	materializeActiveDefaultModelProfileAssignment(model: Model): boolean {
 		// A merged read could let a project-scoped value authorize durable global writes.
 		const persistedProfile = this.settings.getGlobal("modelProfile.default");
-		if (persistedProfile === undefined || persistedProfile !== this.getActiveModelProfile()) return false;
+		if (persistedProfile === undefined || !this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile()))
+			return false;
 		return materializeActiveModelProfileAssignment({
 			session: this,
 			settings: this.settings,
@@ -19734,12 +19842,12 @@ export class AgentSession {
 	/**
 	 * Clear the active-profile marker after a successful concrete
 	 * materialization that persists as the session default with a
-	 * user-selection or startup-override cause. Internal temporary/fallback/
+	 * user-selection cause. Internal temporary/fallback/
 	 * restore/rollback switches and the activation transaction itself (cause
 	 * `profile-activation`) never clear the marker.
 	 */
 	#clearActiveModelProfileForConcreteDefault(cause: ModelChangeCause | undefined): void {
-		if (cause !== "user-selection" && cause !== "startup-override") return;
+		if (cause !== "user-selection") return;
 		// A persisted default profile is replaced by materializing its effective
 		// assignments into the durable layer first. A session-only marker is
 		// dropped together with the runtime role overrides the profile activation
@@ -19752,7 +19860,7 @@ export class AgentSession {
 		// marker is superseded: the concrete selection is now the durable
 		// default, so the next launch must not reapply the stale profile.
 		const persistedProfile = this.settings.get("modelProfile.default");
-		if (persistedProfile !== undefined && persistedProfile !== this.getActiveModelProfile()) {
+		if (persistedProfile !== undefined && !this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile())) {
 			this.settings.unset("modelProfile.default");
 			this.settings.clearOverride("modelProfile.default");
 		}
@@ -19768,7 +19876,7 @@ export class AgentSession {
 	 */
 	clearSessionOnlyModelProfileState(): void {
 		const persistedProfile = this.settings.get("modelProfile.default");
-		if (persistedProfile !== undefined && persistedProfile !== this.getActiveModelProfile()) {
+		if (persistedProfile !== undefined && !this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile())) {
 			this.settings.unset("modelProfile.default");
 			this.settings.clearOverride("modelProfile.default");
 		}
@@ -20023,7 +20131,9 @@ export class AgentSession {
 				`${model.provider}/${model.id}`,
 				options?.persistAsSessionDefault ? "default" : "temporary",
 			);
-			this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+			if (options?.cause !== "startup-override") {
+				this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+			}
 			if (options?.persistAsSessionDefault) {
 				this.#seedSessionCanonicalVariant(model);
 				if (options.cause === "user-selection") this.#recordUserCanonicalVariantSelection();
@@ -20033,16 +20143,17 @@ export class AgentSession {
 			// configured defaultLevel; otherwise re-clamp the current level.
 			this.setThinkingLevel(thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
 			if (options?.persistAsSessionDefault === true && options.cause !== "profile-activation") {
-				// Concrete model selection clears session-scoped profile state (#5919).
-				// Materialize durable profiles first (if persisted and active), then reset
-				// without force to preserve durable semantics.
-				if (this.model && this.settings.get("modelProfile.default") !== undefined) {
-					this.materializeActiveDefaultModelProfileAssignment(this.model);
+				// Concrete user selections clear session-scoped profile state (#5919).
+				// Startup overrides still reset session-only profiles, but never turn
+				// the run-scoped model into a durable profile materialization.
+				if (options.cause !== "startup-override") {
+					if (this.model && this.settings.get("modelProfile.default") !== undefined) {
+						this.materializeActiveDefaultModelProfileAssignment(this.model);
+					}
 				}
 				this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
-				// For user-selection and startup-override causes, also clear stale persisted
-				// defaults via the legacy path when there is no ownership record.
-				if (options.cause === "user-selection" || options.cause === "startup-override") {
+				// Legacy profile ownership has no durable ownership record to validate.
+				if (options.cause === "user-selection") {
 					const ownership = readDurableModelProfileOwnership(this.settings);
 					if (ownership.version === 0) {
 						this.#clearActiveModelProfileForConcreteDefault(options.cause);
@@ -20053,7 +20164,7 @@ export class AgentSession {
 				this.setConfiguredModelChain(
 					"default",
 					[formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel)],
-				origin,
+					origin,
 				);
 			}
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
@@ -28212,7 +28323,9 @@ export class AgentSession {
 						? settingsDefaultEntries
 						: (configuredDefaultChain?.entries ??
 							(sessionContext.models.default ? [sessionContext.models.default] : []));
-				this.setActiveModelProfile(targetActiveModelProfile);
+				const targetProfileWasActivated =
+					targetProfileRuntimeInstalled && this.getActivatedModelProfile() === targetActiveModelProfile;
+				this.setActiveModelProfile(targetActiveModelProfile, targetProfileWasActivated);
 				this.#defaultFallbackController = undefined;
 				if (defaultEntries.length > 0) {
 					const resolution = await resolveModelChainWithAuth(
