@@ -369,6 +369,18 @@ describe("kitty transmit/placement split (dedup on repaint)", () => {
 		expect(chunks.at(-1)).toContain("m=0");
 	});
 
+	it("keeps every chunked transmit escape inside the kitty 4096-byte cap", () => {
+		const payload = "A".repeat(9000);
+		const chunks = encodeKittyTransmit(payload, 42).split("\x1b\\").filter(Boolean);
+		expect(chunks.length).toBeGreaterThan(1);
+		// +2 for the `\x1b\\` terminator removed by the split.
+		for (const chunk of chunks) expect(chunk.length + 2).toBeLessThanOrEqual(4096);
+		// Kitty requires every chunk except the last to be a multiple of 4 bytes.
+		const data = chunks.map(chunk => chunk.slice(chunk.indexOf(";") + 1));
+		for (const chunk of data.slice(0, -1)) expect(chunk.length % 4).toBe(0);
+		expect(data.join("")).toBe(payload);
+	});
+
 	it("retries Kitty pixel transmission after the writer rejects the first attempt", () => {
 		let attempts = 0;
 		setKittyTransmitWriter(() => {
