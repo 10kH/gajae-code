@@ -1008,6 +1008,8 @@ export interface AgentSessionConfig {
 	workflowGatePublication?: "endpoint" | "local";
 	/** Tool registry for LSP and settings */
 	toolRegistry?: Map<string, AgentTool>;
+	/** Publish committed active tool names to tool execution contexts. */
+	onToolNamesChanged?: (toolNames: string[]) => void;
 	/**
 	 * Tool objects this session's builder constructed from built-in descriptors, captured
 	 * before any extension, MCP, or dynamically registered tool could claim their registry
@@ -4067,6 +4069,7 @@ export class AgentSession {
 
 	// Tool registry and prompt builder for extensions
 	#toolRegistry: Map<string, AgentTool>;
+	#onToolNamesChanged: ((toolNames: string[]) => void) | undefined;
 	/**
 	 * Session-owned provenance for tool OBJECTS built from a built-in descriptor.
 	 *
@@ -4126,14 +4129,14 @@ export class AgentSession {
 	// Generic tool discovery (covers built-in + MCP + extension when tools.discoveryMode === "all")
 	#discoverableToolSearchIndex: DiscoverableToolSearchIndex | null = null;
 	#selectedDiscoveredToolNames = new Set<string>();
+	#discoveredToolActivationChain: Promise<void> = Promise.resolve();
+	/** Changes whenever the installed active tool list changes. */
+	#activeToolSelectionRevision = 0;
+	/** Explicit caller selections supersede any older pending discovery activation. */
+	#explicitActiveToolSelectionGeneration = 0;
+	#mcpCatalogGeneration = 0;
 	#baselineDiscoveredBuiltinToolNames = new Set<string>();
 	#discoverableToolAllowedNames: ReadonlySet<string> | undefined;
-	/**
-	 * Tracks tools activated in-history (for cache-prefix stability).
-	 * These tools are mentioned in a developer message but not in the request tools array.
-	 * This preserves the provider's prompt cache prefix mid-session.
-	 */
-	#toolsActivatedInHistory = new Set<string>();
 	#gjcSubskillToolNames = new Set<string>();
 	#gjcSubskillToolSignature: string | undefined;
 	#defaultSelectedMCPServerNames = new Set<string>();
@@ -4442,8 +4445,9 @@ export class AgentSession {
 	 * exposes an unowned history rewrite.
 	 */
 	#sessionTransitionKind: string | undefined;
-	// Detects transitions that begin and finish while an async preflight is staging.
+	// Detects transitions that commit while an async preflight is staging.
 	#sessionTransitionGeneration = 0;
+	#sessionTransitionCommitted = false;
 	#sessionTransitionCompletion: Promise<void> = Promise.resolve();
 	#resolveSessionTransitionCompletion: (() => void) | undefined;
 	#queuedDeliveryPendingWhileTransition = false;
@@ -4526,13 +4530,27 @@ export class AgentSession {
 		if (["new-session", "switch-session", "clear-context", "fork", "branch", "navigate-tree"].includes(kind)) {
 			for (const controller of this.#configurationReloadControllers) controller.abort();
 		}
-		this.#sessionTransitionGeneration += 1;
+		this.#sessionTransitionCommitted = false;
 		this.#sessionTransitionKind = kind;
 		const completion = Promise.withResolvers<void>();
 		this.#sessionTransitionCompletion = completion.promise;
 		this.#resolveSessionTransitionCompletion = completion.resolve;
 		this.#coordinatorPersistGeneration += 1;
 		this.#wakeFollowUpReservationTransitionWaiters();
+	}
+
+	#commitSessionTransition(): void {
+		if (this.#sessionTransitionCommitted) return;
+		this.#sessionTransitionCommitted = true;
+		this.#sessionTransitionGeneration += 1;
+		this.#discoveredToolActivationChain = Promise.resolve();
+	}
+
+	#commitCatalogPreservingTransition(): void {
+		// Compaction commits a history rewrite without changing session identity or
+		// the active tool catalog. Pending discovery activations wait for the lease
+		// to end and then apply to that same catalog.
+		this.#sessionTransitionCommitted = true;
 	}
 
 	async #waitForSessionTransitionEnd(signal: AbortSignal): Promise<void> {
@@ -4561,6 +4579,7 @@ export class AgentSession {
 
 	#endSessionTransition(): void {
 		this.#sessionTransitionKind = undefined;
+		this.#sessionTransitionCommitted = false;
 		const resolveCompletion = this.#resolveSessionTransitionCompletion;
 		this.#resolveSessionTransitionCompletion = undefined;
 		this.#sessionTransitionCompletion = Promise.resolve();
@@ -5865,6 +5884,7 @@ export class AgentSession {
 			this.#providerSessionState = config.providerSessionState;
 		}
 		this.#toolRegistry = config.toolRegistry ?? new Map();
+		this.#onToolNamesChanged = config.onToolNamesChanged;
 		this.#builtinToolIdentities = new WeakSet(config.builtinToolIdentities ?? []);
 		this.#workflowGateToolSession = config.workflowGateToolSession;
 		this.#requestedToolNames = config.requestedToolNames;
@@ -11580,6 +11600,7 @@ export class AgentSession {
 
 	#setDiscoverableMCPTools(discoverableMCPTools: Map<string, DiscoverableTool>): void {
 		this.#discoverableMCPTools = discoverableMCPTools;
+		this.#mcpCatalogGeneration += 1;
 		this.#invalidateDiscoveryCaches();
 	}
 
@@ -12012,6 +12033,7 @@ export class AgentSession {
 				} else if (action === "resume") {
 					this.#exactMcpSuspendedTools.delete(name);
 				}
+				this.#commitSessionTransition();
 				return { action, ...result };
 			} catch (error) {
 				this.#restoreExactMcpSessionState(snapshot);
@@ -12042,11 +12064,13 @@ export class AgentSession {
 		this.#toolRegistry.clear();
 		for (const [name, tool] of snapshot.toolRegistry) this.#toolRegistry.set(name, tool);
 		this.#discoverableMCPTools = snapshot.discoverableMCPTools;
+		this.#mcpCatalogGeneration += 1;
 		this.#selectedMCPToolNames = snapshot.selectedMCPToolNames;
 		this.#selectedDiscoveredToolNames = snapshot.selectedDiscoveredToolNames;
 		// These are the already-prepared predecessor objects from agent.state;
 		// re-preparing them would stack execution guards and break identity.
 		this.agent.setTools(snapshot.tools);
+		this.#onToolNamesChanged?.(snapshot.tools.map(tool => tool.name));
 		this.#baseSystemPrompt = snapshot.baseSystemPrompt;
 		this.agent.setSystemPrompt(snapshot.systemPrompt);
 		this.#lastAppliedToolSignature = snapshot.lastAppliedToolSignature;
@@ -12232,100 +12256,101 @@ export class AgentSession {
 		return [...new Set([...mcpSelected, ...this.#getSelectedDiscoveredBuiltinToolNames()])];
 	}
 
-	async activateDiscoveredTools(toolNames: string[]): Promise<string[]> {
-		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
-		const previousSelectedDiscoveredBuiltinToolNames = this.#getSelectedDiscoveredBuiltinToolNames();
-		const nextActiveToolNames = this.getActiveToolNames();
-		const nextActiveNameSet = new Set(nextActiveToolNames);
-		const nextSelectedDiscoveredBuiltinToolNames = new Set(this.#selectedDiscoveredToolNames);
-		const activated: string[] = [];
-		for (const name of new Set(toolNames)) {
-			if (this.#discoverableMCPTools.has(name) && this.#toolRegistry.has(name)) {
-				if (!nextActiveNameSet.has(name)) {
+	activateDiscoveredTools(toolNames: string[]): Promise<string[]> {
+		const requestedToolNames = [...toolNames];
+		const sessionTransitionGeneration = this.#sessionTransitionGeneration;
+		const explicitActiveToolSelectionGeneration = this.#explicitActiveToolSelectionGeneration;
+		const activation = this.#discoveredToolActivationChain.then(async () => {
+			while (this.#sessionTransitionKind !== undefined) {
+				await this.#waitForSessionTransitionEnd(this.#disposeAbortController.signal);
+			}
+			if (
+				sessionTransitionGeneration !== this.#sessionTransitionGeneration ||
+				explicitActiveToolSelectionGeneration !== this.#explicitActiveToolSelectionGeneration
+			)
+				return [];
+			return this.#activateDiscoveredTools(
+				requestedToolNames,
+				sessionTransitionGeneration,
+				explicitActiveToolSelectionGeneration,
+			);
+		});
+		this.#discoveredToolActivationChain = activation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return activation;
+	}
+
+	async #activateDiscoveredTools(
+		toolNames: string[],
+		sessionTransitionGeneration: number,
+		explicitActiveToolSelectionGeneration: number,
+	): Promise<string[]> {
+		while (true) {
+			if (
+				sessionTransitionGeneration !== this.#sessionTransitionGeneration ||
+				explicitActiveToolSelectionGeneration !== this.#explicitActiveToolSelectionGeneration
+			)
+				return [];
+			const activeToolSelectionRevision = this.#activeToolSelectionRevision;
+			const mcpCatalogGeneration = this.#mcpCatalogGeneration;
+			const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
+			const previousSelectedDiscoveredBuiltinToolNames = this.#getSelectedDiscoveredBuiltinToolNames();
+			const nextActiveToolNames = this.getActiveToolNames();
+			const nextActiveNameSet = new Set(nextActiveToolNames);
+			const nextSelectedDiscoveredBuiltinToolNames = new Set(this.#selectedDiscoveredToolNames);
+			const activated: string[] = [];
+			for (const name of new Set(toolNames)) {
+				if (this.#discoverableMCPTools.has(name) && this.#toolRegistry.has(name)) {
+					if (!nextActiveNameSet.has(name)) {
+						nextActiveToolNames.push(name);
+						nextActiveNameSet.add(name);
+						activated.push(name);
+					}
+					continue;
+				}
+				if (this.#discoverableToolAllowedNames && !this.#discoverableToolAllowedNames.has(name)) continue;
+				const tool = this.#toolRegistry.get(name);
+				if (tool?.loadMode === "discoverable" && !nextActiveNameSet.has(name)) {
 					nextActiveToolNames.push(name);
 					nextActiveNameSet.add(name);
+					nextSelectedDiscoveredBuiltinToolNames.add(name);
 					activated.push(name);
 				}
-				continue;
 			}
-			if (this.#discoverableToolAllowedNames && !this.#discoverableToolAllowedNames.has(name)) continue;
-			const tool = this.#toolRegistry.get(name);
-			if (tool?.loadMode === "discoverable" && !nextActiveNameSet.has(name)) {
-				nextActiveToolNames.push(name);
-				nextActiveNameSet.add(name);
-				nextSelectedDiscoveredBuiltinToolNames.add(name);
-				activated.push(name);
-			}
-		}
-		if (activated.length > 0) {
-			// Check if this is mid-session (cache-prefix-stable mode)
-			const isMidSession = this.agent.state.messages.length > 0;
-
-			if (isMidSession) {
-				// Cache-prefix-stable activation: append message instead of rebuilding
-				// This preserves the provider's prompt cache prefix (tools + system + messages)
-				const toolMetadata = activated
-					.map(name => this.#toolRegistry.get(name))
-					.filter((tool): tool is AgentTool => tool != null)
-					.map(tool => ({
-						name: tool.name,
-						label: tool.label,
-						description: tool.description,
-						parameters: tool.parameters,
-					}));
-
-				// Mark tools as activated in history
-				for (const name of activated) {
-					this.#toolsActivatedInHistory.add(name);
-				}
-
-				// Append metadata message to history
-				const metadataMessage = `The following tools have been discovered and activated:\n\n${
-					toolMetadata
-						.map(tool => JSON.stringify(tool))
-						.join(",\n")
-				}\n\nYou can invoke these by name.`;
-
-				this.agent.appendMessage({
-					role: "developer",
-					content: [{ type: "text", text: metadataMessage }],
-					attribution: "agent",
-				});
-
-				// Update selected tools in state
-				this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
-				// Also update MCP selections for any MCP tools that were activated
-				const nextSelectedMCPToolNames = new Set(previousSelectedMCPToolNames);
-				for (const name of activated) {
-					if (this.#discoverableMCPTools.has(name)) {
-						nextSelectedMCPToolNames.add(name);
-					}
-				}
-				this.#selectedMCPToolNames = nextSelectedMCPToolNames;
-
-				// Add tools to the active tools list (for tracking) but skip system prompt rebuild
-				// This preserves the system prompt portion of the cache prefix
-				const activeTools = nextActiveToolNames
-					.map(name => this.#toolRegistry.get(name))
-					.filter((tool): tool is AgentTool => tool != null);
-				this.#setGuardedAgentTools(activeTools);
-				this.#invalidateDiscoveryCaches();
-
-				// Persist the selection
-				this.#persistSelectedMCPToolNamesIfChanged(
-					Array.from(previousSelectedMCPToolNames),
-					previousSelectedDiscoveredBuiltinToolNames,
-				);
-			} else {
-				// Initial activation: use traditional approach
-				await this.#applyActiveToolsByName(nextActiveToolNames, {
+			const candidateToolEntries = nextActiveToolNames.map(name => this.#toolRegistry.get(name));
+			if (activated.length > 0) {
+				const appliedRevision = await this.#applyActiveToolsByName(nextActiveToolNames, {
 					previousSelectedMCPToolNames,
 					previousSelectedDiscoveredBuiltinToolNames,
 					nextSelectedDiscoveredBuiltinToolNames: [...nextSelectedDiscoveredBuiltinToolNames],
+					sessionTransitionGeneration,
+					expectedActiveToolSelectionRevision: activeToolSelectionRevision,
+					explicitActiveToolSelectionGeneration,
 				});
+				if (appliedRevision === undefined || appliedRevision !== this.#activeToolSelectionRevision) {
+					if (
+						sessionTransitionGeneration !== this.#sessionTransitionGeneration ||
+						explicitActiveToolSelectionGeneration !== this.#explicitActiveToolSelectionGeneration
+					)
+						return [];
+					continue;
+				}
 			}
+			if (
+				sessionTransitionGeneration !== this.#sessionTransitionGeneration ||
+				explicitActiveToolSelectionGeneration !== this.#explicitActiveToolSelectionGeneration
+			)
+				return [];
+			if (
+				mcpCatalogGeneration !== this.#mcpCatalogGeneration ||
+				nextActiveToolNames.some((name, index) => this.#toolRegistry.get(name) !== candidateToolEntries[index])
+			) {
+				continue;
+			}
+			return activated;
 		}
-		return activated;
 	}
 
 	/** Wrap guarded tools so SDK permission modes remain fail-closed without a reverse provider. */
@@ -12559,9 +12584,12 @@ export class AgentSession {
 	}
 
 	#setGuardedAgentTools(tools: AgentTool[]): void {
+		this.#activeToolSelectionRevision++;
 		this.agent.setTools(tools.map(tool => this.#prepareToolForExecution(tool)));
+		this.#onToolNamesChanged?.(tools.map(tool => tool.name));
 	}
 
+	/** Returns the committed selection revision, or undefined when this candidate was superseded. */
 	async #applyActiveToolsByName(
 		toolNames: string[],
 		options?: {
@@ -12569,8 +12597,19 @@ export class AgentSession {
 			previousSelectedMCPToolNames?: string[];
 			previousSelectedDiscoveredBuiltinToolNames?: string[];
 			nextSelectedDiscoveredBuiltinToolNames?: string[];
+			sessionTransitionGeneration?: number;
+			expectedActiveToolSelectionRevision?: number;
+			explicitActiveToolSelectionGeneration?: number;
 		},
-	): Promise<void> {
+	): Promise<number | undefined> {
+		const activeToolSelectionRevision = this.#activeToolSelectionRevision;
+		const selectionIsCurrent = () =>
+			(options?.expectedActiveToolSelectionRevision === undefined ||
+				(options.expectedActiveToolSelectionRevision === activeToolSelectionRevision &&
+					options.expectedActiveToolSelectionRevision === this.#activeToolSelectionRevision)) &&
+			(options?.explicitActiveToolSelectionGeneration === undefined ||
+				options.explicitActiveToolSelectionGeneration === this.#explicitActiveToolSelectionGeneration);
+		const mcpCatalogGeneration = this.#mcpCatalogGeneration;
 		toolNames = [...new Set([...toolNames.map(name => name.toLowerCase()), ...this.#mandatoryMCPToolNames])];
 		const previousSelectedMCPToolNames = options?.previousSelectedMCPToolNames ?? this.getSelectedMCPToolNames();
 		const previousSelectedDiscoveredBuiltinToolNames =
@@ -12608,33 +12647,71 @@ export class AgentSession {
 		const promptRelevantToolsChanged =
 			signature !== (this.#pendingAppliedToolSignature ?? this.#lastAppliedToolSignature);
 		if (promptRelevantToolsChanged && this.#rebuildSystemPrompt) {
-			const generation = this.#reserveBaseSystemPromptGeneration();
-			try {
-				const built = await this.#runAdmittedBaseSystemPromptRebuild(() =>
-					this.#rebuildSystemPrompt!(validToolNames, this.#toolRegistry),
-				);
-				if (this.#isDisposed) {
+			while (true) {
+				const generation = this.#reserveBaseSystemPromptGeneration();
+				let built: { systemPrompt: string[] };
+				try {
+					built = await this.#runAdmittedBaseSystemPromptRebuild(() =>
+						this.#rebuildSystemPrompt!(validToolNames, this.#toolRegistry),
+					);
+				} catch (error) {
 					if (generation === this.#baseSystemPromptGeneration) {
 						this.#pendingAppliedToolSignature = undefined;
 					}
-					return;
+					throw error;
 				}
-				if (generation === this.#baseSystemPromptGeneration) {
-					this.#baseSystemPrompt = built.systemPrompt;
-					this.agent.setSystemPrompt(this.#baseSystemPrompt);
-					this.#lastAppliedToolSignature = signature;
-					this.#pendingAppliedToolSignature = undefined;
+				if (this.#isDisposed || !selectionIsCurrent()) {
+					if (generation === this.#baseSystemPromptGeneration) {
+						this.#pendingAppliedToolSignature = undefined;
+					}
+					return undefined;
 				}
-			} catch (error) {
-				if (generation === this.#baseSystemPromptGeneration) {
-					this.#pendingAppliedToolSignature = undefined;
+				if (options?.sessionTransitionGeneration !== undefined) {
+					while (this.#sessionTransitionKind !== undefined) {
+						await this.#waitForSessionTransitionEnd(this.#disposeAbortController.signal);
+					}
+					if (options.sessionTransitionGeneration !== this.#sessionTransitionGeneration) {
+						if (generation === this.#baseSystemPromptGeneration) {
+							this.#pendingAppliedToolSignature = undefined;
+						}
+						return undefined;
+					}
 				}
-				throw error;
+				if (this.#isDisposed || !selectionIsCurrent()) {
+					if (generation === this.#baseSystemPromptGeneration) {
+						this.#pendingAppliedToolSignature = undefined;
+					}
+					return undefined;
+				}
+				if (
+					mcpCatalogGeneration !== this.#mcpCatalogGeneration ||
+					validToolNames.some((name, index) => this.#toolRegistry.get(name) !== tools[index])
+				) {
+					if (generation === this.#baseSystemPromptGeneration) {
+						this.#pendingAppliedToolSignature = undefined;
+					}
+					return undefined;
+				}
+				if (generation !== this.#baseSystemPromptGeneration) continue;
+				this.#baseSystemPrompt = built.systemPrompt;
+				this.agent.setSystemPrompt(this.#baseSystemPrompt);
+				this.#lastAppliedToolSignature = signature;
+				this.#pendingAppliedToolSignature = undefined;
+				break;
 			}
 		} else if (promptRelevantToolsChanged) {
+			if (!selectionIsCurrent()) return undefined;
 			this.#lastAppliedToolSignature = signature;
 			this.#pendingAppliedToolSignature = undefined;
 		}
+		if (
+			!selectionIsCurrent() ||
+			(options?.sessionTransitionGeneration !== undefined &&
+				options.sessionTransitionGeneration !== this.#sessionTransitionGeneration) ||
+			mcpCatalogGeneration !== this.#mcpCatalogGeneration ||
+			validToolNames.some((name, index) => this.#toolRegistry.get(name) !== tools[index])
+		)
+			return undefined;
 		if (promptRelevantToolsChanged) this.#defaultModelSelectionMutationRevision++;
 		this.#selectedMCPToolNames = nextSelectedMCPToolNames;
 		this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
@@ -12646,6 +12723,7 @@ export class AgentSession {
 				previousSelectedDiscoveredBuiltinToolNames,
 			);
 		}
+		return this.#activeToolSelectionRevision;
 	}
 
 	/**
@@ -12700,7 +12778,8 @@ export class AgentSession {
 	 * Changes take effect before the next model call.
 	 */
 	async setActiveToolsByName(toolNames: string[]): Promise<void> {
-		await this.#applyActiveToolsByName(toolNames);
+		const explicitActiveToolSelectionGeneration = ++this.#explicitActiveToolSelectionGeneration;
+		await this.#applyActiveToolsByName(toolNames, { explicitActiveToolSelectionGeneration });
 	}
 
 	async #restoreMCPSelectionsForSessionContext(sessionContext: SessionContext): Promise<void> {
@@ -18331,6 +18410,7 @@ export class AgentSession {
 				if (exactRetirement && !exactRetirement.canCommit())
 					throw new Error("Exact MCP control retirement changed before session adoption");
 				this.sessionManager.commitPreparedNewSession(prepared);
+				this.#commitSessionTransition();
 				await exactRetirement?.commit();
 				// Endpoint identity committed to the successor: re-register the
 				// manager so post-transition lineage bindings resolve and owned
@@ -18413,6 +18493,7 @@ export class AgentSession {
 				if (exactRetirement && !exactRetirement.canCommit())
 					throw new Error("Exact MCP control retirement changed before session adoption");
 				this.sessionManager.commitPreparedNewSession(prepared);
+				this.#commitSessionTransition();
 				await exactRetirement?.commit();
 				// Endpoint identity committed to the successor: re-register the
 				// manager so post-transition lineage bindings resolve and owned
@@ -18557,6 +18638,7 @@ export class AgentSession {
 			this.#closeAllProviderSessions("context clear");
 			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
 			this.#resetActiveSdkRunOwnership();
+			this.#commitSessionTransition();
 			this.agent.reset();
 			await this.sessionManager.flush();
 			this.sessionManager.appendContextClearEntry({ sessionId });
@@ -18663,6 +18745,7 @@ export class AgentSession {
 					this.sessionManager = forkedManager;
 					adopted = true;
 					await exactRetirement?.commit();
+					this.#commitSessionTransition();
 				} catch (error) {
 					await exactRetirement?.abort();
 					if (adopted) this.sessionManager = previousManager;
@@ -18718,6 +18801,7 @@ export class AgentSession {
 					if (exactRetirement && !exactRetirement.canCommit())
 						throw new Error("Exact MCP control retirement changed before session adoption");
 					this.sessionManager.commitPreparedNewSession(prepared);
+					this.#commitSessionTransition();
 					await exactRetirement?.commit();
 					// Fork commits a successor endpoint identity; re-register the
 					// manager under it (review thread P1).
@@ -21844,6 +21928,7 @@ export class AgentSession {
 					fromExtension,
 					preserveData,
 				);
+				this.#commitCatalogPreservingTransition();
 				this.#recordAdaptiveCompactionReset(tokensBefore);
 				await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
 
@@ -22146,6 +22231,7 @@ export class AgentSession {
 
 				// --- Commit boundary: synchronous adoption is the sole identity publication.
 				this.sessionManager.commitPreparedNewSession(prepared);
+				this.#commitSessionTransition();
 				await exactRetirement?.commit();
 				// Handoff commits a successor endpoint identity; re-register the
 				// manager under it (review thread P1).
@@ -24527,6 +24613,7 @@ export class AgentSession {
 				fromExtension,
 				preserveData,
 			);
+			this.#commitCatalogPreservingTransition();
 			this.#recordAdaptiveCompactionReset(tokensBefore);
 			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
 			if (autoCompactionSignal.aborted) return await emitAborted();
@@ -28527,6 +28614,7 @@ export class AgentSession {
 					);
 					// Different files may intentionally carry the same copied session id; pathname transition is the commit signal.
 					ownerShutdownTransitionCommitted = true;
+					this.#commitSessionTransition();
 					if (ownerShutdownSettled) {
 						// Every predecessor job/delivery has settled. Only now can its
 						// tuple evidence be retired; doing this immediately after rekey
@@ -28571,6 +28659,7 @@ export class AgentSession {
 				);
 				if (recoveredDefaultChainMessage) this.#emitResolutionFallbackSwitch(this.#defaultFallbackChain(false));
 				if (recoveredDefaultChainMessage) this.emitNotice("warning", recoveredDefaultChainMessage, "fallback");
+				this.#commitSessionTransition();
 				return true;
 			} catch (error) {
 				if (transitionCleanupCommitted) throw error;
@@ -28787,6 +28876,7 @@ export class AgentSession {
 				if (exactRetirement && !exactRetirement.canCommit())
 					throw new Error("Exact MCP control retirement changed before session adoption");
 				this.sessionManager.commitPreparedNewSession(prepared);
+				this.#commitSessionTransition();
 				await exactRetirement?.commit();
 			} catch (error) {
 				await exactRetirement?.abort();
@@ -29027,6 +29117,7 @@ export class AgentSession {
 				// No summary, navigating to non-root
 				this.sessionManager.branch(newLeafId);
 			}
+			this.#commitSessionTransition();
 
 			// The history rewrite is now committed. Drop predecessor-owned queued SDK
 			// work at this boundary; cancelled or failed preparation above preserves it.
