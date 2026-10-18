@@ -297,6 +297,87 @@ describe("calculateCost", () => {
 		expect(other.usage.cttl).toBeUndefined();
 	});
 
+	it("holds seeded Bedrock Haiku 5.5 pricing properties over generated token partitions", () => {
+		let state = 0x5eed_6874;
+		const rand = (max: number): number => {
+			state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+			return Math.floor((state / 0x1_0000_0000) * max);
+		};
+		const ids = [
+			"anthropic.claude-haiku-5-5",
+			"au.anthropic.claude-haiku-5-5",
+			"eu.anthropic.claude-haiku-5-5",
+			"global.anthropic.claude-haiku-5-5",
+			"jp.anthropic.claude-haiku-5-5",
+			"us.anthropic.claude-haiku-5-5",
+		];
+		const near = [0, 1, 99_999, 100_000, 100_001, 500_000];
+		const fresh = (): AssistantMessage =>
+			({
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+			}) as AssistantMessage;
+		const round = (x: number): number => Math.round(x * 1e9) / 1e9;
+		for (const id of ids) {
+			const model = getBundledModel("amazon-bedrock", id as never);
+			for (let i = 0; i < 100; i++) {
+				const input = i % 3 === 0 ? near[rand(near.length)]! : rand(300_000);
+				const cacheRead = rand(200_000);
+				const cacheWrite = rand(200_000);
+				const output = rand(10_000);
+				const retention = i % 2 === 0 ? "long" : "short";
+				const message = fresh();
+				handleMetadata(
+					{
+						usage: {
+							inputTokens: input,
+							outputTokens: output,
+							cacheReadInputTokens: cacheRead,
+							cacheWriteInputTokens: cacheWrite,
+							totalTokens: input + output + cacheRead + cacheWrite,
+						},
+					} as never,
+					model as never,
+					message,
+					retention,
+				);
+				const u = message.usage;
+				// The tier counts input + cache reads + cache writes, and the boundary is exclusive.
+				const long = input + cacheRead + cacheWrite > 100_000;
+				const m = long ? 5 : 1;
+				// Rates stay profile-specific: scale the profile's own catalog rates.
+				const rate = {
+					i: round(model.cost.input * m),
+					o: round(model.cost.output * m),
+					r: round(model.cost.cacheRead * m),
+					w5: round(model.cost.cacheWrite * m),
+					w1: round(2 * model.cost.input * m),
+				};
+				// Long retention tags every write as 1-hour; short retention bills the 5-minute rate.
+				const w = retention === "long" ? rate.w1 : rate.w5;
+				expect(u.cost.input).toBeCloseTo((rate.i * input) / 1e6, 9);
+				expect(u.cost.output).toBeCloseTo((rate.o * output) / 1e6, 9);
+				expect(u.cost.cacheRead).toBeCloseTo((rate.r * cacheRead) / 1e6, 9);
+				expect(u.cost.cacheWrite).toBeCloseTo((w * cacheWrite) / 1e6, 9);
+				// TTL-weighted components sum to the total.
+				expect(u.cost.total).toBeCloseTo(u.cost.input + u.cost.output + u.cost.cacheRead + u.cost.cacheWrite, 12);
+				if (retention === "long" && cacheWrite > 0) expect(u.cttl).toEqual({ ephemeral1h: cacheWrite });
+				else expect(u.cttl).toBeUndefined();
+			}
+		}
+		// Profile-specific: regional profiles carry the 10% premium over unprefixed and global.
+		const base = getBundledModel("amazon-bedrock", "anthropic.claude-haiku-5-5" as never);
+		const regional = getBundledModel("amazon-bedrock", "us.anthropic.claude-haiku-5-5" as never);
+		expect(regional.cost.input).toBeGreaterThan(base.cost.input);
+		expect(regional.longContextPricing?.cost.input).toBeGreaterThan(base.longContextPricing?.cost.input ?? 0);
+	});
+
 	it("holds seeded Haiku 5.5 pricing properties over generated token partitions", () => {
 		let state = 0x5eed_6872;
 		const rand = (max: number): number => {
