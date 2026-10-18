@@ -4128,6 +4128,12 @@ export class AgentSession {
 	#selectedDiscoveredToolNames = new Set<string>();
 	#baselineDiscoveredBuiltinToolNames = new Set<string>();
 	#discoverableToolAllowedNames: ReadonlySet<string> | undefined;
+	/**
+	 * Tracks tools activated in-history (for cache-prefix stability).
+	 * These tools are mentioned in a developer message but not in the request tools array.
+	 * This preserves the provider's prompt cache prefix mid-session.
+	 */
+	#toolsActivatedInHistory = new Set<string>();
 	#gjcSubskillToolNames = new Set<string>();
 	#gjcSubskillToolSignature: string | undefined;
 	#defaultSelectedMCPServerNames = new Set<string>();
@@ -12252,11 +12258,72 @@ export class AgentSession {
 			}
 		}
 		if (activated.length > 0) {
-			await this.#applyActiveToolsByName(nextActiveToolNames, {
-				previousSelectedMCPToolNames,
-				previousSelectedDiscoveredBuiltinToolNames,
-				nextSelectedDiscoveredBuiltinToolNames: [...nextSelectedDiscoveredBuiltinToolNames],
-			});
+			// Check if this is mid-session (cache-prefix-stable mode)
+			const isMidSession = this.agent.state.messages.length > 0;
+
+			if (isMidSession) {
+				// Cache-prefix-stable activation: append message instead of rebuilding
+				// This preserves the provider's prompt cache prefix (tools + system + messages)
+				const toolMetadata = activated
+					.map(name => this.#toolRegistry.get(name))
+					.filter((tool): tool is AgentTool => tool != null)
+					.map(tool => ({
+						name: tool.name,
+						label: tool.label,
+						description: tool.description,
+						parameters: tool.parameters,
+					}));
+
+				// Mark tools as activated in history
+				for (const name of activated) {
+					this.#toolsActivatedInHistory.add(name);
+				}
+
+				// Append metadata message to history
+				const metadataMessage = `The following tools have been discovered and activated:\n\n${
+					toolMetadata
+						.map(tool => JSON.stringify(tool))
+						.join(",\n")
+				}\n\nYou can invoke these by name.`;
+
+				this.agent.appendMessage({
+					role: "developer",
+					content: [{ type: "text", text: metadataMessage }],
+					attribution: "agent",
+				});
+
+				// Update selected tools in state
+				this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
+				// Also update MCP selections for any MCP tools that were activated
+				const nextSelectedMCPToolNames = new Set(previousSelectedMCPToolNames);
+				for (const name of activated) {
+					if (this.#discoverableMCPTools.has(name)) {
+						nextSelectedMCPToolNames.add(name);
+					}
+				}
+				this.#selectedMCPToolNames = nextSelectedMCPToolNames;
+
+				// Add tools to the active tools list (for tracking) but skip system prompt rebuild
+				// This preserves the system prompt portion of the cache prefix
+				const activeTools = nextActiveToolNames
+					.map(name => this.#toolRegistry.get(name))
+					.filter((tool): tool is AgentTool => tool != null);
+				this.#setGuardedAgentTools(activeTools);
+				this.#invalidateDiscoveryCaches();
+
+				// Persist the selection
+				this.#persistSelectedMCPToolNamesIfChanged(
+					Array.from(previousSelectedMCPToolNames),
+					previousSelectedDiscoveredBuiltinToolNames,
+				);
+			} else {
+				// Initial activation: use traditional approach
+				await this.#applyActiveToolsByName(nextActiveToolNames, {
+					previousSelectedMCPToolNames,
+					previousSelectedDiscoveredBuiltinToolNames,
+					nextSelectedDiscoveredBuiltinToolNames: [...nextSelectedDiscoveredBuiltinToolNames],
+				});
+			}
 		}
 		return activated;
 	}
