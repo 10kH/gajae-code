@@ -215,6 +215,9 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 			const resolvedToolChoice = resolveToolChoice(model, options.toolChoice);
 			const toolConfig = convertToolConfig(context.tools, resolvedToolChoice.resolvedChoice);
 			let additionalModelRequestFields = buildAdditionalModelRequestFields(model, options);
+			// Selected reasoning fields before forced-tool normalization, restored if the forced
+			// tool choice is later dropped on retry (Haiku 5+ only; see below).
+			let unforcedModelRequestFields: Record<string, unknown> | undefined;
 
 			// Bedrock rejects thinking + forced tool_choice ("any" or specific tool).
 			// When the resolved tool_choice forces tool use, disable thinking to avoid API errors.
@@ -226,6 +229,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 					// explicit `disabled` and keep the selected effort (capped at `high` while
 					// thinking is disabled).
 					const effort = (additionalModelRequestFields.output_config as { effort?: string } | undefined)?.effort;
+					unforcedModelRequestFields = additionalModelRequestFields;
 					additionalModelRequestFields = {
 						thinking: { type: "disabled" },
 						...(effort
@@ -323,7 +327,12 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 					reason,
 					registryKey: resolvedToolChoice.registryKey,
 				});
-				stripBedrockForcedToolChoiceForRetry(commandInput);
+				stripBedrockForcedToolChoiceForRetry(
+					commandInput,
+					unforcedModelRequestFields
+						? { forced: additionalModelRequestFields, restored: unforcedModelRequestFields }
+						: undefined,
+				);
 				const retryBodyText = JSON.stringify(commandInput);
 				const retryBody = new TextEncoder().encode(retryBodyText);
 				if (rawRequestDump) rawRequestDump.body = commandInput;
@@ -860,9 +869,17 @@ function convertMessages(
 	return result;
 }
 
-export function stripBedrockForcedToolChoiceForRetry<T extends { toolConfig?: { toolChoice?: unknown } }>(body: T): T {
+export function stripBedrockForcedToolChoiceForRetry<
+	T extends { toolConfig?: { toolChoice?: unknown }; additionalModelRequestFields?: Record<string, unknown> },
+>(body: T, thinking?: { forced: Record<string, unknown> | undefined; restored: Record<string, unknown> }): T {
 	if (body.toolConfig) {
 		body.toolConfig = { ...body.toolConfig, toolChoice: undefined };
+	}
+	// The forced request replaced the selected thinking fields with a disabled block; with the
+	// forced constraint gone, put the selected reasoning back. A payload the caller replaced via
+	// onPayload (not the object this provider sent) is left untouched.
+	if (thinking && body.additionalModelRequestFields === thinking.forced) {
+		body.additionalModelRequestFields = thinking.restored;
 	}
 	return body;
 }
