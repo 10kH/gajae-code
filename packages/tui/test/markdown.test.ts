@@ -1,4 +1,8 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import * as url from "node:url";
 import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import { Chalk } from "chalk";
@@ -1661,6 +1665,116 @@ bar`,
 			const output = markdown.render(80).join("\n");
 			expect(output.includes("\x1b]8;;https://example.com\x07")).toBeTruthy();
 			expect(output.includes("\x1b]8;;\x07")).toBeTruthy();
+		});
+
+		const absoluteFilePath = path.join(os.tmpdir(), "markdown link.ts");
+		const filesystemLinkCases = [
+			{
+				name: "relative",
+				target: "src/file.ts",
+				resolvePath: () => path.resolve(process.cwd(), "src/file.ts"),
+			},
+			{
+				name: "current-directory",
+				target: "./src/file.ts",
+				resolvePath: () => path.resolve(process.cwd(), "src/file.ts"),
+			},
+			{
+				name: "parent-directory",
+				target: "../shared/file.ts",
+				resolvePath: () => path.resolve(process.cwd(), "../shared/file.ts"),
+			},
+			{
+				name: "home-relative",
+				target: "~/Documents/file.ts",
+				resolvePath: () => path.join(os.homedir(), "Documents", "file.ts"),
+			},
+			{
+				name: "absolute",
+				target: absoluteFilePath,
+				resolvePath: () => absoluteFilePath,
+			},
+			{
+				name: "space and non-ASCII",
+				target: "src/naïve file.md",
+				resolvePath: () => path.resolve(process.cwd(), "src/naïve file.md"),
+			},
+		];
+
+		it.each(filesystemLinkCases)("normalizes $name file links to absolute file URIs", ({ target, resolvePath }) => {
+			const markdown = new Markdown(`[source](<${target}>)`, 0, 0, defaultMarkdownTheme);
+			const output = markdown.render(80).join("\n");
+			const expectedUri = url.pathToFileURL(resolvePath()).href;
+
+			expect(output).toContain(`\x1b]8;;${expectedUri}\x07`);
+			expect(output).toContain("\x1b]8;;\x07");
+			if (target.includes("naïve")) {
+				expect(expectedUri).toContain("%20");
+				expect(expectedUri).toContain("%C3%AF");
+			}
+		});
+
+		it("resolves file links against the current cwd instead of reusing another cwd's cached URI", async () => {
+			const originalCwd = process.cwd();
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "markdown-link-cwd-"));
+			const firstCwd = path.join(root, "first");
+			const secondCwd = path.join(root, "second");
+			await fs.mkdir(firstCwd);
+			await fs.mkdir(secondCwd);
+			const markdown = new Markdown("[source](src/file.ts)", 0, 0, defaultMarkdownTheme);
+
+			try {
+				process.chdir(firstCwd);
+				const firstOutput = markdown.render(80).join("\n");
+				process.chdir(secondCwd);
+				const secondOutput = markdown.render(80).join("\n");
+
+				expect(firstOutput).toContain(`\x1b]8;;${url.pathToFileURL(path.join(firstCwd, "src/file.ts")).href}\x07`);
+				expect(secondOutput).toContain(
+					`\x1b]8;;${url.pathToFileURL(path.join(secondCwd, "src/file.ts")).href}\x07`,
+				);
+			} finally {
+				process.chdir(originalCwd);
+				await fs.rm(root, { recursive: true, force: true });
+			}
+		});
+
+		it("does not emit OSC 8 for relative paths when cwd cannot be resolved", () => {
+			const cwd = vi.spyOn(process, "cwd").mockImplementation(() => {
+				throw new Error("cwd unavailable");
+			});
+			try {
+				const markdown = new Markdown("[source](src/file.ts)", 0, 0, defaultMarkdownTheme);
+				const output = markdown.render(80).join("\n");
+
+				expect(output).not.toContain("\x1b]8;;");
+			} finally {
+				cwd.mockRestore();
+			}
+		});
+
+		it.each([
+			{ name: "HTTPS", target: "https://example.com/source.ts" },
+			{ name: "mailto", target: "mailto:dev@example.com" },
+			{ name: "custom scheme", target: "git+ssh://example.com/repo" },
+			{ name: "fragment", target: "#section" },
+		])("leaves $name link destinations unchanged", ({ target }) => {
+			const markdown = new Markdown(`[source](<${target}>)`, 0, 0, defaultMarkdownTheme);
+			const output = markdown.render(80).join("\n");
+
+			expect(output).toContain(`\x1b]8;;${target}\x07`);
+		});
+
+		it.each([
+			{ name: "ESC", control: "\x1b" },
+			{ name: "BEL", control: "\x07" },
+			{ name: "NUL", control: "\x00" },
+		])("rejects OSC 8 destinations containing $name", ({ control }) => {
+			const target = `https://example.com/a${control}b`;
+			const markdown = new Markdown(`[source](<${target}>)`, 0, 0, defaultMarkdownTheme);
+			const output = markdown.render(80).join("\n");
+
+			expect(output).not.toContain("\x1b]8;;");
 		});
 
 		it("should keep every wrapped URL fragment clickable with the same OSC 8 target (#4711)", () => {

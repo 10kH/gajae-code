@@ -1,3 +1,6 @@
+import * as os from "node:os";
+import * as path from "node:path";
+import * as url from "node:url";
 import { LRUCache } from "lru-cache/raw";
 import { Marked, marked, type Token, Tokenizer, type Tokens } from "marked";
 import { hasSvgFence, isClosedSvgFence } from "../chat/svg-source";
@@ -455,17 +458,48 @@ type ListToken = Token & { items: Array<{ tokens?: Token[] }>; ordered: boolean;
 type TableCellToken = { tokens?: Token[] };
 type TableToken = Token & { header: TableCellToken[]; rows: TableCellToken[][]; raw?: string };
 
+/** Relative markdown links follow the active session's process cwd and home. */
+function markdownLinkContextKey(): string {
+	let cwd = "<unavailable>";
+	let home = "<unavailable>";
+	try {
+		cwd = process.cwd();
+	} catch {}
+	try {
+		home = os.homedir();
+	} catch {}
+	return `${cwd}\x00${home}`;
+}
+
 function formatHyperlink(text: string, target: string): string {
 	if (!TERMINAL.hyperlinks || !target) {
 		return text;
 	}
 
-	const safeTarget = target.replaceAll("\x1b", "").replaceAll("\x07", "");
-	if (!safeTarget) {
+	if (/[\u0000-\u001f\u007f-\u009f]/u.test(target)) {
 		return text;
 	}
 
-	return `\x1b]8;;${safeTarget}\x07${text}\x1b]8;;\x07`;
+	let destination = target;
+	if (!target.startsWith("#")) {
+		const absolutePath = path.isAbsolute(target);
+		if (!/^[a-z][a-z\d+.-]*:/iu.test(target) || absolutePath) {
+			try {
+				if (absolutePath) {
+					destination = url.pathToFileURL(target).href;
+				} else {
+					const homeRelative = target === "~" || target.startsWith("~/");
+					const base = homeRelative ? os.homedir() : process.cwd();
+					const relativePath = target === "~" ? "" : homeRelative ? target.slice(2) : target;
+					destination = url.pathToFileURL(path.resolve(base, relativePath)).href;
+				}
+			} catch {
+				return text;
+			}
+		}
+	}
+
+	return `\x1b]8;;${destination}\x07${text}\x1b]8;;\x07`;
 }
 
 function stripHtmlComments(raw: string): string {
@@ -525,6 +559,7 @@ export class Markdown implements Component {
 	#hasActiveDynamicSvgFigures = false;
 	#hasRetryableSvgFigureFallback = false;
 	#cachedImageProtocol: typeof TERMINAL.imageProtocol | undefined;
+	#cachedLinkContextKey?: string;
 	#dynamicFigures = new Map<number, Component>();
 	#nextDynamicFigureIndex = 0;
 	#disposed = false;
@@ -735,6 +770,8 @@ export class Markdown implements Component {
 		// L1: per-instance cache — fastest path for repeated renders of the same
 		// instance at the same width (e.g. resize debounce, repeated redraws).
 		const copyEnabled = copyAnnotationsEnabled();
+		// Only bracketed Markdown can contain a link target; plain text stays shared.
+		const linkContextKey = this.#text.includes("]") ? markdownLinkContextKey() : "";
 		if (
 			!this.#hasActiveDynamicSvgFigures &&
 			!this.#hasRetryableSvgFigureFallback &&
@@ -743,6 +780,7 @@ export class Markdown implements Component {
 			this.#cachedText === this.#text &&
 			this.#cachedWidth === width &&
 			this.#cachedImageProtocol === TERMINAL.imageProtocol &&
+			this.#cachedLinkContextKey === linkContextKey &&
 			this.#cachedCopyEnabled === copyEnabled &&
 			(!includeAnchors || this.#cachedAnchorSpans !== undefined)
 		) {
@@ -759,6 +797,7 @@ export class Markdown implements Component {
 			this.#cachedLines &&
 			this.#cachedWidth === width &&
 			this.#cachedImageProtocol === TERMINAL.imageProtocol &&
+			this.#cachedLinkContextKey === linkContextKey &&
 			this.#cachedCopyEnabled === copyEnabled &&
 			this.#lastFullParseAt > 0 &&
 			(!includeAnchors || this.#cachedAnchorSpans !== undefined)
@@ -787,6 +826,7 @@ export class Markdown implements Component {
 			this.#cachedCopyEnabled = copyEnabled;
 			this.#cachedAnchorSpans = includeAnchors ? [] : undefined;
 			this.#cachedImageProtocol = TERMINAL.imageProtocol;
+			this.#cachedLinkContextKey = linkContextKey;
 			return { lines: result, spans: this.#cachedAnchorSpans };
 		}
 
@@ -812,7 +852,8 @@ export class Markdown implements Component {
 		// and verify it on hit so hash collisions can never serve wrong output.
 		const bgColorProbe = this.#defaultTextStyle?.bgColor ? this.#defaultTextStyle.bgColor("\x01") : "";
 		const headingProbe = this.#theme.heading("");
-		const cacheKey = `${renderContentKey}\x00${width}\x00${this.#paddingX}\x00${this.#paddingY}\x00${this.#codeBlockIndent}\x00${objectId(this.#theme)}\x00${this.#defaultTextStyle ? objectId(this.#defaultTextStyle) : -1}\x00${TERMINAL.imageProtocol ?? ""}\x00${TERMINAL.hyperlinks ? 1 : 0}\x00${bgColorProbe}\x00${headingProbe}`;
+		const linkContextSuffix = linkContextKey ? `\x00${linkContextKey}` : "";
+		const cacheKey = `${renderContentKey}\x00${width}\x00${this.#paddingX}\x00${this.#paddingY}\x00${this.#codeBlockIndent}\x00${objectId(this.#theme)}\x00${this.#defaultTextStyle ? objectId(this.#defaultTextStyle) : -1}\x00${TERMINAL.imageProtocol ?? ""}\x00${TERMINAL.hyperlinks ? 1 : 0}${linkContextSuffix}\x00${bgColorProbe}\x00${headingProbe}`;
 		const cached = renderCache.get(cacheKey);
 		if (
 			!this.#mayHaveDynamicSvgFigures &&
@@ -828,6 +869,7 @@ export class Markdown implements Component {
 			this.#cachedLines = lines;
 			this.#cachedAnchorSpans = cached.anchorSpans;
 			this.#cachedImageProtocol = TERMINAL.imageProtocol;
+			this.#cachedLinkContextKey = linkContextKey;
 			if (!this.#streaming || this.#currentParse?.source !== normalizedText) this.#currentParse = undefined;
 			return { lines, spans: cached.anchorSpans };
 		}
@@ -1237,12 +1279,14 @@ export class Markdown implements Component {
 			this.#cachedLines = undefined;
 			this.#cachedAnchorSpans = undefined;
 			this.#cachedImageProtocol = undefined;
+			this.#cachedLinkContextKey = undefined;
 		} else {
 			this.#cachedText = renderedText;
 			this.#cachedWidth = width;
 			this.#cachedLines = copyBoundResult;
 			this.#cachedAnchorSpans = anchorSpans;
 			this.#cachedImageProtocol = TERMINAL.imageProtocol;
+			this.#cachedLinkContextKey = linkContextKey;
 			this.#lastFullParseAt = markdownNow();
 		}
 
