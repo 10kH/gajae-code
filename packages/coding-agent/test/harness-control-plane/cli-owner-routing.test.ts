@@ -160,6 +160,7 @@ describe("gjc harness CLI -> live owner routing", () => {
 	async function finalizeFromProject(
 		repo: string,
 		extra: Record<string, string | undefined> = {},
+		input: Record<string, unknown> = {},
 	): Promise<{ code: number; json: Record<string, unknown> | null; stderr: string }> {
 		const env: Record<string, string> = {};
 		for (const [name, value] of Object.entries(cliEnv.env)) {
@@ -172,12 +173,15 @@ describe("gjc harness CLI -> live owner routing", () => {
 			if (value === undefined) delete env[name];
 			else env[name] = value;
 		}
-		const proc = Bun.spawn(["bun", cliEntry, "harness", "finalize", "--session", SID, "--input", "{}"], {
-			cwd: repo,
-			env,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
+		const proc = Bun.spawn(
+			["bun", cliEntry, "harness", "finalize", "--session", SID, "--input", JSON.stringify(input)],
+			{
+				cwd: repo,
+				env,
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
 		const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
 		const code = await proc.exited;
 		let json: Record<string, unknown> | null = null;
@@ -202,6 +206,53 @@ describe("gjc harness CLI -> live owner routing", () => {
 		} finally {
 			await rm(repo, { recursive: true, force: true });
 			await rm(attacker, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("does not forward a project dotenv spool directory supplied in the command input", async () => {
+		const repo = await mkdtemp(path.join(tmpdir(), "harness-owner-repo-"));
+		const attacker = await mkdtemp(path.join(tmpdir(), "harness-owner-attacker-"));
+		try {
+			await writeFile(path.join(repo, ".env"), `${RECEIPT_SPOOL_DIR_ENV}=${attacker}\n`);
+			const res = await finalizeFromProject(repo, {}, { [RECEIPT_SPOOL_DIR_ENV]: attacker });
+			expect(res.code).toBe(0);
+			expect(res.json?.ok).toBe(true);
+			expect(await Bun.file(path.join(attacker, RECEIPT_SPOOL_FILENAME)).exists()).toBe(false);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+			await rm(attacker, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("keeps an explicit spool directory when the project declares none", async () => {
+		const repo = await mkdtemp(path.join(tmpdir(), "harness-owner-repo-"));
+		const operator = await mkdtemp(path.join(tmpdir(), "harness-owner-operator-"));
+		try {
+			const res = await finalizeFromProject(repo, {}, { [RECEIPT_SPOOL_DIR_ENV]: operator });
+			expect(res.code).toBe(0);
+			expect(res.json?.ok).toBe(true);
+			expect(await Bun.file(path.join(operator, RECEIPT_SPOOL_FILENAME)).exists()).toBe(true);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+			await rm(operator, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("uses an explicit spool directory instead of a project dotenv value", async () => {
+		const repo = await mkdtemp(path.join(tmpdir(), "harness-owner-repo-"));
+		const attacker = await mkdtemp(path.join(tmpdir(), "harness-owner-attacker-"));
+		const operator = await mkdtemp(path.join(tmpdir(), "harness-owner-operator-"));
+		try {
+			await writeFile(path.join(repo, ".env"), `${RECEIPT_SPOOL_DIR_ENV}=${attacker}\n`);
+			const res = await finalizeFromProject(repo, {}, { [RECEIPT_SPOOL_DIR_ENV]: operator });
+			expect(res.code).toBe(0);
+			expect(res.json?.ok).toBe(true);
+			expect(await Bun.file(path.join(operator, RECEIPT_SPOOL_FILENAME)).exists()).toBe(true);
+			expect(await Bun.file(path.join(attacker, RECEIPT_SPOOL_FILENAME)).exists()).toBe(false);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+			await rm(attacker, { recursive: true, force: true });
+			await rm(operator, { recursive: true, force: true });
 		}
 	}, 30_000);
 

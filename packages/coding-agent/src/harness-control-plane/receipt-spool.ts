@@ -54,6 +54,11 @@ function adoptReceiptSpoolDir(raw: string | undefined): string | undefined {
 	return trimmed ? path.resolve(trimmed) : undefined;
 }
 
+/** A spool directory the startup project snapshot does not declare. */
+export function trustedReceiptSpoolDir(raw: string | undefined): string | undefined {
+	return adoptReceiptSpoolDir(raw);
+}
+
 interface ReceiptSpoolCursorCache {
 	mtimeMs: number;
 	size: number;

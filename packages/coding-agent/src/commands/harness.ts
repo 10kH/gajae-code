@@ -47,7 +47,11 @@ import {
 } from "../harness-control-plane/lifecycle-reconciliation";
 import { type ResolvedOwner, RuntimeOwner, resolveOwner, resolveOwnerLive } from "../harness-control-plane/owner";
 import { preserveDirtyWorktree } from "../harness-control-plane/preserve";
-import { RECEIPT_SPOOL_DIR_ENV, resolveReceiptSpoolDir } from "../harness-control-plane/receipt-spool";
+import {
+	RECEIPT_SPOOL_DIR_ENV,
+	resolveReceiptSpoolDir,
+	trustedReceiptSpoolDir,
+} from "../harness-control-plane/receipt-spool";
 import { buildReceipt, requiresVanishBeforeAction, type VanishEvidence } from "../harness-control-plane/receipts";
 import { createSdkSessionTransport, spawnNormalHarnessSession } from "../harness-control-plane/sdk-transport";
 import { classifyLeaseStatus, readLease } from "../harness-control-plane/session-lease";
@@ -1376,8 +1380,11 @@ export default class Harness extends Command {
 		if (!owner.live || !owner.socketPath) return false;
 		const priorSpoolDir = input[RECEIPT_SPOOL_DIR_ENV];
 		try {
-			const trustedSpoolDir = resolveReceiptSpoolDir();
+			const fromEnv = resolveReceiptSpoolDir();
+			const fromInput = trustedReceiptSpoolDir(typeof priorSpoolDir === "string" ? priorSpoolDir : undefined);
+			const trustedSpoolDir = fromEnv ?? fromInput;
 			if (trustedSpoolDir) input[RECEIPT_SPOOL_DIR_ENV] = trustedSpoolDir;
+			else delete input[RECEIPT_SPOOL_DIR_ENV];
 			const res = (await callEndpoint(owner.socketPath, { verb, input })) as { ok?: boolean };
 			writeJson(res);
 			if (res?.ok === false) process.exitCode = 1;
