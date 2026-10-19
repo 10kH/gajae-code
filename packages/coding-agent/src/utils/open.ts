@@ -15,23 +15,17 @@ function hasAsciiControl(value: string): boolean {
 	return false;
 }
 
-function stripOuterFormat(value: string): string {
-	let start = 0;
-	let end = value.length;
-	while (start < end && OUTER_FORMAT.test(value.charAt(start))) start++;
-	while (end > start && OUTER_FORMAT.test(value.charAt(end - 1))) end--;
-	return start === 0 && end === value.length ? value : value.slice(start, end);
+function isOuterPadding(ch: string): boolean {
+	return ch.trim() === "" || OUTER_FORMAT.test(ch);
 }
 
-/** Peel alternating ASCII spaces and format characters. Classification only; local paths stay raw. */
+/** Drop every outer space or format character. Classification only; local paths stay raw. */
 function peelPadding(value: string): string {
-	let current = value;
-	for (let i = 0; i < 8; i++) {
-		const next = stripOuterFormat(current.trim());
-		if (next === current) return current;
-		current = next;
-	}
-	return current;
+	let start = 0;
+	let end = value.length;
+	while (start < end && isOuterPadding(value.charAt(start))) start++;
+	while (end > start && isOuterPadding(value.charAt(end - 1))) end--;
+	return start === 0 && end === value.length ? value : value.slice(start, end);
 }
 
 /** Drive paths parse as one-letter schemes (`c:`). Recognize them before that check. */

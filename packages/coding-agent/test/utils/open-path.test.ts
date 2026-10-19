@@ -129,6 +129,22 @@ describe("openPath", () => {
 		}
 	});
 
+	it("nested padding does not hide a scheme or a flag", () => {
+		const calls = spySpawn();
+		const unit = String.fromCharCode(0x200b, 32);
+		for (const layers of [7, 8, 9, 16, 64]) {
+			for (const core of ["--help", "javascript:alert(1)", ""]) {
+				calls.length = 0;
+				openPath(`${unit.repeat(layers)}${core}`);
+				expect(calls).toEqual([]);
+			}
+			const path = `${unit.repeat(layers)}/tmp/report`;
+			calls.length = 0;
+			openPath(path);
+			expect(calls).toEqual([openerArgv(process.platform, path)]);
+		}
+	});
+
 	it("non-http schemes stay out of opener argv", () => {
 		const calls = spySpawn();
 		const attacks = [
