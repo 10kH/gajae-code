@@ -9,6 +9,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { $env, $which, getPythonEnvDir, WhichCachePolicy } from "@gajae-code/utils";
 import { withFileLock } from "../../config/file-lock";
+import { isProjectControlledPath } from "../../lsp/path-trust";
 
 export const RLM_MANAGED_PYTHON_PACKAGES: readonly string[] = ["numpy", "pandas", "matplotlib", "polars"];
 
@@ -133,6 +134,26 @@ function resolvePythonCandidateInVenv(venvPath: string): { venvPath: string; pyt
 	return { venvPath, pythonPath, binDir };
 }
 
+/**
+ * A workspace `.venv` or `venv` directory is repository content. Use it only when
+ * it is a real virtualenv (`pyvenv.cfg`) whose interpreter file resolves outside
+ * the project. An in-tree script or binary is not an interpreter.
+ */
+function isAutoDetectedWorkspaceVenv(candidate: string, cwd: string): boolean {
+	try {
+		if (!fs.statSync(path.join(candidate, "pyvenv.cfg")).isFile()) return false;
+	} catch {
+		return false;
+	}
+	let canonicalPython: string;
+	try {
+		canonicalPython = fs.realpathSync(resolvePythonCandidateInVenv(candidate).pythonPath);
+	} catch {
+		return false;
+	}
+	return !isProjectControlledPath(canonicalPython, cwd);
+}
+
 function resolveManagedPythonCandidate(): { venvPath: string; pythonPath: string; binDir: string } {
 	return resolvePythonCandidateInVenv(resolveGlobalManagedPythonEnv());
 }
@@ -197,9 +218,7 @@ export function resolveVenvPath(cwd: string): string | undefined {
 	if ($env.CONDA_PREFIX) return $env.CONDA_PREFIX;
 	const candidates = [path.join(cwd, ".venv"), path.join(cwd, "venv")];
 	for (const candidate of candidates) {
-		if (fs.existsSync(candidate)) {
-			return candidate;
-		}
+		if (isAutoDetectedWorkspaceVenv(candidate, cwd)) return candidate;
 	}
 	return undefined;
 }
