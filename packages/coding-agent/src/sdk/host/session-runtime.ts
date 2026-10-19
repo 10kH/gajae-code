@@ -521,6 +521,10 @@ export interface SdkOnlyDeadlineRecoveryCheckpoint {
  * dispatch, replay/event publication, and reverse-provider lifecycle without
  * importing any notification adapter or native notification class.
  */
+function isStringArray(value: unknown): value is string[] {
+	return Array.isArray(value) && value.every((item: unknown) => typeof item === "string");
+}
+
 export class SessionSdkSessionRuntime {
 	readonly host: SessionSdkHost;
 	readonly transport: SessionSdkTransport;
@@ -551,6 +555,16 @@ export class SessionSdkSessionRuntime {
 			onFrame: handler =>
 				options.transport.onFrame((connectionId, frame) => {
 					this.#connectionIds.add(connectionId);
+					if (
+						!options.connectionCapabilities &&
+						frame.type === "event_replay" &&
+						isStringArray(frame.capabilities)
+					) {
+						this.#connectionCapabilities.set(
+							connectionId,
+							new Set([...(this.#connectionCapabilities.get(connectionId) ?? []), ...frame.capabilities]),
+						);
+					}
 					handler(connectionId, frame);
 				}),
 		});
@@ -562,7 +576,10 @@ export class SessionSdkSessionRuntime {
 		this.#capabilitiesDisposer = options.transport.onNegotiatedCapabilities?.((connectionId, negotiated) => {
 			if (options.connectionCapabilities && this.#connectionCapabilitiesProvider(connectionId) === undefined) return;
 			this.#connectionIds.add(connectionId);
-			this.#connectionCapabilities.set(connectionId, new Set(negotiated));
+			this.#connectionCapabilities.set(
+				connectionId,
+				new Set([...(this.#connectionCapabilities.get(connectionId) ?? []), ...negotiated]),
+			);
 		});
 		this.#malformedDisposer = options.transport.onMalformedFrame?.((connectionId, message) => {
 			this.host.handleMalformedFrame(connectionId, message);
@@ -2298,7 +2315,8 @@ function createQuerySurface(
 	};
 	const getProfileCredentialSessionId = () => ctx.credentialSessionId ?? id;
 	const profileSettings = (options.settings ?? ctx.settings) as Pick<Settings, "get"> | undefined;
-	const getProfileAvailableModels = (): Model<Api>[] => ctx.modelRegistry.getAvailable();
+	const getProfileAvailableModels = (): Model<Api>[] =>
+		ctx.modelRegistry.getAvailable(getProfileCredentialSessionId());
 	const resolveProfileAvailability = async (
 		profile: ModelProfileDefinition,
 		authenticatedProviders: ReadonlySet<string>,
@@ -2519,7 +2537,7 @@ function createQuerySurface(
 		getDiff,
 		getUsage: () => ctx.sessionManager.getUsageStatistics(),
 		getModels: async () => {
-			const models = ctx.modelRegistry.getAll();
+			const models = ctx.modelRegistry.getAll(getProfileCredentialSessionId());
 			const currentModel = ctx.model;
 			const currentThinkingLevel = api.getThinkingLevel();
 			const activeProfile =
@@ -2642,7 +2660,9 @@ function createQuerySurface(
 		getBranchCandidates: () => ctx.getBranchCandidates(),
 		getLastAssistant: lastAssistant,
 		getCapabilities: () => createSdkCapabilities(policy, hasHostTools(), options.primaryControlSurface),
-		getAuthProviders: () => [...new Set(ctx.modelRegistry.getAll().map(model => model.provider))],
+		getAuthProviders: () => [
+			...new Set(ctx.modelRegistry.getAll(getProfileCredentialSessionId()).map(model => model.provider)),
+		],
 		getActiveProviders: () => ctx.modelRegistry.getActiveProviders(),
 		getTools: () => {
 			const tools = typeof (ctx as Partial<ExtensionContext>).getAllTools === "function" ? ctx.getAllTools() : [];
@@ -3174,8 +3194,14 @@ function createControlSurface(
 		const [provider, ...modelId] = id.split("/");
 		const model =
 			modelId.length > 0
-				? ctx.modelRegistry.find(provider, modelId.join("/"))
-				: ctx.modelRegistry.getAll().find(candidate => candidate.id === id);
+				? ctx.modelRegistry.find(
+						provider,
+						modelId.join("/"),
+						ctx.credentialSessionId ?? ctx.sessionManager.getSessionId(),
+					)
+				: ctx.modelRegistry
+						.getAll(ctx.credentialSessionId ?? ctx.sessionManager.getSessionId())
+						.find(candidate => candidate.id === id);
 		if (!model) throw Object.assign(new Error(`Model ${id} was not found.`), { code: "invalid_input" });
 		return model;
 	};

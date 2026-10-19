@@ -57,14 +57,19 @@ Pass `--no-mcp` to skip conventional autoload for one session (plugin-bundle MCP
 ## Public slash-command boundary
 
 The ordinary interactive TUI and ACP slash-command surfaces intentionally do not
-register a top-level `/mcp` command. `/mcp test`, `/mcp reauth`, `/mcp
-reconnect`, and `/mcp reload` are not supported user-input entry points. Use
-`gjc mcp add`, `gjc mcp list`, or `gjc mcp remove` to manage stored registrations
-and start a new session. `--mcp-config` and the SDK's `mcpConfigPath` are
+register a top-level `/mcp` command. On those surfaces `/mcp test`, `/mcp reauth`,
+`/mcp reconnect`, and `/mcp reload` are not supported user-input entry points.
+Use `gjc mcp add`, `gjc mcp list`, or `gjc mcp remove` to manage stored
+registrations and start a new session.
+
+An interactive session started with exact-file `--mcp-config` is the exception:
+it exposes the session-scoped `/mcp` status and control command for the servers
+in that exact config, including `/mcp suspend <name>`, `/mcp resume <name>`, and
+`/mcp reconnect <name>`. `--mcp-config` and the SDK's `mcpConfigPath` are
 explicit connection-consumer entry points for a trusted config; they do not
 initiate MCP OAuth authorization. Existing credentials bound through `auth` may
 be refreshed by the runtime, but there is no public MCP OAuth authorization or
-reauthorization entry path, nor a public `/mcp` reconnection or reload contract.
+reauthorization entry path, and no `/mcp reload` contract.
 
 ## Subagents and lifecycle
 
@@ -142,6 +147,86 @@ This adds MCP tools alongside the built-in `web_search` tool; it does not select
 ```bash
 gjc mcp remove parallel-search --project
 ```
+
+## Example: local code navigation with Sem
+
+[Sem](https://github.com/Ataraxy-Labs/sem) provides structural code search,
+caller navigation, impact analysis, and diffs through a local stdio MCP server.
+Install Sem separately and confirm `sem --version` (tested with 0.27.0).
+From the Git repository you want GJC to inspect.
+
+Sem is a project-scope **stdio** server, so GJC spawns it only when the user
+config opts in. A project settings file cannot grant that flag; set it in the
+user config (`~/.gjc/agent/config.yml`, or the active agent directory). This is
+a global setting that covers every checkout, so remove it after the example:
+
+```bash
+gjc config set mcp.enableProjectConfig true
+```
+
+Then register the server from the Git repository you want GJC to inspect:
+
+```bash
+gjc mcp add sem --project --command sem --arg mcp \
+  --cwd "$PWD" --env "SEM_REPO=$PWD" \
+  --env SEM_NO_NETWORK=1 --env SEM_NO_TELEMETRY=1 --timeout 10000
+gjc mcp list --project
+```
+
+This records an absolute repository path in `./.gjc/mcp.json`; register again
+if you move the checkout. Review the configuration before sharing it. `list`
+checks registration, not connectivity. Start a new `gjc` session **after** the
+user-config opt-in above; without it the project stdio server is skipped and no
+`mcp__sem_*` tools appear. No Sem account or API key is required; indexing can
+create local cache files.
+
+Try asking the agent to find a function with `sem_find`, then request its
+source and surrounding context with the same tool's `mode: "context"`.
+Use a symbol that exists in your repository. Keep normal file tools available
+for unsupported syntax and non-code files.
+
+The server is not a read-only sandbox: for example, `sem_check` can execute
+repository validation commands. Only connect trusted repositories and approve
+operations according to your normal workflow. The repository path and offline
+environment settings do not restrict the process's filesystem permissions.
+
+Remove the registration with `gjc mcp remove sem --project`.
+
+`mcp.enableProjectConfig` is a **global** user setting: it applies to every
+checkout you open, not just this repository or Sem. Setting it to `false` is not
+the equivalent of leaving it alone — `false` disables *every* project-scope MCP
+source, including project HTTP and SSE servers that load by default. Remove the
+key from your user settings instead, which restores the unset behavior (project
+HTTP/SSE enabled, project stdio servers not spawned):
+
+```bash
+# Prints the agent directory that holds the user settings.json.
+gjc config path
+```
+
+Delete only the `mcp.enableProjectConfig` entry from that `settings.json`,
+leaving the rest of the file intact. `gjc config reset mcp.enableProjectConfig`
+is not equivalent: the setting has a schema default of `false`, so reset writes
+an explicit `false` and disables project HTTP/SSE sources everywhere.
+
+### Optional: preview overlapping branch changes with Weave
+
+[Weave](https://github.com/Ataraxy-Labs/weave) complements navigation with
+structural merging. It is a separate CLI, not a dependency of this MCP setup.
+If installed (`weave --version`, tested with 0.5.4), ask GJC to use its terminal
+tool in the chosen Git repository to inspect status and preview a specific
+existing branch:
+
+```bash
+git status --short
+weave preview feature-branch
+```
+
+Replace `feature-branch` with the branch you actually want compared to HEAD.
+Preview does not apply the merge. Do not automatically run `weave setup`,
+`weave land`, or `git merge` after it succeeds. A clean structural merge is
+not proof of compilation or behavioral correctness; applying changes and
+running the project's checks remain separate, explicitly requested steps.
 
 ## Boundary
 

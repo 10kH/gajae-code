@@ -189,6 +189,7 @@ import {
 	parsePersistedCredentialSelector,
 	resolveStartupAuthConfig,
 	type StartupAuthConfigSnapshot,
+	startupAuthConfigError,
 } from "../session/startup-auth-config";
 import {
 	isOwnedCompletionEnvelopeAllowed,
@@ -795,7 +796,7 @@ export async function discoverAuthStorage(
 			credentialRankingMode,
 			credentialPreferences,
 		});
-		return await reloadDiscoveredAuthStorage(storage);
+		return rejectDuplicateCredentialPreferences(await reloadDiscoveredAuthStorage(storage), agentDir);
 	}
 	const dbPath = getAgentDbPath(agentDir);
 	const storage = await AuthStorage.create(dbPath, {
@@ -804,7 +805,7 @@ export async function discoverAuthStorage(
 		credentialRankingMode,
 		credentialPreferences,
 	});
-	return await reloadDiscoveredAuthStorage(storage);
+	return rejectDuplicateCredentialPreferences(await reloadDiscoveredAuthStorage(storage), agentDir);
 }
 
 async function reloadDiscoveredAuthStorage(storage: AuthStorage): Promise<AuthStorage> {
@@ -819,6 +820,26 @@ async function reloadDiscoveredAuthStorage(storage: AuthStorage): Promise<AuthSt
 		throw error;
 	}
 	return storage;
+}
+
+/**
+ * Two preference entries can name one stored account through different selectors (`email:` and `account:` for the
+ * same login). Only the loaded rows reveal that, so the startup-config check finishes here and fails closed like any
+ * other invalid preference list.
+ */
+function rejectDuplicateCredentialPreferences(storage: AuthStorage, agentDir: string): AuthStorage {
+	const duplicates = storage.findDuplicateCredentialPreferences();
+	if (duplicates.length === 0) return storage;
+	logger.warn("Configured credential preferences name one account twice", {
+		providers: duplicates.map(({ provider }) => sanitizeProviderForLog(provider)),
+	});
+	const error = startupAuthConfigError(agentDir, "invalid-credential-preferences");
+	try {
+		storage.close();
+	} catch (cleanupError) {
+		throw attachStartupCleanupDiagnostic(error, cleanupError);
+	}
+	throw error;
 }
 
 /** Ranking is resolved as part of the typed startup-auth snapshot. */
@@ -2237,7 +2258,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			? { aliasIntent: "preset-equivalent" }
 			: undefined;
 		const allowedModels = await logger.time("resolveAllowedModels", () =>
-			resolveAllowedModels(modelRegistry, settings, modelMatchPreferences),
+			resolveAllowedModels(modelRegistry, settings, modelMatchPreferences, credentialSessionId),
 		);
 		const defaultRoleSpec = logger.time("resolveDefaultModelRole", () =>
 			resolveModelRoleValue(settings.getModelRole("default"), allowedModels, {
@@ -2477,7 +2498,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const rulebookRules: Rule[] = [];
 			const alwaysApplyRules: Rule[] = [];
 			for (const rule of rulesResult.items) {
-				const isTtsrRule = rule.condition && rule.condition.length > 0 ? ttsrManager.addRule(rule) : false;
+				const hasTtsrCondition = (rule.condition?.length ?? 0) > 0 || (rule.astCondition?.length ?? 0) > 0;
+				const isTtsrRule = hasTtsrCondition ? ttsrManager.addRule(rule) : false;
 				if (isTtsrRule) {
 					continue;
 				}
@@ -4422,7 +4444,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					startupModelReference.id,
 					startupCredentialSelector,
 				);
-			const currentStartupModel = modelRegistry.find(startupModelReference.provider, startupModelReference.id);
+			const currentStartupModel = modelRegistry.find(
+				startupModelReference.provider,
+				startupModelReference.id,
+				credentialSessionId,
+			);
 			const providerMismatchRejectsTarget =
 				startupCredentialProviderMismatch &&
 				modelRegistry.requiresStoredLiteralCredentialCacheAdmission(
@@ -4447,7 +4473,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		// Resolve deferred --model pattern now that extension models are registered.
 		if (!model && options.modelPattern && !startupCredentialModelRejected) {
-			const availableModels = modelRegistry.getAll();
+			const availableModels = modelRegistry.getAll(credentialSessionId);
 			const matchPreferences = {
 				usageOrder: settings.getStorage()?.getModelUsageOrder(),
 			};
@@ -4489,7 +4515,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		) {
 			// Re-resolve the allowed set: extension factories above may have
 			// registered providers/models that weren't visible at startup.
-			const allowedFallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
+			const allowedFallbackCandidates = await resolveAllowedModels(
+				modelRegistry,
+				settings,
+				modelMatchPreferences,
+				credentialSessionId,
+			);
 			// Candidate order is not a quality signal: catalogs sort retired models
 			// ahead of current ones whenever their IDs carry older date suffixes, so
 			// an unconfigured install would otherwise start on a model its provider
@@ -4778,7 +4809,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// epoch additionally fences overlapping rebuilds, so a slower earlier
 			// pass cannot publish over a newer one.
 			const gjcPassEpoch = gjcRuntimeStore.beginPass();
-			toolContextStore.setToolNames(toolNames);
 			const promptTools = (() => {
 				const previousPromptMetadataModel = promptMetadataModel;
 				promptMetadataModel = candidateModel;
@@ -5445,6 +5475,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			taskDepth,
 			workflowGatePublication: isCanonicalSubSession ? "local" : "endpoint",
 			toolRegistry,
+			onToolNamesChanged: toolNames => toolContextStore.setToolNames(toolNames),
 			builtinToolIdentities,
 			workflowGateToolSession: toolSession,
 			transformContext,

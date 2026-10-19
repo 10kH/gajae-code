@@ -1041,6 +1041,29 @@ function redactSecrets(input: string): string {
 	for (const pattern of patterns) {
 		out = out.replace(pattern, "[REDACTED]");
 	}
+	return redactBearerAndBasicAssignments(out);
+}
+
+/**
+ * Bearer and Basic assignments have no vendor prefix, so the rules above miss
+ * them. A following word with no digit, "+", "/", or "=" stays, which keeps
+ * phrases such as "Basic authentication" and "the bearer of".
+ */
+function bearerOrBasicValueIsCredential(value: string): boolean {
+	if (value.length < 8) return false;
+	if (value.includes("+") || value.includes("/") || value.includes("=")) return true;
+	return value.length >= 12 && /[0-9]/.test(value);
+}
+
+function redactBearerAndBasicAssignments(input: string): string {
+	const labeled = /(["']?authorization["']?\s*[:=]\s*["']?)((?:bearer|basic)\s+["']?)([A-Za-z0-9._~+/=-]{8,})/gi;
+	const bare = /\b((?:bearer|basic)\s+["']?)([A-Za-z0-9._~+/=-]{8,})/gi;
+	let out = input.replace(labeled, (match, label: string, scheme: string, value: string) =>
+		bearerOrBasicValueIsCredential(value) ? `${label}${scheme}[REDACTED]` : match,
+	);
+	out = out.replace(bare, (match, scheme: string, value: string) =>
+		bearerOrBasicValueIsCredential(value) ? `${scheme}[REDACTED]` : match,
+	);
 	return out;
 }
 
@@ -1196,7 +1219,7 @@ async function resolveMemoryModel(options: {
 	const { modelRegistry, session, fallbackRole } = options;
 	const requestedModel = session.settings.getModelRole(fallbackRole) || session.settings.getModelRole("default");
 	if (requestedModel) {
-		const resolved = resolveModelRoleValue(requestedModel, modelRegistry.getAll(), {
+		const resolved = resolveModelRoleValue(requestedModel, modelRegistry.getAll(session.credentialSessionId), {
 			settings: session.settings,
 			matchPreferences: { usageOrder: session.settings.getStorage()?.getModelUsageOrder() },
 			modelRegistry,
@@ -1210,7 +1233,7 @@ async function resolveMemoryModel(options: {
 	// before lazy model resolution): prefer the most recently used model over
 	// raw registry order. `getAll()[0]` can be a retired model the provider
 	// now rejects with 404, which permanently fails consolidation jobs.
-	const allModels = modelRegistry.getAll();
+	const allModels = modelRegistry.getAll(session.credentialSessionId);
 	const usageOrder = session.settings.getStorage()?.getModelUsageOrder() ?? [];
 	for (const usedKey of usageOrder) {
 		const match = allModels.find(model => `${model.provider}/${model.id}` === usedKey);
