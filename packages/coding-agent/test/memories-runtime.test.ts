@@ -88,6 +88,53 @@ async function runPhase2(
 	return { input, options };
 }
 
+async function seedPhase2Thread(
+	fx: SessionFixture,
+	threadId: string,
+	rolloutSlug: string | null,
+	summary: string,
+): Promise<void> {
+	const db = memoryStorage.openMemoryDb(getAgentDbPath(fx.agentDir));
+	memoryStorage.upsertThreads(db, [
+		{
+			id: threadId,
+			updatedAt: 100,
+			rolloutPath: path.join(fx.sessionDir, "seed.jsonl"),
+			cwd: fx.session.sessionManager.getCwd(),
+			sourceKind: "cli",
+		},
+	]);
+	db.prepare(
+		"INSERT INTO stage1_outputs (thread_id, source_updated_at, raw_memory, rollout_summary, rollout_slug, generated_at) VALUES (?, ?, ?, ?, ?, ?)",
+	).run(threadId, 100, `raw ${summary}`, summary, rolloutSlug, 100);
+	memoryStorage.enqueueGlobalWatermark(db, 100, fx.session.sessionManager.getCwd(), {
+		forceDirtyWhenNotAdvanced: true,
+	});
+	memoryStorage.closeMemoryDb(db);
+}
+
+function legacyRolloutStem(threadId: string, rolloutSlug: string | null): string {
+	if (!rolloutSlug) return threadId;
+	const normalized = rolloutSlug
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "_")
+		.replace(/_+$/g, "")
+		.slice(0, 20);
+	if (!normalized) return threadId;
+	return `${threadId}-${normalized}`;
+}
+
+function mulberry32(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (state + 0x6d2b79f5) >>> 0;
+		let t = state;
+		t = Math.imul(t ^ (t >>> 15), t | 1);
+		t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+}
+
 async function writeRollout(fx: SessionFixture, threadId: string): Promise<void> {
 	const rows = [
 		{ type: "session", id: threadId, cwd: fx.agentDir },
@@ -607,6 +654,139 @@ describe("memories runtime", () => {
 			const raw = await fs.readFile(path.join(memoryRoot, "raw_memories.md"), "utf8");
 			expect(raw.indexOf("## thread-b")).toBeLessThan(raw.indexOf("## thread-a"));
 		});
+	});
+
+	test("phase2 rollout summary thread id cannot write outside summaries", async () => {
+		const fx = await createFixture();
+		const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
+		const summariesDir = path.join(memoryRoot, "rollout_summaries");
+		const outsideDir = path.join(fx.agentDir, "outside-sink");
+		await fs.mkdir(outsideDir, { recursive: true });
+		const sentinel = path.join(outsideDir, "do-not-delete.md");
+		await fs.writeFile(sentinel, "keep");
+		const threadId = path.relative(summariesDir, path.join(outsideDir, "evil"));
+		expect(threadId.includes("..")).toBe(true);
+		expect(path.isAbsolute(threadId)).toBe(false);
+
+		vi.spyOn(ai, "completeSimple").mockResolvedValue(
+			createAssistantMessage(
+				JSON.stringify({
+					memory_md: "# Memory\n\nMerged",
+					memory_summary: "Merged summary",
+					skills: [{ name: "ops", content: "# Ops\nRunbook" }],
+				}),
+			),
+		);
+		await seedPhase2Thread(fx, threadId, null, "escaped-summary");
+		startMemoryStartupTask({
+			session: fx.session,
+			settings: fx.settings,
+			modelRegistry: fx.modelRegistry,
+			agentDir: fx.agentDir,
+			taskDepth: 0,
+		});
+
+		await waitFor(async () => {
+			const raw = await fs.readFile(path.join(memoryRoot, "raw_memories.md"), "utf8");
+			expect(raw).toContain("escaped-summary");
+		});
+		expect(await Bun.file(path.join(outsideDir, "evil.md")).exists()).toBe(false);
+		expect(await fs.readFile(sentinel, "utf8")).toBe("keep");
+		const written = await fs.readdir(summariesDir).catch(() => [] as string[]);
+		expect(written.every(name => !name.includes("/") && !name.includes("\\"))).toBe(true);
+	});
+
+	test("phase2 still allows a plain thread id rollout summary", async () => {
+		const fx = await createFixture();
+		const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
+		const summariesDir = path.join(memoryRoot, "rollout_summaries");
+		vi.spyOn(ai, "completeSimple").mockResolvedValue(
+			createAssistantMessage(
+				JSON.stringify({
+					memory_md: "# Memory\n\nMerged",
+					memory_summary: "Merged summary",
+					skills: [{ name: "ops", content: "# Ops\nRunbook" }],
+				}),
+			),
+		);
+		await seedPhase2Thread(fx, "thread-ok", null, "plain-summary");
+		startMemoryStartupTask({
+			session: fx.session,
+			settings: fx.settings,
+			modelRegistry: fx.modelRegistry,
+			agentDir: fx.agentDir,
+			taskDepth: 0,
+		});
+
+		await waitFor(async () => {
+			const text = await fs.readFile(path.join(summariesDir, "thread-ok.md"), "utf8");
+			expect(text).toContain("thread_id: thread-ok");
+			expect(text).toContain("plain-summary");
+		});
+	});
+
+	test("property: rollout summary filename containment seed 468", async () => {
+		const memories = await import("@gajae-code/coding-agent/memories");
+		const destination = (
+			memories as {
+				rolloutSummaryDestinationForTesting?: (
+					summariesDir: string,
+					threadId: string,
+					rolloutSlug: string | null,
+				) => string | undefined;
+			}
+		).rolloutSummaryDestinationForTesting;
+		if (typeof destination !== "function") {
+			throw new Error("rollout summary destination seam missing");
+		}
+		const summariesDir = path.join(path.sep, "rollout-summaries-root");
+		const root = path.resolve(summariesDir);
+		const rand = mulberry32(468);
+		const safeAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-";
+		const unsafe: Array<[string, string | null]> = [
+			["../../../../outside/evil", null],
+			["../outside/evil", "Hello"],
+			["/outside/evil", null],
+			["foo/bar", null],
+			["foo\\bar", null],
+			["a\0b", null],
+			["..\\outside\\evil", "slug"],
+			["thread/../../outside", null],
+		];
+		const cases: Array<[string, string | null]> = [];
+		for (const item of unsafe) cases.push(item);
+		while (cases.length < 64) {
+			const length = 1 + Math.floor(rand() * 16);
+			let threadId = "";
+			for (let i = 0; i < length; i += 1) {
+				threadId += safeAlphabet[Math.floor(rand() * safeAlphabet.length)];
+			}
+			const slug = rand() < 0.5 ? null : `S${Math.floor(rand() * 1000)} x`;
+			cases.push([threadId, slug]);
+		}
+		expect(cases.length).toBe(64);
+		for (const [threadId, rolloutSlug] of cases) {
+			const target = destination(summariesDir, threadId, rolloutSlug);
+			const stem = legacyRolloutStem(threadId, rolloutSlug);
+			const filename = `${stem}.md`;
+			const safe =
+				!filename.includes("/") &&
+				!filename.includes("\\") &&
+				!filename.includes("\0") &&
+				filename !== "." &&
+				filename !== ".." &&
+				path.basename(filename) === filename;
+			if (!safe) {
+				expect(target).toBeUndefined();
+				continue;
+			}
+			const expected = path.resolve(root, filename);
+			expect(target).toBe(expected);
+			expect(destination(summariesDir, threadId, rolloutSlug)).toBe(expected);
+			expect(path.basename(expected)).toBe(filename);
+			const relative = path.relative(root, expected);
+			expect(relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)).toBe(false);
+		}
 	});
 
 	test("phase2 empty-input cleanup removes consolidated files and skills dir", async () => {

@@ -681,23 +681,27 @@ async function runStage1Job(options: {
 async function syncPhase2Artifacts(memoryRoot: string, outputs: Stage1OutputRow[]): Promise<void> {
 	const summariesDir = path.join(memoryRoot, "rollout_summaries");
 	await fs.mkdir(summariesDir, { recursive: true });
+	const summariesRoot = path.resolve(summariesDir);
 
 	const keepFiles = new Set<string>();
 	for (const row of outputs) {
-		const stem = formatRolloutFilename(row.threadId, row.rolloutSlug);
-		const filename = `${stem}.md`;
+		const target = rolloutSummaryDestination(summariesRoot, row.threadId, row.rolloutSlug);
+		if (!target) continue;
+		const filename = path.basename(target);
 		keepFiles.add(filename);
 		const body = [`thread_id: ${row.threadId}`, `updated_at: ${row.sourceUpdatedAt}`, "", row.rolloutSummary].join(
 			"\n",
 		);
-		await Bun.write(path.join(summariesDir, filename), `${body.trim()}\n`);
+		await Bun.write(target, `${body.trim()}\n`);
 	}
 
 	const currentFiles = await fs.readdir(summariesDir).catch(() => [] as string[]);
 	for (const file of currentFiles) {
 		if (!file.endsWith(".md")) continue;
 		if (keepFiles.has(file)) continue;
-		await fs.rm(path.join(summariesDir, file), { force: true });
+		const target = containedSummaryFilename(summariesRoot, file);
+		if (!target) continue;
+		await fs.rm(target, { force: true });
 	}
 
 	const rawBody = buildRawMemoriesMarkdown(outputs);
@@ -923,6 +927,43 @@ function formatRolloutFilename(threadId: string, rolloutSlug: string | null): st
 		.slice(0, 20);
 	if (!normalized) return threadId;
 	return `${threadId}-${normalized}`;
+}
+
+/** Single file name under rollout_summaries, or undefined when the name would leave that directory. */
+function containedSummaryFilename(summariesRoot: string, filename: string): string | undefined {
+	if (filename.length === 0 || filename.includes("\0")) return undefined;
+	if (filename.includes("/") || filename.includes("\\")) return undefined;
+	if (filename === "." || filename === "..") return undefined;
+	if (path.basename(filename) !== filename) return undefined;
+	const target = path.resolve(summariesRoot, filename);
+	const relative = path.relative(summariesRoot, target);
+	if (
+		relative.length === 0 ||
+		relative === ".." ||
+		relative.startsWith(`..${path.sep}`) ||
+		path.isAbsolute(relative)
+	) {
+		return undefined;
+	}
+	if (relative !== filename) return undefined;
+	return target;
+}
+
+function rolloutSummaryDestination(
+	summariesRoot: string,
+	threadId: string,
+	rolloutSlug: string | null,
+): string | undefined {
+	return containedSummaryFilename(summariesRoot, `${formatRolloutFilename(threadId, rolloutSlug)}.md`);
+}
+
+/** Test seam for the rollout summary path gate. */
+export function rolloutSummaryDestinationForTesting(
+	summariesDir: string,
+	threadId: string,
+	rolloutSlug: string | null,
+): string | undefined {
+	return rolloutSummaryDestination(path.resolve(summariesDir), threadId, rolloutSlug);
 }
 
 function parseJsonObject(text: string): Record<string, unknown> | undefined {
