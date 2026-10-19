@@ -305,8 +305,12 @@ endpoint records or credentials under .gjc/state/sdk, never open a raw session W
 6. Answer durable workflow-gate questions:
      gjc sdk session raw control <sessionId> --op workflow.gate_answer --json-input '{...}' --json
    For gate answers use the durable workflow gate ID plus expectedSessionId; a transient
-   action_needed.id is never durable authority. The current host does not implement the
-   protocol's general ask.answer operation. Other allowed per-session controls:
+   action_needed.id is never durable authority. General ask.answer availability depends
+   on the host: the SDK-only host does not implement it, while the notifications-enabled
+   host supports it for ordinary pending asks:
+     gjc sdk session raw control <sessionId> --op ask.answer --json-input '{...}' --json
+   Use workflow.gate_answer, not ask.answer, for durable workflow gates.
+   Other allowed per-session controls:
    turn.prompt, turn.steer, turn.follow_up, todo.replace, session.switch, session.rename.
 
 7. Show the human the exact operation and target before any mutating call, and treat the
@@ -417,7 +421,7 @@ gjc setup defaults --check
 
 | ツールまたは bot | 推奨する GJC コマンド | 境界 |
 | --- | --- | --- |
-| Codex CLI | `gjc --tmux --worktree <name>` または `gjc` | 既定では `--worktree` は `<repo>/.worktrees/<name>` に GJC 管理ワークツリーを作成します。`GJC_WORKTREE_DIR` で保存先を変更できます。既存のパスでは先にそこへ `cd` してください。 |
+| Codex CLI | `gjc --tmux --worktree <name>` または `gjc` | 既定では `--worktree` は `<repo>/.worktrees/<generated-slug>` に GJC 管理ワークツリーを作成します。ディレクトリ名は指定名を正規化し、8 桁のハッシュを付加して生成されます。正確なパスは `git worktree list` で確認できます。`GJC_WORKTREE_DIR` で保存先を変更できます。既存のパスでは先にそこへ `cd` してください。 |
 | Claude Code | `gjc --tmux` または `gjc --tmux --worktree <name>` | GJC は Claude Code の拡張にはなりません。 |
 | OpenCode | `gjc` または `gjc --tmux` | 現時点では外部ランナーのワークフローのみです。 |
 | Claw Code | `gjc --tmux --worktree <name>` | GJC は Claw Code にインストールされたり、置き換えたりしません。 |
