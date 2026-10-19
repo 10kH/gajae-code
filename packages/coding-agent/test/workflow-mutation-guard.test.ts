@@ -2537,6 +2537,59 @@ describe("bash scanner quoting model", () => {
 				command: `perl -e 'open(F, "<", "src/product.ts"); print 1;'`,
 				blocked: false,
 			},
+			{
+				name: "Perl list-form open for writing",
+				command: `perl -e 'open F, ">", "src/product.ts"; print F "PWNED";'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Perl list-form open with a variable mode fails closed",
+				command: `perl -e 'open F, $mode, "src/product.ts"; print F "PWNED";'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Perl list-form read-mode open stays allowed",
+				command: `perl -e 'open F, "<", "src/product.ts"; print 1;'`,
+				blocked: false,
+			},
+			{
+				name: "Node stream method rebound reflectively then written",
+				command: `node -e 'Object.assign(process.stdout,{write:process.getBuiltinModule("fs").writeFileSync});process.stdout.write("src/product.ts","PWNED")'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Node stream method defined reflectively then written",
+				command: `node -e 'Object.defineProperty(process.stdout,"write",{value:process.getBuiltinModule("fs").writeFileSync});process.stdout.write("src/product.ts","PWNED")'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "sed GNU e command hides a shell redirection",
+				command: `printf x | sed 'e : > src/product.ts'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "sed substitution e flag runs the replacement as a shell command",
+				command: `printf x | sed 's|x|: > src/product.ts|e'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Python os.system captured as a callable then invoked",
+				command: `python3 -c 'import os; run=os.system; run("printf PWNED > src/product.ts")'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Python os module aliased then system invoked",
+				command: `python3 -c 'import os as o; o.system("printf PWNED > src/product.ts")'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
 		];
 
 		for (const scenario of cases) {

@@ -133,6 +133,14 @@ const BASH_INTERPRETER_WRITE_API = `(?:${BASH_INTERPRETER_WRITE_API_PATTERNS.joi
 const BASH_INTERPRETER_WRITE_API_EXCLUDING_OPEN = `(?:${BASH_INTERPRETER_WRITE_API_PATTERNS.slice(1).join("|")})`;
 const INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE =
 	/^\b(?:(?:process|Bun|Deno|sys)(?:\s*\.\s*(?:stdout|stderr)|\s*\[\s*["'`](?:stdout|stderr)["'`]\s*\])|(?:process|Bun|Deno|sys)\s*\[\s*[^\]]+\s*\]\s*(?:\.\s*write|\[\s*["'`]write["'`]\s*\])|(?:(?:globalThis|global)\s*\.\s*)?console)(?:\s*(?:\.\s*[\w$]+|\[\s*[^\]]+\s*\]))?\s*(?:\|\|=|&&=|\?\?=|[+\-*/%&|^]?=(?!=|>))/;
+
+/**
+ * A stream object can also be mutated reflectively, so an exempted
+ * `process.stdout.write(...)` is only trustworthy when nothing in the source can
+ * have replaced that method (`Object.assign(process.stdout, {write: ...})`).
+ */
+const INTERPRETER_OUTPUT_STREAM_MUTATION_RE =
+	/\b(?:Object\s*\.\s*(?:assign|definePropert(?:y|ies))|Reflect\s*\.\s*(?:set|defineProperty))\s*\(\s*(?:process|Bun|Deno|sys)\s*(?:\.\s*(?:stdout|stderr)|\[\s*["'`](?:stdout|stderr)["'`]\s*\])/;
 /**
  * Inline interpreter source is opaque whenever it exposes code evaluation or
  * reflective loading. This deliberately scans the complete source spelling,
@@ -1697,7 +1705,19 @@ function sedRegexAddressWritePath(script: string, start: number): { path: string
  * `undefined` means this text does not write. `null` means it writes without a
  * literal filename.
  */
+/**
+ * GNU sed can execute shell commands: the `e` command replaces the pattern
+ * space with a shell command's output and `s///e` runs the result. Neither form
+ * names a file, so their write targets cannot be derived and the whole program
+ * must be treated as an unclassified mutation.
+ */
+function sedScriptRunsShellCommand(script: string): boolean {
+	if (/(?:^|[;{}\n])\s*(?:[0-9$]+(?:,[0-9$]+)?\s*!?\s*)?e(?=[\s;}\n]|$)/.test(script)) return true;
+	return /\bs(\W)(?:\\.|(?!\1)[^\n])*?\1(?:\\.|(?!\1)[^\n])*?\1[gpiImM0-9]*e(?![A-Za-z])/.test(script);
+}
+
 function sedScriptWritePath(script: string): string | null | undefined {
+	if (sedScriptRunsShellCommand(script)) return null;
 	let index = 0;
 	let foundWrite = false;
 	let foundPath: string | null | undefined;
@@ -1867,6 +1887,15 @@ function pythonSystemCallArguments(script: string): { starts: number[]; unclassi
 			index += call[0].length - 1;
 		}
 	}
+	// `os.system` can reach the shell under another name: a captured callable
+	// (`run = os.system`), a module alias (`import os as o`), or any other
+	// `<obj>.system(...)`. Neither form names its command here, so the shell
+	// payload is unclassifiable rather than invisible.
+	const systemCalls = (script.match(/\.\s*system\s*\(/g) ?? []).length;
+	const osSystemCalls = (script.match(/\bos\s*\.\s*system\s*\(/g) ?? []).length;
+	if (systemCalls > osSystemCalls) unclassifiable = true;
+	if (/\b[A-Za-z_]\w*\s*=\s*(?:os\s*\.\s*(?:system|popen)|subprocess\s*\.\s*\w+)\b/.test(script))
+		unclassifiable = true;
 	return { starts, unclassifiable };
 }
 
@@ -2128,6 +2157,10 @@ function interpreterCodeContainsWriteApi(
 	api: RegExp,
 ): boolean {
 	const apiAtStart = new RegExp(`^(?:${api.source})`, "i");
+	// Reflective mutation of a stream object defeats the stdout/stderr write
+	// exemption: the method that runs may write to a file. Fail closed instead.
+	const streamMutated =
+		INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE.test(script) || INTERPRETER_OUTPUT_STREAM_MUTATION_RE.test(script);
 	let index = 0;
 	while (index < script.length) {
 		if (language === "py" || language === "js") {
@@ -2165,12 +2198,16 @@ function interpreterCodeContainsWriteApi(
 		if (INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE.test(script.slice(index))) return true;
 		if (language === "py" && PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))) return true;
 		if (language === "js" && JAVASCRIPT_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))) return true;
-		if (language === "perl" && isReadOnlyPerlOpen(script, index)) {
+		if (language === "perl" && /^open\b/.test(script.slice(index))) {
+			// Both `open(...)` and the list form `open H, MODE, EXPR` matter; only an
+			// explicit read mode is safe, and an unparsed open fails closed.
+			if (!isReadOnlyPerlOpen(script, index)) return true;
 			index += "open".length;
 			continue;
 		}
 		if (apiAtStart.test(script.slice(index))) {
 			const outputWrite =
+				!streamMutated &&
 				/^\.\s*write\s*\(/.test(script.slice(index)) &&
 				/\b(?:process|Bun)\s*\.\s*(?:stdout|stderr)\s*$/.test(script.slice(0, index));
 			if (!outputWrite) return true;
@@ -2180,11 +2217,25 @@ function interpreterCodeContainsWriteApi(
 	return false;
 }
 
+/**
+ * Perl `open` accepts two spellings — `open(H, MODE, EXPR)` and the list form
+ * `open H, MODE, EXPR` — and only an explicit read mode is safe. Any other shape
+ * (write/pipe modes, a variable mode, or an unparsed statement) fails closed.
+ */
 function isReadOnlyPerlOpen(script: string, index: number): boolean {
-	const call = /^open\s*\(/.exec(script.slice(index));
-	if (!call) return false;
-	const mode = /^\s*(?:[^,()]+,\s*)?(['"])([^'"]*)\1/.exec(script.slice(index + call[0].length))?.[2];
-	return mode?.startsWith("<") === true && !mode.startsWith("<+");
+	const rest = script.slice(index);
+	if (!/^open\b/.test(rest)) return false;
+	const parenthesized = /^open\s*\(/.exec(rest);
+	const body = parenthesized ? rest.slice(parenthesized[0].length) : rest.slice("open".length);
+	const statementEnd = body.search(/[;\n}]/);
+	const statement = statementEnd < 0 ? body : body.slice(0, statementEnd);
+	const quoted = [...statement.matchAll(/(['"])((?:\\.|(?!\1)[^\n])*?)\1/g)].map(match => match[2] ?? "");
+	const modes = quoted.filter(value => /^\s*[<>+|]/.test(value));
+	if (modes.length === 0) return false;
+	return modes.every(value => {
+		const mode = value.trimStart();
+		return mode.startsWith("<") && !mode.startsWith("<+");
+	});
 }
 
 function skipJavaScriptTemplate(script: string, index: number): number {
@@ -3204,7 +3255,10 @@ function scanInterpreterWrites(code: string, language: "py" | "js", targets: Ext
 			index = trivia;
 			continue;
 		}
-		if (INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE.test(code.slice(index))) {
+		if (
+			INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE.test(code.slice(index)) ||
+			INTERPRETER_OUTPUT_STREAM_MUTATION_RE.test(code.slice(index))
+		) {
 			targets.explicitMutation = true;
 			targets.unknown = true;
 			return;
