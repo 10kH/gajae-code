@@ -52,6 +52,50 @@ const { BrowserTool } = await import("../../src/tools/browser");
 
 const CLOSE = "</untrusted-content>";
 const MIXED_CLOSE = "</Untrusted-Content>";
+const FRAME_SEED = 40318;
+const FRAME_CASES = 64;
+
+/** Independent framing reference. Not the production helper. */
+function referenceFrame(text: string): string {
+	return `<untrusted-content>\n${text.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>")}\n</untrusted-content>`;
+}
+
+function mulberry32(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (state + 0x6d2b79f5) >>> 0;
+		let t = Math.imul(state ^ (state >>> 15), 1 | state);
+		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+}
+
+function pageSamples(seed: number, count: number): string[] {
+	const rng = mulberry32(seed);
+	const pieces = [
+		"",
+		"ok",
+		"Install docs",
+		"a\nb",
+		"한글",
+		"café",
+		"😀",
+		CLOSE,
+		MIXED_CLOSE,
+		"</UNTRUSTED-CONTENT>",
+		`x${CLOSE}y${MIXED_CLOSE}z`,
+		"<>&",
+		" \t",
+	];
+	const samples: string[] = [];
+	for (let n = 0; n < count; n++) {
+		const parts = 1 + Math.floor(rng() * 3);
+		let sample = "";
+		for (let i = 0; i < parts; i++) sample += pieces[Math.floor(rng() * pieces.length)] ?? "";
+		samples.push(sample);
+	}
+	return samples;
+}
 
 function session(): ToolSession {
 	return {
@@ -220,5 +264,52 @@ describe("browser page text trust boundary", () => {
 		const text = textOf(ran);
 		expect(text).toContain('Ran code on tab "main"');
 		expect(text).not.toContain("<untrusted-content>");
+	});
+
+	it("property browser page framing seed 40318 64 inputs", async () => {
+		const samples = pageSamples(FRAME_SEED, FRAME_CASES);
+		expect(samples).toHaveLength(FRAME_CASES);
+		acquireBrowserImpl = async kind => stubBrowser(kind);
+		for (let n = 0; n < samples.length; n++) {
+			const sample = samples[n] ?? "";
+			const url = `https://example.test/${n}/${sample}`;
+			getTabImpl = () => undefined;
+			acquireTabImpl = async () => ({ created: true, tab: stubTab({ url, title: sample }) });
+			const opened = await settle(tool().execute(`open-p-${n}`, { action: "open", url, timeout: 1 }));
+			const openedText = textOf(opened);
+			expect(openedText).toContain(`URL: ${referenceFrame(url)}`);
+			if (sample.length > 0) expect(openedText).toContain(`Title: ${referenceFrame(sample)}`);
+			else expect(openedText).not.toContain("Title:");
+
+			const displays = [
+				{ type: "text" as const, text: sample },
+				{ type: "image" as const, data: `img-${n}`, mimeType: "image/png" },
+			];
+			const before = JSON.stringify(displays);
+			getTabImpl = () => stubTab({ url, title: sample });
+			runInTabImpl = async () => ({ displays, returnValue: sample, screenshots: [] }) satisfies RunResultOk;
+			const ran = await settle(tool().execute(`run-p-${n}`, { action: "run", code: "return page", timeout: 1 }));
+			expect(JSON.stringify(displays)).toBe(before);
+			const ranText = ran.content.filter(block => block.type === "text").map(block => block.text);
+			expect(ranText).toEqual([referenceFrame(sample), referenceFrame(sample)]);
+			expect(ran.content).toContainEqual({ type: "image", data: `img-${n}`, mimeType: "image/png" });
+
+			const payload = { verb: "extract", content: sample };
+			runInTabImpl = async () =>
+				({
+					displays: [{ type: "text", text: sample }],
+					returnValue: payload,
+					screenshots: [],
+				}) satisfies RunResultOk;
+			const acted = await settle(
+				tool().execute(`act-p-${n}`, {
+					action: "act",
+					actions: [{ verb: "extract", format: "markdown" }],
+					timeout: 1,
+				}),
+			);
+			const actedText = acted.content.filter(block => block.type === "text").map(block => block.text);
+			expect(actedText).toEqual([referenceFrame(sample), referenceFrame(JSON.stringify(payload, null, 2))]);
+		}
 	});
 });
