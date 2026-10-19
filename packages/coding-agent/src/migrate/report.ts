@@ -7,6 +7,7 @@
 import {
 	emptyStatusCounts,
 	isFailureStatus,
+	type ManualAction,
 	type MigrateAction,
 	type MigrateDestinations,
 	type MigrateReport,
@@ -20,6 +21,7 @@ export interface BuildReportInput {
 	warnings: MigrateWarning[];
 	sources: MigrateSource[];
 	destinations: MigrateDestinations;
+	manualActions: ManualAction[];
 	dryRun: boolean;
 	project: boolean;
 	force: boolean;
@@ -54,6 +56,7 @@ export function buildReport(input: BuildReportInput): MigrateReport {
 		sources: input.sources,
 		destinations: input.destinations,
 		summary: { total, byType, bySource },
+		manualActions: input.manualActions,
 		actions: input.actions.map(action => ({
 			source: action.source,
 			type: action.type,
@@ -128,6 +131,14 @@ export function renderHuman(report: MigrateReport): string {
 		lines.push("Failures:");
 		for (const f of failures) {
 			lines.push(`  - [${f.source}] ${f.type} ${f.name ?? ""}: ${f.status}${f.reason ? ` (${f.reason})` : ""}`);
+		}
+	}
+
+	if (report.manualActions.length > 0) {
+		lines.push("");
+		lines.push("Manual actions:");
+		for (const m of report.manualActions) {
+			lines.push(`  - [${m.source}] ${m.area}: ${m.detail}`);
 		}
 	}
 

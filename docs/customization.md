@@ -123,9 +123,18 @@ reported. An agent whose name collides with a bundled role (`executor`,
 bundled role stays authoritative. Frontmatter other than `name`, `description`,
 and `tools` — including Claude's `model` — is not translated.
 
-Still manual: extensions, Claude Code/Codex hooks and settings (model,
-permissions, and environment), and optional session history. This is not a
+Still manual: extensions, and optional session history. This is not a
 replacement for the all-surface `/extensions` preview.
+
+Hooks and settings are never translated — only reported. `gjc migrate` lists
+each one under `Manual actions:` (and in `manualActions` with `--json`):
+Claude Code `hooks` by event with its shell-command count, `model`,
+`permissions` allow/deny/ask counts, `env` variable names, and Codex
+`config.toml` `model`, `approval_policy`, `sandbox_mode`, and
+`shell_environment_policy` names. Guessing these would silently change what the
+agent is permitted to do, and gjc hooks are TypeScript modules rather than shell
+commands. Secret values are never read, so only names appear. Manual actions are
+advisory and never make a migration fail.
 Direct native MCP registration uses `gjc mcp add`; see the linked MCP reference.
 
 ### Effective runtime precedence

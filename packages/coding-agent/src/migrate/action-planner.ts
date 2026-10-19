@@ -15,7 +15,7 @@ import { readMCPConfigFile, validateServerName } from "../runtime-mcp/config-wri
 import { PROTECTED_AGENT_NAMES } from "./adapters";
 import { mapMcpEntry } from "./mcp-mapper";
 import { slugify } from "./skill-normalizer";
-import type { AdapterResult, MigrateAction, MigrateDestinations, MigrateWarning } from "./types";
+import type { AdapterResult, ManualAction, MigrateAction, MigrateDestinations, MigrateWarning } from "./types";
 
 export interface PlanInput {
 	results: AdapterResult[];
@@ -26,6 +26,7 @@ export interface PlanInput {
 export interface PlanOutput {
 	actions: MigrateAction[];
 	warnings: MigrateWarning[];
+	manualActions: ManualAction[];
 }
 
 interface DestSkillIndex {
@@ -225,6 +226,8 @@ async function inspectCommandDestination(
 export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 	const actions: MigrateAction[] = [];
 	const warnings: MigrateWarning[] = [];
+	// Settings that cannot be expressed in gjc are reported, never guessed at.
+	const manualActions = input.results.flatMap(result => result.manualActions);
 
 	// 1. Source-level diagnostics become `source`-typed actions.
 	for (const result of input.results) {
@@ -821,5 +824,5 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 		}
 	}
 
-	return { actions, warnings };
+	return { actions, warnings, manualActions };
 }

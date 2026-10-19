@@ -49,6 +49,7 @@ function result(partial: Partial<AdapterResult>): AdapterResult {
 		slashCommandCandidates: [],
 		agentCandidates: [],
 		instructionCandidates: [],
+		manualActions: [],
 		diagnostics: [],
 		...partial,
 	};

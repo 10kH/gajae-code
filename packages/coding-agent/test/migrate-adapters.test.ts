@@ -32,7 +32,58 @@ describe("claude-code adapter", () => {
 		expect(result.skillCandidates).toHaveLength(0);
 		expect(result.slashCommandCandidates).toHaveLength(0);
 		expect(result.instructionCandidates).toHaveLength(0);
+		expect(result.manualActions).toHaveLength(0);
 		expect(result.diagnostics.every(d => d.status === "skipped_absent_source")).toBe(true);
+	});
+
+	test("reports hooks, model, permissions and env names without reading env values", async () => {
+		await writeFile(
+			".claude/settings.json",
+			JSON.stringify({
+				model: "claude-sonnet-4-5",
+				env: { ANTHROPIC_API_KEY: "sk-secret-value", DEBUG: "1" },
+				permissions: { allow: ["Bash(ls:*)"], deny: ["Read(./.env)"] },
+				hooks: {
+					PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "echo pre" }] }],
+					PostToolUse: [
+						{
+							hooks: [
+								{ type: "command", command: "echo a" },
+								{ type: "command", command: "echo b" },
+							],
+						},
+					],
+				},
+			}),
+		);
+		const result = await getAdapter("claude-code").collect(adapterOptions());
+		const byArea = new Map(result.manualActions.map(action => [action.area, action.detail]));
+		expect(byArea.get("settings.json: hooks.PreToolUse")).toContain("1 shell command run on PreToolUse");
+		expect(byArea.get("settings.json: hooks.PostToolUse")).toContain("2 shell commands run on PostToolUse");
+		expect(byArea.get("settings.json: model")).toContain("claude-sonnet-4-5");
+		expect(byArea.get("settings.json: permissions")).toContain("1 allow, 1 deny, 0 ask");
+		expect(byArea.get("settings.json: permissions")).toContain("Deny rules are the security-relevant ones");
+		expect(byArea.get("settings.json: env")).toContain("ANTHROPIC_API_KEY, DEBUG");
+		// Values must never appear in the report.
+		const serialized = JSON.stringify(result.manualActions);
+		expect(serialized).not.toContain("sk-secret-value");
+		expect(serialized.includes(JSON.stringify("1"))).toBe(false);
+	});
+
+	test("reports project settings.local.json separately and ignores malformed settings", async () => {
+		const projectDir = path.join(cwd, ".claude");
+		await fs.mkdir(projectDir, { recursive: true });
+		await fs.writeFile(path.join(projectDir, "settings.json"), "{ not json", "utf-8");
+		await fs.writeFile(
+			path.join(projectDir, "settings.local.json"),
+			JSON.stringify({ permissions: { deny: ["Bash(rm:*)"] } }),
+			"utf-8",
+		);
+		const result = await getAdapter("claude-code").collect(adapterOptions("project"));
+		expect(result.diagnostics.some(d => d.status === "failed_invalid_source")).toBe(true);
+		const areas = result.manualActions.map(action => action.area);
+		expect(areas).toContain("settings.local.json: permissions");
+		expect(areas.some(area => area.startsWith("settings.json:"))).toBe(false);
 	});
 
 	test("reads mcpServers and skills", async () => {
@@ -174,6 +225,31 @@ describe("opencode adapter", () => {
 		expect(result.mcpCandidates).toHaveLength(1);
 		expect(result.skillCandidates.map(c => c.slug).sort()).toEqual(["deploy", "helper"]);
 		expect(result.instructionCandidates).toHaveLength(0);
+	});
+
+	test("reports codex approval, sandbox and shell environment settings by name", async () => {
+		await writeFile(
+			".codex/config.toml",
+			[
+				'model = "gpt-5-codex"',
+				'approval_policy = "never"',
+				'sandbox_mode = "danger-full-access"',
+				"",
+				"[shell_environment_policy]",
+				'unset = ["AWS_SECRET_ACCESS_KEY"]',
+				"",
+				"[shell_environment_policy.set]",
+				'TOKEN = "secret-token-value"',
+			].join("\n"),
+		);
+		const result = await getAdapter("codex").collect(adapterOptions());
+		const byArea = new Map(result.manualActions.map(action => [action.area, action.detail]));
+		expect(byArea.get("config.toml: model")).toContain("gpt-5-codex");
+		expect(byArea.get("config.toml: approval_policy")).toContain("never");
+		expect(byArea.get("config.toml: sandbox_mode")).toContain("danger-full-access");
+		expect(byArea.get("config.toml: shell_environment_policy")).toContain("sets TOKEN");
+		expect(byArea.get("config.toml: shell_environment_policy")).toContain("unsets AWS_SECRET_ACCESS_KEY");
+		expect(JSON.stringify(result.manualActions)).not.toContain("secret-token-value");
 	});
 
 	test("discovers nested skills/**/SKILL.md recursively", async () => {

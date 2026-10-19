@@ -73,12 +73,13 @@ export async function runMigrate(args: MigrateCommandArgs): Promise<MigrateRepor
 		results.push(await getAdapter(source).collect({ homeDir, cwd, scope: args.project ? "project" : "user" }));
 	}
 
-	const { actions, warnings } = await planMigration({ results, destinations, force: args.force });
+	const { actions, warnings, manualActions } = await planMigration({ results, destinations, force: args.force });
 	const finalActions = args.dryRun ? actions : await executeActions(actions, { project: args.project });
 
 	return buildReport({
 		actions: finalActions,
 		warnings,
+		manualActions,
 		sources,
 		destinations,
 		dryRun: args.dryRun,
