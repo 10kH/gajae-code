@@ -5548,6 +5548,9 @@ export class Broker {
 			const begun = await this.ledger.begin(identity, requestHash, metadata);
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
+				// Proven errors are immutable even when their response carries cleanup
+				// metadata. Only unproven cleanup outcomes may execute again.
+				if (begun.entry.state === "terminal_error") return replay;
 				const cleanup = cleanupFromResponse(replay) ?? reconstructedDeleteCleanup;
 				if (!cleanup) {
 					if (
