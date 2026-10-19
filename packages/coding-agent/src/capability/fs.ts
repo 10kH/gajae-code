@@ -241,6 +241,28 @@ async function openIsolatedFile(abs: string, options?: ReadFileOptions): Promise
 	}
 }
 
+/**
+ * A lexical path outside the boundary keeps the historical ancestor read.
+ * A path inside the boundary must still be inside after realpath, so a
+ * repository symlink cannot be opened as its external target.
+ */
+async function containedReadPath(abs: string, options?: ReadFileOptions): Promise<string | null> {
+	const root = options?.containmentRoot;
+	if (!root || options?.isolatedHome) return abs;
+	const lexical = path.resolve(abs);
+	const boundary = path.resolve(root);
+	if (!isWithinOrEqual(boundary, lexical)) return lexical;
+	try {
+		const [boundaryReal, targetReal] = await Promise.all([
+			fs.promises.realpath(boundary),
+			fs.promises.realpath(lexical),
+		]);
+		return isWithinOrEqual(boundaryReal, targetReal) ? targetReal : null;
+	} catch {
+		return null;
+	}
+}
+
 export async function readFile(filePath: string, options?: ReadFileOptions): Promise<string | null> {
 	let abs: string | null;
 	try {
@@ -255,8 +277,13 @@ export async function readFile(filePath: string, options?: ReadFileOptions): Pro
 		return contentCache.get(abs) ?? null;
 	}
 	if (!options?.isolatedHome) {
+		const readable = await containedReadPath(abs, options);
+		if (readable === null) {
+			if (useCache) contentCache.set(abs, null);
+			return null;
+		}
 		try {
-			const content = await Bun.file(abs).text();
+			const content = await Bun.file(readable).text();
 			if (useCache) contentCache.set(abs, content);
 			return content;
 		} catch {
