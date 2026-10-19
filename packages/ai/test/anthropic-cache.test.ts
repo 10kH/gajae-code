@@ -217,7 +217,7 @@ describe("Anthropic prompt caching", () => {
 		expect(cacheControls(payload)).toEqual([{ type: "ephemeral", ttl: "1h" }]);
 	});
 	it("preserves an existing system breakpoint without adding another", () => {
-		const params: MessageCreateParamsStreaming = cacheParams({
+		const params = cacheParams({
 			system: [
 				{ type: "text", text: "stable", cache_control: { type: "ephemeral", ttl: "1h" } },
 				{ type: "text", text: "tail" },
@@ -234,7 +234,7 @@ describe("Anthropic prompt caching", () => {
 	it("keeps the automatic system breakpoint within the total cap and retry budget", () => {
 		for (const budget of [2, 1] as const) {
 			for (const existingCount of [0, 2, 3]) {
-				const params: MessageCreateParamsStreaming = cacheParams({
+				const params = cacheParams({
 					system: [{ type: "text", text: "stable" }],
 					tools: Array.from({ length: existingCount }, (_, index) => ({
 						name: `tool_${index}`,
