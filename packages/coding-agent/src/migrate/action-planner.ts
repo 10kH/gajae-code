@@ -12,7 +12,6 @@ import * as path from "node:path";
 import { FileType, glob } from "@gajae-code/natives";
 import { isEnoent, parseFrontmatter } from "@gajae-code/utils";
 import { readMCPConfigFile, validateServerName } from "../runtime-mcp/config-writer";
-import { lookupBuiltinSlashCommand } from "../slash-commands/builtin-registry";
 import { mapMcpEntry } from "./mcp-mapper";
 import { slugify } from "./skill-normalizer";
 import type { AdapterResult, MigrateAction, MigrateDestinations, MigrateWarning } from "./types";
