@@ -65,7 +65,11 @@ import { truncateToWidth } from "../tui/utils";
 import { getSixelLineMask } from "../utils/sixel";
 import type { ToolSession } from ".";
 import { AwaitingInputDetector, type AwaitingInputSignal } from "./awaiting-input";
-import { checkBashAllowedPrefixes, normalizeReadOnlyBashCommand } from "./bash-allowed-prefixes";
+import {
+	checkBashAllowedPrefixes,
+	normalizeReadOnlyBashCommand,
+	normalizeWorkflowBashCommand,
+} from "./bash-allowed-prefixes";
 import { applyBashFixups } from "./bash-command-fixup";
 import { type BashInteractiveResult, runInteractiveBashPty } from "./bash-interactive";
 import { checkBashInterception } from "./bash-interceptor";
@@ -1568,6 +1572,29 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			if (injection.block) {
 				throw new ToolError(injection.reason ?? "Blocked: tmux self-pane injection.");
 			}
+		}
+		// Direct master spawn parses the original command itself and does not source
+		// a shell snapshot. Every other restricted workflow command is rebound here,
+		// after the allowlist and interceptor have seen the caller's text.
+		if (
+			!directMasterSpawn &&
+			this.session.bashRestrictionProfile !== "read-only" &&
+			allowedPrefixes &&
+			allowedPrefixes.length > 0
+		) {
+			const normalizedWorkflowCommand = normalizeWorkflowBashCommand(command, allowedPrefixes, {
+				profile: "workflow",
+				gjcSessionBinding: {
+					sessionId: this.session.getSessionId?.() ?? null,
+					credentialSessionId: this.session.getCredentialSessionId?.() ?? null,
+					worktreeRoot: this.session.cwd,
+					invocationCwd: commandCwd,
+				},
+			});
+			if (!normalizedWorkflowCommand) {
+				throw new ToolError("Restricted role-agent bash command could not be normalized safely.");
+			}
+			command = normalizedWorkflowCommand;
 		}
 
 		const requestedTimeoutSec = input.timeout ?? 300;
