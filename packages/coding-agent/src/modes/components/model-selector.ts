@@ -9,6 +9,7 @@ import {
 import {
 	Container,
 	fuzzyFilter,
+	fuzzyMatch,
 	getKeybindings,
 	Input,
 	matchesKey,
@@ -99,6 +100,34 @@ function computeModelRank(model: Model, roles: Record<string, RoleAssignment | u
 	return roles.default && modelsAreEqual(roles.default.model, model) ? 0 : 1;
 }
 
+/**
+ * Compute and assign fuzzy scores to model items based on a query.
+ * Scores are based on fuzzy matching against the model's searchable text.
+ */
+function assignFuzzyScoresToModels(items: ModelItem[], query: string): void {
+	if (!query.trim()) return;
+	for (const item of items) {
+		const searchText = `${item.id} ${item.provider}`;
+		const match = fuzzyMatch(query, searchText);
+		if (match.matches) {
+			item.fuzzyScore = match.score;
+		}
+	}
+}
+
+/**
+ * Compute and assign fuzzy scores to canonical model items based on a query.
+ */
+function assignFuzzyScoresToCanonicalModels(items: CanonicalModelItem[], query: string): void {
+	if (!query.trim()) return;
+	for (const item of items) {
+		const match = fuzzyMatch(query, item.searchText);
+		if (match.matches) {
+			item.fuzzyScore = match.score;
+		}
+	}
+}
+
 interface ModelItem {
 	kind: "provider";
 	provider: string;
@@ -107,6 +136,7 @@ interface ModelItem {
 	selector: string;
 	thinkingLevel?: ThinkingLevel;
 	explicitThinkingLevel?: boolean;
+	fuzzyScore?: number;
 }
 
 interface CanonicalModelItem {
@@ -120,6 +150,7 @@ interface CanonicalModelItem {
 	compactSearchText: string;
 	thinkingLevel?: ThinkingLevel;
 	explicitThinkingLevel?: boolean;
+	fuzzyScore?: number;
 }
 
 type ScopedModelItem = ScopedModelSelection;
@@ -754,6 +785,22 @@ export class ModelSelectorComponent extends Container {
 		const latestRe = /-latest$/;
 
 		models.sort((a, b) => {
+			// When fuzzy scores are present (search query active), prioritize match quality
+			const aHasFuzzyScore = a.fuzzyScore !== undefined;
+			const bHasFuzzyScore = b.fuzzyScore !== undefined;
+			if (aHasFuzzyScore || bHasFuzzyScore) {
+				const aScore = a.fuzzyScore ?? Number.MAX_SAFE_INTEGER;
+				const bScore = b.fuzzyScore ?? Number.MAX_SAFE_INTEGER;
+				if (aScore !== bScore) return aScore - bScore;
+				// If fuzzy scores are tied, use MRU as tiebreaker
+				const aKey = a.selector;
+				const bKey = b.selector;
+				const aMru = mruIndex.get(aKey) ?? Number.MAX_SAFE_INTEGER;
+				const bMru = mruIndex.get(bKey) ?? Number.MAX_SAFE_INTEGER;
+				if (aMru !== bMru) return aMru - bMru;
+				return 0;
+			}
+
 			const aKey = a.selector;
 			const bKey = b.selector;
 
@@ -830,6 +877,20 @@ export class ModelSelectorComponent extends Container {
 		const modelRank = (item: CanonicalModelItem) => computeModelRank(item.model, roles);
 
 		models.sort((a, b) => {
+			// When fuzzy scores are present (search query active), prioritize match quality
+			const aHasFuzzyScore = a.fuzzyScore !== undefined;
+			const bHasFuzzyScore = b.fuzzyScore !== undefined;
+			if (aHasFuzzyScore || bHasFuzzyScore) {
+				const aScore = a.fuzzyScore ?? Number.MAX_SAFE_INTEGER;
+				const bScore = b.fuzzyScore ?? Number.MAX_SAFE_INTEGER;
+				if (aScore !== bScore) return aScore - bScore;
+				// If fuzzy scores are tied, use MRU as tiebreaker
+				const aMru = mruIndex.get(`${a.model.provider}/${a.model.id}`) ?? Number.MAX_SAFE_INTEGER;
+				const bMru = mruIndex.get(`${b.model.provider}/${b.model.id}`) ?? Number.MAX_SAFE_INTEGER;
+				if (aMru !== bMru) return aMru - bMru;
+				return 0;
+			}
+
 			const aRank = modelRank(a);
 			const bRank = modelRank(b);
 			if (aRank !== bRank) return aRank - bRank;
@@ -1205,10 +1266,12 @@ export class ModelSelectorComponent extends Container {
 							? alphaFiltered
 							: baseCanonicalModels;
 				const fuzzyMatches = fuzzyFilter(fuzzySource, query, ({ searchText }) => searchText);
+				assignFuzzyScoresToCanonicalModels(fuzzyMatches, query);
 				this.#sortCanonicalModels(fuzzyMatches);
 				this.#filteredCanonicalModels = fuzzyMatches;
 			} else {
 				const fuzzyMatches = fuzzyFilter(baseModels, query, ({ id, provider }) => `${id} ${provider}`);
+				assignFuzzyScoresToModels(fuzzyMatches, query);
 				this.#sortModels(fuzzyMatches);
 				this.#filteredModels = fuzzyMatches;
 			}
