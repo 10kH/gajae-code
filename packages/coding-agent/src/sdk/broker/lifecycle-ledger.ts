@@ -968,6 +968,9 @@ export class LifecycleLedger {
 		return this.#mutate(async () => {
 			const previous = this.#byIdentity.get(identity);
 			if (!previous) throw new Error("Unknown lifecycle identity");
+			// Match replay validation: proven terminal records admit no successor.
+			// A late failure must not append a row that will be quarantined on reopen.
+			if (terminal(previous.state)) return previous;
 			const next = {
 				...previous,
 				...fields,
