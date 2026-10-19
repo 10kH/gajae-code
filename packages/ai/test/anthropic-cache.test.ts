@@ -559,20 +559,33 @@ describe("Anthropic prompt caching", () => {
 				const countBefore = cacheControls(before).length;
 				const rootBefore = params.cache_control;
 
-				applyPromptCaching(params, "automatic", { ...control }, pick(random, [1, 2] as const));
+				const budget = pick(random, [1, 2] as const);
 
-				expect(withoutRoot(params)).toEqual(withoutRoot(before));
+				applyPromptCaching(params, "automatic", { ...control }, budget);
+
+				// The root marker is replaced or added only while it fits the cap; then the last system
+				// block gains one only when no system block had one and the cap still has room.
+				const rootAfter = before.cache_control || countBefore < 4;
+				const countAfterRoot = countBefore + (before.cache_control || !rootAfter ? 0 : 1);
+				const systemBefore = Array.isArray(before.system) ? before.system : [];
+				const systemAdds =
+					budget > 1 &&
+					systemBefore.length > 0 &&
+					!systemBefore.some(block => block.cache_control) &&
+					countAfterRoot < 4;
+				const expected = withoutRoot(before);
+				if (systemAdds && Array.isArray(expected.system)) expected.system.at(-1)!.cache_control = control;
+				expect(withoutRoot(params)).toEqual(expected);
 				if (before.cache_control) {
 					// replaced by a fresh marker, even when the caller's root already had the same value
 					expect(params.cache_control).not.toBe(rootBefore);
 					expect(params.cache_control).toEqual(control);
-					expect(cacheControls(params)).toHaveLength(countBefore);
-				} else if (countBefore < 4) {
+				} else if (rootAfter) {
 					expect(params.cache_control).toEqual(control);
-					expect(cacheControls(params)).toHaveLength(countBefore + 1);
 				} else {
 					expect(params.cache_control).toBeUndefined();
 				}
+				expect(cacheControls(params)).toHaveLength(countAfterRoot + (systemAdds ? 1 : 0));
 				expect(cacheControls(params).length).toBeLessThanOrEqual(4);
 				expect(() => normalizeCacheControlTtlOrdering(params)).not.toThrow();
 			});
