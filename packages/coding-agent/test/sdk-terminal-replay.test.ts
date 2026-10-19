@@ -1,9 +1,9 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, test, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Broker, lifecycleTargetForTest } from "../src/sdk/broker/broker";
+import { Broker, type BrokerResponse, lifecycleTargetForTest } from "../src/sdk/broker/broker";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 
 function canonicalJson(value: unknown): string {
@@ -41,15 +41,12 @@ test("Broker replays the proven retirement error after the indexed session disap
 			.digest("hex");
 		const identity = await deriveIdempotencyIdentity(agentDir, operation, key, target);
 		const requestHash = createHash("sha256").update(canonicalJson({ operation, input })).digest("hex");
-		const response = {
+		const response: BrokerResponse = {
 			ok: false,
 			error: {
 				code: "endpoint_stale",
 				message: "retirement endpoint was replaced",
-				cleanup: {
-					sessionId: input.sessionId,
-					uncertainRetirement: { stage: "index" },
-				},
+				cleanup: { phase: "artifacts", sessionId: input.sessionId },
 			},
 		};
 		await broker.ledger.begin(identity, requestHash, {
@@ -66,6 +63,64 @@ test("Broker replays the proven retirement error after the indexed session disap
 		expect(broker.ledger.get(identity)?.response).toEqual(response);
 		expect(await file.text()).toBe(before);
 	} finally {
+		await broker.stop();
+	}
+});
+
+test("Broker returns the proven terminal error when a late transition wins the replay race", async () => {
+	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-terminal-race-"));
+	roots.push(agentDir);
+	const broker = new Broker({ agentDir });
+	await broker.start();
+	type BeginArgs = Parameters<typeof broker.ledger.begin>;
+	const realBegin = broker.ledger.begin.bind(broker.ledger);
+	try {
+		const operation = "session.reconcile_uncertain";
+		const key = "race-key";
+		const input = {
+			sessionId: "racing-session",
+			cwd: agentDir,
+			stateRoot: path.join(agentDir, ".gjc", "state"),
+			remoteCreateKey: "race-create-key",
+		};
+		const target = createHash("sha256")
+			.update(canonicalJson(lifecycleTargetForTest(operation, input)))
+			.digest("hex");
+		const identity = await deriveIdempotencyIdentity(agentDir, operation, key, target);
+		const requestHash = createHash("sha256").update(canonicalJson({ operation, input })).digest("hex");
+		const cleanupPending: BrokerResponse = {
+			ok: false,
+			error: {
+				code: "cleanup_pending",
+				message: "retirement cleanup is still pending",
+				cleanup: { phase: "artifacts", sessionId: input.sessionId },
+			},
+		};
+		const proven: BrokerResponse = {
+			ok: false,
+			error: { code: "endpoint_stale", message: "retirement endpoint was replaced" },
+		};
+		await broker.ledger.begin(identity, requestHash, {
+			operationKey: `${operation}\u0000${key}`,
+			fingerprint: createHash("sha256").update(JSON.stringify({ operation, input })).digest("hex"),
+		});
+		await broker.ledger.transition(identity, "effect_started", { response: cleanupPending });
+		let seeded = false;
+		vi.spyOn(broker.ledger, "begin").mockImplementation(async (...args: BeginArgs) => {
+			const result = await realBegin(...args);
+			// Simulate a late failure proving the terminal result after begin decided
+			// to replay the cleanup-bearing effect_started row.
+			if (!seeded && result.kind === "replay") {
+				seeded = true;
+				await broker.ledger.transition(identity, "terminal_error", { response: proven });
+			}
+			return result;
+		});
+		expect(await broker.handleRequest(operation, input, key)).toEqual(proven);
+		expect(broker.ledger.get(identity)?.response).toEqual(proven);
+		expect(seeded).toBe(true);
+	} finally {
+		vi.restoreAllMocks();
 		await broker.stop();
 	}
 });
