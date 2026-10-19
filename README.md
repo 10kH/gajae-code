@@ -91,7 +91,7 @@ powershell -File gjc-install.ps1
 /skill:ralplan               build and critique the plan
 ```
 
-After approving the plan, ask the active GJC session to run this through its Bash tool, which supplies `GJC_SESSION_ID`, to create durable goals (creation alone does not execute them). A standalone shell without that session context fails:
+After approving the plan, ask the active GJC session to run this through its Bash tool, which supplies `GJC_SESSION_ID`, to create durable goals. With goal mode enabled, the session can activate inline goal mode and begin work in the same turn, before another user action; run this only when ready for execution. The command does not start the durable scheduler. A standalone shell without that session context fails:
 
 ```sh
 gjc ultragoal create-goals --brief-file <approved-plan>
