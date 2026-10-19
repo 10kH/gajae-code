@@ -16,6 +16,7 @@ import { executeSSH } from "../ssh/ssh-executor";
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import type { ToolSession } from ".";
+import { wrapUntrustedContent } from "./fetch";
 import { formatStyledTruncationWarning, type OutputMeta, stripOutputNotice } from "./output-meta";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
@@ -87,6 +88,11 @@ function quotePowerShellPath(value: string): string {
 function quoteCmdPath(value: string): string {
 	const escaped = value.replace(/"/g, '""');
 	return `"${escaped}"`;
+}
+
+/** Remote stdout/stderr is external content. Local status strings stay outside the frame. */
+function frameSshRemoteOutput(output: string): string {
+	return wrapUntrustedContent(output);
 }
 
 function buildRemoteCommand(command: string, cwd: string | undefined, info: SSHHostInfo): string {
@@ -176,10 +182,10 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 		});
 
 		if (result.cancelled) {
-			throw new ToolError(result.output || "Command aborted");
+			throw new ToolError(result.output ? frameSshRemoteOutput(result.output) : "Command aborted");
 		}
 
-		const outputText = result.output || "(no output)";
+		const outputText = result.output ? frameSshRemoteOutput(result.output) : "(no output)";
 		const details: SSHToolDetails = {};
 		const resultBuilder = toolResult(details).text(outputText).truncationFromSummary(result, { direction: "tail" });
 
