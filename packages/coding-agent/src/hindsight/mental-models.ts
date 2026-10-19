@@ -219,6 +219,17 @@ const TRUNCATION_MARKER = "\n\n…[mental-model snapshot truncated at render bud
  */
 const MIN_CONTENT_ROOM_CHARS = 64;
 
+const MEMORY_FRAME_NAMES = ["memories", "hindsight_memories", "relevant_memories", "mental_models"] as const;
+
+/** Escape the same frame tokens as recalled memory text so a stored closer cannot end this block early. */
+function escapeMemoryFrameTokens(text: string): string {
+	let out = text;
+	for (const name of MEMORY_FRAME_NAMES) {
+		out = out.replace(new RegExp(`<\\s*\\/?\\s*${name}\\s*>`, "gi"), tag => tag.replace("<", "&lt;"));
+	}
+	return out;
+}
+
 /** Smallest budget that can yield a usable block (wrapper + preamble + marker + a few chars of content). */
 function minRenderBudgetChars(): number {
 	const cleanOverhead = `<mental_models>\n${PREAMBLE}\n\n\n</mental_models>`.length;
@@ -243,10 +254,11 @@ export function renderMentalModelsBlock(models: MentalModelSummary[], budgetChar
 	let consumed = 0;
 	let truncated = false;
 	for (const model of models) {
-		const heading = `# ${model.name}`;
-		const refreshed = model.last_refreshed_at ? ` _(refreshed ${model.last_refreshed_at})_` : "";
+		const heading = `# ${escapeMemoryFrameTokens(model.name)}`;
+		const refreshedStamp = model.last_refreshed_at ? escapeMemoryFrameTokens(model.last_refreshed_at) : "";
+		const refreshed = refreshedStamp ? ` _(refreshed ${refreshedStamp})_` : "";
 		const headerLine = `${heading}${refreshed}`;
-		const body = (model.content ?? "").trim();
+		const body = escapeMemoryFrameTokens((model.content ?? "").trim());
 		const truncatedBody = truncateTo(body, perModelBudget);
 		if (truncatedBody.length < body.length) truncated = true;
 		const section = `${headerLine}\n${truncatedBody}`;
