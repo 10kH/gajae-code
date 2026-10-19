@@ -557,16 +557,54 @@ function nearestExistingDirectory(start: string): string | null {
 }
 
 /**
+ * Canonical path of `start`, following a symlink ancestor.
+ * The unmatched suffix is appended so a not-yet-created cache root classifies
+ * the directory `openVerifiedResidentCacheInstanceDir` would create it in.
+ */
+function canonicalCachePath(start: string): string | null {
+	let current = path.resolve(start);
+	const pending: string[] = [];
+	for (let depth = 0; depth < 64; depth++) {
+		try {
+			const stat = fs.lstatSync(current);
+			if (stat.isDirectory() || stat.isSymbolicLink()) {
+				const real = fs.realpathSync(current);
+				return pending.length === 0 ? real : path.join(real, ...pending.reverse());
+			}
+		} catch {
+			// Missing components are resolved from the nearest existing ancestor.
+		}
+		const parent = path.dirname(current);
+		if (parent === current) return null;
+		pending.push(path.basename(current));
+		current = parent;
+	}
+	return null;
+}
+
+function cacheDirectoryInsideGitWorktree(directory: string): boolean {
+	return git.repo.resolveSync(directory) !== null;
+}
+
+/**
  * Resident text is a second plaintext copy of assistant and tool output.
  * A cache root inside a Git worktree can be staged by a later `git add`, so
- * that root stays in memory. Classification starts at the nearest directory so
- * a non-directory root still reaches the resident-cache trust check.
+ * that root stays in memory. Both the lexical directory and the canonical
+ * directory are classified: a symlink outside the worktree must not hide a
+ * target inside it, and a lexical worktree path stays refused when its
+ * canonical target is outside. A missing or non-directory root still reaches
+ * the resident-cache trust check when both views are outside a worktree.
+ * No existing directory within 64 ancestors, or a resolver error, stays in memory.
  */
 export function residentTextCacheRootAllowsDisk(cacheRoot: string): boolean {
 	try {
-		const directory = nearestExistingDirectory(cacheRoot);
-		if (directory === null) return false;
-		return git.repo.resolveSync(directory) === null;
+		const lexical = nearestExistingDirectory(cacheRoot);
+		if (lexical === null || cacheDirectoryInsideGitWorktree(lexical)) return false;
+		const canonical = canonicalCachePath(cacheRoot);
+		if (canonical === null) return false;
+		const canonicalDirectory = nearestExistingDirectory(canonical);
+		if (canonicalDirectory === null || cacheDirectoryInsideGitWorktree(canonicalDirectory)) return false;
+		return true;
 	} catch {
 		return false;
 	}

@@ -218,6 +218,114 @@ describe.skipIf(process.platform === "win32")("resident text cache inside a git 
 			await manager.close().catch(() => {});
 		}
 	});
+
+	it("does not write assistant or tool text when an outside symlink points the cache into a worktree", async () => {
+		const root = makeTemp("gjc-resident-alias-in-");
+		const repo = path.join(root, "repo");
+		const inside = path.join(repo, "cache");
+		ensurePrivate(repo);
+		fs.mkdirSync(path.join(repo, ".git"));
+		ensurePrivate(inside);
+		const alias = path.join(root, "alias");
+		fs.symlinkSync(inside, alias);
+		delete process.env.XDG_CACHE_HOME;
+		delete process.env.XDG_DATA_HOME;
+		delete process.env.XDG_STATE_HOME;
+		delete process.env.GJC_CONFIG_DIR;
+		delete process.env.PI_CONFIG_DIR;
+		setAgentDir(path.join(alias, "agent"));
+		const manager = await persistLargeOutput(path.join(root, "project"), path.join(root, "sessions"));
+		try {
+			expect(manager.residentTextCacheDirForTests()).toBeUndefined();
+			expect(treeHas(repo, ASSISTANT_CANARY)).toBe(false);
+			expect(treeHas(repo, TOOL_CANARY)).toBe(false);
+			expect(JSON.stringify(manager.getEntries())).toContain(ASSISTANT_CANARY);
+			expect(JSON.stringify(manager.getEntries())).toContain(TOOL_CANARY);
+		} finally {
+			await manager.close().catch(() => {});
+		}
+	});
+
+	it("still writes long assistant and tool text when an outside symlink points at a cache outside a worktree", async () => {
+		const root = makeTemp("gjc-resident-alias-out-");
+		const realCache = path.join(root, "real-cache");
+		ensurePrivate(realCache);
+		const alias = path.join(root, "alias");
+		fs.symlinkSync(realCache, alias);
+		delete process.env.XDG_CACHE_HOME;
+		delete process.env.XDG_DATA_HOME;
+		delete process.env.XDG_STATE_HOME;
+		delete process.env.GJC_CONFIG_DIR;
+		delete process.env.PI_CONFIG_DIR;
+		setAgentDir(path.join(alias, "agent"));
+		expect(git.repo.resolveSync(fs.realpathSync(alias))).toBeNull();
+		const manager = await persistLargeOutput(path.join(root, "project"), path.join(root, "sessions"));
+		try {
+			const cacheDir = manager.residentTextCacheDirForTests();
+			expect(cacheDir).toBeString();
+			expect(treeHas(fs.realpathSync(cacheDir ?? realCache), ASSISTANT_CANARY)).toBe(true);
+			expect(treeHas(fs.realpathSync(cacheDir ?? realCache), TOOL_CANARY)).toBe(true);
+			expect(git.repo.resolveSync(fs.realpathSync(cacheDir ?? realCache))).toBeNull();
+		} finally {
+			await manager.close().catch(() => {});
+		}
+	});
+});
+
+describe.skipIf(process.platform === "win32")("resident text cache path spelling", () => {
+	const varPathIsSymlink = (() => {
+		try {
+			return fs.lstatSync("/var").isSymbolicLink();
+		} catch {
+			return false;
+		}
+	})();
+
+	it.skipIf(!varPathIsSymlink)(
+		"still writes long assistant and tool text through the macOS /var symlink",
+		async () => {
+			const varPath = "/var";
+			const real = fs.realpathSync(varPath);
+			const root = makeTemp("gjc-resident-var-");
+			if (!root.startsWith(real)) throw new Error("temp dir is not under the /var target");
+			const spelled = path.join(varPath, path.relative(real, root), "agent");
+			delete process.env.XDG_CACHE_HOME;
+			delete process.env.XDG_DATA_HOME;
+			delete process.env.XDG_STATE_HOME;
+			delete process.env.GJC_CONFIG_DIR;
+			delete process.env.PI_CONFIG_DIR;
+			setAgentDir(spelled);
+			const manager = await persistLargeOutput(path.join(root, "project"), path.join(root, "sessions"));
+			try {
+				const cacheDir = manager.residentTextCacheDirForTests();
+				expect(cacheDir).toBeString();
+				expect(treeHas(fs.realpathSync(cacheDir ?? spelled), ASSISTANT_CANARY)).toBe(true);
+				expect(git.repo.resolveSync(fs.realpathSync(cacheDir ?? spelled))).toBeNull();
+			} finally {
+				await manager.close().catch(() => {});
+			}
+		},
+	);
+
+	it("uses memory when more than 64 missing ancestors hide the cache root", async () => {
+		const root = makeTemp("gjc-resident-deep-");
+		const segments = Array.from({ length: 70 }, () => "p");
+		const agentDir = path.join(root, ...segments, "agent");
+		delete process.env.XDG_CACHE_HOME;
+		delete process.env.XDG_DATA_HOME;
+		delete process.env.XDG_STATE_HOME;
+		delete process.env.GJC_CONFIG_DIR;
+		delete process.env.PI_CONFIG_DIR;
+		setAgentDir(agentDir);
+		const manager = await persistLargeOutput(path.join(root, "project"), path.join(root, "sessions"));
+		try {
+			expect(manager.residentTextCacheDirForTests()).toBeUndefined();
+			expect(JSON.stringify(manager.getEntries())).toContain(ASSISTANT_CANARY);
+			expect(fs.existsSync(path.join(agentDir, "resident-cache"))).toBe(false);
+		} finally {
+			await manager.close().catch(() => {});
+		}
+	});
 });
 
 describe("residentTextCacheRootAllowsDisk", () => {
@@ -263,5 +371,19 @@ describe("residentTextCacheRootAllowsDisk", () => {
 		expect(allowsDisk(path.join(occupied, "resident-cache"))).toBe(true);
 		fs.writeFileSync(path.join(repo, "occupied-root"), "not-a-directory");
 		expect(allowsDisk(path.join(repo, "occupied-root"))).toBe(false);
+		const aliasIn = path.join(parent, "alias-in");
+		fs.symlinkSync(repo, aliasIn);
+		expect(allowsDisk(path.join(aliasIn, "resident-cache"))).toBe(false);
+		expect(allowsDisk(path.join(aliasIn, "missing", "resident-cache"))).toBe(false);
+		const outsideTarget = path.join(parent, "outside-target");
+		fs.mkdirSync(outsideTarget);
+		const aliasOut = path.join(parent, "alias-out");
+		fs.symlinkSync(outsideTarget, aliasOut);
+		expect(allowsDisk(path.join(aliasOut, "resident-cache"))).toBe(true);
+		const trailed = path.join(plain, "trailed");
+		expect(allowsDisk(trailed + path.sep)).toBe(allowsDisk(trailed));
+		expect(allowsDisk(path.parse(parent).root)).toBe(true);
+		const deep = path.join(parent, ...Array.from({ length: 70 }, () => "q"));
+		expect(allowsDisk(deep)).toBe(false);
 	});
 });
