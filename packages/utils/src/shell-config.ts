@@ -148,7 +148,6 @@ export function projectSafeHomeOverride(explicit?: Record<string, string>): Reco
  * flag value.
  */
 function buildSpawnEnv(shell: string): Record<string, string> {
-	const noCI = $pickflag("GJC_BASH_NO_CI", "PI_BASH_NO_CI", "CLAUDE_BASH_NO_CI");
 	const inherited = filterProcessEnv(Bun.env);
 	delete inherited.GJC_SESSION_FILE;
 	delete inherited.GJC_MANAGED_OWNER_TRANSCRIPT_PATH;
@@ -159,7 +158,6 @@ function buildSpawnEnv(shell: string): Record<string, string> {
 		GPG_TTY: "not a tty",
 		GJCCODE: "1",
 		CLAUDECODE: "1",
-		...(noCI ? {} : { CI: "true" }),
 	} as Record<string, string>;
 }
 
