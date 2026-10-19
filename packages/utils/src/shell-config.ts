@@ -65,12 +65,27 @@ function isExecutable(path: string): boolean {
  * runs code for every dynamically linked command from `LD_PRELOAD` and `LD_AUDIT` modules, and
  * resolves libraries from `LD_LIBRARY_PATH` first, so a project directory there
  * can shadow a system library (macOS: `DYLD_INSERT_LIBRARIES` and the
- * `DYLD_*_LIBRARY_PATH`/`DYLD_*_FRAMEWORK_PATH` search overrides). A
- * repository `.env` must not be able to set them, or bash tool commands could
- * execute repository code.
+ * `DYLD_*_LIBRARY_PATH`/`DYLD_*_FRAMEWORK_PATH` search overrides). Sibling
+ * spellings load the same code: Perl `PERLLIB`, the JVM `_JAVA_OPTIONS`, and npm
+ * `npm_config_node_options` (matched separately below, in any case). Common tools also read programs from the
+ * environment: ripgrep `RIPGREP_CONFIG_PATH` (a config file that can add
+ * `--pre=<program>`), GNU tar `TAR_OPTIONS` (`--use-compress-program`,
+ * `--to-command`), rsync `RSYNC_RSH`, make `MAKEFLAGS` (`SHELL=`) and
+ * `MAKEFILES` (a makefile with `$(shell …)`), and bash `SHELLOPTS`, which turns on
+ * `xtrace` so `PS4` command substitutions run in every `bash -c`. A repository
+ * `.env` must not be able to set them, or bash tool commands could execute
+ * repository code.
  */
 const PROJECT_DENIED_SPAWN_ENV =
-	/^(?:BASH_ENV|BUN_OPTIONS|ENV|ZDOTDIR|HOME|USERPROFILE|HOMEDRIVE|HOMEPATH|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXEC_PATH|GIT_EXTERNAL_DIFF|GIT_PROXY_COMMAND|GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|GIT_SEQUENCE_EDITOR|GIT_TEMPLATE_DIR|NODE_OPTIONS|PYTHONPATH|PYTHONUSERBASE|PYTHONSTARTUP|PERL5OPT|PERL5LIB|JAVA_TOOL_OPTIONS|JDK_JAVA_OPTIONS|LD_PRELOAD|LD_AUDIT|LD_LIBRARY_PATH|DYLD_(?:INSERT_LIBRARIES|LIBRARY_PATH|FALLBACK_LIBRARY_PATH|FRAMEWORK_PATH|FALLBACK_FRAMEWORK_PATH|VERSIONED_LIBRARY_PATH|VERSIONED_FRAMEWORK_PATH)|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
+	/^(?:BASH_ENV|BUN_OPTIONS|ENV|ZDOTDIR|HOME|USERPROFILE|HOMEDRIVE|HOMEPATH|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXEC_PATH|GIT_EXTERNAL_DIFF|GIT_PROXY_COMMAND|GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|GIT_SEQUENCE_EDITOR|GIT_TEMPLATE_DIR|NODE_OPTIONS|PYTHONPATH|PYTHONUSERBASE|PYTHONSTARTUP|PERL5OPT|PERL5LIB|JAVA_TOOL_OPTIONS|JDK_JAVA_OPTIONS|_JAVA_OPTIONS|PERLLIB|RIPGREP_CONFIG_PATH|TAR_OPTIONS|RSYNC_RSH|MAKEFLAGS|MAKEFILES|SHELLOPTS|PS4|LD_PRELOAD|LD_AUDIT|LD_LIBRARY_PATH|DYLD_(?:INSERT_LIBRARIES|LIBRARY_PATH|FALLBACK_LIBRARY_PATH|FRAMEWORK_PATH|FALLBACK_FRAMEWORK_PATH|VERSIONED_LIBRARY_PATH|VERSIONED_FRAMEWORK_PATH)|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
+/**
+ * npm reads `npm_config_<key>` with the prefix in any case and normalizes the key
+ * (case and `_`/`-`), so `npm_config_Node_Options` and `npm_config_node-options`
+ * both set `node-options`, which npm hands to the Node processes it starts as
+ * `NODE_OPTIONS`, and `script-shell` picks the program every lifecycle script
+ * (`npm run`, `npm test`, install hooks) runs through.
+ */
+const PROJECT_DENIED_NPM_SPAWN_ENV = /^npm_config_(?:node[_-]options|script[_-]shell)$/i;
 const PROJECT_HOME_SPAWN_ENV = new Set(["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"]);
 
 /**
@@ -88,7 +103,8 @@ export function projectDeclaredSpawnHookNames(env: Record<string, string | undef
 	for (const name of Object.keys(env)) {
 		const key = canonicalEnvKey(name);
 		const dynamic = snapshot.dynamic.has(key);
-		if (!PROJECT_DENIED_SPAWN_ENV.test(key) || (snapshot.values[key] === undefined && !dynamic)) continue;
+		const denied = PROJECT_DENIED_SPAWN_ENV.test(key) || PROJECT_DENIED_NPM_SPAWN_ENV.test(key);
+		if (!denied || (snapshot.values[key] === undefined && !dynamic)) continue;
 		if (env[name] === undefined || (!dynamic && $inheritedEnv(name) !== undefined)) continue;
 		names.push(name);
 	}
@@ -143,12 +159,11 @@ export function projectSafeHomeOverride(explicit?: Record<string, string>): Reco
 /**
  * Build the spawn environment (cached).
  *
- * `CI=true` is injected unless the documented `GJC_BASH_NO_CI` (or its legacy
- * `PI_BASH_NO_CI` / `CLAUDE_BASH_NO_CI` aliases) is set to a canonical truthy
- * flag value.
+ * The spawn environment is the inherited process environment plus the fixed
+ * hardening entries below. `CI` is not injected: a process that did not export
+ * it must not look like CI to the tools it runs.
  */
 function buildSpawnEnv(shell: string): Record<string, string> {
-	const noCI = $pickflag("GJC_BASH_NO_CI", "PI_BASH_NO_CI", "CLAUDE_BASH_NO_CI");
 	const inherited = filterProcessEnv(Bun.env);
 	delete inherited.GJC_SESSION_FILE;
 	delete inherited.GJC_MANAGED_OWNER_TRANSCRIPT_PATH;
@@ -159,7 +174,6 @@ function buildSpawnEnv(shell: string): Record<string, string> {
 		GPG_TTY: "not a tty",
 		GJCCODE: "1",
 		CLAUDECODE: "1",
-		...(noCI ? {} : { CI: "true" }),
 	} as Record<string, string>;
 }
 
