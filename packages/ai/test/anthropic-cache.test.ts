@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { MessageCreateParamsStreaming } from "@anthropic-ai/sdk/resources/messages";
 import {
+	applyPromptCaching,
 	isAnthropicCacheBreakpointOverflowError,
 	normalizeCacheControlTtlOrdering,
 	streamAnthropic,
@@ -151,9 +152,17 @@ describe("Anthropic prompt caching", () => {
 		]);
 
 		expect(canonical.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+		expect(canonical.system).toEqual([
+			{ type: "text", text: "Stable instructions" },
+			{ type: "text", text: "Second stable instruction", cache_control: canonical.cache_control },
+		]);
 		// Compatible Claude gateways default to explicit block markers because many
 		// proxies add their own controls or do not understand the root field.
 		expect(proxiedClaude.cache_control).toBeUndefined();
+		expect(proxiedClaude.system).toEqual([
+			{ type: "text", text: "Stable instructions" },
+			{ type: "text", text: "Second stable instruction" },
+		]);
 		expect(
 			(proxiedClaude.messages.at(-1)?.content as Array<{ cache_control?: CacheControl }>)[0]?.cache_control,
 		).toEqual({
@@ -161,9 +170,58 @@ describe("Anthropic prompt caching", () => {
 		});
 		// A verified gateway can explicitly opt into top-level automatic caching.
 		expect(automatic.cache_control).toEqual({ type: "ephemeral" });
-		expect(cacheControls(automatic)).toEqual([{ type: "ephemeral" }]);
+		expect(automatic.system).toEqual([
+			{ type: "text", text: "Stable instructions" },
+			{ type: "text", text: "Second stable instruction", cache_control: automatic.cache_control },
+		]);
+		expect(cacheControls(automatic)).toEqual([{ type: "ephemeral" }, { type: "ephemeral" }]);
 		// Non-Claude models on unknown compatible endpoints still get no generated caching.
 		expect(nonClaude.cache_control).toBeUndefined();
+	});
+	it("does not add a system marker when automatic caching has no system blocks", async () => {
+		const payload = await capturePayload(canonicalModel, { ...context(), systemPrompt: undefined });
+		expect(payload.system).toBeUndefined();
+		expect(cacheControls(payload)).toEqual([{ type: "ephemeral", ttl: "1h" }]);
+	});
+	it("preserves an existing system breakpoint without adding another", () => {
+		const params: MessageCreateParamsStreaming = cacheParams({
+			system: [
+				{ type: "text", text: "stable", cache_control: { type: "ephemeral", ttl: "1h" } },
+				{ type: "text", text: "tail" },
+			],
+		});
+		applyPromptCaching(params, "automatic", { type: "ephemeral", ttl: "1h" });
+		expect(params.system).toEqual([
+			{ type: "text", text: "stable", cache_control: { type: "ephemeral", ttl: "1h" } },
+			{ type: "text", text: "tail" },
+		]);
+		expect(cacheControls(params)).toHaveLength(2);
+		normalizeCacheControlTtlOrdering(params);
+	});
+	it("keeps the automatic system breakpoint within the total cap and retry budget", () => {
+		for (const budget of [2, 1] as const) {
+			for (const existingCount of [0, 2, 3]) {
+				const params: MessageCreateParamsStreaming = cacheParams({
+					system: [{ type: "text", text: "stable" }],
+					tools: Array.from({ length: existingCount }, (_, index) => ({
+						name: `tool_${index}`,
+						input_schema: { type: "object" },
+						cache_control: { type: "ephemeral", ttl: "1h" },
+					})),
+				});
+				applyPromptCaching(params, "automatic", { type: "ephemeral", ttl: "1h" }, budget);
+				const hasSystemMarker = budget === 2 && existingCount < 3;
+				expect(params.system).toEqual([
+					{
+						type: "text",
+						text: "stable",
+						...(hasSystemMarker ? { cache_control: { type: "ephemeral", ttl: "1h" } } : {}),
+					},
+				]);
+				expect(cacheControls(params)).toHaveLength(existingCount + 1 + Number(hasSystemMarker));
+				normalizeCacheControlTtlOrdering(params);
+			}
+		}
 	});
 	it("classifies the dispatched model id and honors every cache opt-out", async () => {
 		const proxyUrl = "https://proxy.example.test/anthropic";
@@ -239,7 +297,12 @@ describe("Anthropic prompt caching", () => {
 		for (const { name, model, options, expected } of cases) {
 			const payload = await capturePayload(model, context(), undefined, options?.cacheRetention);
 			expect(payload.model, name).toBe(model.id);
-			expect(cacheControls(payload), name).toEqual(expected ? [expected] : []);
+			const expectedControls = expected
+				? model.compat?.promptCacheMode === "automatic"
+					? [expected, expected]
+					: [expected]
+				: [];
+			expect(cacheControls(payload), name).toEqual(expectedControls);
 		}
 	});
 	it("preserves configured cache retention through GitLab Duo and lets request options win", async () => {
