@@ -195,13 +195,19 @@ Remove the registration with `gjc mcp remove sem --project`.
 `mcp.enableProjectConfig` is a **global** user setting: it applies to every
 checkout you open, not just this repository or Sem. Setting it to `false` is not
 the equivalent of leaving it alone — `false` disables *every* project-scope MCP
-source, including project HTTP and SSE servers that load by default. Reset the
-key instead, which restores the default (project HTTP/SSE enabled, project stdio
-servers not spawned):
+source, including project HTTP and SSE servers that load by default. Remove the
+key from your user settings instead, which restores the unset behavior (project
+HTTP/SSE enabled, project stdio servers not spawned):
 
 ```bash
-gjc config reset mcp.enableProjectConfig
+# Prints the agent directory that holds the user settings.json.
+gjc config path
 ```
+
+Delete only the `mcp.enableProjectConfig` entry from that `settings.json`,
+leaving the rest of the file intact. `gjc config reset mcp.enableProjectConfig`
+is not equivalent: the setting has a schema default of `false`, so reset writes
+an explicit `false` and disables project HTTP/SSE sources everywhere.
 
 ### Optional: preview overlapping branch changes with Weave
 
