@@ -49,6 +49,71 @@ async function expectIntegrationBase(root: string, ref: string, base: string): P
 }
 
 describe("ultragoal Git integration base resolution", () => {
+	it.each([
+		"develop",
+		"dev",
+		"main",
+		"master",
+	])("excludes checked-out local %s and captures committed changes beyond a distinct ancestor", async branch => {
+		await withIntegrationFixture(async (root, baseline) => {
+			await fixtureGit(root, "branch", "-m", branch);
+			const integration = branch === "main" ? "dev" : "main";
+			await fixtureGit(root, "branch", integration);
+			await commitFixtureFile(root, "feature.txt");
+			await expectIntegrationBase(root, integration, baseline);
+
+			const changeSet = await computeCheckpointChangeSet(root);
+			expect(changeSet?.baseRef).toBe(integration);
+			expect(changeSet?.mergeBase).toBe(baseline);
+			expect(changeSet?.paths).toEqual([
+				{ path: "feature.txt", oldPath: undefined, status: "added", category: "other" },
+			]);
+			expect(changeSet?.captureIncomplete).toBe(false);
+			expect(changeSet?.rawDiff).toContain("+feature.txt");
+			expect(computeUltragoalReviewSourceHash(changeSet)).toMatch(/^sha256:[0-9a-f]{64}$/);
+		});
+	});
+
+	it("fails closed when checked-out develop is the only integration ref", async () => {
+		await withIntegrationFixture(async root => {
+			await commitFixtureFile(root, "feature.txt");
+			await expect(resolveGitBase(root)).rejects.toThrow("authoritative integration base");
+			await expect(computeCheckpointChangeSet(root)).rejects.toThrow("authoritative integration base");
+		});
+	});
+
+	it("retains distinct origin/develop when local develop is checked out", async () => {
+		await withIntegrationFixture(async (root, baseline) => {
+			await fixtureGit(root, "update-ref", "refs/remotes/origin/develop", baseline);
+			await commitFixtureFile(root, "feature.txt");
+			await expectIntegrationBase(root, "origin/develop", baseline);
+		});
+	});
+
+	it("retains a distinct local integration ref at HEAD", async () => {
+		await withIntegrationFixture(async root => {
+			await commitFixtureFile(root, "feature.txt");
+			await fixtureGit(root, "branch", "dev");
+			expect(await resolveGitBase(root)).toBe("dev");
+		});
+	});
+
+	it("preserves explicit overrides naming the checked-out branch", async () => {
+		await withIntegrationFixture(async root => {
+			await commitFixtureFile(root, "feature.txt");
+			expect(await resolveGitBase(root, "develop")).toBe("develop");
+			expect(await resolveGitBase(root, "refs/heads/develop")).toBe("refs/heads/develop");
+		});
+	});
+
+	it("retains local integration candidates with detached HEAD", async () => {
+		await withIntegrationFixture(async (root, baseline) => {
+			await fixtureGit(root, "checkout", "--detach");
+			await commitFixtureFile(root, "feature.txt");
+			await expectIntegrationBase(root, "develop", baseline);
+		});
+	});
+
 	it("resolves local develop-only history and authenticates the checkpoint source hash", async () => {
 		await withIntegrationFixture(async (root, baseline) => {
 			await fixtureGit(root, "checkout", "-b", "feature");
