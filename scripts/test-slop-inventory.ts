@@ -2,6 +2,7 @@
 
 import * as path from "node:path";
 import { $ } from "bun";
+import { sanitizeDisplayLine } from "../packages/utils/src/sanitize-text";
 
 // Discussion #6286, Phase 0. These are review signals, never deletion verdicts.
 // Only Git-tracked .ts/.tsx files under packages/ and scripts/ are counted.
@@ -151,14 +152,23 @@ async function main(): Promise<void> {
 				: item.categories[signal].length,
 		);
 		console.log(
-			[item.package, item.testFiles, item.testCases, item.testLines, item.sourceLines, ...counts].join("\t"),
+			[
+				sanitizeDisplayLine(item.package).replaceAll("\t", " "),
+				item.testFiles,
+				item.testCases,
+				item.testLines,
+				item.sourceLines,
+				...counts,
+			].join("\t"),
 		);
 	}
 	for (const item of packages) {
 		for (const signal of Object.keys(signals) as Signal[]) {
 			const rows = item.categories[signal];
-			console.log(`\n${item.package} — ${signals[signal]}: ${rows.length} files`);
-			for (const row of rows) console.log(`  ${row.file}\t${row.count}`);
+			console.log(
+				`\n${sanitizeDisplayLine(item.package).replaceAll("\t", " ")} — ${signals[signal]}: ${rows.length} files`,
+			);
+			for (const row of rows) console.log(`  ${sanitizeDisplayLine(row.file).replaceAll("\t", " ")}\t${row.count}`);
 		}
 	}
 }
