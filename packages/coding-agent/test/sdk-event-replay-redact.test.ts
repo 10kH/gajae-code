@@ -20,6 +20,58 @@ function mulberry32(seed: number): () => number {
 }
 
 describe("session event replay redaction", () => {
+	test("property: session id capture, seed 516, 64 inputs", () => {
+		const next = mulberry32(516);
+		const alphabet = "abcdefghijklmnopqrstuvwxyz";
+		const genId = (): string => {
+			let id = "s";
+			const length = 1 + (next() % 8);
+			for (let n = 0; n < length; n++) id += alphabet[next() % alphabet.length]!;
+			return id;
+		};
+		const reference = (frame: Record<string, unknown>): string | undefined => {
+			if (typeof frame.sessionId === "string") return frame.sessionId;
+			const payload = frame.payload;
+			if (!payload || typeof payload !== "object") return undefined;
+			const sessionId = (payload as { sessionId?: unknown }).sessionId;
+			return typeof sessionId === "string" ? sessionId : undefined;
+		};
+		const withheld = (stream: SessionEventStream): boolean =>
+			!stream.replay(0).events.some(event => event.kind === "turn_stream");
+		for (let i = 0; i < 64; i++) {
+			const mode = next() % 7;
+			const top = genId();
+			const nested = genId();
+			const frame: Record<string, unknown> = { kind: "activity", payload: { state: "idle" } };
+			if (mode === 0) frame.sessionId = top;
+			else if (mode === 1) frame.payload = { state: "idle", sessionId: nested };
+			else if (mode === 2) {
+				frame.sessionId = top;
+				frame.payload = { state: "idle", sessionId: nested };
+			} else if (mode === 3) frame.sessionId = null;
+			else if (mode === 4) frame.sessionId = next() % 1000;
+			else if (mode === 5) frame.payload = { state: "idle", sessionId: null };
+			else frame.payload = null;
+			const expected = reference(frame);
+			const stream = new SessionEventStream();
+			stream.emit(frame);
+			stream.emit({ kind: "turn_stream", payload: { text: MARKER } });
+			const other = `${expected ?? "none"}-other-${i}`;
+			setSessionOutboundRedact(other, true);
+			expect(withheld(stream)).toBe(false);
+			if (expected !== undefined) {
+				setSessionOutboundRedact(expected, true);
+				expect(withheld(stream)).toBe(true);
+				const once = stream.replay(0).events.map(event => String(event.kind));
+				expect(stream.replay(0).events.map(event => String(event.kind))).toEqual(once);
+				setSessionOutboundRedact(expected, false);
+				expect(withheld(stream)).toBe(false);
+			}
+			setSessionOutboundRedact(other, false);
+			if (expected !== undefined) setSessionOutboundRedact(expected, false);
+		}
+	});
+
 	test("property: replay kind filter, seed 516, 64 inputs", () => {
 		const next = mulberry32(516);
 		const alphabet = "abcdefghijklmnopqrstuvwxyz_";
