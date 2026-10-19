@@ -1,13 +1,30 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Args } from "@gajae-code/coding-agent/cli/args";
-import { launchDefaultTmuxIfNeeded, type TmuxLaunchContext } from "@gajae-code/coding-agent/gjc-runtime/launch-tmux";
+import {
+	buildDefaultTmuxLaunchPlan,
+	launchDefaultTmuxIfNeeded,
+	type TmuxLaunchContext,
+} from "@gajae-code/coding-agent/gjc-runtime/launch-tmux";
+import {
+	__setBinaryResolverForTests,
+	__setExecutableIdentityResolverForTests,
+	clearPsmuxDetectionCache,
+} from "@gajae-code/coding-agent/gjc-runtime/psmux-detect";
+import { lifecyclePaths } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
+import {
+	__setTmuxProviderAuthorityPlatformForTests,
+	bindGjcTmuxProviderAuthority,
+	persistGjcTmuxProviderAuthoritySync,
+	resolveGjcTmuxProviderContext,
+} from "@gajae-code/coding-agent/gjc-runtime/tmux-provider-context";
 import {
 	__setCreateOwnerIsolationForTests,
 	createGjcTmuxSession,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-sessions";
+import { prepareManagedDirectoryRoot } from "../../src/session/internal/managed-session-storage";
 
 const PLANTED_SESSION = "victim-tmux-493";
 const PLANTED_COORDINATOR = "victim-coordinator-493";
@@ -100,6 +117,10 @@ async function withRepo(
 describe("tmux launch identity provenance", () => {
 	afterEach(() => {
 		__setCreateOwnerIsolationForTests(null);
+		__setTmuxProviderAuthorityPlatformForTests(null);
+		__setBinaryResolverForTests(null);
+		__setExecutableIdentityResolverForTests(null);
+		clearPsmuxDetectionCache();
 	});
 
 	it("does not adopt project dotenv session, root, or state-file pins", async () => {
@@ -190,6 +211,109 @@ describe("tmux launch identity provenance", () => {
 				expect(launched.inner).not.toContain("/declared/state.json");
 			},
 		);
+	});
+
+	it("still uses a padded operator coordinator id to attach the existing provider session", async () => {
+		const root = await mkdtemp(path.join(tmpdir(), "tmux-identity-attach-"));
+		const cwd = path.join(root, "repo");
+		const stateDir = path.join(root, "state");
+		await mkdir(cwd, { recursive: true });
+		await writeFile(
+			path.join(cwd, ".env"),
+			[`GJC_TMUX_SESSION=${OPERATOR_SESSION}`, `GJC_COORDINATOR_SESSION_ID=${OPERATOR_COORDINATOR}`, ""].join("\n"),
+		);
+		const generation = "generation-a";
+		clearPsmuxDetectionCache();
+		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "/usr/bin/psmux" : null));
+		__setExecutableIdentityResolverForTests(() => "volume:42");
+		__setTmuxProviderAuthorityPlatformForTests("win32");
+		const authority = bindGjcTmuxProviderAuthority(
+			resolveGjcTmuxProviderContext({
+				platform: "win32",
+				env: { GJC_TMUX_COMMAND: "psmux" },
+				runner: () => ({ exitCode: 0, stdout: "psmux 3.3.0\n", stderr: "" }),
+			}),
+			{ stateDir, sessionId: OPERATOR_COORDINATOR, generation },
+		);
+		persistGjcTmuxProviderAuthoritySync(authority);
+		const paths = lifecyclePaths(stateDir, authority.sessionId, authority.generation);
+		prepareManagedDirectoryRoot(paths.root);
+		await writeFile(
+			paths.generationFile,
+			`${JSON.stringify({
+				schema_version: 1,
+				session_id: authority.sessionId,
+				generation: authority.generation,
+				published_at: "2026-07-28T00:00:00.000Z",
+			})}\n`,
+		);
+		const listed: string[][] = [];
+		const spy = spyOn(Bun, "spawnSync").mockImplementation(((command: unknown) => {
+			const argv = Array.isArray(command)
+				? command.map(String)
+				: Array.isArray((command as { cmd?: unknown } | null)?.cmd)
+					? (command as { cmd: unknown[] }).cmd.map(String)
+					: [];
+			listed.push(argv);
+			if (argv.includes("list-sessions")) {
+				return {
+					exitCode: 0,
+					stdout: Buffer.from(`${OPERATOR_SESSION}\t1\t0\t1770000000\t1\troot\t1\t1\t\t\t\t\t\t\t\t\t$9`),
+					stderr: Buffer.from(""),
+				};
+			}
+			return { exitCode: 0, stdout: Buffer.from(""), stderr: Buffer.from("") };
+		}) as never);
+		const previous = process.cwd();
+		const launchCalls: string[][] = [];
+		try {
+			process.chdir(cwd);
+			const env = {
+				GJC_PSMUX_DETECTION: "off",
+				GJC_TMUX_COMMAND: "ambient-tmux",
+				GJC_TMUX_SESSION: ` ${OPERATOR_SESSION} `,
+				GJC_COORDINATOR_SESSION_ID: ` ${OPERATOR_COORDINATOR} `,
+				GJC_TMUX_OWNER_STATE_DIR: stateDir,
+				GJC_TMUX_OWNER_GENERATION: generation,
+			};
+			const plan = buildDefaultTmuxLaunchPlan({
+				parsed: args(),
+				rawArgs: ["--tmux"],
+				cwd,
+				env,
+				argv: ["bun", "packages/coding-agent/src/cli.ts"],
+				execPath: process.execPath,
+				tty: { stdin: true, stdout: true, columns: 80, rows: 24 },
+				tmuxAvailable: true,
+				currentBranch: "main",
+				ownerIsolationProbe: ownerProbe(),
+			});
+			expect(plan?.attachSessionName).toBe(OPERATOR_SESSION);
+			expect(listed.some(call => call[0] === authority.command && call.includes("list-sessions"))).toBe(true);
+			const handled = launchDefaultTmuxIfNeeded({
+				parsed: args(),
+				rawArgs: ["--tmux"],
+				cwd,
+				env,
+				argv: ["bun", "packages/coding-agent/src/cli.ts"],
+				execPath: process.execPath,
+				tty: { stdin: true, stdout: true, columns: 80, rows: 24 },
+				tmuxAvailable: true,
+				currentBranch: "main",
+				ownerIsolationProbe: ownerProbe(),
+				spawnSync: (_command, spawnArgs) => {
+					launchCalls.push([...spawnArgs]);
+					return { exitCode: 0, stdout: "" };
+				},
+			});
+			expect(handled).toBe(true);
+			const attach = launchCalls.find(call => call[0] === "attach-session");
+			expect(attach?.some(arg => arg.includes(OPERATOR_SESSION))).toBe(true);
+		} finally {
+			spy.mockRestore();
+			process.chdir(previous);
+			await rm(root, { recursive: true, force: true });
+		}
 	});
 
 	it("session create ignores a project dotenv session and state-file pin", async () => {
