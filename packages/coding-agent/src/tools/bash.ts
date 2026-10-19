@@ -1170,8 +1170,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								spillThreshold,
 								headBytes,
 								oneShot: true,
-								ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
-								disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
+								ignoreShellPrefix: this.#isolateRestrictedShell(),
+								disableShellSnapshot: this.#isolateRestrictedShell(),
 								onChunk: chunk => {
 									tailBuffer.append(chunk);
 									latestText = tailBuffer.text();
@@ -1352,6 +1352,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	 * helper after `AgentSession` has applied the public-tool permission gate, so
 	 * Monitor inherits Bash's cwd / env / artifact / interceptor pipeline 1:1.
 	 */
+	/** Read-only and workflow allowlists must not source a snapshot or a shell prefix. */
+	#isolateRestrictedShell(): boolean {
+		return this.session.bashRestrictionProfile === "read-only" || (this.session.bashAllowedPrefixes?.length ?? 0) > 0;
+	}
+
 	async #prepareBashExecution(
 		input: { command: string; env?: Record<string, string>; timeout?: number; cwd?: string },
 		ctx?: AgentToolContext,
@@ -1779,9 +1784,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						spillThreshold,
 						headBytes,
 						oneShot: true,
-						ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only" || prepared.directMasterSpawn,
-						disableShellSnapshot:
-							this.session.bashRestrictionProfile === "read-only" || prepared.directMasterSpawn,
+						ignoreShellPrefix: this.#isolateRestrictedShell() || prepared.directMasterSpawn,
+						disableShellSnapshot: this.#isolateRestrictedShell() || prepared.directMasterSpawn,
 						onChunk: chunk => {
 							tailBuffer.append(chunk);
 							void reportProgress(tailBuffer.text(), {
@@ -2921,8 +2925,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					// onChunk is throttled and drops chunks; the detector needs all of them.
 					onRawChunk: chunk => awaitingInput.push(chunk),
 					onMinimizedSave: async originalText => saveBashOriginalArtifact(artifactPublication, originalText),
-					ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only" || directMasterSpawn,
-					disableShellSnapshot: this.session.bashRestrictionProfile === "read-only" || directMasterSpawn,
+					ignoreShellPrefix: this.#isolateRestrictedShell() || directMasterSpawn,
+					disableShellSnapshot: this.#isolateRestrictedShell() || directMasterSpawn,
 				}).finally(() => awaitingInput.dispose());
 		ptyFoldUnregister?.();
 		// Folded: the foreground was settled by the fold, so return the background

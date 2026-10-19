@@ -101,7 +101,7 @@ function createWorkflowRepo(options?: { externalMarker?: string; textconvMarker?
 
 let sessionSerial = 0;
 
-function createWorkflowTool(repo: WorkflowRepo, snapshotBody: string): BashTool {
+function createWorkflowTool(repo: WorkflowRepo, snapshotBody: string, shellPrefix?: string): BashTool {
 	sessionSerial += 1;
 	const snapshotPath = path.join(repo.dir, `snapshot-${sessionSerial}.sh`);
 	fs.writeFileSync(snapshotPath, snapshotBody);
@@ -138,7 +138,7 @@ function createWorkflowTool(repo: WorkflowRepo, snapshotBody: string): BashTool 
 						GIT_CONFIG_GLOBAL: "/dev/null",
 						GIT_CONFIG_SYSTEM: "/dev/null",
 					},
-					prefix: undefined,
+					prefix: shellPrefix,
 				};
 			},
 		},
@@ -184,6 +184,53 @@ describe("workflow bash command binding", () => {
 			const result = checkBashAllowedPrefixes(command, ROLE_PREFIXES);
 			expect({ command, ...result }).toMatchObject({ allowed: false });
 			expect(result.reason).toContain("external diff or textconv");
+		}
+	});
+
+	it("property pins workflow command normalization, seed 40517, 64 inputs", async () => {
+		const mod = await import("../../src/tools/bash-allowed-prefixes");
+		const normalize = mod.normalizeWorkflowBashCommand;
+		if (typeof normalize !== "function") throw new Error("workflow normalizer is missing");
+		const gitPath = Bun.which("git", { PATH: process.env.PATH ?? "" });
+		if (!gitPath) throw new Error("git is not on PATH");
+		const random = mulberry32(PROPERTY_SEED);
+		const subs = ["diff", "log", "show", "blame", "status", "rev-parse", "ls-files"];
+		const tails = [
+			"",
+			"--stat",
+			"--src-prefix a",
+			"--src-prefix a -- f",
+			"--dst-prefix z -- f",
+			"--unified 3",
+			"--abbrev 8",
+			"-- f",
+			"--",
+			"HEAD -- f",
+			"--text",
+			"--no-ext-diff",
+		];
+		const quotedWords = (command: string): string[] => command.split(" ").map(word => word.slice(1, -1));
+		for (let index = 0; index < PROPERTY_INPUTS; index += 1) {
+			const sub = subs[Math.floor(random() * subs.length)]!;
+			const tail = tails[Math.floor(random() * tails.length)]!;
+			const command = tail ? `git ${sub} ${tail}` : `git ${sub}`;
+			const userRest = tail ? tail.split(" ") : [];
+			const normalized = normalize(command, ROLE_PREFIXES, { profile: "workflow" });
+			if (!normalized) throw new Error(`normalizer rejected a safe command: ${command}`);
+			const words = quotedWords(normalized);
+			expect(words[0]).toBe(gitPath);
+			expect(words[1]).toBe(sub);
+			if (sub === "blame" || sub === "diff" || sub === "log" || sub === "show") {
+				expect(words.slice(2, 4)).toEqual(["--no-ext-diff", "--no-textconv"]);
+				expect(words.slice(4)).toEqual(userRest);
+				const prefixAt = words.indexOf("--src-prefix");
+				if (prefixAt !== -1 && words[prefixAt + 1] !== undefined && words[prefixAt + 1] !== "--") {
+					expect(words[prefixAt + 1]).not.toBe("--no-ext-diff");
+				}
+			} else {
+				expect(words.slice(2)).toEqual(userRest);
+			}
+			expect(normalize(command, ROLE_PREFIXES, { profile: "workflow" })).toBe(normalized);
 		}
 	});
 
@@ -290,6 +337,63 @@ describe("workflow bash command binding", () => {
 			const plain = await tool.execute("tool-call", { command: "git diff -- f" });
 			expect(fs.existsSync(marker)).toBe(false);
 			expect(resultText(plain)).toContain("+changed");
+		} finally {
+			repo.cleanup();
+			fs.rmSync(marker, { force: true });
+		}
+	});
+
+	it.skipIf(!HAS_BASH)("refuses a snapshot function named for the resolved git path", async () => {
+		const repo = createWorkflowRepo();
+		const marker = path.join(repo.dir, "abs-fn-marker");
+		const gitPath = Bun.which("git", { PATH: process.env.PATH ?? "" });
+		if (!gitPath) throw new Error("git is not on PATH");
+		try {
+			const tool = createWorkflowTool(repo, `${gitPath}() { touch '${marker}'; }\n`);
+			const result = await tool.execute("tool-call", { command: "git diff -- f" });
+			expect(fs.existsSync(marker)).toBe(false);
+			expect(resultText(result)).toContain("+changed");
+		} finally {
+			repo.cleanup();
+		}
+	});
+
+	it.skipIf(!HAS_BASH)("refuses a configured shell prefix before an allowlisted git command", async () => {
+		const repo = createWorkflowRepo();
+		const marker = path.join(repo.dir, "prefix-marker");
+		try {
+			const tool = createWorkflowTool(repo, ":\n", `touch ${marker};`);
+			const result = await tool.execute("tool-call", { command: "git diff -- f" });
+			expect(fs.existsSync(marker)).toBe(false);
+			expect(resultText(result)).toContain("+changed");
+		} finally {
+			repo.cleanup();
+		}
+	});
+
+	it.skipIf(!HAS_BASH)("allows an incomplete src-prefix to leave the helper unrun", async () => {
+		const marker = path.join(os.tmpdir(), `gjc-wf-src-miss-${process.pid}`);
+		fs.rmSync(marker, { force: true });
+		const repo = createWorkflowRepo({ externalMarker: marker });
+		try {
+			const tool = createWorkflowTool(repo, ":\n");
+			await expect(tool.execute("tool-call", { command: "git diff --src-prefix" })).rejects.toThrow();
+			expect(fs.existsSync(marker)).toBe(false);
+		} finally {
+			repo.cleanup();
+			fs.rmSync(marker, { force: true });
+		}
+	});
+
+	it.skipIf(!HAS_BASH)("refuses an external diff helper when src-prefix takes a value", async () => {
+		const marker = path.join(os.tmpdir(), `gjc-wf-src-${process.pid}`);
+		fs.rmSync(marker, { force: true });
+		const repo = createWorkflowRepo({ externalMarker: marker });
+		try {
+			const tool = createWorkflowTool(repo, ":\n");
+			const result = await tool.execute("tool-call", { command: "git diff --src-prefix b/ -- f" });
+			expect(fs.existsSync(marker)).toBe(false);
+			expect(resultText(result)).toContain("+changed");
 		} finally {
 			repo.cleanup();
 			fs.rmSync(marker, { force: true });

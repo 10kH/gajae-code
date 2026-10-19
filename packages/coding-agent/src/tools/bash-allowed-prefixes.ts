@@ -356,15 +356,15 @@ function rejectGitHostAccess(words: readonly string[]): BashAllowedPrefixesCheck
 
 /**
  * Diff-family git commands run `diff.external`, `GIT_EXTERNAL_DIFF`, and textconv
- * filters unless these flags are present. Insert them before `--`, because tokens
- * after `--` are pathspecs and the last enabling flag wins.
+ * filters unless these flags are present. Place them immediately after the
+ * subcommand so a later value-taking option cannot consume them and they stay
+ * before a `--` pathspec. The gate rejects a later `--ext-diff` or `--textconv`,
+ * which would otherwise win.
  */
 function disableGitExternalHelpers(commandName: string, argv: readonly string[]): string[] {
 	if (commandName !== "git" || !GIT_DIFF_FAMILY_SUBCOMMANDS.has(argv[1] ?? "")) return [...argv];
-	const end = argv.indexOf("--", 2);
-	const insertAt = end === -1 ? argv.length : end;
 	const next = [...argv];
-	next.splice(insertAt, 0, "--no-ext-diff", "--no-textconv");
+	next.splice(2, 0, "--no-ext-diff", "--no-textconv");
 	return next;
 }
 
@@ -510,8 +510,8 @@ function commandAllowedPrefixesReason(normalizedPrefixes: readonly string[], opt
 
 /**
  * Workflow restricted bash keeps the lexical prefix check, then runs the resolved
- * executable. A sourced shell snapshot cannot retarget that path through an alias,
- * a function, or PATH.
+ * executable. Callers also skip the shell snapshot and shell prefix, because a
+ * snapshot function can be named for that absolute path.
  */
 export function normalizeWorkflowBashCommand(
 	command: string,
