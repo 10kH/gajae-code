@@ -1,54 +1,49 @@
-import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { ToolSession } from "../../src/sdk";
+import { BrowserTool } from "../../src/tools/browser";
 import type { BrowserHandle, BrowserKind } from "../../src/tools/browser/registry";
 import * as registry from "../../src/tools/browser/registry";
 import type { RunResultOk } from "../../src/tools/browser/tab-protocol";
 import type { TabSession } from "../../src/tools/browser/tab-supervisor";
 import * as supervisor from "../../src/tools/browser/tab-supervisor";
 
-const registryPath = "../../src/tools/browser/registry";
-const supervisorPath = "../../src/tools/browser/tab-supervisor";
-const realRegistry = { ...registry };
-const realSupervisor = { ...supervisor };
+const originalAcquireBrowser = registry.acquireBrowser;
+const originalAcquireTab = supervisor.acquireTab;
+const originalRunInTab = supervisor.runInTab;
+const originalGetTab = supervisor.getTab;
 
-let acquireBrowserImpl: typeof registry.acquireBrowser = registry.acquireBrowser;
-let acquireTabImpl: typeof supervisor.acquireTab = supervisor.acquireTab;
-let runInTabImpl: typeof supervisor.runInTab = supervisor.runInTab;
-let getTabImpl: typeof supervisor.getTab = supervisor.getTab;
-
-mock.module(registryPath, () => ({
-	...realRegistry,
-	acquireBrowser: (kind: BrowserKind, opts: Parameters<typeof registry.acquireBrowser>[1]) =>
-		acquireBrowserImpl(kind, opts),
-}));
-mock.module(supervisorPath, () => ({
-	...realSupervisor,
-	acquireTab: (name: string, browser: BrowserHandle, opts: Parameters<typeof supervisor.acquireTab>[2]) =>
-		acquireTabImpl(name, browser, opts),
-	runInTab: (name: string, opts: Parameters<typeof supervisor.runInTab>[1]) => runInTabImpl(name, opts),
-	getTab: (name: string) => getTabImpl(name),
-}));
+let acquireBrowserImpl: typeof registry.acquireBrowser = originalAcquireBrowser;
+let acquireTabImpl: typeof supervisor.acquireTab = originalAcquireTab;
+let runInTabImpl: typeof supervisor.runInTab = originalRunInTab;
+let getTabImpl: typeof supervisor.getTab = originalGetTab;
+const spies: Array<{ mockRestore(): void }> = [];
 
 function unstubbed(name: string): never {
 	throw new Error(`${name} was not stubbed`);
 }
 
-afterEach(() => {
+beforeEach(() => {
 	acquireBrowserImpl = (() => unstubbed("acquireBrowser")) as typeof registry.acquireBrowser;
 	acquireTabImpl = (() => unstubbed("acquireTab")) as typeof supervisor.acquireTab;
 	runInTabImpl = (() => unstubbed("runInTab")) as typeof supervisor.runInTab;
 	getTabImpl = (() => unstubbed("getTab")) as typeof supervisor.getTab;
-});
-afterAll(() => {
-	acquireBrowserImpl = registry.acquireBrowser;
-	acquireTabImpl = supervisor.acquireTab;
-	runInTabImpl = supervisor.runInTab;
-	getTabImpl = supervisor.getTab;
-	mock.module(registryPath, () => realRegistry);
-	mock.module(supervisorPath, () => realSupervisor);
+	spies.push(
+		vi.spyOn(registry, "acquireBrowser").mockImplementation((kind, opts) => acquireBrowserImpl(kind, opts)),
+		vi
+			.spyOn(supervisor, "acquireTab")
+			.mockImplementation((name, browser, opts) => acquireTabImpl(name, browser, opts)),
+		vi.spyOn(supervisor, "runInTab").mockImplementation((name, opts) => runInTabImpl(name, opts)),
+		vi.spyOn(supervisor, "getTab").mockImplementation(name => getTabImpl(name)),
+	);
 });
 
-const { BrowserTool } = await import("../../src/tools/browser");
+afterEach(() => {
+	while (spies.length > 0) spies.pop()?.mockRestore();
+	if (registry.acquireBrowser !== originalAcquireBrowser) throw new Error("acquireBrowser spy leaked");
+	if (supervisor.acquireTab !== originalAcquireTab) throw new Error("acquireTab spy leaked");
+	if (supervisor.runInTab !== originalRunInTab) throw new Error("runInTab spy leaked");
+	if (supervisor.getTab !== originalGetTab) throw new Error("getTab spy leaked");
+});
 
 const CLOSE = "</untrusted-content>";
 const MIXED_CLOSE = "</Untrusted-Content>";
