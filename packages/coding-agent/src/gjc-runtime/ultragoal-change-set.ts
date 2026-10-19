@@ -153,9 +153,33 @@ export async function spawnText(
 }
 
 /**
- * The canonical empty tree object. A repository with no commits has no refs and
- * no merge base, so the empty tree is the only authoritative baseline: every
- * tracked, staged, and untracked file is an addition on top of it.
+ * Derive the empty tree object ID for the given repository, which depends on the
+ * repository's object format (SHA-1 vs SHA-256). A repository with no commits has
+ * no refs and no merge base, so the empty tree is the only authoritative baseline:
+ * every tracked, staged, and untracked file is an addition on top of it.
+ *
+ * @param cwd The repository root directory
+ * @returns The empty tree object ID (format-specific), or the SHA-1 ID if derivation fails
+ */
+async function getEmptyTreeId(cwd: string): Promise<string> {
+	// Compute the empty tree object ID by hashing an empty tree.
+	// This respects the repository's object format (SHA-1 or SHA-256).
+	const result = await spawnText(["git", "hash-object", "-t", "tree", "--stdin"], {
+		cwd,
+		timeoutMs: 3000,
+		stdin: "", // Empty input for empty tree
+	});
+	if (result.ok && result.stdout.trim()) {
+		return result.stdout.trim();
+	}
+	// Fallback to SHA-1 empty tree ID if derivation fails
+	// (e.g., git command not available, permission denied, etc.)
+	return "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+}
+
+/**
+ * The canonical empty tree object for SHA-1 repositories. Use getEmptyTreeId()
+ * to derive the format-specific ID for a given repository.
  */
 export const GIT_EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
@@ -299,7 +323,7 @@ export async function computeCheckpointChangeSet(cwd: string): Promise<Ultragoal
 	// addition, which is hashed like any other added file and never committed.
 	const headPresent = await spawnText(["git", "rev-parse", "--verify", "HEAD"], { cwd, timeoutMs: 3000 });
 	const unborn = !headPresent.ok;
-	const baseRef = unborn ? GIT_EMPTY_TREE_SHA : await resolveGitBase(cwd);
+	const baseRef = unborn ? await getEmptyTreeId(cwd) : await resolveGitBase(cwd);
 	const base = baseRef;
 	const mergeBase = unborn
 		? { ok: false, stdout: "", stderr: "repository has no commits" }
