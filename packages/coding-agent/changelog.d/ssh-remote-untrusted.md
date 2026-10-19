@@ -1,3 +1,3 @@
 ### Fixed
 
-- SSH remote command output is framed as untrusted content before it reaches the model.
+- The SSH tool frames remote command output in its direct result and error text. Saved output artifacts are unchanged.
