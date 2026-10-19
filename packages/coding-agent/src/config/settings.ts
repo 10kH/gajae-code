@@ -316,7 +316,6 @@ const GLOBAL_ONLY_AUTH_SETTING_KEYS = new Set([
 	"credentialPins",
 	"credentialPinStoreIdentity",
 	"credentialPreferences",
-	"credentialPreferenceMaxUsedPercent",
 ]);
 const LOCAL_NOTIFICATION_SETTING_PATHS = new Set(
 	[...LOCAL_NOTIFICATION_SETTING_KEYS].map(key => `notifications.${key}`),
@@ -391,6 +390,11 @@ const GLOBAL_ONLY_SETTINGS = new Set<SettingPath>([
 	"paseo.autoImport",
 	"ui.language",
 	"telemetry.enabled",
+	// Destination of the operator Hindsight server. A project file must not redirect it.
+	"hindsight.apiUrl",
+	// Operator consent for repository skills. A project file must not flip it.
+	"skills.trustProjectSkills",
+	"skills.enablePiProject",
 ]);
 const LEGACY_THEME_NAME_REPLACEMENTS = {
 	dark: "red-claw",

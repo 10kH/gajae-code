@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import {
 	classifyStateArgv,
 	STATE_ACTION_NAMES,
@@ -13,8 +15,20 @@ export interface BashAllowedPrefixesCheck {
 
 export type BashRestrictionProfile = "workflow" | "read-only";
 
+/** Session identities and workspace the restricted `gjc` command may name. */
+export interface GjcSessionBinding {
+	sessionId?: string | null;
+	/** Owner identity already on the tool session. Role-agent ralplan writes use it. */
+	credentialSessionId?: string | null;
+	/** Session workspace. A `--worktree-root` must be this repo, not a foreign one. */
+	worktreeRoot: string;
+	/** Child cwd. Relative `--worktree-root` resolves against it, as ralplan does. */
+	invocationCwd: string;
+}
+
 export interface BashRestrictionOptions {
 	profile?: BashRestrictionProfile;
+	gjcSessionBinding?: GjcSessionBinding;
 }
 
 const SHELL_CONTROL_CHARS = new Set([";", "|", "&", "<", ">", "(", ")"]);
@@ -231,6 +245,33 @@ function isLongOption(word: string, option: string): boolean {
 	return word === option || word.startsWith(`${option}=`);
 }
 
+function fileCompilesMagic(words: readonly string[]): boolean {
+	const valueOptions = ["--exclude", "--exclude-quiet", "--files-from", "--separator", "--magic-file", "--parameter"];
+	for (let index = 1; index < words.length; index += 1) {
+		const word = words[index]!;
+		if (word === "--") break;
+		if (word.startsWith("--")) {
+			const equalsAt = word.indexOf("=");
+			const name = equalsAt === -1 ? word : word.slice(0, equalsAt);
+			if (name.length > 2 && "--compile".startsWith(name)) return true;
+			if (equalsAt === -1 && valueOptions.some(option => name.length > 2 && option.startsWith(name))) {
+				index += 1;
+			}
+		} else if (word.startsWith("-")) {
+			for (let offset = 1; offset < word.length; offset += 1) {
+				const flag = word[offset]!;
+				if (flag === "C") return true;
+				// Required arguments consume the rest of the cluster, or the next word (even `--`).
+				if ("eFfmMP".includes(flag)) {
+					if (offset === word.length - 1) index += 1;
+					break;
+				}
+			}
+		}
+	}
+	return false;
+}
+
 function hasShortOption(word: string, option: string): boolean {
 	return word.startsWith("-") && !word.startsWith("--") && word.slice(1).includes(option);
 }
@@ -254,6 +295,9 @@ function validateReadOnlyCommand(words: readonly string[]): BashAllowedPrefixesC
 			if (isLongOption(option, "--pre") || isLongOption(option, "--pre-glob")) {
 				return { allowed: false, reason: "read-only bash does not allow ripgrep preprocessors" };
 			}
+			if (isLongOption(option, "--hostname-bin")) {
+				return { allowed: false, reason: "read-only bash does not allow ripgrep hostname commands" };
+			}
 			if (isLongOption(option, "--search-zip") || hasShortOption(option, "z")) {
 				return { allowed: false, reason: "read-only bash does not allow ripgrep compressed-file subprocesses" };
 			}
@@ -266,6 +310,10 @@ function validateReadOnlyCommand(words: readonly string[]): BashAllowedPrefixesC
 				return { allowed: false, reason: "read-only bash does not allow tree output-file writes" };
 			}
 		}
+	}
+
+	if (command === "file" && fileCompilesMagic(words)) {
+		return { allowed: false, reason: "read-only bash does not allow file magic compilation" };
 	}
 
 	const gitWrite = rejectGitHostAccess(words);
@@ -284,7 +332,107 @@ function rejectGitHostAccess(words: readonly string[]): BashAllowedPrefixesCheck
 	return undefined;
 }
 
-function validateMatchedGjcCommand(words: readonly string[]): BashAllowedPrefixesCheck {
+const GJC_SESSION_BIND_REASON = "restricted role-agent bash binds gjc to the current session";
+const GJC_WORKTREE_BIND_REASON = "restricted role-agent bash binds gjc --worktree-root to the current repository";
+
+function separateFlagValues(words: readonly string[], flag: string): string[] {
+	const values: string[] = [];
+	for (let index = 0; index < words.length; index += 1) {
+		if (words[index] !== flag) continue;
+		values.push(words[index + 1] ?? "");
+		index += 1;
+	}
+	return values;
+}
+
+function boundSessionIds(binding: GjcSessionBinding): ReadonlySet<string> {
+	const ids = new Set<string>();
+	for (const value of [binding.sessionId, binding.credentialSessionId]) {
+		if (typeof value !== "string") continue;
+		const trimmed = value.trim();
+		if (trimmed) ids.add(trimmed);
+	}
+	return ids;
+}
+
+function inlineStateSessionIds(words: readonly string[]): string[] {
+	if (words[1] !== "state") return [];
+	const ids: string[] = [];
+	for (const input of classifyStateArgv(words.slice(2)).inputs) {
+		if (input.kind !== "inline") continue;
+		let payload: unknown;
+		try {
+			payload = JSON.parse(input.raw);
+		} catch {
+			continue;
+		}
+		if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
+		const sessionId = (payload as Record<string, unknown>).session_id;
+		if (typeof sessionId === "string") ids.push(sessionId);
+	}
+	return ids;
+}
+
+function gitCommonDir(directory: string): string | undefined {
+	const result = Bun.spawnSync(["git", "-C", directory, "rev-parse", "--git-common-dir"], {
+		stdout: "pipe",
+		stderr: "ignore",
+	});
+	if (result.exitCode !== 0) return undefined;
+	const text = result.stdout.toString().trim();
+	if (!text) return undefined;
+	const absolute = path.isAbsolute(text) ? text : path.resolve(directory, text);
+	try {
+		return fs.realpathSync(absolute);
+	} catch {
+		return undefined;
+	}
+}
+
+/** Same directory, or another worktree of the same git common dir (isolated tasks). */
+function sameRepository(workspace: string, target: string): boolean {
+	let workspaceReal: string;
+	let targetReal: string;
+	try {
+		workspaceReal = fs.realpathSync(workspace);
+		targetReal = fs.realpathSync(target);
+	} catch {
+		return false;
+	}
+	if (workspaceReal === targetReal) return true;
+	const workspaceCommon = gitCommonDir(workspaceReal);
+	const targetCommon = gitCommonDir(targetReal);
+	return workspaceCommon !== undefined && workspaceCommon === targetCommon;
+}
+
+function worktreeSelectorAllowed(binding: GjcSessionBinding, rawTarget: string): boolean {
+	const trimmed = rawTarget.trim();
+	if (!trimmed) return false;
+	const resolved = path.isAbsolute(trimmed) ? trimmed : path.resolve(binding.invocationCwd, trimmed);
+	return sameRepository(binding.worktreeRoot, resolved);
+}
+
+function rejectUnboundGjcCommand(
+	words: readonly string[],
+	options: BashRestrictionOptions,
+): BashAllowedPrefixesCheck | undefined {
+	const binding = options.gjcSessionBinding;
+	if (!binding) return undefined;
+	const allowed = boundSessionIds(binding);
+	const sessionSelectors = [...separateFlagValues(words, "--session-id"), ...inlineStateSessionIds(words)];
+	if (sessionSelectors.some(value => !allowed.has(value.trim()))) {
+		return { allowed: false, reason: GJC_SESSION_BIND_REASON };
+	}
+	if (separateFlagValues(words, "--worktree-root").some(value => !worktreeSelectorAllowed(binding, value))) {
+		return { allowed: false, reason: GJC_WORKTREE_BIND_REASON };
+	}
+	return undefined;
+}
+
+function validateMatchedGjcCommand(
+	words: readonly string[],
+	options: BashRestrictionOptions,
+): BashAllowedPrefixesCheck {
 	const gitWrite = rejectGitHostAccess(words);
 	if (gitWrite) return gitWrite;
 	if (words[0] !== "gjc") return { allowed: true };
@@ -293,7 +441,7 @@ function validateMatchedGjcCommand(words: readonly string[]): BashAllowedPrefixe
 		if (!words.includes("--write")) {
 			return { allowed: false, reason: "restricted role-agent bash only allows `gjc ralplan --write ...`" };
 		}
-		return { allowed: true };
+		return rejectUnboundGjcCommand(words, options) ?? { allowed: true };
 	}
 
 	if (words[1] === "state") {
@@ -311,10 +459,10 @@ function validateMatchedGjcCommand(words: readonly string[]): BashAllowedPrefixe
 				reason: `restricted role-agent bash does not allow \`gjc state ${classification.parsed.action}\``,
 			};
 		}
-		return { allowed: true };
+		return rejectUnboundGjcCommand(words, options) ?? { allowed: true };
 	}
 
-	return { allowed: true };
+	return rejectUnboundGjcCommand(words, options) ?? { allowed: true };
 }
 
 function commandAllowedPrefixesReason(normalizedPrefixes: readonly string[], options: BashRestrictionOptions): string {
@@ -360,5 +508,5 @@ export function checkBashAllowedPrefixes(
 	if (options.profile === "read-only") {
 		return validateReadOnlyCommand(parsed.words);
 	}
-	return validateMatchedGjcCommand(parsed.words);
+	return validateMatchedGjcCommand(parsed.words, options);
 }

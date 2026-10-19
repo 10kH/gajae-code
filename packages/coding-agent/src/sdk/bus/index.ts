@@ -117,6 +117,7 @@ import {
 	type SessionSdkHost,
 	SessionSdkSessionRuntime,
 	shouldHostSdk,
+	TURN_STREAM_CAPABILITY,
 	verifyMasterCapabilityFrame,
 } from "../host";
 import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
@@ -2659,6 +2660,10 @@ function sdkControlSurface(
 		// the session-wide preflight seam must not be invoked while another
 		// connection's active preflight could be cancelled by it (review P1).
 		noOtherConnectionPreflights?: () => boolean,
+		// True only for an operator terminal abort that the broker control route already
+		// authorized (`TerminalAbortInput.operator`, which a public SDK caller cannot grant):
+		// it addresses the session's active turn, not the requesting connection's own prompt.
+		operatorAuthorized?: boolean,
 	) => Promise<
 		| {
 				ok: true;
@@ -3178,6 +3183,9 @@ function sdkControlSurface(
 				// invoking it (review thread P1).
 				() =>
 					![...pendingPreflightCancellations.values()].some(entry => entry.connectionId !== requesterConnectionId),
+				// Broker-authorized operator authority is the one case where the abort
+				// addresses a turn another connection submitted (see the parameter note).
+				input.operator === true,
 			);
 			// Preflight cancellation happens ONLY for a NEWLY ADMITTED abort,
 			// after the durable admission/replay decision inside
@@ -4281,6 +4289,34 @@ export function boundedCorrelatedAgentEndFrame(frame: Record<string, unknown>): 
 	};
 }
 
+/** Connection-scoped identity of a queued prompt submission an abort may address. */
+export interface TerminalAbortSubmissionScope {
+	connectionId?: string;
+	terminal: boolean;
+}
+
+/**
+ * Whether a terminal abort addresses this prompt submission.
+ *
+ * An ordinary abort is scoped to the requesting connection's own prompt: `connectionId`
+ * identifies the connection that submitted it, and a submission that already reached a
+ * terminal state is never addressed. Broker-authorized operator authority
+ * (`TerminalAbortInput.operator`, granted only through the broker control route) is the
+ * documented exception — "operator authority changes only connection ownership, never
+ * those settlement proofs" — so it addresses the session's submission even when another
+ * connection submitted it. Without that override every operator abort issued over a
+ * second connection (the SDK client case, where each request is its own connection)
+ * reported no_active_turn while the turn was still running.
+ */
+export function terminalAbortAddressesSubmission(input: {
+	connectionId: string | undefined;
+	operatorAuthorized: boolean;
+	submission: TerminalAbortSubmissionScope;
+}): boolean {
+	if (input.submission.terminal) return false;
+	return input.operatorAuthorized || input.submission.connectionId === input.connectionId;
+}
+
 export function createNotificationsExtension(
 	api: ExtensionAPI,
 	options: {
@@ -5071,9 +5107,13 @@ export function createNotificationsExtension(
 		const rememberHostCapabilities = (connectionId: string, capabilities: readonly string[]): void => {
 			const incarnation = liveHostConnection(connectionId);
 			if (!incarnation) return;
+			const previous = hostCapCache.get(connectionId);
+			const merged =
+				previous?.generation === incarnation.generation ? new Set(previous.capabilities) : new Set<string>();
+			for (const capability of capabilities) merged.add(capability);
 			hostCapCache.set(connectionId, {
 				generation: incarnation.generation,
-				capabilities: new Set(capabilities),
+				capabilities: merged,
 			});
 		};
 		const liveHostCapabilities = (connectionId: string): ReadonlySet<string> | undefined => {
@@ -5815,7 +5855,7 @@ export function createNotificationsExtension(
 			);
 		};
 		const emitPromptEvent = (event: AgentSessionEvent) => {
-			if (!runtime) return;
+			if (!runtime || runtime.stopping || runtime.serverStopped || runtimes.get(id) !== runtime) return;
 			cleanupPromptRecords();
 			const handle = ctx.getActivePromptHandle();
 			const domain = handle ? terminalAbortSeams?.getRunOwnerDomain?.(handle) : undefined;
@@ -5828,12 +5868,14 @@ export function createNotificationsExtension(
 				)
 			)
 				correlations.unshift(root);
+			const owners = new Set<string>();
 			for (const correlation of correlations) {
 				// Renewal is attributed exactly like the correlated delivery below.
 				renewPromptDeadline(correlation, event);
 				noteToolDispatchBoundary(correlation, event);
 				const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 				if (!submission || submission.abandoned) continue;
+				owners.add(submission.connectionId);
 				const frame = {
 					type: "event",
 					kind: event.type,
@@ -5845,6 +5887,25 @@ export function createNotificationsExtension(
 					continue;
 				}
 				deliverCorrelatedFrame(submission, frame);
+			}
+			// Broker-created hosts use this bus, not the SDK-only extension. Observers
+			// must opt into BOTH capabilities and receive no other client's correlation.
+			// Keep cumulative partialResult snapshots and authoritative final result
+			// intact, and off the durable lifecycle replay ring, like owner content.
+			for (const connectionId of sdkRuntime?.connectionIdsWithCapabilities([
+				TURN_STREAM_CAPABILITY,
+				SESSION_HOST_OBSERVER_CAPABILITY,
+			]) ?? []) {
+				if (owners.has(connectionId)) continue;
+				try {
+					sdkRuntime?.sendFrameTo(connectionId, {
+						type: "event",
+						kind: event.type,
+						payload: toAgentWireEventPayload(event),
+					});
+				} catch {
+					// Content delivery is best-effort and must not interrupt execution.
+				}
 			}
 		};
 		/**
@@ -6727,7 +6788,14 @@ export function createNotificationsExtension(
 				}
 				return { aborted: true, disposition: "cancelled" as const };
 			},
-			async (connectionId, scope, idempotencyKey, preflightCancel, noOtherConnectionPreflights) => {
+			async (
+				connectionId,
+				scope,
+				idempotencyKey,
+				preflightCancel,
+				noOtherConnectionPreflights,
+				operatorAuthorized = false,
+			) => {
 				// Capture the steering snapshot at ADMISSION (before the durable
 				// marker transaction): client steering admitted while the abort
 				// is in flight classifies as post-snapshot and is preserved at
@@ -7089,9 +7157,9 @@ export function createNotificationsExtension(
 						return "failed";
 					}
 				};
-				let active = [...promptSubmissions.entries()].find(
-					([, submission]) => submission.connectionId === connectionId && !submission.terminal,
-				);
+				const addresses = (submission: TerminalAbortSubmissionScope): boolean =>
+					terminalAbortAddressesSubmission({ connectionId, operatorAuthorized, submission });
+				let active = [...promptSubmissions.entries()].find(([, submission]) => addresses(submission));
 				if (!active) {
 					// DURABLY reserve the key even for a no-active-turn abort: the
 					// generic idempotency cache is in-memory only, so after restart
@@ -7121,9 +7189,7 @@ export function createNotificationsExtension(
 					// and the durable no-effect row would block a same-key retry from
 					// stopping it — fall through to the pre-run / active fencing path
 					// when a submission now exists (review thread P1).
-					active = [...promptSubmissions.entries()].find(
-						([, submission]) => submission.connectionId === connectionId && !submission.terminal,
-					);
+					active = [...promptSubmissions.entries()].find(([, submission]) => addresses(submission));
 					if (!active) {
 						// Close the remaining acceptance race: cancel the requester's
 						// preflights HERE, in the same synchronous region as the
@@ -8407,6 +8473,13 @@ export function createNotificationsExtension(
 						return;
 					}
 					if (typedFrame.type === "event_replay") {
+						const capabilities = typedFrame.capabilities;
+						if (
+							Array.isArray(capabilities) &&
+							capabilities.every((capability: unknown) => typeof capability === "string")
+						) {
+							rememberHostCapabilities(inbound.connectionId, capabilities as string[]);
+						}
 						if (liveHostConnection(inbound.connectionId)) hostAttachedConnections.add(inbound.connectionId);
 					}
 					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;

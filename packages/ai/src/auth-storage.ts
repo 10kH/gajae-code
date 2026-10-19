@@ -699,19 +699,22 @@ export interface CredentialDisabledEvent {
 export type CredentialRankingMode = "balanced" | "earliest-reset";
 
 /**
- * Persisted soft preference for one provider's OAuth pool.
+ * One entry of a provider's ordered, persisted soft preference list.
  *
- * The matching credential is moved ahead of the normal ranking while it is
- * usable. It yields to the normal ranking when it is blocked, when it cannot be
- * found, or when its most-used known usage window has reached
- * `maxUsedFraction`. Unknown usage never counts as over the threshold.
+ * Entries are consulted in list order when a credential is selected. Usable
+ * entries under their cap are tried first, in list order; the remaining
+ * credentials follow in the normal ranking order. An entry whose most-used
+ * known usage window has reached `maxUsedFraction` is demoted behind every
+ * other credential, so it is used only when nothing else is available. A
+ * blocked or missing entry is skipped. Unknown usage never counts as over the
+ * cap.
  *
  * Runtime selectors (`--credential`, `--prefer-credential`) and session
- * stickiness take precedence over a configured preference.
+ * stickiness take precedence over configured preferences.
  */
 export interface ConfiguredCredentialPreference {
 	selector: AuthCredentialSelector;
-	/** Used fraction in (0, 1] at which the preference stops applying. Absent means only blocking rotates away. */
+	/** Used fraction in (0, 1] at which this entry stops being preferred. Absent means only blocking moves past it. */
 	maxUsedFraction?: number;
 }
 
@@ -731,8 +734,8 @@ export type AuthStorageOptions = {
 	usageProviderResolver?: (provider: Provider) => UsageProvider | undefined;
 	rankingStrategyResolver?: (provider: Provider) => CredentialRankingStrategy | undefined;
 	credentialRankingMode?: CredentialRankingMode;
-	/** Persisted soft preferences keyed by provider id. */
-	credentialPreferences?: Readonly<Record<string, ConfiguredCredentialPreference>>;
+	/** Persisted ordered soft preferences keyed by provider id. */
+	credentialPreferences?: Readonly<Record<string, readonly ConfiguredCredentialPreference[]>>;
 	usageFetch?: typeof fetch;
 	usageRequestTimeoutMs?: number;
 	usageLogger?: UsageLogger;
@@ -1207,7 +1210,7 @@ export function formatOAuthIdentityLabel(
 	return base ? `${base} (${organization})` : organization;
 }
 
-type OAuthResolutionResult = { apiKey: string; credential: OAuthCredential };
+type OAuthResolutionResult = { apiKey: string; credential: OAuthCredential; credentialRowId: number };
 
 /**
  * Refreshed OAuth access plus identity metadata returned by
@@ -1546,8 +1549,10 @@ export class AuthStorage {
 	#runtimeCredentialSelectors: Map<string, AuthCredentialSelector> = new Map();
 	/** Soft runtime credential preference per provider; quota failures may rotate away from it. */
 	#runtimePreferredCredentialSelectors: Map<string, AuthCredentialSelector> = new Map();
-	/** Persisted soft credential preference per provider; usage threshold and quota failures may rotate away from it. */
-	#configuredCredentialPreferences: Map<string, ConfiguredCredentialPreference> = new Map();
+	/** Persisted ordered soft credential preferences per provider; usage caps and quota failures move past entries. */
+	#configuredCredentialPreferences: Map<string, readonly ConfiguredCredentialPreference[]> = new Map();
+	/** Providers already warned that their preference list names one stored row twice. */
+	#warnedDuplicateCredentialPreferences = new Set<string>();
 	/** Credential selectors explicitly attached to a credential session scope. */
 	#sessionCredentialSelectors: Map<string, Map<string, AuthCredentialSelector>> = new Map();
 	/** Explicit AUTO masks suppress both scoped and process-global selectors for a scope/provider. */
@@ -1638,8 +1643,10 @@ export class AuthStorage {
 				: DEFAULT_USAGE_REQUEST_TIMEOUT_MS;
 		this.#usageFetchLeaseMs = usageTimeoutForLease + USAGE_FETCH_LEASE_GRACE_MS;
 		this.#credentialRankingMode = options.credentialRankingMode ?? "balanced";
-		for (const [provider, preference] of Object.entries(options.credentialPreferences ?? {})) {
-			this.#configuredCredentialPreferences.set(resolveOAuthStorageProvider(provider), preference);
+		for (const [provider, preferences] of Object.entries(options.credentialPreferences ?? {})) {
+			if (preferences.length > 0) {
+				this.#configuredCredentialPreferences.set(resolveOAuthStorageProvider(provider), preferences);
+			}
 		}
 		this.#refreshOAuthCredentialOverride = options.refreshOAuthCredential;
 		this.#fetchUsageReportsOverride = options.fetchUsageReports;
@@ -3222,10 +3229,41 @@ export class AuthStorage {
 	}
 
 	/**
-	 * Move the configured preferred credential to the front of `candidates` while it is usable and under its usage
-	 * threshold. A missing row, a blocked row, or a row at its threshold leaves the normal ranking untouched.
+	 * Providers whose configured preference list names one stored credential row through more than one entry, for
+	 * example `email:` and `account:` selectors for the same login. Startup rejects such a list.
 	 */
-	async #applyConfiguredCredentialPreference(
+	findDuplicateCredentialPreferences(): Array<{ provider: string; credentialId: number }> {
+		const duplicates: Array<{ provider: string; credentialId: number }> = [];
+		for (const [provider, preferences] of this.#configuredCredentialPreferences) {
+			const credentialId = this.#duplicateConfiguredPreferenceRow(provider, preferences);
+			if (credentialId !== undefined) duplicates.push({ provider, credentialId });
+		}
+		return duplicates;
+	}
+
+	/** Id of the first stored row that two entries of `preferences` both designate; undefined when every entry differs. */
+	#duplicateConfiguredPreferenceRow(
+		provider: string,
+		preferences: readonly ConfiguredCredentialPreference[],
+	): number | undefined {
+		const designatedIds = new Set<number>();
+		for (const { selector } of preferences) {
+			const credentialId = this.#findCredentialBySelector(provider, selector)?.id;
+			if (credentialId === undefined) continue;
+			if (designatedIds.has(credentialId)) return credentialId;
+			designatedIds.add(credentialId);
+		}
+		return undefined;
+	}
+
+	/**
+	 * Reorder `candidates` by the provider's configured preference list: usable entries under their cap first, in list
+	 * order; then the remaining candidates in their ranked order; then entries at or over their cap, in list order.
+	 * Missing and blocked entries are skipped and keep their ranked position. A list that names one stored row twice
+	 * (startup rejects it, but a later login can make two entries resolve to one row) is ignored as a whole rather than
+	 * applying one entry's position and cap and dropping the other's.
+	 */
+	async #applyConfiguredCredentialPreferences(
 		provider: string,
 		providerKey: string,
 		candidates: Array<{
@@ -3236,28 +3274,56 @@ export class AuthStorage {
 		strategy: CredentialRankingStrategy | undefined,
 		options?: AuthApiKeyOptions,
 	): Promise<void> {
-		const preference = this.#configuredCredentialPreferences.get(resolveOAuthStorageProvider(provider));
-		if (!preference) return;
-		const preferredCandidate = this.#findUsableOAuthCandidate(provider, providerKey, candidates, preference.selector);
-		if (preferredCandidate < 0) return;
-		const { maxUsedFraction } = preference;
-		if (maxUsedFraction !== undefined) {
-			const candidate = candidates[preferredCandidate]!;
-			if (!candidate.usageChecked) {
+		const preferences = this.#configuredCredentialPreferences.get(resolveOAuthStorageProvider(provider));
+		if (!preferences) return;
+		const duplicateCredentialId = this.#duplicateConfiguredPreferenceRow(provider, preferences);
+		if (duplicateCredentialId !== undefined) {
+			const storageProvider = resolveOAuthStorageProvider(provider);
+			if (!this.#warnedDuplicateCredentialPreferences.has(storageProvider)) {
+				this.#warnedDuplicateCredentialPreferences.add(storageProvider);
+				logger.warn("Configured credential preferences name one account twice; using normal ranking", {
+					provider: storageProvider,
+					credentialId: duplicateCredentialId,
+				});
+			}
+			return;
+		}
+		type Candidate = (typeof candidates)[number];
+		const matched: Array<{ candidate: Candidate; maxUsedFraction: number | undefined }> = [];
+		const claimed = new Set<Candidate>();
+		for (const preference of preferences) {
+			const position = this.#findUsableOAuthCandidate(provider, providerKey, candidates, preference.selector);
+			if (position < 0) continue;
+			const candidate = candidates[position]!;
+			claimed.add(candidate);
+			matched.push({ candidate, maxUsedFraction: preference.maxUsedFraction });
+		}
+		if (matched.length === 0) return;
+		// Ranking already fetched usage for strategy-backed providers; fetch only what a cap still needs.
+		await Promise.all(
+			matched.map(async ({ candidate, maxUsedFraction }) => {
+				if (maxUsedFraction === undefined || candidate.usageChecked) return;
 				candidate.usage = await this.#getUsageReport(provider, candidate.selection.credential, {
 					baseUrl: options?.baseUrl,
 					timeoutMs: this.#usageRequestTimeoutMs,
 					signal: options?.signal,
 				});
 				candidate.usageChecked = true;
+			}),
+		);
+		const preferred: Candidate[] = [];
+		const capped: Candidate[] = [];
+		for (const { candidate, maxUsedFraction } of matched) {
+			const usedFraction =
+				maxUsedFraction === undefined ? undefined : this.#maxKnownUsedFraction(candidate.usage, strategy);
+			if (maxUsedFraction !== undefined && usedFraction !== undefined && usedFraction >= maxUsedFraction) {
+				capped.push(candidate);
+			} else {
+				preferred.push(candidate);
 			}
-			const usedFraction = this.#maxKnownUsedFraction(candidate.usage, strategy);
-			if (usedFraction !== undefined && usedFraction >= maxUsedFraction) return;
 		}
-		if (preferredCandidate > 0) {
-			const [preferred] = candidates.splice(preferredCandidate, 1);
-			candidates.unshift(preferred);
-		}
+		const rest = candidates.filter(candidate => !claimed.has(candidate));
+		candidates.splice(0, candidates.length, ...preferred, ...rest, ...capped);
 	}
 
 	/**
@@ -3300,12 +3366,14 @@ export class AuthStorage {
 				`Credential selector ${this.#formatCredentialSelector(selector)} cannot be used for ${provider} while a runtime API key override is active`,
 			);
 		}
-		if (this.#hasConfigOverride(provider, owner)) {
+		const selected = this.#findCredentialBySelector(provider, selector);
+		const configOverride = this.#configOverrideRegistration(provider, owner);
+		if (configOverride && !(configOverride.envSourced && selected?.credential.type === "api_key")) {
 			throw new Error(
 				`Credential selector ${this.#formatCredentialSelector(selector)} cannot be used for ${provider} while a config API key override is active`,
 			);
 		}
-		if (!this.#findCredentialBySelector(provider, selector)) {
+		if (!selected) {
 			throw new Error(`No credential found for ${provider} matching ${this.#formatCredentialSelector(selector)}`);
 		}
 	}
@@ -5669,6 +5737,30 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Opaque stored row IDs for credentials whose resolved key matches `apiKey`.
+	 * Unlike the session's sticky row pointer, these remain tied to the actual key
+	 * when concurrent requests share a credential session ID.
+	 * A row that cannot be resolved is skipped so an unrelated resolver failure
+	 * cannot prevent callers from using already-known credential identity.
+	 */
+	async getCredentialRowIdsMatchingApiKey(provider: string, apiKey: string): Promise<number[]> {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const rowIds: number[] = [];
+		for (const entry of this.#getStoredCredentials(storageProvider)) {
+			try {
+				if (await this.#credentialMatchesApiKey(storageProvider, entry.credential, apiKey)) rowIds.push(entry.id);
+			} catch (error) {
+				logger.warn("Failed to resolve stored API key while matching credential rows", {
+					provider: storageProvider,
+					credentialId: entry.id,
+					errorType: error instanceof Error ? error.name : typeof error,
+				});
+			}
+		}
+		return rowIds;
+	}
+
+	/**
 	 * Mark the stored credential whose key matches `apiKey` usage-limited for
 	 * `retryAfterMs` (or the default backoff). Used when the caller knows
 	 * exactly which leased credential failed (e.g. the auth-gateway leases a
@@ -6001,8 +6093,10 @@ export class AuthStorage {
 					const [preferred] = candidates.splice(preferredCandidate, 1);
 					candidates.unshift(preferred);
 				}
-			} else if (!preferredSelector) {
-				await this.#applyConfiguredCredentialPreference(provider, providerKey, candidates, strategy, options);
+			} else if (!preferredSelector && !sessionPreferredIsAvailable) {
+				// Configured preferences choose a credential; a session that already sticks to a usable one keeps it, so
+				// the list (and any usage fetch its caps need) is consulted only at selection time.
+				await this.#applyConfiguredCredentialPreferences(provider, providerKey, candidates, strategy, options);
 			}
 		}
 
@@ -6589,7 +6683,7 @@ export class AuthStorage {
 			if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
 			if (!authCredentialEquals(selection.credential, updated)) return undefined;
 			this.#recordSessionCredential(provider, sessionId, "oauth", selection.index);
-			return { apiKey: result.apiKey, credential: updated };
+			return { apiKey: result.apiKey, credential: updated, credentialRowId: selection.id };
 		} catch (error) {
 			if (options?.signal?.aborted) throw error;
 			if (isSqliteError(error)) throw error;
@@ -6932,6 +7026,31 @@ export class AuthStorage {
 	 * 10. Fallback resolver (models.yml custom providers, last-resort)
 	 */
 	async getApiKey(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<string | undefined> {
+		return this.#resolveApiKey(provider, sessionId, options);
+	}
+
+	/**
+	 * Resolve an API key and retain the selected stored row identity across token refreshes
+	 * and concurrent changes to the session's sticky credential pointer.
+	 */
+	async getApiKeyWithCredentialRowId(
+		provider: string,
+		sessionId?: string,
+		options?: AuthApiKeyOptions,
+	): Promise<{ apiKey: string | undefined; credentialRowId: number | undefined }> {
+		let credentialRowId: number | undefined;
+		const apiKey = await this.#resolveApiKey(provider, sessionId, options, rowId => {
+			credentialRowId = rowId;
+		});
+		return { apiKey, credentialRowId };
+	}
+
+	async #resolveApiKey(
+		provider: string,
+		sessionId?: string,
+		options?: AuthApiKeyOptions,
+		onCredentialRowResolved?: (rowId: number) => void,
+	): Promise<string | undefined> {
 		provider = resolveOAuthStorageProvider(provider);
 		const selectedCredential = this.#resolveSelectedStoredCredential(provider, options, sessionId);
 
@@ -6953,7 +7072,12 @@ export class AuthStorage {
 			// (validated at login, rotated on 401), while the pointed-to env
 			// value can go stale with no recovery path — prefer the stored
 			// credential. Stored OAuth credentials still yield to the override.
-			const storedApiKey = await this.#resolveStoredApiKeyOverEnvConfig(provider, selectedCredential, sessionId);
+			const storedApiKey = await this.#resolveStoredApiKeyOverEnvConfig(
+				provider,
+				selectedCredential,
+				sessionId,
+				onCredentialRowResolved,
+			);
 			if (storedApiKey) return storedApiKey;
 			return configKey;
 		}
@@ -6968,14 +7092,19 @@ export class AuthStorage {
 
 		if (selectedCredential?.credential.type === "api_key") {
 			this.#recordSessionCredential(provider, sessionId, "api_key", selectedCredential.index);
-			return this.#resolveStoredApiKey(provider, selectedCredential.credential.key);
+			const apiKey = await this.#resolveStoredApiKey(provider, selectedCredential.credential.key);
+			if (apiKey) onCredentialRowResolved?.(selectedCredential.id);
+			return apiKey;
 		}
 
 		let oauthAttempted = false;
 		if (!selectedCredential && this.#getSessionCredential(provider, sessionId)?.type === "oauth") {
 			const oauthResolved = await this.#resolveOAuthSelection(provider, sessionId, options);
 			oauthAttempted = true;
-			if (oauthResolved) return oauthResolved.apiKey;
+			if (oauthResolved) {
+				onCredentialRowResolved?.(oauthResolved.credentialRowId);
+				return oauthResolved.apiKey;
+			}
 		}
 
 		const attemptedApiKeyIndices = new Set<number>();
@@ -6987,6 +7116,7 @@ export class AuthStorage {
 				const resolved = await this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
 				if (resolved) {
 					this.#recordSessionCredential(provider, sessionId, "api_key", apiKeySelection.index);
+					onCredentialRowResolved?.(apiKeySelection.id);
 					return resolved;
 				}
 			}
@@ -6994,7 +7124,10 @@ export class AuthStorage {
 
 		if (!oauthAttempted) {
 			const oauthResolved = await this.#resolveOAuthSelection(provider, sessionId, options);
-			if (oauthResolved) return oauthResolved.apiKey;
+			if (oauthResolved) {
+				onCredentialRowResolved?.(oauthResolved.credentialRowId);
+				return oauthResolved.apiKey;
+			}
 		}
 
 		if (!selectedCredential) {
@@ -7005,6 +7138,7 @@ export class AuthStorage {
 				const resolved = await this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
 				if (resolved) {
 					this.#recordSessionCredential(provider, sessionId, "api_key", apiKeySelection.index);
+					onCredentialRowResolved?.(apiKeySelection.id);
 					return resolved;
 				}
 			}
@@ -7023,21 +7157,25 @@ export class AuthStorage {
 	/**
 	 * Resolve a stored api_key credential that outranks an env-sourced config
 	 * override (`apiKeyEnv`). Mirrors the api_key branches of {@link getApiKey}:
-	 * the selector-pinned credential first, then the round-robin/session pool.
-	 * Returns undefined when no stored api_key credential resolves, leaving the
-	 * env-sourced override in effect.
+	 * a selected credential must resolve or fail closed; unpinned resolution then
+	 * tries the round-robin/session pool. Returns undefined when no unpinned
+	 * stored api_key credential resolves, leaving the env-sourced override in
+	 * effect.
 	 */
 	async #resolveStoredApiKeyOverEnvConfig(
 		provider: string,
 		selectedCredential: ({ index: number } & StoredCredential) | undefined,
 		sessionId?: string,
+		onCredentialRowResolved?: (rowId: number) => void,
 	): Promise<string | undefined> {
 		if (selectedCredential?.credential.type === "api_key") {
 			const resolved = await this.#resolveStoredApiKey(provider, selectedCredential.credential.key);
 			if (resolved) {
 				this.#recordSessionCredential(provider, sessionId, "api_key", selectedCredential.index);
+				onCredentialRowResolved?.(selectedCredential.id);
 				return resolved;
 			}
+			throw new Error(`Selected credential for ${provider} (id:${selectedCredential.id}) is unavailable`);
 		}
 		const attemptedApiKeyIndices = new Set<number>();
 		for (;;) {
@@ -7047,6 +7185,7 @@ export class AuthStorage {
 			const resolved = await this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
 			if (resolved) {
 				this.#recordSessionCredential(provider, sessionId, "api_key", apiKeySelection.index);
+				onCredentialRowResolved?.(apiKeySelection.id);
 				return resolved;
 			}
 		}
