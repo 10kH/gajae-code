@@ -72,11 +72,15 @@ afterEach(() => {
 const STABLE = [
 	"https://example.com/oauth",
 	"http://127.0.0.1:9/dashboard",
+	"http://[::1]:8080/",
+	"http://localhost/dashboard",
 	"http://example.com/callback",
 	"/tmp/work-profile.svg",
+	"/",
 	"report.html",
 	String.raw`C:\Users\Public\report.html`,
 	"C:/Users/Public/report.html",
+	String.raw`\\server\share\report.html`,
 ];
 
 describe("openPath", () => {
