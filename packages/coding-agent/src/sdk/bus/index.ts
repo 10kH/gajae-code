@@ -102,6 +102,7 @@ import {
 	registerAskAnswerSource,
 	registerWorkflowGateEmitterListener,
 } from "../../tools/ask-answer-registry";
+import type { AwaitingInputKind } from "../../tools/awaiting-input";
 import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
@@ -1422,6 +1423,12 @@ interface SessionRuntime {
 		string,
 		{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
 	>;
+	/**
+	 * Running tool calls that reported an awaiting-input signal, keyed by tool call
+	 * id. An entry stays undelivered while notifications are inactive or policy is
+	 * provisional, and is dropped when the call ends; one notification per call.
+	 */
+	awaitingInput: Map<string, { toolName: string; kind: AwaitingInputKind; delivered: boolean }>;
 	/** Cancels the postmortem cleanup that emits `session_closed` on process teardown. */
 	cancelPostmortemCleanup: () => void;
 	/** Disposes side-turn resources when their owning logical session becomes unavailable. */
@@ -1431,6 +1438,48 @@ interface SessionRuntime {
 const SENSITIVE_MODEL_LABEL =
 	/(?:\b(?:https?|wss?):\/\/|\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|\b(?:api[-_ ]?key|access[-_ ]?token|bearer|secret|password|account(?:\s*id)?|email|exception|stack trace)\b|\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,}\b)/i;
 const TOOL_SUMMARY_MAX = 280;
+
+/** The `awaitingInput` signal a running bash update carries, validated at the extension boundary. */
+function readAwaitingInput(partialResult: unknown): { kind: AwaitingInputKind } | undefined {
+	if (!partialResult || typeof partialResult !== "object") return undefined;
+	const details = (partialResult as { details?: unknown }).details;
+	if (!details || typeof details !== "object") return undefined;
+	const signal = (details as { awaitingInput?: unknown }).awaitingInput;
+	if (!signal || typeof signal !== "object") return undefined;
+	const kind = (signal as { kind?: unknown }).kind;
+	return kind === "browser_auth" || kind === "device_code" ? { kind } : undefined;
+}
+
+/**
+ * Deliver every undelivered awaiting-input notice once stable policy admits it.
+ * The notice describes the present ("a command is waiting now"), so it goes out
+ * on the live native leg only and never enters the replay ring: a client that
+ * reconnects after the command exited must not receive it. The native server
+ * still withholds it from connections without `awaiting_input_v1`.
+ */
+function deliverAwaitingInput(
+	runtime: Pick<SessionRuntime, "server" | "awaitingInput" | "notificationsActive" | "policySuspended">,
+	sessionId: string,
+): void {
+	if (!runtime.notificationsActive || runtime.policySuspended) return;
+	for (const [toolCallId, entry] of runtime.awaitingInput) {
+		if (entry.delivered) continue;
+		entry.delivered = true;
+		try {
+			runtime.server.pushFrame(
+				JSON.stringify({
+					type: "awaiting_input",
+					sessionId,
+					toolCallId,
+					toolName: entry.toolName,
+					kind: entry.kind,
+				}),
+			);
+		} catch (e) {
+			logger.warn(`notifications: awaiting_input failed: ${String(e)}`);
+		}
+	}
+}
 
 /** Stable projection of the tool-owned safe-display seam (never the full Tool surface). */
 type SafeSummaryTool = Pick<Tool, "safeSummary" | "safeSummaryFields">;
@@ -5090,7 +5139,11 @@ export function createNotificationsExtension(
 		};
 
 		type HostConnectionIncarnation = { generation: number; closed: boolean };
-		type HostCapabilityCacheEntry = { generation: number; capabilities: ReadonlySet<string> };
+		type HostCapabilityCacheEntry = {
+			generation: number;
+			capabilities: ReadonlySet<string>;
+			nativeConfirmed: ReadonlySet<string>;
+		};
 		const hostCapCache = new Map<string, HostCapabilityCacheEntry>();
 		const hostConnectionIncarnations = new Map<string, HostConnectionIncarnation>();
 		const hostAttachedConnections = new Set<string>();
@@ -5104,16 +5157,28 @@ export function createNotificationsExtension(
 			hostConnectionIncarnations.set(connectionId, incarnation);
 			return incarnation;
 		};
-		const rememberHostCapabilities = (connectionId: string, capabilities: readonly string[]): void => {
+		const rememberHostCapabilities = (
+			connectionId: string,
+			capabilities: readonly string[],
+			source: "replay" | "native",
+		): void => {
 			const incarnation = liveHostConnection(connectionId);
 			if (!incarnation) return;
 			const previous = hostCapCache.get(connectionId);
 			const merged =
 				previous?.generation === incarnation.generation ? new Set(previous.capabilities) : new Set<string>();
+			const nativeConfirmed =
+				previous?.generation === incarnation.generation ? new Set(previous.nativeConfirmed) : new Set<string>();
 			for (const capability of capabilities) merged.add(capability);
+			// Replay claims enable stream routing immediately, but only native snapshots
+			// can remove a socket from host demand. Merge delayed snapshots monotonically.
+			if (source === "native") {
+				for (const capability of capabilities) nativeConfirmed.add(capability);
+			}
 			hostCapCache.set(connectionId, {
 				generation: incarnation.generation,
 				capabilities: merged,
+				nativeConfirmed,
 			});
 		};
 		const liveHostCapabilities = (connectionId: string): ReadonlySet<string> | undefined => {
@@ -8353,6 +8418,7 @@ export function createNotificationsExtension(
 				string,
 				{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
 			>(),
+			awaitingInput: new Map(),
 			deferredInboundControls: [],
 		};
 		const initializedRuntime = runtime;
@@ -8478,7 +8544,7 @@ export function createNotificationsExtension(
 							Array.isArray(capabilities) &&
 							capabilities.every((capability: unknown) => typeof capability === "string")
 						) {
-							rememberHostCapabilities(inbound.connectionId, capabilities as string[]);
+							rememberHostCapabilities(inbound.connectionId, capabilities as string[], "replay");
 						}
 						if (liveHostConnection(inbound.connectionId)) hostAttachedConnections.add(inbound.connectionId);
 					}
@@ -8524,7 +8590,7 @@ export function createNotificationsExtension(
 				const negotiated = tuple?.[1] ?? capabilities;
 				if (typeof id !== "string" || !Array.isArray(negotiated)) return;
 				const normalized = negotiated.filter((capability): capability is string => typeof capability === "string");
-				rememberHostCapabilities(id, normalized);
+				rememberHostCapabilities(id, normalized, "native");
 				if (liveHostCapabilities(id) === undefined) return;
 				hostAttachedConnections.add(id);
 				negotiatedCapabilitiesHandler?.(id, normalized);
@@ -9067,8 +9133,10 @@ export function createNotificationsExtension(
 				attachedClients: () => server.clientCount(),
 				observerClients: () => {
 					if (workLease.isHeld()) return 0;
-					const observers = [...hostCapCache.keys()].filter(connectionId =>
-						liveHostCapabilities(connectionId)?.has(SESSION_HOST_OBSERVER_CAPABILITY),
+					const observers = [...hostCapCache.entries()].filter(
+						([connectionId, entry]) =>
+							liveHostCapabilities(connectionId)?.has(SESSION_HOST_OBSERVER_CAPABILITY) &&
+							entry.nativeConfirmed.has(SESSION_HOST_OBSERVER_CAPABILITY),
 					).length;
 					return Math.min(server.clientCount(), observers);
 				},
@@ -9523,6 +9591,7 @@ export function createNotificationsExtension(
 			runtime.gatePresentations?.activateDeferred(runtime.workflowGatePublicationEpoch);
 			flushPendingFinal(runtime, runtime.id);
 			flushPendingSettled(runtime, runtime.id);
+			deliverAwaitingInput(runtime, runtime.id);
 			for (const processControl of runtime.deferredInboundControls.splice(0)) processControl();
 		},
 		reproveOwnership: async binding => {
@@ -10424,8 +10493,18 @@ export function createNotificationsExtension(
 	});
 
 	api.on("tool_execution_update", (event, ctx) => {
-		const rt = runtimes.get(sessionId(ctx));
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
 		rt?.emitPromptEvent(event);
+		if (!rt) return;
+		const awaitingInput = readAwaitingInput(event.partialResult);
+		if (!awaitingInput || rt.awaitingInput.has(event.toolCallId)) return;
+		// Notify-only and content-free (prompt kind only, never the URL or code), so
+		// it is delivered under redaction exactly like the idle marker. While policy
+		// is provisional it stays pending; activation delivers it if the call is
+		// still running.
+		rt.awaitingInput.set(event.toolCallId, { toolName: event.toolName, kind: awaitingInput.kind, delivered: false });
+		deliverAwaitingInput(rt, id);
 	});
 
 	api.on("tool_execution_end", (event, ctx) => {
@@ -10433,6 +10512,7 @@ export function createNotificationsExtension(
 		const rt = runtimes.get(id);
 		if (!rt) return;
 		rt.emitPromptEvent(event);
+		rt.awaitingInput.delete(event.toolCallId);
 		const inFlight = rt.inFlightTools.get(event.toolCallId);
 		if (!inFlight) return;
 		if (!rt.notificationsActive) {

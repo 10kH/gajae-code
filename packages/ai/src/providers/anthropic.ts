@@ -35,8 +35,9 @@ import {
 } from "../adapter-internals/provider-safety-stop";
 import {
 	getMiniMaxThinkingMode,
-	hasOpus47ApiRestrictions,
+	hasAnthropicModelSamplingRestrictions,
 	mapEffortToAnthropicAdaptiveEffort,
+	requiresAnthropicThinkingDisableWhenOff,
 	supportsAnthropicAdaptiveThinkingDisplay as supportsAdaptiveThinkingDisplay,
 } from "../model-thinking";
 import { calculateCost } from "../models";
@@ -2381,6 +2382,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				}
 				if (droppedForcedToolChoice) {
 					delete nextParams.tool_choice;
+					if (options?.thinkingEnabled === false && requiresAnthropicThinkingDisableWhenOff(model.id)) {
+						nextParams.thinking = { type: "disabled" };
+					}
 				}
 				if (disableStrictTools) {
 					dropAnthropicStrictTools(nextParams);
@@ -3707,11 +3711,22 @@ function createClient(
  * request drops `thinking`/`output_config`. Reports whether the forced-choice branch
  * applied so the caller can keep the replayed history consistent with it.
  */
-function disableThinkingIfToolChoiceForced(params: MessageCreateParamsStreaming): boolean {
+function disableThinkingIfToolChoiceForced(params: MessageCreateParamsStreaming, modelId: string): boolean {
 	const toolChoice = params.tool_choice;
 	if (!toolChoice) return false;
 	if (toolChoice.type !== "any" && toolChoice.type !== "tool") return false;
-	delete params.thinking;
+	if (requiresAnthropicThinkingDisableWhenOff(modelId)) {
+		// Haiku 5+ enables adaptive thinking when `thinking` is omitted, which a forced tool
+		// choice rejects, and applies `output_config.effort` to all response tokens including
+		// tool-call arguments. Send an explicit `disabled` and keep the selected effort;
+		// effort is capped at `high` while thinking is disabled.
+		params.thinking = { type: "disabled" };
+		const effort = params.output_config?.effort;
+		if (effort === "xhigh" || effort === "max") params.output_config = { ...params.output_config, effort: "high" };
+		return true;
+	}
+	// An explicit `disabled` is compatible with forced tool use and is kept.
+	if (params.thinking?.type !== "disabled") delete params.thinking;
 	delete params.output_config;
 	return true;
 }
@@ -3955,7 +3970,7 @@ function applyExplicitPromptCaching(
 	}
 }
 
-function applyPromptCaching(
+export function applyPromptCaching(
 	params: AnthropicCacheParams,
 	cacheMode: AnthropicCacheMode,
 	cacheControl?: AnthropicCacheControl,
@@ -3964,9 +3979,18 @@ function applyPromptCaching(
 	if (!cacheControl || cacheMode === "none" || budget === 0) return;
 	validateCacheControls(params);
 	if (cacheMode === "automatic") {
-		// Automatic mode only ever emits one marker, so any non-zero budget
-		// covers it; the zero case already returned above.
 		params.cache_control = { ...cacheControl };
+		// #2383's moving breakpoint reasoning holds within a session, not across
+		// sessions: anchor tools + system so new messages can reuse that prefix.
+		if (
+			budget > 1 &&
+			Array.isArray(params.system) &&
+			!params.system.some(block => block.cache_control) &&
+			countCacheControlBreakpoints(params) < 4
+		) {
+			const lastBlock = params.system.at(-1);
+			if (lastBlock) lastBlock.cache_control = { ...cacheControl };
+		}
 		return;
 	}
 	applyExplicitPromptCaching(params, cacheControl, budget);
@@ -4040,8 +4064,8 @@ function buildParams(
 			seqs.length > ANTHROPIC_STOP_SEQUENCES_MAX ? seqs.slice(0, ANTHROPIC_STOP_SEQUENCES_MAX) : seqs;
 	}
 
-	// Opus 4.7+ rejects non-default sampling parameters with 400 error.
-	if (hasOpus47ApiRestrictions(model.id)) {
+	// Opus 4.7+ and Haiku 5+ reject non-default sampling parameters.
+	if (hasAnthropicModelSamplingRestrictions(model.id)) {
 		delete params.top_p;
 		delete params.top_k;
 		delete params.temperature;
@@ -4061,7 +4085,9 @@ function buildParams(
 	}
 
 	const miniMaxMode = getMiniMaxThinkingMode(model, baseUrl);
-	if (model.reasoning && miniMaxMode === "toggle") {
+	if (options?.thinkingEnabled === false && requiresAnthropicThinkingDisableWhenOff(model.id)) {
+		params.thinking = { type: "disabled" };
+	} else if (model.reasoning && miniMaxMode === "toggle") {
 		// MiniMax's Messages endpoint defaults to off and only supports a
 		// switch. Claude budget_tokens/output_config.effort do not apply.
 		if (options?.thinkingEnabled !== undefined) {
@@ -4077,8 +4103,8 @@ function buildParams(
 
 			const compat = getAnthropicCompat(model);
 			if (mode === "anthropic-adaptive" && !compat.disableAdaptiveThinking) {
-				// Starting with Anthropic model Opus 4.7, adaptive thinking content is omitted from the
-				// response by default. Opt into summarized reasoning so thinking deltas keep
+				// Opus 4.7+, Fable, and Haiku 5+ omit adaptive thinking content by
+				// default. Opt into summarized reasoning so thinking deltas keep
 				// streaming with human-readable content for callers that rely on it.
 				const adaptive: { type: "adaptive"; display?: AnthropicThinkingDisplay } = { type: "adaptive" };
 				if (supportsAdaptiveThinkingDisplay(model.id)) {
@@ -4136,7 +4162,7 @@ function buildParams(
 	// that pair with `thinking`/`redacted_thinking` blocks "cannot be modified", so the
 	// replay has to degrade in the same rebuild. Runs before the billing/system payload
 	// snapshot so the attribution hash covers the messages actually sent.
-	if (disableThinkingIfToolChoiceForced(params) && hasNativeThinkingBlocks(params.messages)) {
+	if (disableThinkingIfToolChoiceForced(params, model.id) && hasNativeThinkingBlocks(params.messages)) {
 		params.messages = convertAnthropicMessages(context.messages, model, isOAuthToken, {
 			...thinkingRepair,
 			repairAllAssistantThinking: true,

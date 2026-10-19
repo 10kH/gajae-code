@@ -16,7 +16,7 @@ import { projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import type { Args as ParsedArgs } from "../cli/args";
 import { isSafeSdkInternalAgentDir, scanPublicCommand } from "../cli/public-command-entry";
 import { PublicCommandFailure } from "../cli/public-command-errors";
-import { FileLockAcquireError } from "../config/file-lock";
+import { FileLockAcquireError, isFileLockAcquireTimeout } from "../config/file-lock";
 import { parseModelString } from "../config/model-resolver";
 import { Settings } from "../config/settings";
 import { trustedCoordinatorEnv } from "../gjc-runtime/sidecar-bootstrap-env";
@@ -1990,9 +1990,8 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 					return await singleStartupAttempt(deadline);
 				} catch (error) {
 					if (
-						!(error instanceof FileLockAcquireError) ||
+						!isFileLockAcquireTimeout(error) ||
 						!startupFenceAcquired ||
-						error.code !== "acquire_timeout" ||
 						path.resolve(error.filePath) !==
 							path.resolve(path.join(agentDir, "sdk", "sessions", "index.jsonl")) ||
 						sessionIndexTimeoutRetries >= MAX_SESSION_INDEX_TIMEOUT_RETRIES
@@ -2172,14 +2171,19 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 								}
 							}
 						: undefined;
+				const brokerSettings = await Settings.loadForScope({ cwd: process.cwd(), agentDir });
 				const candidate = new Broker({
 					agentDir,
 					startupAbortSignal: startupAbortController.signal,
 					startupCheckpointDeadline: effectiveCheckpointDeadline,
 					onStartupReady: () => clearTimeout(startupWatchdog),
-					masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
-						"sdk.masterOrphanGraceMs",
-					),
+					masterOrphanGraceMs: brokerSettings.get("sdk.masterOrphanGraceMs"),
+					abandonedGraceMs: brokerSettings.get("sdk.brokerAbandonedGraceMs"),
+					// Only the detached autostart entry retires itself when nobody is left to
+					// use it. A supervised `gjc sdk broker run` service is owned by its
+					// operator's process manager, which reads an owned-root completion as a
+					// clean exit and would not restart it.
+					reapWhenAbandoned: !publicBrokerRun,
 					resolveDirectoryMigration: async cwd => {
 						const settings = await Settings.loadForScope({ cwd, agentDir });
 						try {

@@ -2573,7 +2573,9 @@ export class SelectorController {
 		if (issues.length > 0)
 			throw new Error(issues.map(issue => `${issue.path || "setup"}: ${issue.detail}`).join("; "));
 		const setup = structuredClone(draft);
-		const generated = generateTierChains(setup, CURATED_TIER_MAP, [...this.ctx.session.modelRegistry.getAll()]);
+		const generated = generateTierChains(setup, CURATED_TIER_MAP, [
+			...this.ctx.session.modelRegistry.getAll(this.ctx.session.credentialSessionId),
+		]);
 		const provenance: AutoroutingProvenance = {
 			schema: 1,
 			source: structuredClone(generated.sourceIdentity),
@@ -3241,6 +3243,16 @@ export class SelectorController {
 						// cancelled transition or roll it back to the parent's UI.
 						branchFailure = error;
 					}
+					if (
+						this.ctx.sessionManager.getSessionId() !== openedSessionId ||
+						this.ctx.sessionManager.getSessionFile() !== openedSessionFile
+					) {
+						try {
+							await this.ctx.refreshSlashCommandState();
+						} catch (error) {
+							branchFailure ??= error;
+						}
+					}
 
 					try {
 						onCommitted?.();
@@ -3662,6 +3674,7 @@ export class SelectorController {
 					if (option === `Use ${currentDefault.id}`) {
 						try {
 							await this.ctx.session.setModel(currentDefault);
+							this.ctx.updateEditorChrome();
 							this.ctx.showStatus(`Switched to ${currentDefault.provider}/${currentDefault.id}`);
 						} catch (err) {
 							this.ctx.showError(err instanceof Error ? err.message : String(err));

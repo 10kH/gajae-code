@@ -35,7 +35,7 @@ export const TtyWriter = nativeBindings.TtyWriter;
 // functions
 export const __gjcInstallTokioRuntime = nativeBindings.__gjcInstallTokioRuntime;
 export const __piNativesPublishOutcomeV1 = nativeBindings.__piNativesPublishOutcomeV1;
-export const __piNativesV0_18_11 = nativeBindings.__piNativesV0_18_11;
+export const __piNativesV0_18_12 = nativeBindings.__piNativesV0_18_12;
 export const applyBashFixups = nativeBindings.applyBashFixups;
 export const applyOwnerOnlyFdSecurity = nativeBindings.applyOwnerOnlyFdSecurity;
 export const applyOwnerOnlyPathSecurity = nativeBindings.applyOwnerOnlyPathSecurity;
@@ -65,6 +65,7 @@ export const exactSwapManagedLink = nativeBindings.exactSwapManagedLink;
 export const exactUnlink = nativeBindings.exactUnlink;
 export const exactUnlinkDirect = nativeBindings.exactUnlinkDirect;
 export const exactUnlinkDirectDetached = nativeBindings.exactUnlinkDirectDetached;
+export const exactUnlinkOpenFile = nativeBindings.exactUnlinkOpenFile;
 export const executeShell = nativeBindings.executeShell;
 export const extractSegments = nativeBindings.extractSegments;
 export const fuzzyFind = nativeBindings.fuzzyFind;
