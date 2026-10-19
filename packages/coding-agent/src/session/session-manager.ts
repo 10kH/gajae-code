@@ -540,6 +540,38 @@ function isUnwritableResidentCacheFailure(error: unknown): boolean {
 	);
 }
 
+/** Nearest real directory at or above `start`. A file or missing path is not a root. */
+function nearestExistingDirectory(start: string): string | null {
+	let current = path.resolve(start);
+	for (let depth = 0; depth < 64; depth++) {
+		try {
+			if (fs.lstatSync(current).isDirectory()) return current;
+		} catch {
+			// Missing components are not worktree roots.
+		}
+		const parent = path.dirname(current);
+		if (parent === current) return null;
+		current = parent;
+	}
+	return null;
+}
+
+/**
+ * Resident text is a second plaintext copy of assistant and tool output.
+ * A cache root inside a Git worktree can be staged by a later `git add`, so
+ * that root stays in memory. Classification starts at the nearest directory so
+ * a non-directory root still reaches the resident-cache trust check.
+ */
+export function residentTextCacheRootAllowsDisk(cacheRoot: string): boolean {
+	try {
+		const directory = nearestExistingDirectory(cacheRoot);
+		if (directory === null) return false;
+		return git.repo.resolveSync(directory) === null;
+	} catch {
+		return false;
+	}
+}
+
 export interface SessionEntryBase {
 	type: string;
 	id: string;
@@ -8092,9 +8124,13 @@ export class SessionManager {
 			this.#residentCacheWin32FallbackCount++;
 			return { store: this.#newCanonicalResidentTextStore(), ownsStore: false };
 		}
-		const instanceDir = openVerifiedResidentCacheInstanceDir(
-			getResidentCacheRootDir(this.#residentCacheProfileAgentDir()),
-		);
+		const cacheRoot = getResidentCacheRootDir(this.#residentCacheProfileAgentDir());
+		// Not a provisioning failure: retain-and-throw must still commit, with no file to stage.
+		if (!residentTextCacheRootAllowsDisk(cacheRoot)) {
+			this.#residentCacheAdoptFallbackCount++;
+			return { store: this.#newCanonicalResidentTextStore(), ownsStore: false };
+		}
+		const instanceDir = openVerifiedResidentCacheInstanceDir(cacheRoot);
 		return { store: EphemeralBlobStore.adoptVerifiedDir(instanceDir), ownsStore: true };
 	}
 
