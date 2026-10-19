@@ -1879,6 +1879,8 @@ bar`,
 			{ name: "mailto", target: "mailto:dev@example.com" },
 			{ name: "custom scheme", target: "git+ssh://example.com/repo" },
 			{ name: "fragment", target: "#section" },
+			{ name: "network-path reference", target: "//example.com/docs" },
+			{ name: "network-path reference with fragment", target: "//example.com/docs#intro" },
 		])("leaves $name link destinations unchanged", ({ target }) => {
 			const markdown = new Markdown(`[source](<${target}>)`, 0, 0, defaultMarkdownTheme);
 			const output = markdown.render(80).join("\n");

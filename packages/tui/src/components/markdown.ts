@@ -515,8 +515,13 @@ function formatHyperlink(text: string, target: string): string {
 		return text;
 	}
 
+	// `#fragment` and `//authority/path` (network-path reference) are URI references, not local paths.
 	let destination = target;
-	if (!target.startsWith("#") && (path.isAbsolute(target) || !/^[a-z][a-z\d+.-]*:/iu.test(target))) {
+	if (
+		!target.startsWith("#") &&
+		!target.startsWith("//") &&
+		(path.isAbsolute(target) || !/^[a-z][a-z\d+.-]*:/iu.test(target))
+	) {
 		try {
 			destination = localFileUri(target);
 		} catch {
