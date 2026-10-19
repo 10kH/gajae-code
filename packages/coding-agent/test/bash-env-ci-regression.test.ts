@@ -1,6 +1,6 @@
-import { afterAll, describe, expect, it } from "bun:test";
-import { disposeAllShellSessions, executeBash } from "../src/exec/bash-executor";
+import { describe, expect, it } from "bun:test";
 import { resetShellConfigCache } from "@gajae-code/utils/shell-config";
+import { disposeAllShellSessions, executeBash } from "../src/exec/bash-executor";
 
 /**
  * Regression test for #6883: Default bash execution should not impersonate CI.
