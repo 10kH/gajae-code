@@ -1350,6 +1350,17 @@ export declare function exactUnlinkDirect(path: string, identity: NativeExactFil
 export declare function exactUnlinkDirectDetached(path: string, identity: NativeExactFileIdentity): boolean
 
 /**
+ * Delete only the empty regular file opened by the caller's retained
+ * descriptor.
+ *
+ * This is used when a newly created staging file cannot be statted through the
+ * host API. Native code derives identity from the open descriptor and verifies
+ * the public entry still names that object before using the platform's exact
+ * unlink protocol.
+ */
+export declare function exactUnlinkOpenFile(path: string, callerFd: number, quarantineName: string): NativeExactUnlinkResult
+
+/**
  * Execute a brush shell command.
  *
  * Creates a fresh session for each call. The `on_chunk` callback receives
@@ -2160,7 +2171,7 @@ export type NativeCanonicalDirectoryIdentity =
 			ok: false;
 			platform?: never;
 			canonicalPath?: never;
-			code: "not_found" | "not_directory" | "not_utf8" | "network_unsupported" | "identity_unavailable" | "io_error";
+			code: "access_denied" | "not_found" | "not_directory" | "not_utf8" | "network_unsupported" | "identity_unavailable" | "io_error";
 	  }
 
 /** Bytes copied out of one read-only broker publication observation. */
@@ -2376,6 +2387,7 @@ export type NativeOwnerOnlySecurityResult =
 	| {
 			ok: false;
 			code:
+				| "access_denied"
 				| "not_found"
 				| "not_directory"
 				| "network_unsupported"
