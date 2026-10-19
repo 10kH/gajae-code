@@ -5548,6 +5548,9 @@ export class Broker {
 			const begun = await this.ledger.begin(identity, requestHash, metadata);
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
+				// Proven errors are immutable even when their response carries cleanup
+				// metadata. Only unproven cleanup outcomes may execute again.
+				if (begun.entry.state === "terminal_error") return replay;
 				const cleanup = cleanupFromResponse(replay) ?? reconstructedDeleteCleanup;
 				if (!cleanup) {
 					if (
@@ -5592,7 +5595,7 @@ export class Broker {
 				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
 				const response = outcome.response;
 				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
-				await this.ledger.transition(identity, lifecycleResponseState(response), {
+				const recorded = await this.ledger.transition(identity, lifecycleResponseState(response), {
 					...(operation === "session.delete" &&
 					typeof input.sessionId === "string" &&
 					lifecycleResponseState(response) === "terminal_uncertain" &&
@@ -5604,6 +5607,10 @@ export class Broker {
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
 					...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
 				});
+				// A late transition may have proven a terminal result already. The ledger
+				// preserves that row; return it instead of the freshly computed response.
+				if (recorded.state === "terminal_error" && recorded.response !== undefined)
+					return recorded.response as BrokerResponse;
 				return response;
 			}
 			if (begun.kind === "idempotency_conflict")
@@ -5616,7 +5623,7 @@ export class Broker {
 				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
 				const response = outcome.response;
 				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
-				await this.ledger.transition(identity, lifecycleResponseState(response), {
+				const recorded = await this.ledger.transition(identity, lifecycleResponseState(response), {
 					...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
 					...(operation === "session.delete" &&
 					typeof input.sessionId === "string" &&
@@ -5629,6 +5636,8 @@ export class Broker {
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
 					...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
 				});
+				if (recorded.state === "terminal_error" && recorded.response !== undefined)
+					return recorded.response as BrokerResponse;
 				return response;
 			}
 			if (begun.kind === "in_progress") return error("broker_restarting", "lifecycle operation is in progress");
