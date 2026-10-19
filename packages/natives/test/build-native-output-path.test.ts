@@ -1,4 +1,5 @@
 import { expect, it } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -46,6 +47,9 @@ async function runBuildScript(extra: Record<string, string>): Promise<{ exitCode
 
 async function withSentinel(sentinel: string, body: () => Promise<void>): Promise<void> {
 	await fs.mkdir(path.dirname(sentinel), { recursive: true });
+	if (await Bun.file(sentinel).exists()) {
+		throw new Error(`refusing to overwrite existing sentinel ${path.basename(sentinel)}`);
+	}
 	await Bun.write(sentinel, "sentinel");
 	try {
 		await body();
@@ -58,7 +62,7 @@ async function withSentinel(sentinel: string, body: () => Promise<void>): Promis
 }
 
 it("rejects TARGET_ARCH values that would install the addon outside nativeDir", async () => {
-	const targetArch = "../../../gjc-native-victim";
+	const targetArch = `../../../gjc-native-victim-${crypto.randomUUID()}`;
 	const sentinel = path.join(nativeDir, `pi_natives.${process.platform}-${targetArch}.node`);
 	expect(path.relative(nativeDir, sentinel).startsWith("..")).toBe(true);
 	await withSentinel(sentinel, async () => {
@@ -69,7 +73,7 @@ it("rejects TARGET_ARCH values that would install the addon outside nativeDir", 
 });
 
 it("rejects CROSS_TARGET values that would create the build directory outside nativeDir", async () => {
-	const crossTarget = "../../../../gjc-native-escape";
+	const crossTarget = `../../../../gjc-native-escape-${crypto.randomUUID()}`;
 	const escapedPrefix = path.join(nativeDir, ".build", `${crossTarget}-baseline-ci-`);
 	expect(path.relative(path.join(nativeDir, ".build"), escapedPrefix).startsWith("..")).toBe(true);
 	const parent = path.dirname(escapedPrefix);
@@ -82,13 +86,13 @@ it("rejects CROSS_TARGET values that would create the build directory outside na
 	expect(result.exitCode).not.toBe(0);
 	expect(result.output).toContain("Unsupported CROSS_TARGET: path separators are not allowed");
 	const created = (await fs.readdir(parent)).filter(
-		entry => !before.has(entry) && entry.includes("gjc-native-escape"),
+		entry => !before.has(entry) && entry.includes(crossTarget.split("/").at(-1) ?? crossTarget),
 	);
 	expect(created).toEqual([]);
 });
 
 it("rejects TARGET_PLATFORM values that would install the addon outside nativeDir", async () => {
-	const targetPlatform = "../../../gjc-native-plat";
+	const targetPlatform = `../../../gjc-native-plat-${crypto.randomUUID()}`;
 	const sentinel = path.join(nativeDir, `pi_natives.${targetPlatform}-arm64.node`);
 	expect(path.relative(nativeDir, sentinel).startsWith("..")).toBe(true);
 	await withSentinel(sentinel, async () => {
@@ -150,7 +154,7 @@ function referenceLayout(
 	};
 }
 
-it("property: native build output paths stay inside the native directory, seed 39664, 80 inputs", async () => {
+it("property: native build output paths stay inside the native directory, seed 39664, 64 generated inputs", async () => {
 	const source = await Bun.file(scriptPath).text();
 	expect(source).toContain("export function resolveNativeBuildOutputPaths");
 	const { resolveNativeBuildOutputPaths } = await import("../scripts/build-native");
@@ -159,7 +163,7 @@ it("property: native build output paths stay inside the native directory, seed 3
 	const alphabet = "abcXYZ012._-";
 	const pick = (length: number) =>
 		Array.from({ length }, () => alphabet[Math.floor(random() * alphabet.length)]).join("");
-	const safeInputs = [
+	const manualInputs = [
 		{
 			nativeDir: "/pkg/packages/natives/native",
 			targetPlatform: "darwin",
@@ -196,17 +200,17 @@ it("property: native build output paths stay inside the native directory, seed 3
 			profileLabel: "dist",
 		},
 	];
-	for (let index = safeInputs.length; index < 64; index++) {
-		safeInputs.push({
-			nativeDir: "/pkg/packages/natives/native",
-			crossTarget: index % 2 === 0 ? pick(12) : undefined,
-			targetPlatform: pick(6),
-			targetArch: pick(4),
-			variantSuffix: index % 3 === 0 ? "-baseline" : "",
-			variantLabel: "default",
-			profileLabel: "local",
-		});
-	}
+	const generatedInputs = Array.from({ length: 64 }, (_, index) => ({
+		nativeDir: "/pkg/packages/natives/native",
+		crossTarget: index % 2 === 0 ? pick(12) : undefined,
+		targetPlatform: pick(6),
+		targetArch: pick(4),
+		variantSuffix: index % 3 === 0 ? "-baseline" : "",
+		variantLabel: "default",
+		profileLabel: "local",
+	}));
+	expect(generatedInputs).toHaveLength(64);
+	const safeInputs = [...manualInputs, ...generatedInputs];
 	const attacks = ["../x", "..\\x", "/tmp/x", "C:\\temp\\x", "a/b", "a\\b", "a\0b", "ok/../../etc"];
 	let checked = 0;
 	for (const pathApi of [path.posix, path.win32]) {
@@ -232,5 +236,5 @@ it("property: native build output paths stay inside the native directory, seed 3
 			checked += 2;
 		}
 	}
-	expect(checked).toBe(80 * 2);
+	expect(checked).toBe((manualInputs.length + generatedInputs.length + attacks.length * 2) * 2);
 });
