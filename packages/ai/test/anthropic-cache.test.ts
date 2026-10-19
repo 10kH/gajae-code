@@ -349,8 +349,7 @@ describe("Anthropic prompt caching", () => {
 				if (disabled) expect(after).toEqual(before);
 				for (let index = 0; index < systemCount; index++) {
 					const path = `system.${index}`;
-					const expected =
-						shouldAddSystem && index === systemCount - 1 ? control : before.get(path);
+					const expected = shouldAddSystem && index === systemCount - 1 ? control : before.get(path);
 					expect(after.get(path)).toEqual(expected);
 				}
 				if (cacheControls(params).length > 4) expect(() => normalizeCacheControlTtlOrdering(params)).toThrow();
