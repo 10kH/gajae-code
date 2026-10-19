@@ -117,6 +117,7 @@ import {
 	type SessionSdkHost,
 	SessionSdkSessionRuntime,
 	shouldHostSdk,
+	TURN_STREAM_CAPABILITY,
 	verifyMasterCapabilityFrame,
 } from "../host";
 import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
@@ -5089,7 +5090,11 @@ export function createNotificationsExtension(
 		};
 
 		type HostConnectionIncarnation = { generation: number; closed: boolean };
-		type HostCapabilityCacheEntry = { generation: number; capabilities: ReadonlySet<string> };
+		type HostCapabilityCacheEntry = {
+			generation: number;
+			capabilities: ReadonlySet<string>;
+			nativeConfirmed: ReadonlySet<string>;
+		};
 		const hostCapCache = new Map<string, HostCapabilityCacheEntry>();
 		const hostConnectionIncarnations = new Map<string, HostConnectionIncarnation>();
 		const hostAttachedConnections = new Set<string>();
@@ -5103,12 +5108,28 @@ export function createNotificationsExtension(
 			hostConnectionIncarnations.set(connectionId, incarnation);
 			return incarnation;
 		};
-		const rememberHostCapabilities = (connectionId: string, capabilities: readonly string[]): void => {
+		const rememberHostCapabilities = (
+			connectionId: string,
+			capabilities: readonly string[],
+			source: "replay" | "native",
+		): void => {
 			const incarnation = liveHostConnection(connectionId);
 			if (!incarnation) return;
+			const previous = hostCapCache.get(connectionId);
+			const merged =
+				previous?.generation === incarnation.generation ? new Set(previous.capabilities) : new Set<string>();
+			const nativeConfirmed =
+				previous?.generation === incarnation.generation ? new Set(previous.nativeConfirmed) : new Set<string>();
+			for (const capability of capabilities) merged.add(capability);
+			// Replay claims enable stream routing immediately, but only native snapshots
+			// can remove a socket from host demand. Merge delayed snapshots monotonically.
+			if (source === "native") {
+				for (const capability of capabilities) nativeConfirmed.add(capability);
+			}
 			hostCapCache.set(connectionId, {
 				generation: incarnation.generation,
-				capabilities: new Set(capabilities),
+				capabilities: merged,
+				nativeConfirmed,
 			});
 		};
 		const liveHostCapabilities = (connectionId: string): ReadonlySet<string> | undefined => {
@@ -5850,7 +5871,7 @@ export function createNotificationsExtension(
 			);
 		};
 		const emitPromptEvent = (event: AgentSessionEvent) => {
-			if (!runtime) return;
+			if (!runtime || runtime.stopping || runtime.serverStopped || runtimes.get(id) !== runtime) return;
 			cleanupPromptRecords();
 			const handle = ctx.getActivePromptHandle();
 			const domain = handle ? terminalAbortSeams?.getRunOwnerDomain?.(handle) : undefined;
@@ -5863,12 +5884,14 @@ export function createNotificationsExtension(
 				)
 			)
 				correlations.unshift(root);
+			const owners = new Set<string>();
 			for (const correlation of correlations) {
 				// Renewal is attributed exactly like the correlated delivery below.
 				renewPromptDeadline(correlation, event);
 				noteToolDispatchBoundary(correlation, event);
 				const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 				if (!submission || submission.abandoned) continue;
+				owners.add(submission.connectionId);
 				const frame = {
 					type: "event",
 					kind: event.type,
@@ -5880,6 +5903,25 @@ export function createNotificationsExtension(
 					continue;
 				}
 				deliverCorrelatedFrame(submission, frame);
+			}
+			// Broker-created hosts use this bus, not the SDK-only extension. Observers
+			// must opt into BOTH capabilities and receive no other client's correlation.
+			// Keep cumulative partialResult snapshots and authoritative final result
+			// intact, and off the durable lifecycle replay ring, like owner content.
+			for (const connectionId of sdkRuntime?.connectionIdsWithCapabilities([
+				TURN_STREAM_CAPABILITY,
+				SESSION_HOST_OBSERVER_CAPABILITY,
+			]) ?? []) {
+				if (owners.has(connectionId)) continue;
+				try {
+					sdkRuntime?.sendFrameTo(connectionId, {
+						type: "event",
+						kind: event.type,
+						payload: toAgentWireEventPayload(event),
+					});
+				} catch {
+					// Content delivery is best-effort and must not interrupt execution.
+				}
 			}
 		};
 		/**
@@ -8447,6 +8489,13 @@ export function createNotificationsExtension(
 						return;
 					}
 					if (typedFrame.type === "event_replay") {
+						const capabilities = typedFrame.capabilities;
+						if (
+							Array.isArray(capabilities) &&
+							capabilities.every((capability: unknown) => typeof capability === "string")
+						) {
+							rememberHostCapabilities(inbound.connectionId, capabilities as string[], "replay");
+						}
 						if (liveHostConnection(inbound.connectionId)) hostAttachedConnections.add(inbound.connectionId);
 					}
 					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;
@@ -8491,7 +8540,7 @@ export function createNotificationsExtension(
 				const negotiated = tuple?.[1] ?? capabilities;
 				if (typeof id !== "string" || !Array.isArray(negotiated)) return;
 				const normalized = negotiated.filter((capability): capability is string => typeof capability === "string");
-				rememberHostCapabilities(id, normalized);
+				rememberHostCapabilities(id, normalized, "native");
 				if (liveHostCapabilities(id) === undefined) return;
 				hostAttachedConnections.add(id);
 				negotiatedCapabilitiesHandler?.(id, normalized);
@@ -9034,8 +9083,10 @@ export function createNotificationsExtension(
 				attachedClients: () => server.clientCount(),
 				observerClients: () => {
 					if (workLease.isHeld()) return 0;
-					const observers = [...hostCapCache.keys()].filter(connectionId =>
-						liveHostCapabilities(connectionId)?.has(SESSION_HOST_OBSERVER_CAPABILITY),
+					const observers = [...hostCapCache.entries()].filter(
+						([connectionId, entry]) =>
+							liveHostCapabilities(connectionId)?.has(SESSION_HOST_OBSERVER_CAPABILITY) &&
+							entry.nativeConfirmed.has(SESSION_HOST_OBSERVER_CAPABILITY),
 					).length;
 					return Math.min(server.clientCount(), observers);
 				},

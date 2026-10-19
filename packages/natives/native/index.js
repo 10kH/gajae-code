@@ -35,12 +35,13 @@ export const TtyWriter = nativeBindings.TtyWriter;
 // functions
 export const __gjcInstallTokioRuntime = nativeBindings.__gjcInstallTokioRuntime;
 export const __piNativesPublishOutcomeV1 = nativeBindings.__piNativesPublishOutcomeV1;
-export const __piNativesV0_18_11 = nativeBindings.__piNativesV0_18_11;
+export const __piNativesV0_18_12 = nativeBindings.__piNativesV0_18_12;
 export const applyBashFixups = nativeBindings.applyBashFixups;
 export const applyOwnerOnlyFdSecurity = nativeBindings.applyOwnerOnlyFdSecurity;
 export const applyOwnerOnlyPathSecurity = nativeBindings.applyOwnerOnlyPathSecurity;
 export const astEdit = nativeBindings.astEdit;
 export const astGrep = nativeBindings.astGrep;
+export const astMatch = nativeBindings.astMatch;
 export const canonicalExistingDirectoryIdentity = nativeBindings.canonicalExistingDirectoryIdentity;
 export const computerScreenshot = nativeBindings.computerScreenshot;
 export const copyToClipboard = nativeBindings.copyToClipboard;
