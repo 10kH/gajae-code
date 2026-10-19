@@ -71,13 +71,24 @@ async function startupPrompt(dir: string, args: Partial<Args> = {}): Promise<str
 		auth.close();
 		setProjectDir(previous);
 	}
-	const prompt = captured?.systemPrompt;
+	return promptFromCaptured(captured);
+}
+
+function promptFromCaptured(captured: CreateAgentSessionOptions | undefined): string[] {
+	if (captured === undefined) {
+		throw new Error("createAgentSession was not called");
+	}
+	const prompt = captured.systemPrompt;
 	if (typeof prompt === "function") return prompt([...BASE]);
 	if (Array.isArray(prompt)) return prompt;
 	return [...BASE];
 }
 
 describe("APPEND_SYSTEM.md startup", () => {
+	test("startup prompt helper fails when the session was not created", () => {
+		expect(() => promptFromCaptured(undefined)).toThrow("createAgentSession was not called");
+	});
+
 	test("does not append a repository APPEND_SYSTEM.md", async () => {
 		using temp = TempDir.createSync("@gjc-append-proj-");
 		const dir = temp.path();
