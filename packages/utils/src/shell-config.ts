@@ -65,12 +65,19 @@ function isExecutable(path: string): boolean {
  * runs code for every dynamically linked command from `LD_PRELOAD` and `LD_AUDIT` modules, and
  * resolves libraries from `LD_LIBRARY_PATH` first, so a project directory there
  * can shadow a system library (macOS: `DYLD_INSERT_LIBRARIES` and the
- * `DYLD_*_LIBRARY_PATH`/`DYLD_*_FRAMEWORK_PATH` search overrides). A
- * repository `.env` must not be able to set them, or bash tool commands could
- * execute repository code.
+ * `DYLD_*_LIBRARY_PATH`/`DYLD_*_FRAMEWORK_PATH` search overrides). Sibling
+ * spellings load the same code: Perl `PERLLIB`, the JVM `_JAVA_OPTIONS`, and npm
+ * `npm_config_node_options` (npm reads its config variables in either case). Common tools also read programs from the
+ * environment: ripgrep `RIPGREP_CONFIG_PATH` (a config file that can add
+ * `--pre=<program>`), GNU tar `TAR_OPTIONS` (`--use-compress-program`,
+ * `--to-command`), rsync `RSYNC_RSH`, make `MAKEFLAGS` (`SHELL=`) and
+ * `MAKEFILES` (a makefile with `$(shell …)`), and bash `SHELLOPTS`, which turns on
+ * `xtrace` so `PS4` command substitutions run in every `bash -c`. A repository
+ * `.env` must not be able to set them, or bash tool commands could execute
+ * repository code.
  */
 const PROJECT_DENIED_SPAWN_ENV =
-	/^(?:BASH_ENV|BUN_OPTIONS|ENV|ZDOTDIR|HOME|USERPROFILE|HOMEDRIVE|HOMEPATH|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXEC_PATH|GIT_EXTERNAL_DIFF|GIT_PROXY_COMMAND|GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|GIT_SEQUENCE_EDITOR|GIT_TEMPLATE_DIR|NODE_OPTIONS|PYTHONPATH|PYTHONUSERBASE|PYTHONSTARTUP|PERL5OPT|PERL5LIB|JAVA_TOOL_OPTIONS|JDK_JAVA_OPTIONS|LD_PRELOAD|LD_AUDIT|LD_LIBRARY_PATH|DYLD_(?:INSERT_LIBRARIES|LIBRARY_PATH|FALLBACK_LIBRARY_PATH|FRAMEWORK_PATH|FALLBACK_FRAMEWORK_PATH|VERSIONED_LIBRARY_PATH|VERSIONED_FRAMEWORK_PATH)|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
+	/^(?:BASH_ENV|BUN_OPTIONS|ENV|ZDOTDIR|HOME|USERPROFILE|HOMEDRIVE|HOMEPATH|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXEC_PATH|GIT_EXTERNAL_DIFF|GIT_PROXY_COMMAND|GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|GIT_SEQUENCE_EDITOR|GIT_TEMPLATE_DIR|NODE_OPTIONS|PYTHONPATH|PYTHONUSERBASE|PYTHONSTARTUP|PERL5OPT|PERL5LIB|JAVA_TOOL_OPTIONS|JDK_JAVA_OPTIONS|_JAVA_OPTIONS|PERLLIB|(?:npm|NPM)_(?:config|CONFIG)_(?:node_options|NODE_OPTIONS)|RIPGREP_CONFIG_PATH|TAR_OPTIONS|RSYNC_RSH|MAKEFLAGS|MAKEFILES|SHELLOPTS|PS4|LD_PRELOAD|LD_AUDIT|LD_LIBRARY_PATH|DYLD_(?:INSERT_LIBRARIES|LIBRARY_PATH|FALLBACK_LIBRARY_PATH|FRAMEWORK_PATH|FALLBACK_FRAMEWORK_PATH|VERSIONED_LIBRARY_PATH|VERSIONED_FRAMEWORK_PATH)|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
 const PROJECT_HOME_SPAWN_ENV = new Set(["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"]);
 
 /**
