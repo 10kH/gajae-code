@@ -261,35 +261,27 @@ const TMUX_LAUNCH_IDENTITY_ENV_NAMES = [
  * Drop project-dotenv copies of the tmux session name, coordinator id, and
  * state-file path. A pin is kept only when every snapshot accepts it, so a
  * declaration Bun loaded before `chdir` is refused even if the launch cwd no
- * longer contains that file.
+ * longer contains that file. Acceptance uses the shared helper, but the
+ * original string stays: callers trim at use, and a later check must see the
+ * same value that was accepted.
  */
 export function trustedTmuxLaunchIdentityEnv(
 	env: NodeJS.ProcessEnv,
 	snapshots: readonly ProjectEnvSnapshot[],
 ): NodeJS.ProcessEnv {
-	const updates: Array<[string, string | undefined]> = [];
+	const denied: string[] = [];
 	for (const name of TMUX_LAUNCH_IDENTITY_ENV_NAMES) {
-		let trusted: string | undefined;
+		if (!env[name]) continue;
 		for (const snapshot of snapshots) {
-			const accepted = trustedCoordinatorEnv(name, env, snapshot);
-			if (accepted === undefined) {
-				trusted = undefined;
+			if (trustedCoordinatorEnv(name, env, snapshot) === undefined) {
+				denied.push(name);
 				break;
 			}
-			trusted = accepted;
 		}
-		if (trusted === undefined) {
-			if (env[name]) updates.push([name, undefined]);
-			continue;
-		}
-		if (env[name] !== trusted) updates.push([name, trusted]);
 	}
-	if (updates.length === 0) return env;
+	if (denied.length === 0) return env;
 	const next: NodeJS.ProcessEnv = { ...env };
-	for (const [name, value] of updates) {
-		if (value === undefined) delete next[name];
-		else next[name] = value;
-	}
+	for (const name of denied) delete next[name];
 	return next;
 }
 

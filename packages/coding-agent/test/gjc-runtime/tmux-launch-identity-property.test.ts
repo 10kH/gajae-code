@@ -42,7 +42,7 @@ describe("tmux launch identity property", () => {
 					env[key] = projectValue;
 				} else if (mode === 2) {
 					snapshot.values[key] = projectValue;
-					env[key] = ` operator-${projectValue} `;
+					env[key] = ` ${projectValue} `;
 				} else {
 					snapshot.values[key] = projectValue;
 					snapshot.dynamic.add(key);
@@ -59,8 +59,21 @@ describe("tmux launch identity property", () => {
 					return declared !== undefined && (candidate.dynamic.has(key) || declared === env[key]);
 				});
 				if (rejected || !env[key]?.trim()) expect(once[key]).toBeUndefined();
-				else expect(once[key]).toBe(env[key]?.trim());
+				else expect(once[key]).toBe(env[key]);
 			}
+		}
+		for (const key of keys) {
+			const declared = `value-${key}`;
+			const operator = ` ${declared} `;
+			const env: NodeJS.ProcessEnv = { [key]: operator };
+			const snapshots: ProjectEnvSnapshot[] = [
+				{ values: { [key]: declared }, dynamic: new Set<string>() },
+				{ values: { [key]: declared }, dynamic: new Set<string>() },
+			];
+			const once = trustedTmuxLaunchIdentityEnv(env, snapshots);
+			const twice = trustedTmuxLaunchIdentityEnv(once, snapshots);
+			expect(twice).toEqual(once);
+			expect(once[key]).toBe(operator);
 		}
 	});
 });

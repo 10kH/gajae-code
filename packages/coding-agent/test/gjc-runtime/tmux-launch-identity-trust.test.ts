@@ -168,6 +168,30 @@ describe("tmux launch identity provenance", () => {
 		);
 	});
 
+	it("still uses an operator pin that differs from the static declaration only by surrounding spaces", async () => {
+		await withRepo(
+			[
+				`GJC_TMUX_SESSION=${OPERATOR_SESSION}`,
+				`GJC_COORDINATOR_SESSION_ID=${OPERATOR_COORDINATOR}`,
+				`GJC_SESSION_ID=${OPERATOR_GJC_SESSION}`,
+				"GJC_COORDINATOR_SESSION_STATE_FILE=/declared/state.json",
+			].join("\n"),
+			async cwd => {
+				const stateFile = path.join(cwd, "operator-state.json");
+				const launched = launchPins(cwd, {
+					GJC_TMUX_SESSION: ` ${OPERATOR_SESSION} `,
+					GJC_COORDINATOR_SESSION_ID: ` ${OPERATOR_COORDINATOR} `,
+					GJC_SESSION_ID: ` ${OPERATOR_GJC_SESSION} `,
+					GJC_COORDINATOR_SESSION_STATE_FILE: ` ${stateFile} `,
+				});
+				expect(launched.sessionName).toBe(OPERATOR_SESSION);
+				expect(launched.inner).toContain(OPERATOR_COORDINATOR);
+				expect(launched.inner).toContain(stateFile);
+				expect(launched.inner).not.toContain("/declared/state.json");
+			},
+		);
+	});
+
 	it("session create ignores a project dotenv session and state-file pin", async () => {
 		const root = await mkdtemp(path.join(tmpdir(), "tmux-create-identity-"));
 		const cwd = path.join(root, "repo");
