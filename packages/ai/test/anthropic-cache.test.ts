@@ -458,6 +458,52 @@ describe("Anthropic prompt caching", () => {
 		expect(cacheControls(requestOverride)).toEqual([{ type: "ephemeral" }]);
 	});
 
+	for (const callerMarkerCount of [3, 4]) {
+		it(`respects ${callerMarkerCount} caller markers in automatic mode`, () => {
+			const params = cacheParams({
+				tools: [
+					{
+						name: "lookup",
+						input_schema: { type: "object", properties: {} },
+						cache_control: { type: "ephemeral" },
+					},
+				],
+				system: [{ type: "text", text: "stable", cache_control: { type: "ephemeral" } }],
+				messages: [
+					{
+						role: "user",
+						content: Array.from({ length: callerMarkerCount - 2 }, (_, index) => ({
+							type: "text" as const,
+							text: `question ${index}`,
+							cache_control: { type: "ephemeral" as const },
+						})),
+					},
+				],
+			});
+			const before = structuredClone(params);
+
+			applyPromptCaching(params, "automatic", { type: "ephemeral" });
+
+			if (callerMarkerCount === 4) {
+				expect(params.cache_control).toBeUndefined();
+				expect(params).toEqual(before);
+			} else {
+				expect(params.cache_control).toEqual({ type: "ephemeral" });
+				expect(params).toEqual({ ...before, cache_control: { type: "ephemeral" } });
+			}
+			expect(cacheControls(params)).toHaveLength(4);
+			expect(() => normalizeCacheControlTtlOrdering(params)).not.toThrow();
+		});
+	}
+
+	it("still replaces an existing root marker in automatic mode", () => {
+		const params = cacheParams({ cache_control: { type: "ephemeral" } });
+
+		applyPromptCaching(params, "automatic", { type: "ephemeral", ttl: "1h" });
+
+		expect(params.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+	});
+
 	it("counts top-level automatic and caller controls together without mutating a callback replacement", async () => {
 		const replacement = cacheParams({
 			cache_control: { type: "ephemeral", ttl: "1h" },
