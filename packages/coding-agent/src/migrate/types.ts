@@ -114,6 +114,20 @@ export interface SourceDiagnostic {
 	message: string;
 }
 
+/**
+ * A source setting the migration cannot express in gjc. Reported instead of
+ * guessed at: silently translating an approval or hook policy would change what
+ * the agent is allowed to do. Secret values are never read, so detail may name
+ * keys but never their contents.
+ */
+export interface ManualAction {
+	source: MigrateSource;
+	/** Setting area, e.g. `hooks`, `settings.model`, `env`. */
+	area: string;
+	/** One-line instruction naming the concrete follow-up. */
+	detail: string;
+}
+
 /** Normalized candidates + diagnostics returned by an adapter. */
 export interface AdapterResult {
 	mcpCandidates: McpCandidate[];
@@ -122,6 +136,7 @@ export interface AdapterResult {
 	agentCandidates: AgentCandidate[];
 	instructionCandidates: InstructionCandidate[];
 	diagnostics: SourceDiagnostic[];
+	manualActions: ManualAction[];
 }
 
 /** A single planned action consumed identically by dry-run and live execution. */
@@ -194,6 +209,7 @@ export interface MigrateReport {
 		warnings?: string[];
 	}>;
 	warnings: MigrateWarning[];
+	manualActions: ManualAction[];
 }
 
 /** Create a zeroed status-count record. */
