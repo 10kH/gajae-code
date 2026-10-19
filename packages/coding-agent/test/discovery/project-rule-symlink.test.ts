@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { loadCapability } from "../../src/capability";
-import { clearCache } from "../../src/capability/fs";
+import { clearCache, readFile } from "../../src/capability/fs";
 import { type Rule, ruleCapability } from "../../src/capability/rule";
 import "../../src/discovery";
 
@@ -118,6 +118,48 @@ test.skipIf(!canSymlink)(
 		expect(blob.includes("SECRET_NO_REPO")).toBe(false);
 	},
 );
+
+test.skipIf(!canSymlink)("a contained project read does not reuse an unconstrained cache entry", async () => {
+	const target = path.join(outside, "cached.md");
+	writeFile(target, "SECRET_CACHE");
+	const link = path.join(project, "leak.md");
+	fs.symlinkSync(target, link);
+	clearCache();
+	const open = await readFile(link);
+	const bounded = await readFile(link, { containmentRoot: project, scope: "project" });
+	expect(open).toContain("SECRET_CACHE");
+	expect(bounded).toBeNull();
+});
+
+test.skipIf(!canSymlink)("an unconstrained read still loads after a contained read", async () => {
+	const target = path.join(outside, "open.md");
+	writeFile(target, "SECRET_OPEN");
+	const link = path.join(project, "open.md");
+	fs.symlinkSync(target, link);
+	clearCache();
+	await readFile(link, { containmentRoot: project, scope: "project" });
+	const open = await readFile(link);
+	expect(open).toContain("SECRET_OPEN");
+});
+
+test.skipIf(!canSymlink)("narrowing the repository does not reuse a wider discovery cache", async () => {
+	const nested = path.join(project, "nested");
+	fs.mkdirSync(path.join(nested, ".gjc", "rules"), { recursive: true });
+	writeFile(path.join(project, "secret.md"), ruleText("SECRET_NARROW"));
+	fs.symlinkSync(path.join(project, "secret.md"), path.join(nested, ".gjc", "rules", "leak.md"));
+	clearCache();
+	const wide = await loadCapability<Rule>(ruleCapability.id, { cwd: nested, providers: ["native"] });
+	expect(wide.items.some(rule => rule._source.level === "project" && rule.content.includes("SECRET_NARROW"))).toBe(
+		true,
+	);
+	fs.mkdirSync(path.join(nested, ".git"));
+	const narrow = await loadCapability<Rule>(ruleCapability.id, { cwd: nested, providers: ["native"] });
+	const blob = narrow.items
+		.filter(rule => rule._source.level === "project")
+		.map(rule => rule.content)
+		.join("\n");
+	expect(blob.includes("SECRET_NARROW")).toBe(false);
+});
 
 test.skipIf(!canSymlink)("generated project rule paths stay inside the repository", async () => {
 	const random = mulberry32(PROPERTY_SEED);

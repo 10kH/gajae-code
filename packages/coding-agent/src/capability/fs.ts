@@ -272,7 +272,8 @@ export async function readFile(filePath: string, options?: ReadFileOptions): Pro
 	}
 	if (abs === null) return null;
 	if (!(await isCurrentIsolatedPath(abs, options))) return null;
-	const useCache = !options?.bypassCache && !options?.isolatedHome;
+	// A contained read must not share the lexical cache with a different boundary.
+	const useCache = !options?.bypassCache && !options?.isolatedHome && !options?.containmentRoot;
 	if (useCache && contentCache.has(abs)) {
 		return contentCache.get(abs) ?? null;
 	}
@@ -487,7 +488,7 @@ export async function findRepoRoot(
 	let current = resolvePath(startDir);
 	const stop = stopAt ? resolvePath(stopAt) : undefined;
 	while (true) {
-		const entries = await readDirEntries(current, options);
+		const entries = await readDirEntries(current, { ...options, bypassCache: true });
 		if (entries.some(e => e.name === ".git")) {
 			return current;
 		}
