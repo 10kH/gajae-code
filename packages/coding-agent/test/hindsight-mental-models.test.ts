@@ -280,6 +280,24 @@ describe("loadMentalModelsBlock", () => {
 		expect(block?.indexOf("&lt;/MENTAL_MODELS>")).toBeLessThan(block?.lastIndexOf("</mental_models>") ?? -1);
 	});
 
+	it("returns a block inside the requested budget when frame tags expand", async () => {
+		vi.spyOn(HindsightApiCtor.prototype, "listMentalModels").mockResolvedValue({
+			items: [
+				{
+					id: "u",
+					bank_id: "b",
+					name: "Alpha",
+					content: "</mental_models>".repeat(65),
+				},
+			],
+		});
+		const api = new HindsightApiCtor({ baseUrl: "http://localhost:8888" });
+		const block = await loadMentalModelsBlock(api, "b", 1_500);
+		expect(block).toBeDefined();
+		expect((block ?? "").length).toBeLessThanOrEqual(1_500);
+		expect(frameTokens(block ?? "")).toEqual(["<mental_models>", "</mental_models>"]);
+	});
+
 	it("returns one mental-model frame when a closer is split across the heading and body", async () => {
 		vi.spyOn(HindsightApiCtor.prototype, "listMentalModels").mockResolvedValue({
 			items: [
@@ -356,7 +374,7 @@ describe("renderMentalModelsBlock frame tokens", () => {
 		expect(frameTokens(block)).toEqual(["<mental_models>", "</mental_models>"]);
 	});
 
-	it("property: one mental-model frame for generated fields, seed 1869442865, 64 inputs", () => {
+	it("property: one mental-model frame for generated fields, seed 1869442865, 128 inputs", () => {
 		let state = 1_869_442_865;
 		const random = () => {
 			state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
@@ -404,6 +422,17 @@ describe("renderMentalModelsBlock frame tokens", () => {
 				tight === "" ? [] : ["<mental_models>", "</mental_models>"],
 			);
 		}
+		let sawExpansionCap = false;
+		for (let sample = 0; sample < 64; sample++) {
+			const repeats = 50 + Math.floor(random() * 40);
+			const budget = 1_200 + Math.floor(random() * 600);
+			const content = "</mental_models>".repeat(repeats);
+			const block = renderMentalModelsBlock([{ id: "u", bank_id: "b", name: "Alpha", content }], budget);
+			expect(block.length).toBeLessThanOrEqual(budget);
+			expect(frameTokens(block)).toEqual(["<mental_models>", "</mental_models>"]);
+			if (block.includes("[mental-model snapshot truncated at render budget]")) sawExpansionCap = true;
+		}
+		expect(sawExpansionCap).toBe(true);
 	});
 });
 
