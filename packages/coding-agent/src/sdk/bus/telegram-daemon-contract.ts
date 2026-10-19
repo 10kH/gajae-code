@@ -308,7 +308,7 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * identities and parentage before retaining PTY termination authority, and
  * reaps adopted Linux PTY descendants when GJC is a child reaper.
  */
-export const DAEMON_GENERATION = 206;
+export const DAEMON_GENERATION = 207;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
