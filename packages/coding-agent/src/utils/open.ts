@@ -23,6 +23,17 @@ function stripOuterFormat(value: string): string {
 	return start === 0 && end === value.length ? value : value.slice(start, end);
 }
 
+/** Peel alternating ASCII spaces and format characters. Classification only; local paths stay raw. */
+function peelPadding(value: string): string {
+	let current = value;
+	for (let i = 0; i < 8; i++) {
+		const next = stripOuterFormat(current.trim());
+		if (next === current) return current;
+		current = next;
+	}
+	return current;
+}
+
 /** Drive paths parse as one-letter schemes (`c:`). Recognize them before that check. */
 function isWindowsDrivePath(value: string): boolean {
 	return /^[A-Za-z]:[\\/]/.test(value);
@@ -50,7 +61,7 @@ function resolveOpenTarget(raw: string): string | undefined {
 	if (direct === "reject") return undefined;
 	if (direct !== undefined) return direct;
 
-	const peeled = stripOuterFormat(raw.trim());
+	const peeled = peelPadding(raw);
 	if (peeled.length === 0) return undefined;
 	// Padding can hide a scheme or a flag. Refuse that instead of opening a different string.
 	if (peeled !== raw && !isWindowsDrivePath(peeled)) {

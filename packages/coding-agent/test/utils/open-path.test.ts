@@ -114,6 +114,21 @@ describe("openPath", () => {
 		}
 	});
 
+	it("normalizes http urls the parser already accepts", () => {
+		const calls = spySpawn();
+		const cases: Array<[string, string]> = [
+			[" https://example.com ", "https://example.com/"],
+			["http://localhost:3000", "http://localhost:3000/"],
+			["http://localhost:80/", "http://localhost/"],
+			["https://example.com:443/a", "https://example.com/a"],
+		];
+		for (const [input, href] of cases) {
+			calls.length = 0;
+			openPath(input);
+			expect(calls).toEqual([openerArgv(process.platform, href)]);
+		}
+	});
+
 	it("non-http schemes stay out of opener argv", () => {
 		const calls = spySpawn();
 		const attacks = [
@@ -132,6 +147,9 @@ describe("openPath", () => {
 			"note:draft",
 			"https://example.com%00",
 			"foo:bar",
+			"C:name",
+			"\u200B \u200Bjavascript:alert(1)",
+			"\u200Bhttps://example.com/a",
 		];
 		for (const input of attacks) {
 			calls.length = 0;
@@ -161,6 +179,9 @@ describe("openPath", () => {
 			"java\nscript:alert(1)",
 			"",
 			"   ",
+			"\u200B --help",
+			" --help",
+			" \u200B \u200B --help \u200B ",
 		]) {
 			calls.length = 0;
 			openPath(input);
@@ -209,16 +230,10 @@ describe("openPath", () => {
 			openPath(input);
 			expect(calls).toEqual([]);
 		}
-		for (const input of ["\u200B --help", " --help", "\u200Bjavascript:alert(1)", "\u200Bhttps://example.com/a"]) {
+		for (const input of ["\u200B --help", " --help", "\u200B \u200Bjavascript:alert(1)"]) {
 			calls.length = 0;
 			openPath(input);
-			expect(calls.length).toBeLessThanOrEqual(1);
-			if (calls.length !== 1) continue;
-			const argv = calls[0] ?? [];
-			expect(argv[argv.length - 1]).toBe(input);
-			calls.length = 0;
-			openPath(input);
-			expect(calls).toEqual([openerArgv(process.platform, input)]);
+			expect(calls).toEqual([]);
 		}
 		for (const input of generated) {
 			calls.length = 0;
