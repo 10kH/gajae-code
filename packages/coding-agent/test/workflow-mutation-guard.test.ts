@@ -2641,6 +2641,11 @@ describe("bash scanner quoting model", () => {
 			`awk 'BEGIN { print 1; print "PWNED" > "src/product.ts" }' input`,
 			"awk -W unsupported-extension",
 			`if awk 'BEGIN { print "PWNED" > "src/product.ts" }' input; then :; fi`,
+			`sed -n '/x/e printf PWNED > src/product.ts' input`,
+			`sed -n '/needle/e touch src/product.ts' input`,
+			`if python3 -c 'open("src/product.ts","w").write("x")'; then :; fi`,
+			`while true; do node -e "require('fs').writeFileSync('src/product.ts','x')"; done`,
+			`until ruby -e 'File.write("src/product.ts","x")'; do :; done`,
 			"ln -sf stage/pwn.txt src/product.ts",
 			`python3 -c "import os; os.symlink('stage/pwn.txt','src/pwn-link.ts')"`,
 		];

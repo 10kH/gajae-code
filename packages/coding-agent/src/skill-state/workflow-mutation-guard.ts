@@ -1712,7 +1712,13 @@ function sedRegexAddressWritePath(script: string, start: number): { path: string
  * must be treated as an unclassified mutation.
  */
 function sedScriptRunsShellCommand(script: string): boolean {
-	if (/(?:^|[;{}\n])\s*(?:[0-9$]+(?:,[0-9$]+)?\s*!?\s*)?e(?=[\s;}\n]|$)/.test(script)) return true;
+	// GNU sed accepts a numeric, `$`, or regular-expression address (`/re/e cmd`).
+	if (
+		/(?:^|[;{}\n])\s*(?:(?:[0-9$]+(?:,[0-9$]+)?|\/(?:\\[\s\S]|[^\\/\n])*\/)\s*!?\s*)?e(?=[\s;}\n]|$)/.test(
+			script,
+		)
+	)
+		return true;
 	return /\bs(\W)(?:\\.|(?!\1)[^\n])*?\1(?:\\.|(?!\1)[^\n])*?\1[gpiImM0-9]*e(?![A-Za-z])/.test(script);
 }
 
@@ -2052,7 +2058,7 @@ function cleanInterpreterCodeWord(word: string): string | undefined {
 function collectInterpreterOneLinerWrites(command: string, targets: ExtractedTargets, depth: number): void {
 	const api = new RegExp(BASH_INTERPRETER_WRITE_API, "i");
 	const names = new RegExp(
-		`(?:^|[;&|\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(?:busybox\\s+)?(python(?:\\d+(?:\\.\\d+)*)?|pypy(?:\\d+(?:\\.\\d+)*)?|node(?:js)?|bun|deno|ruby|jruby|perl|php(?:\\d+(?:\\.\\d+)*)?|lua(?:\\d+(?:\\.\\d+)*)?|bash|ash|sh|zsh|dash|ksh|fish)\\b`,
+		`(?:^|[;&|\\n])\\s*(?:(?:if|then|else|elif|do|in|while|until)\\s+)*(?:!\\s+)?(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(?:busybox\\s+)?(python(?:\\d+(?:\\.\\d+)*)?|pypy(?:\\d+(?:\\.\\d+)*)?|node(?:js)?|bun|deno|ruby|jruby|perl|php(?:\\d+(?:\\.\\d+)*)?|lua(?:\\d+(?:\\.\\d+)*)?|bash|ash|sh|zsh|dash|ksh|fish)\\b`,
 		"gi",
 	);
 	for (const match of command.matchAll(names)) {
