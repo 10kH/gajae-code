@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { $ } from "bun";
 import { sanitizeDisplayLine } from "../packages/utils/src/sanitize-text";
@@ -101,7 +102,11 @@ async function inventory(root: string): Promise<PackageInventory[]> {
 		}
 		const isTest = /\.test\.tsx?$/.test(file);
 		if (!isTest && !file.includes("/src/")) continue;
-		const text = await Bun.file(path.join(root, file)).text();
+		const filePath = path.join(root, file);
+		if (!(await fs.lstat(filePath)).isFile()) {
+			throw new Error(`Expected a regular tracked file: ${sanitizeDisplayLine(file).replaceAll("\t", " ")}`);
+		}
+		const text = await Bun.file(filePath).text();
 		if (!isTest) {
 			item.sourceLines += lines(text);
 			continue;
@@ -130,6 +135,7 @@ async function main(): Promise<void> {
 	const notes = [
 		"Reporting only; no thresholds, CI gate, or deletion verdicts. Categories overlap.",
 		"Scope: Git-tracked packages/ and scripts/ .ts/.tsx working-tree contents; stage additions AND deletions before measurement.",
+		"Requires a stable, fully materialized checkout of regular files, not a sparse checkout or symlinked inputs.",
 		"Test files end in .test.ts/.test.tsx. Source LOC: non-test files under src/ (including generated/declaration files).",
 		"All counts are lexical heuristics, may include comments/strings, and do not count executed parameterized cases.",
 		"Strict source-text means a source-path read and a text matcher co-occur in a file, not proven data flow.",
