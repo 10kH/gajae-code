@@ -6246,7 +6246,9 @@ for (const eventType of ["session_switch", "session_branch"] as const) {
 		} finally {
 			stop.mockRestore();
 		}
-	});
+		// Rotating two real hosts and their predecessor releases exceeds the
+		// default 5s budget on a loaded shard; the assertions stay unchanged.
+	}, 30_000);
 }
 
 test("SDK host binds session query and control seams and excludes uninstalled resources", async () => {
@@ -6377,9 +6379,7 @@ test("SDK host binds session query and control seams and excludes uninstalled re
 		});
 		expect(response).toMatchObject({ ok: false, error: { code: "resource_gone" } });
 	}
-	// Rotating two real hosts and their predecessor releases exceeds the default
-	// 5s budget on a loaded shard; the assertions stay unchanged.
-}, 30_000);
+});
 
 test("SDK host routes pure ACP permission prompts through a live reverse provider", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-permission-provider-"));
