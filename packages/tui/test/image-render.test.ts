@@ -381,6 +381,32 @@ describe("kitty transmit/placement split (dedup on repaint)", () => {
 		expect(data.join("")).toBe(payload);
 	});
 
+	it("holds every chunking invariant across payload lengths", () => {
+		// Property-style sweep: the per-frame budget depends on the header length, so
+		// chunk boundaries must stay valid for every payload size, not just the one
+		// fixed example above.
+		for (let length = 1; length <= 12_000; length = length < 64 ? length + 1 : Math.ceil(length * 1.7)) {
+			const payload = "AB".repeat(Math.ceil(length / 2)).slice(0, length);
+			const chunks = encodeKittyTransmit(payload, 42).split("\x1b\\").filter(Boolean);
+			const data = chunks.map(chunk => chunk.slice(chunk.indexOf(";") + 1));
+			expect(data.join("")).toBe(payload);
+			expect(data.every(chunk => chunk.length > 0)).toBe(true);
+			for (const chunk of data.slice(0, -1)) expect(chunk.length % 4).toBe(0);
+			for (const chunk of chunks) expect(chunk.length + 2).toBeLessThanOrEqual(4096);
+			expect(chunks[0]?.startsWith("\x1b_G")).toBe(true);
+			expect(chunks[0]?.includes("i=42")).toBe(true);
+			// A single frame carries no `m=` flag at all; a chunked upload marks every
+			// frame but the last as continuing.
+			if (chunks.length === 1) continue;
+			for (const [index, chunk] of chunks.entries()) {
+				const more = index === chunks.length - 1 ? "m=0" : "m=1";
+				const params = chunk.slice(3, chunk.indexOf(";"));
+				expect(params.endsWith(`,${more}`) || params === more).toBe(true);
+				expect(params.includes("i=42")).toBe(index === 0);
+			}
+		}
+	});
+
 	it("retries Kitty pixel transmission after the writer rejects the first attempt", () => {
 		let attempts = 0;
 		setKittyTransmitWriter(() => {
