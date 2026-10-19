@@ -3,6 +3,7 @@ import { Image } from "@gajae-code/tui/components/image";
 import {
 	type CellDimensions,
 	encodeKittyPlacementDelete,
+	encodeKittyTransmission,
 	encodeKittyTransmit,
 	extractKittyPlacementReferences,
 	getCellDimensions,
@@ -403,6 +404,34 @@ describe("kitty transmit/placement split (dedup on repaint)", () => {
 				const params = chunk.slice(3, chunk.indexOf(";"));
 				expect(params.endsWith(`,${more}`) || params === more).toBe(true);
 				expect(params.includes("i=42")).toBe(index === 0);
+			}
+		}
+	});
+
+	it("holds frame invariants for generated headers and payloads", () => {
+		// The per-frame budget is header-length dependent, so both inputs are
+		// generated: every frame must stay inside the kitty cap, only the first frame
+		// may carry the header, and every continuation frame must be a 4-byte quantum.
+		for (const header of ["a=t", "a=t,f=100,q=2,i=42", "a=t,f=100,q=2,i=42,c=80,r=24,C=1,Y=12", "i=1"]) {
+			for (let length = 1; length <= 9_000; length = length < 32 ? length + 1 : Math.ceil(length * 2.3)) {
+				const payload = "AB".repeat(Math.ceil(length / 2)).slice(0, length);
+				const chunks = encodeKittyTransmission(header, payload).split("\x1b\\").filter(Boolean);
+				const data = chunks.map(chunk => chunk.slice(chunk.indexOf(";") + 1));
+				expect(data.join(""), `${header}/${length}`).toBe(payload);
+				expect(
+					data.every(chunk => chunk.length > 0),
+					`${header}/${length}`,
+				).toBe(true);
+				for (const chunk of data.slice(0, -1)) expect(chunk.length % 4, `${header}/${length}`).toBe(0);
+				for (const chunk of chunks) expect(chunk.length + 2, `${header}/${length}`).toBeLessThanOrEqual(4096);
+				expect(chunks[0]?.includes(header), `${header}/${length}`).toBe(true);
+				if (chunks.length === 1) continue;
+				for (const [index, chunk] of chunks.entries()) {
+					const more = index === chunks.length - 1 ? "m=0" : "m=1";
+					const params = chunk.slice(3, chunk.indexOf(";"));
+					expect(params.endsWith(`,${more}`) || params === more, `${header}/${length}/${index}`).toBe(true);
+					expect(params.includes(header), `${header}/${length}/${index}`).toBe(index === 0);
+				}
 			}
 		}
 	});
