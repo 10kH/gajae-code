@@ -19122,8 +19122,11 @@ export class AgentSession {
 				}
 			}
 
-			// A transition may have completed while staging, so checking only the active kind is insufficient.
-			if (transitionGeneration !== this.#sessionTransitionGeneration) {
+			// Staging can overlap a transition before its generation commits, or outlive the transition entirely.
+			if (
+				this.#sessionTransitionKind !== undefined ||
+				transitionGeneration !== this.#sessionTransitionGeneration
+			) {
 				await this.#waitForSessionTransitionEnd(this.#disposeAbortController.signal);
 				this.#assertConfigurationReloadAvailable(candidate);
 				continue;
