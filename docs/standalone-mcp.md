@@ -57,14 +57,19 @@ Pass `--no-mcp` to skip conventional autoload for one session (plugin-bundle MCP
 ## Public slash-command boundary
 
 The ordinary interactive TUI and ACP slash-command surfaces intentionally do not
-register a top-level `/mcp` command. `/mcp test`, `/mcp reauth`, `/mcp
-reconnect`, and `/mcp reload` are not supported user-input entry points. Use
-`gjc mcp add`, `gjc mcp list`, or `gjc mcp remove` to manage stored registrations
-and start a new session. `--mcp-config` and the SDK's `mcpConfigPath` are
+register a top-level `/mcp` command. On those surfaces `/mcp test`, `/mcp reauth`,
+`/mcp reconnect`, and `/mcp reload` are not supported user-input entry points.
+Use `gjc mcp add`, `gjc mcp list`, or `gjc mcp remove` to manage stored
+registrations and start a new session.
+
+An interactive session started with exact-file `--mcp-config` is the exception:
+it exposes the session-scoped `/mcp` status and control command for the servers
+in that exact config, including `/mcp suspend <name>`, `/mcp resume <name>`, and
+`/mcp reconnect <name>`. `--mcp-config` and the SDK's `mcpConfigPath` are
 explicit connection-consumer entry points for a trusted config; they do not
 initiate MCP OAuth authorization. Existing credentials bound through `auth` may
 be refreshed by the runtime, but there is no public MCP OAuth authorization or
-reauthorization entry path, nor a public `/mcp` reconnection or reload contract.
+reauthorization entry path, and no `/mcp reload` contract.
 
 ## Subagents and lifecycle
 
@@ -153,7 +158,7 @@ From the Git repository you want GJC to inspect.
 Sem is a project-scope **stdio** server, so GJC spawns it only when the user
 config opts in. A project settings file cannot grant that flag; set it in the
 user config (`~/.gjc/agent/config.yml`, or the active agent directory). This is
-a global setting that covers every checkout, so revert it after the example:
+a global setting that covers every checkout, so remove it after the example:
 
 ```bash
 gjc config set mcp.enableProjectConfig true
@@ -188,11 +193,14 @@ environment settings do not restrict the process's filesystem permissions.
 Remove the registration with `gjc mcp remove sem --project`.
 
 `mcp.enableProjectConfig` is a **global** user setting: it applies to every
-checkout you open, not just this repository or Sem. Revert it when you are done
-so later checkouts cannot spawn project stdio commands:
+checkout you open, not just this repository or Sem. Setting it to `false` is not
+the equivalent of leaving it alone — `false` disables *every* project-scope MCP
+source, including project HTTP and SSE servers that load by default. Reset the
+key instead, which restores the default (project HTTP/SSE enabled, project stdio
+servers not spawned):
 
 ```bash
-gjc config set mcp.enableProjectConfig false
+gjc config reset mcp.enableProjectConfig
 ```
 
 ### Optional: preview overlapping branch changes with Weave
