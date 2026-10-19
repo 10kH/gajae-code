@@ -128,7 +128,9 @@ describe("multi-session session runner", () => {
 		}
 
 		await expect(compareEvidence(first.evidenceDir, second.evidenceDir)).resolves.toEqual({ equal: true, diffs: [] });
-	});
+		// Two full workloads, each constructing and disposing a real session host.
+		// The default 5s budget only covers one on a loaded CI shard.
+	}, 30_000);
 
 	test("trims MockModel calls to two while streaming every emitted request", async () => {
 		tempDir = TempDir.createSync("@bench-multisession-retention-");
