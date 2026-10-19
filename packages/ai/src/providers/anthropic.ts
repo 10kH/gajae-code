@@ -3933,7 +3933,11 @@ export function applyPromptCaching(
 	if (!cacheControl || cacheMode === "none" || budget === 0) return;
 	validateCacheControls(params);
 	if (cacheMode === "automatic") {
-		params.cache_control = { ...cacheControl };
+		// A caller layout that already holds four block markers leaves no room for a new root marker;
+		// adding one anyway made validateCacheControls reject the request. An existing root is still replaced.
+		if (params.cache_control || countCacheControlBreakpoints(params) < 4) {
+			params.cache_control = { ...cacheControl };
+		}
 		// #2383's moving breakpoint reasoning holds within a session, not across
 		// sessions: anchor tools + system so new messages can reuse that prefix.
 		if (
