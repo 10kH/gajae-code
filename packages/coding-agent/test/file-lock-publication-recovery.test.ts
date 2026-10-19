@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	acquireFileLock,
+	describeRetainedLockTransition,
 	FileLockAcquireError,
 	FileLockTestHooks,
 	fileLockStagingOwnerPid,
@@ -19,6 +20,7 @@ import {
 	type NativeDirectoryTreeSnapshot,
 	type NativeExactUnlinkResult,
 	type NativeNoReplaceResult,
+	RecoveryFsRoot,
 	renameDirectoryNoReplacePathAsync,
 	renameNoReplacePathAsync,
 	snapshotDirectoryTree,
@@ -54,6 +56,9 @@ interface RemovalCall {
 
 afterEach(async () => {
 	vi.restoreAllMocks();
+	FileLockTestHooks.afterRemovalTransitionMissing = undefined;
+	FileLockTestHooks.afterRemovalOwnerPublish = undefined;
+	FileLockTestHooks.beforeRemovalRecordUnlink = undefined;
 	FileLockTestHooks.nativePublicationBindings = undefined;
 	FileLockTestHooks.stagingIdentityEvidence = undefined;
 	FileLockTestHooks.stagingRootIdentity = undefined;
@@ -91,10 +96,35 @@ async function makeFixture(parent = os.tmpdir()): Promise<Fixture> {
 function exactRemoveStagingSnapshotForTest(
 	target: string,
 	expected: NativeDirectoryTreeSnapshot,
+	_parentIdentity?: { dev: bigint; ino: bigint },
+	detachOnly?: boolean,
 ): NativeExactUnlinkResult {
 	const current = snapshotDirectoryTree(target);
-	if (!current.ok || !current.snapshot || JSON.stringify(current.snapshot) !== JSON.stringify(expected))
+	// Renaming a tree updates ctime; compare the identity-bearing fields only.
+	const normalize = (snapshot: NativeDirectoryTreeSnapshot) => ({
+		rootDev: snapshot.rootDev,
+		rootIno: snapshot.rootIno,
+		entries: snapshot.entries.map(entry => ({
+			relativePath: entry.relativePath,
+			kind: entry.kind,
+			dev: entry.dev,
+			ino: entry.ino,
+			nlink: entry.nlink,
+			size: entry.size,
+			sha256: entry.sha256,
+		})),
+	});
+	if (
+		!current.ok ||
+		!current.snapshot ||
+		JSON.stringify(normalize(current.snapshot)) !== JSON.stringify(normalize(expected))
+	)
 		return { ok: false, code: "identity_mismatch" };
+	if (detachOnly && !target.endsWith(".removing")) {
+		const detachedPath = `${target}.removing`;
+		syncFs.renameSync(target, detachedPath);
+		return { ok: true, detachedPath };
+	}
 	syncFs.rmSync(target, { recursive: true, force: true });
 	return { ok: true };
 }
@@ -103,6 +133,15 @@ async function deadPid(): Promise<number> {
 	const child = Bun.spawn(["sh", "-c", "exit 0"], { stdout: "ignore", stderr: "ignore" });
 	await child.exited;
 	return child.pid;
+}
+
+async function waitForAbsence(target: string, timeoutMs = 5_000): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (!(await fs.exists(target))) return true;
+		await Bun.sleep(10);
+	}
+	return !(await fs.exists(target));
 }
 
 function removalInfo(
@@ -300,6 +339,44 @@ describe.skipIf(process.platform !== "linux")("file lock receipt producer valida
 			"invalid primary success receipt",
 		);
 		await expect(fs.lstat(lock)).resolves.toBeTruthy();
+	});
+
+	test("drains a failed rollback release before same-process reacquisition replaces its state", async () => {
+		vi.useFakeTimers();
+		try {
+			const { file, lock } = await makeFixture();
+			const transition = `${lock}.removing`;
+			const publication = installPublicationFailure(async (_source, destination) => {
+				await fs.mkdir(`${destination}.removing`);
+				await Bun.write(path.join(`${destination}.removing`, "info"), "foreign predecessor");
+			});
+			const closeAuthority = RecoveryFsRoot.prototype.close;
+			const closeSpy = vi.spyOn(RecoveryFsRoot.prototype, "close").mockImplementation(function (
+				this: RecoveryFsRoot,
+			) {
+				closeAuthority.call(this);
+				throw new Error("injected close failure after committed rollback");
+			});
+
+			await expect(withFileLock(file, async () => undefined, quickAcquire)).rejects.toThrow(
+				"File lock rollback authority failed",
+			);
+			expect(closeSpy).toHaveBeenCalledTimes(1);
+			expect(publication.source).not.toBe("");
+
+			closeSpy.mockRestore();
+			FileLockTestHooks.nativePublicationBindings = undefined;
+			await fs.rm(transition, { recursive: true, force: true });
+
+			const release = await acquireFileLock(file, quickAcquire);
+			try {
+				await expect(fs.lstat(publication.source)).rejects.toMatchObject({ code: "ENOENT" });
+			} finally {
+				await release();
+			}
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
 
@@ -597,12 +674,6 @@ test("acquisition reports live-holder evidence separately from ambiguous lock re
 			description: `held by pid ${process.pid} (liveness unknown)`,
 		},
 		{
-			info: removalInfo(await deadPid()),
-			currentIncarnation: null,
-			isLive: false,
-			description: undefined,
-		},
-		{
 			info: "malformed owner metadata",
 			currentIncarnation: null,
 			isLive: false,
@@ -625,11 +696,22 @@ test("acquisition reports live-holder evidence separately from ambiguous lock re
 		if (!scenario.isLive) expect(failure.holder).not.toContain("(live)");
 		expect(failure.holderIsLive).toBe(scenario.isLive);
 	}
+
+	// A proven-dead owner is reclaimed by the bounded recovery extension in the same call.
+	FileLockTestHooks.processIncarnation = () => null;
+	const deadFixture = await makeFixture();
+	await fs.mkdir(deadFixture.lock);
+	await Bun.write(path.join(deadFixture.lock, "info"), removalInfo(await deadPid()));
+	const deadRelease = await acquireFileLock(deadFixture.file, { retries: 1, retryDelayMs: 1, staleMs: 10_000 });
+	await deadRelease();
+	await expect(fs.lstat(deadFixture.lock)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 test("keeps the staging component within filesystem limits for long target names", async () => {
 	const { root } = await makeFixture();
 	const file = path.join(root, "x".repeat(196));
+	const lock = `${file}.lock`;
+	const transitionPath = `${lock}.removing`;
 	const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
 	if (!originalPlatform?.configurable) throw new Error("process_platform_not_configurable");
 	let stagingComponentLength = 0;
@@ -643,7 +725,11 @@ test("keeps the staging component within filesystem limits for long target names
 	});
 	FileLockTestHooks.nativeQuarantineBindings = () => ({
 		snapshotDirectoryTree,
-		exactRemoveDirectoryTree: target => {
+		exactRemoveDirectoryTree: (target, _snapshot, _parentIdentity, detachOnly) => {
+			if (target === lock && detachOnly) {
+				syncFs.renameSync(target, transitionPath);
+				return { ok: true, detachedPath: transitionPath };
+			}
 			syncFs.rmSync(target, { recursive: true, force: true });
 			return { ok: true };
 		},
@@ -1336,6 +1422,43 @@ test("retains staging cleanup ownership after abort and blocks acquisition until
 	expect((await fs.readdir(root)).filter(name => name.includes(".pending."))).toHaveLength(0);
 });
 
+test.each([
+	"x".repeat(196),
+	"x".repeat(240),
+	"x".repeat(250),
+	"é".repeat(125),
+])("acquires and releases a long canonical target without overflowing derived components: %s", async name => {
+	const { root } = await makeFixture();
+	const file = path.join(root, name);
+	const lock = `${file}.lock`;
+	const transitions: string[] = [];
+	FileLockTestHooks.beforeRemovalOwnerPublish = async transition => {
+		transitions.push(transition);
+		expect(Buffer.byteLength(path.basename(transition), "utf8")).toBeLessThanOrEqual(255);
+		for (const entry of await fs.readdir(root)) {
+			expect(Buffer.byteLength(entry, "utf8")).toBeLessThanOrEqual(255);
+		}
+	};
+	try {
+		await expect(
+			withFileLock(
+				file,
+				async () => {
+					const info = JSON.parse(await Bun.file(path.join(lock, "info")).text());
+					expect(info.pid).toBe(process.pid);
+					expect((await fs.lstat(lock)).isDirectory()).toBe(true);
+					return "released";
+				},
+				quickAcquire,
+			),
+		).resolves.toBe("released");
+		expect(transitions.length).toBeGreaterThan(0);
+		expect(await fs.readdir(root)).toEqual([]);
+	} finally {
+		FileLockTestHooks.beforeRemovalOwnerPublish = undefined;
+	}
+});
+
 test("uses a liveness-probed legacy staging name when process identity is unavailable", async () => {
 	const { file } = await makeFixture();
 	FileLockTestHooks.stagingIdentityEvidence = () => ({ processIncarnation: null, startTime: null });
@@ -1715,7 +1838,43 @@ describe.skipIf(process.platform !== "linux")("file lock committed publication r
 		expect(await fs.readdir(root)).toEqual([]);
 	});
 
-	test("propagates onAcquired failure without retrying or entering protected work", async () => {
+	test("retains release authority when post-publication transition validation throws", async () => {
+		const { root, file, lock } = await makeFixture();
+		const failure = new Error("post-publication transition check failed");
+		let transitionChecks = 0;
+		let acquired = 0;
+		FileLockTestHooks.afterRemovalTransitionMissing = () => {
+			transitionChecks++;
+			if (transitionChecks === 2) throw failure;
+		};
+
+		await expect(
+			withFileLock(file, async () => "unexpected", {
+				...quickAcquire,
+				onAcquired: () => acquired++,
+			}),
+		).rejects.toBe(failure);
+		expect(transitionChecks).toBe(2);
+		expect(acquired).toBe(0);
+		expect(await fs.readdir(lock)).toEqual(["info"]);
+
+		FileLockTestHooks.afterRemovalTransitionMissing = undefined;
+		let entered = 0;
+		await expect(
+			withFileLock(
+				file,
+				async () => {
+					entered++;
+					return "recovered";
+				},
+				quickAcquire,
+			),
+		).resolves.toBe("recovered");
+		expect(entered).toBe(1);
+		expect(await fs.readdir(root)).toEqual([]);
+	});
+
+	test("retains release authority when onAcquired throws", async () => {
 		const { file, lock } = await makeFixture();
 		const publication = installPublicationFailure();
 		const failure = Object.assign(new Error("acquisition callback failed"), { code: "EACCES" });
@@ -1736,6 +1895,12 @@ describe.skipIf(process.platform !== "linux")("file lock committed publication r
 		expect(publication.fallback).toBe(1);
 		expect(await fs.readdir(lock)).toEqual(["info"]);
 		expect(await Bun.file(path.join(lock, "info")).text()).toBe(publication.originalInfo);
+		FileLockTestHooks.nativePublicationBindings = undefined;
+		await expect(withFileLock(file, async () => "recovered", quickAcquire)).resolves.toBe("recovered");
+		expect(entered).toBe(0);
+		expect(publication.primary).toBe(1);
+		expect(publication.fallback).toBe(1);
+		expect(await fs.readdir(path.dirname(lock))).toEqual([]);
 	});
 
 	test("preserves a preexisting removal transition without invoking publication", async () => {
@@ -1777,6 +1942,51 @@ describe.skipIf(process.platform !== "linux")("file lock committed publication r
 		expect(treeSnapshot(`${lock}.removing`)).toEqual(recordedSnapshot(retained));
 		expect(await Bun.file(path.join(`${lock}.removing`, "info")).text()).toBe("foreign predecessor");
 		expect(await fs.readdir(root)).toEqual([path.basename(`${lock}.removing`)]);
+	});
+
+	test("releases a staged generation when rollback commits before authority close fails", async () => {
+		const { file, lock } = await makeFixture();
+		const transition = `${lock}.removing`;
+		const publication = installPublicationFailure(async (_source, destination) => {
+			await fs.mkdir(`${destination}.removing`);
+			await Bun.write(path.join(`${destination}.removing`, "info"), "foreign predecessor");
+		});
+		const closeAuthority = RecoveryFsRoot.prototype.close;
+		let stagingExistsAtClose = false;
+		const closeSpy = vi.spyOn(RecoveryFsRoot.prototype, "close").mockImplementation(function (this: RecoveryFsRoot) {
+			closeAuthority.call(this);
+			stagingExistsAtClose = syncFs.existsSync(publication.source);
+			throw new Error("injected close failure after committed rollback");
+		});
+		const removalRecordUnlinks: string[] = [];
+		FileLockTestHooks.beforeRemovalRecordUnlink = recordPath => {
+			removalRecordUnlinks.push(recordPath);
+			return true;
+		};
+		const publishedRemovalRecords: string[] = [];
+		FileLockTestHooks.afterRemovalOwnerPublish = transitionPath => {
+			publishedRemovalRecords.push(transitionPath);
+		};
+		let entered = 0;
+		let acquired = 0;
+
+		await expect(
+			withFileLock(file, async () => entered++, { ...quickAcquire, onAcquired: () => acquired++ }),
+		).rejects.toThrow("File lock rollback authority failed");
+
+		expect(entered).toBe(0);
+		expect(acquired).toBe(0);
+		expect(closeSpy).toHaveBeenCalledTimes(1);
+		expect(stagingExistsAtClose).toBe(true);
+		expect(publication.source).not.toBe("");
+		expect(await waitForAbsence(publication.source)).toBe(true);
+		expect(publishedRemovalRecords).toContain(`${publication.source}.removing`);
+		expect(await waitForAbsence(`${publication.source}.removing`)).toBe(true);
+		expect(await waitForAbsence(`${publication.source}.removing.owner`)).toBe(true);
+		expect(removalRecordUnlinks).toContain(`${publication.source}.removing.owner`);
+		await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await Bun.file(path.join(transition, "info")).text()).toBe("foreign predecessor");
+		expect(await fs.readdir(path.dirname(lock))).toEqual([path.basename(transition)]);
 	});
 });
 
@@ -1869,6 +2079,26 @@ describe.skipIf(process.platform === "win32")("file lock abandoned removal recov
 		});
 		expect(treeSnapshot(transition)).toEqual(retained);
 		expect(await Bun.file(path.join(transition, "payload")).text()).toBe("must survive");
+	});
+	test("reports an abandoned transition whose payload adoption refuses", async () => {
+		const { file, lock } = await makeFixture();
+		const transition = `${lock}.removing`;
+		await fs.mkdir(transition);
+		await Bun.write(path.join(transition, "info"), removalInfo(await deadPid(), "host-a"));
+		await Bun.write(path.join(transition, "payload"), "must survive");
+
+		const blocked = await describeRetainedLockTransition(file, { ownerHostId: "host-a" });
+		expect(blocked).toBeInstanceOf(FileLockAcquireError);
+		expect(blocked).toMatchObject({ code: "orphan_transition", orphanPath: transition });
+	});
+
+	test("does not report an adoptable abandoned transition as blocked", async () => {
+		const { file, lock } = await makeFixture();
+		const transition = `${lock}.removing`;
+		await fs.mkdir(transition);
+		await Bun.write(path.join(transition, "info"), removalInfo(await deadPid(), "host-a"));
+
+		await expect(describeRetainedLockTransition(file, { ownerHostId: "host-a" })).resolves.toBeUndefined();
 	});
 
 	test("adopts a host-less abandoned transition and acquires", async () => {
