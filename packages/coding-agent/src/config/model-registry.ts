@@ -1462,7 +1462,8 @@ function getOAuthCredentialsForProvider(authStorage: AuthStorage, provider: stri
 	return entries.filter((entry): entry is OAuthCredential => entry.type === "oauth");
 }
 
-function extractGoogleOAuthProjectId(value: string | undefined, accessToken: string): string | undefined {
+/** Internal pure parser shared by discovery; exported for regression coverage. */
+export function extractGoogleOAuthProjectId(value: string | undefined, accessToken: string): string | undefined {
 	if (!value) return undefined;
 	try {
 		const parsed = JSON.parse(value) as { token?: unknown; projectId?: unknown; project_id?: unknown };
@@ -2363,7 +2364,7 @@ export class ModelRegistry {
 	#cacheDbPath?: string;
 	#suppressedSelectors: Map<string, number> = new Map();
 	#selectorCircuits: Map<string, SelectorCircuit> = new Map();
-	#backgroundRefresh?: Promise<void>;
+	#backgroundRefreshes: Map<string, Promise<void>> = new Map();
 	#catalogMutationTail: Promise<void> = Promise.resolve();
 	#pendingCatalogMutations = 0;
 	#catalogRefreshGeneration = 0;
@@ -3159,9 +3160,12 @@ export class ModelRegistry {
 	}
 
 	refreshInBackground(strategy: ModelRefreshStrategy = "online-if-uncached", credentialSessionId?: string): void {
-		if (this.#backgroundRefresh) {
-			return;
-		}
+		// Each credential context has an isolated discovery catalog. Coalescing every
+		// request behind one global promise discarded B's refresh when A was pending.
+		// Equivalent contexts still coalesce; distinct ones queue through the catalog
+		// mutation tail so their overlays remain independently populated.
+		const contextKey = `${strategy}\u0000${credentialSessionId ?? ""}`;
+		if (this.#backgroundRefreshes.has(contextKey)) return;
 		const refreshPromise = this.refresh(strategy, credentialSessionId)
 			.catch(error => {
 				logger.warn("background model refresh failed", {
@@ -3169,11 +3173,11 @@ export class ModelRegistry {
 				});
 			})
 			.finally(() => {
-				if (this.#backgroundRefresh === refreshPromise) {
-					this.#backgroundRefresh = undefined;
+				if (this.#backgroundRefreshes.get(contextKey) === refreshPromise) {
+					this.#backgroundRefreshes.delete(contextKey);
 				}
 			});
-		this.#backgroundRefresh = refreshPromise;
+		this.#backgroundRefreshes.set(contextKey, refreshPromise);
 	}
 
 	async refreshProvider(
@@ -4748,7 +4752,7 @@ export class ModelRegistry {
 		}
 	}
 
-	#getGoogleSessionDiscoveryModels(credentialSessionId: string): Model<Api>[] {
+	#getGoogleSessionDiscoveryModels(credentialSessionId?: string): Model<Api>[] {
 		const models: Model<Api>[] = [];
 		for (const provider of ["google-antigravity", "google-gemini-cli"] as const) {
 			const identity = this.#googleSessionDescriptorIdentity(provider, credentialSessionId);
@@ -7120,7 +7124,10 @@ export class ModelRegistry {
 				return true;
 			return this.#providerActivity.get(model.provider)?.staticModelIds.has(model.id) === true;
 		});
-		const scopedDiscovered = credentialSessionId ? this.#getGoogleSessionDiscoveryModels(credentialSessionId) : [];
+		// Commands such as `--list-models` read without a credential session. The
+		// effective (default) credential still has a descriptor identity, so its
+		// discovery overlay must be visible here instead of being dropped.
+		const scopedDiscovered = this.#getGoogleSessionDiscoveryModels(credentialSessionId);
 		const catalog =
 			scopedDiscovered.length > 0
 				? this.#resolveDiscoveredModelCatalog(commonModels, scopedDiscovered)

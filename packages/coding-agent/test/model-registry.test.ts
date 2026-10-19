@@ -3816,7 +3816,10 @@ describe("ModelRegistry", () => {
 					expect(projectAAvailableIds.has(`${projectB}-model`)).toBe(false);
 					expect(projectBAvailableIds.has(`${projectA}-model`)).toBe(false);
 					expect(projectBAvailableIds.has(`${projectB}-model`)).toBe(true);
-					expect(unscopedAvailableIds.has(`${projectA}-model`)).toBe(false);
+					// Unscoped command callers (for example `--list-models`) resolve the
+					// effective default credential, which is the first stored OAuth entry
+					// (project A), so their own discovery must remain visible.
+					expect(unscopedAvailableIds.has(`${projectA}-model`)).toBe(true);
 					expect(unscopedAvailableIds.has(`${projectB}-model`)).toBe(false);
 
 					await registry.refreshProvider(provider, "offline", sessionA);
