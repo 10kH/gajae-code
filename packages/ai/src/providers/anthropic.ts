@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import { scheduler } from "node:timers/promises";
 import * as tls from "node:tls";
+import { gzipSync } from "node:zlib";
 import Anthropic, { type ClientOptions as AnthropicSdkClientOptions } from "@anthropic-ai/sdk";
 import type {
 	ContentBlockParam,
@@ -1582,6 +1583,51 @@ function wrapAnthropicFetchForBoundedRateLimits(baseFetch: FetchImpl, maxRetryDe
 				statusText: response.statusText,
 				headers,
 			});
+		},
+		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
+	);
+}
+
+/** Body bytes for a request `BodyInit`, or `undefined` when the body cannot be inspected. */
+function requestBodyBuffer(body: RequestInit["body"]): Buffer | undefined {
+	if (typeof body === "string") return Buffer.from(body, "utf-8");
+	if (body instanceof ArrayBuffer) return Buffer.from(body);
+	if (ArrayBuffer.isView(body)) return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+	return undefined;
+}
+
+/** Compresses request bodies with gzip for first-party Anthropic endpoints only. */
+export function wrapAnthropicFetchForGzip(baseFetch: FetchImpl): FetchImpl {
+	return Object.assign(
+		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			const url = new URL(input instanceof Request ? input.url : String(input), "https://api.anthropic.com");
+			const isFirstPartyAnthropicApi =
+				url.protocol.toLowerCase() === "https:" &&
+				url.hostname.toLowerCase() === "api.anthropic.com" &&
+				(url.port === "" || url.port === "443");
+			const bodyBuffer = init?.body ? requestBodyBuffer(init.body) : undefined;
+			if (!isFirstPartyAnthropicApi || !bodyBuffer) return baseFetch(input, init);
+
+			let compressedBody: Buffer;
+			try {
+				compressedBody = gzipSync(bodyBuffer);
+			} catch (error) {
+				logger.debug("anthropic: gzip compression failed, falling back to uncompressed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return baseFetch(input, init);
+			}
+
+			// The caller's Content-Length describes the uncompressed body; drop it so
+			// fetch recomputes the length for the compressed payload.
+			const headers = new Headers(init?.headers ?? {});
+			headers.set("Content-Encoding", "gzip");
+			headers.delete("Content-Length");
+			logger.debug("anthropic: gzip compression", {
+				uncompressed: bodyBuffer.length,
+				compressed: compressedBody.length,
+			});
+			return baseFetch(input, { ...init, body: compressedBody, headers });
 		},
 		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
 	);
@@ -3481,8 +3527,9 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	const tlsFetchOptions = buildClaudeCodeTlsFetchOptions(model, baseUrl);
 	const baseFetch = args.fetch ?? fetch;
 	const boundedFetch = wrapAnthropicFetchForBoundedRateLimits(baseFetch, args.maxRetryDelayMs);
+	const gzipFetch = wrapAnthropicFetchForGzip(boundedFetch);
 	const openCodeGoSessionId = resolveOpenCodeGoSessionId(model, baseUrl, args.providerSessionId, "anthropic");
-	const providerScopedFetch = wrapFetchForOpenCodeGoSession(boundedFetch, openCodeGoSessionId);
+	const providerScopedFetch = wrapFetchForOpenCodeGoSession(gzipFetch, openCodeGoSessionId);
 	const debugFetch = onSseEvent
 		? wrapFetchForSseDebug(providerScopedFetch, event => onSseEvent(event, model))
 		: providerScopedFetch;
@@ -3886,7 +3933,11 @@ export function applyPromptCaching(
 	if (!cacheControl || cacheMode === "none" || budget === 0) return;
 	validateCacheControls(params);
 	if (cacheMode === "automatic") {
-		params.cache_control = { ...cacheControl };
+		// A caller layout that already holds four block markers leaves no room for a new root marker;
+		// adding one anyway made validateCacheControls reject the request. An existing root is still replaced.
+		if (params.cache_control || countCacheControlBreakpoints(params) < 4) {
+			params.cache_control = { ...cacheControl };
+		}
 		// #2383's moving breakpoint reasoning holds within a session, not across
 		// sessions: anchor tools + system so new messages can reuse that prefix.
 		if (
