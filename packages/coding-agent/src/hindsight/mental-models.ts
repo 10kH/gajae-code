@@ -254,11 +254,10 @@ export function renderMentalModelsBlock(models: MentalModelSummary[], budgetChar
 	let consumed = 0;
 	let truncated = false;
 	for (const model of models) {
-		const heading = `# ${escapeMemoryFrameTokens(model.name)}`;
-		const refreshedStamp = model.last_refreshed_at ? escapeMemoryFrameTokens(model.last_refreshed_at) : "";
-		const refreshed = refreshedStamp ? ` _(refreshed ${refreshedStamp})_` : "";
+		const heading = `# ${model.name}`;
+		const refreshed = model.last_refreshed_at ? ` _(refreshed ${model.last_refreshed_at})_` : "";
 		const headerLine = `${heading}${refreshed}`;
-		const body = escapeMemoryFrameTokens((model.content ?? "").trim());
+		const body = (model.content ?? "").trim();
 		const truncatedBody = truncateTo(body, perModelBudget);
 		if (truncatedBody.length < body.length) truncated = true;
 		const section = `${headerLine}\n${truncatedBody}`;
@@ -272,18 +271,19 @@ export function renderMentalModelsBlock(models: MentalModelSummary[], budgetChar
 		consumed += sectionCost;
 	}
 
+	// Escape after the heading/body join. A closer split across that newline
+	// (`</mental_models` + `>`) is not visible in either field alone.
+	// The wrapper is added after this step and is not escaped.
+	let inner = escapeMemoryFrameTokens(sections.join("\n\n"));
 	const tail = truncated ? TRUNCATION_MARKER : "";
-	let assembled = `<mental_models>\n${PREAMBLE}\n\n${sections.join("\n\n")}${tail}\n</mental_models>`;
+	let assembled = `<mental_models>\n${PREAMBLE}\n\n${inner}${tail}\n</mental_models>`;
 
-	// Final hard-cap: if the careful per-model budgeting still slips past the
-	// requested ceiling (small budgets, fat preambles, etc.), brutally truncate
-	// the body region while keeping the wrapper intact so `stripMemoryTags` can
-	// still find the closing tag.
+	// Final hard-cap: slice the already escaped body so a cut cannot restore a raw closer.
 	if (assembled.length > budgetChars) {
 		const overhead = truncated ? truncatedOverhead : cleanOverhead;
 		const room = Math.max(0, budgetChars - overhead);
-		const body = sections.join("\n\n").slice(0, room).trimEnd();
-		assembled = `<mental_models>\n${PREAMBLE}\n\n${body}${TRUNCATION_MARKER}\n</mental_models>`;
+		inner = inner.slice(0, room).trimEnd();
+		assembled = `<mental_models>\n${PREAMBLE}\n\n${inner}${TRUNCATION_MARKER}\n</mental_models>`;
 	}
 	return assembled;
 }
