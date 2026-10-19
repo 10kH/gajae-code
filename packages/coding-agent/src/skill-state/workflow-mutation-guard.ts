@@ -1713,11 +1713,7 @@ function sedRegexAddressWritePath(script: string, start: number): { path: string
  */
 function sedScriptRunsShellCommand(script: string): boolean {
 	// GNU sed accepts a numeric, `$`, or regular-expression address (`/re/e cmd`).
-	if (
-		/(?:^|[;{}\n])\s*(?:(?:[0-9$]+(?:,[0-9$]+)?|\/(?:\\[\s\S]|[^\\/\n])*\/)\s*!?\s*)?e(?=[\s;}\n]|$)/.test(
-			script,
-		)
-	)
+	if (/(?:^|[;{}\n])\s*(?:(?:[0-9$]+(?:,[0-9$]+)?|\/(?:\\[\s\S]|[^\\/\n])*\/)\s*!?\s*)?e(?=[\s;}\n]|$)/.test(script))
 		return true;
 	return /\bs(\W)(?:\\.|(?!\1)[^\n])*?\1(?:\\.|(?!\1)[^\n])*?\1[gpiImM0-9]*e(?![A-Za-z])/.test(script);
 }
