@@ -4,6 +4,8 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Process } from "@gajae-code/natives";
+import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
+import { type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { managedSecurityFailureClassification } from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTime, readLinuxProcStartTimeSync } from "./linux-proc";
@@ -23,6 +25,7 @@ import {
 	GJC_TMUX_OWNER_SERVER_KEY_ENV,
 	GJC_TMUX_OWNER_STATE_DIR_ENV,
 } from "./session-state-sidecar";
+import { trustedCoordinatorEnv } from "./sidecar-bootstrap-env";
 import {
 	assertGjcTmuxMutationAuthoritySync,
 	bindGjcTmuxProviderAuthority,
@@ -245,6 +248,53 @@ export function __setMutationServerProofForTests(
 	dependency: ((tmuxCommand: string, env: NodeJS.ProcessEnv) => unknown) | null,
 ): void {
 	mutationServerProofTestDependency = dependency;
+}
+
+const TMUX_LAUNCH_IDENTITY_ENV_NAMES = [
+	"GJC_SESSION_ID",
+	GJC_COORDINATOR_SESSION_ID_ENV,
+	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+	"GJC_TMUX_SESSION",
+] as const;
+
+/**
+ * Drop project-dotenv copies of the tmux session name, coordinator id, and
+ * state-file path. A pin is kept only when every snapshot accepts it, so a
+ * declaration Bun loaded before `chdir` is refused even if the launch cwd no
+ * longer contains that file.
+ */
+export function trustedTmuxLaunchIdentityEnv(
+	env: NodeJS.ProcessEnv,
+	snapshots: readonly ProjectEnvSnapshot[],
+): NodeJS.ProcessEnv {
+	const updates: Array<[string, string | undefined]> = [];
+	for (const name of TMUX_LAUNCH_IDENTITY_ENV_NAMES) {
+		let trusted: string | undefined;
+		for (const snapshot of snapshots) {
+			const accepted = trustedCoordinatorEnv(name, env, snapshot);
+			if (accepted === undefined) {
+				trusted = undefined;
+				break;
+			}
+			trusted = accepted;
+		}
+		if (trusted === undefined) {
+			if (env[name]) updates.push([name, undefined]);
+			continue;
+		}
+		if (env[name] !== trusted) updates.push([name, trusted]);
+	}
+	if (updates.length === 0) return env;
+	const next: NodeJS.ProcessEnv = { ...env };
+	for (const [name, value] of updates) {
+		if (value === undefined) delete next[name];
+		else next[name] = value;
+	}
+	return next;
+}
+
+export function tmuxLaunchIdentityEnv(env: NodeJS.ProcessEnv, cwd: string): NodeJS.ProcessEnv {
+	return trustedTmuxLaunchIdentityEnv(env, [projectEnvSnapshot(cwd), startupProjectEnvSnapshot()]);
 }
 
 function psmuxAuthorityFromEnv(env: NodeJS.ProcessEnv): ProviderAuthority | null {
@@ -515,11 +565,14 @@ function canonicalProviderStateDirs(cwd: string): string[] {
 }
 
 function psmuxAuthorityEnvironments(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv[] {
-	const explicitAuthority = psmuxAuthorityFromEnv(env);
+	const identityEnv = tmuxLaunchIdentityEnv(env, process.cwd());
+	const explicitAuthority = psmuxAuthorityFromEnv(identityEnv);
 	if (explicitAuthority) return [environmentForProviderAuthority(env, explicitAuthority)];
 	const explicitStateDir =
-		env[GJC_TMUX_OWNER_STATE_DIR_ENV]?.trim() ??
-		(env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] ? path.dirname(env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]) : "");
+		identityEnv[GJC_TMUX_OWNER_STATE_DIR_ENV]?.trim() ??
+		(identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]
+			? path.dirname(identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV])
+			: "");
 	const ambient = resolveGjcTmuxBinary({ env });
 	if (gjcTmuxAuthorityPlatform() === "win32") {
 		const ambientAvailable = path.isAbsolute(ambient.command)
@@ -669,15 +722,16 @@ export function createGjcTmuxSession(
 	if (launch && !validManagedLaunchSpec(launch, platform)) throw new Error("gjc_tmux_managed_launch_spec_invalid");
 	const provider = resolveGjcTmuxProviderContext({ env, platform });
 	const tmuxCommand = provider.command;
-	const launchEnvironment = launch ? { ...env, GJC_TMUX_SESSION: launch.childSessionId } : env;
-	const sessionName = buildGjcTmuxSessionName(launchEnvironment);
 	const cwd = launch?.cwd ?? process.cwd();
-	const sessionId = launch?.childSessionId ?? (env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || sessionName);
+	const identityEnv = tmuxLaunchIdentityEnv(env, cwd);
+	const launchEnvironment = launch ? { ...identityEnv, GJC_TMUX_SESSION: launch.childSessionId } : identityEnv;
+	const sessionName = buildGjcTmuxSessionName(launchEnvironment);
+	const sessionId = launch?.childSessionId ?? (identityEnv[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || sessionName);
 	const stateFile =
-		(!launch ? env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() : undefined) ||
+		(!launch ? identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() : undefined) ||
 		tmuxRuntimeSessionPath(
 			cwd,
-			launch?.childSessionId ?? (env.GJC_SESSION_ID?.trim() || sessionId),
+			launch?.childSessionId ?? (identityEnv.GJC_SESSION_ID?.trim() || sessionId),
 			buildGjcTmuxSessionSlug(sessionName),
 		);
 	const stateDir = (platform === "win32" ? path.win32 : path).dirname(stateFile);
@@ -699,7 +753,7 @@ export function createGjcTmuxSession(
 			: {}),
 	};
 	const childEnvironment: Record<string, string> = { ...(launch?.env ?? {}), ...managedEnvironment };
-	const executionEnv = { ...env, ...managedEnvironment };
+	const executionEnv = { ...identityEnv, ...managedEnvironment };
 	const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
 	const command =
 		platform === "win32"
