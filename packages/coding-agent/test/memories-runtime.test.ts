@@ -754,12 +754,13 @@ describe("memories runtime", () => {
 			});
 
 			await waitFor(async () => {
-				const text = await fs.readFile(path.join(summariesDir, "thread-ok.md"), "utf8");
-				expect(text).toContain("plain-summary");
+				const raw = await fs.readFile(path.join(memoryRoot, "raw_memories.md"), "utf8");
+				expect(raw).toContain("plain-summary");
+				const names = await fs.readdir(summariesDir);
+				expect(names.includes("thread-ok.md")).toBe(true);
+				expect(names.includes("old.md")).toBe(false);
+				expect(names.includes(backslashName)).toBe(false);
 			});
-			const names = await fs.readdir(summariesDir);
-			expect(names.includes("old.md")).toBe(false);
-			expect(names.includes(backslashName)).toBe(false);
 		},
 	);
 
