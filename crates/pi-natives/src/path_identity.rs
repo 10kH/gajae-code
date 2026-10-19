@@ -1013,9 +1013,12 @@ fn retained_replace_error_code(status: i32) -> &'static str {
 }
 
 #[cfg(any(windows, test))]
-/// Exact-replace code for a held-path open that already mapped its NTSTATUS
-/// through [`ntstatus_code`]. A denied open of the staged source or the live
-/// destination is a publication failure, not an owner-identity one (#6760).
+/// Publication code for a held-path open that already mapped its NTSTATUS
+/// through [`ntstatus_code`]. Exact-replace and no-replace publication open the
+/// staged source and the destination (or its parent) before any rename, so a
+/// denied open is a pre-mutation publication failure, not an owner-identity
+/// one (#6760). Left as `owner_mismatch`, a no-replace file-lock publication
+/// was reported as an unclassified, possibly committed outcome.
 fn exact_replace_open_error_code(code: Option<&str>) -> &str {
 	match code {
 		Some("owner_mismatch") => "access_denied",
@@ -12854,7 +12857,9 @@ mod platform {
 		let source = match open_exact(&source_path, source_kind, FILE_READ_ATTRIBUTES | 0x0001_0000) {
 			Ok(handle) => handle,
 			Err(result) => {
-				return NativeExactUnlinkResult::failure(result.code.as_deref().unwrap_or("io_error"));
+				return NativeExactUnlinkResult::failure(exact_replace_open_error_code(
+					result.code.as_deref(),
+				));
 			},
 		};
 		let Some(destination_parent_path) = destination_path.parent() else {
@@ -12865,7 +12870,9 @@ mod platform {
 		};
 		let destination_parent = match open_directory_exact(destination_parent_path) {
 			Ok(handle) => handle,
-			Err(code) => return NativeExactUnlinkResult::failure(&code),
+			Err(code) => {
+				return NativeExactUnlinkResult::failure(exact_replace_open_error_code(Some(&code)));
+			},
 		};
 		let destination_name: Vec<u16> = destination_name.encode_wide().collect();
 		match rename_handle(source.target, destination_parent.target, &destination_name, false) {
