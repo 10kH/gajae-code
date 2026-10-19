@@ -3020,6 +3020,7 @@ export class AgentSession {
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
 	#eventListeners: AgentSessionEventListener[] = [];
+	#sessionIdentityChangeListeners = new Set<() => void | Promise<void>>();
 	#eventListenerSnapshot: readonly AgentSessionEventListener[] = Object.freeze([]);
 	/** Resolution-time switches that occur before a consumer can subscribe. */
 	#pendingFallbackSwitches: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>[] = [];
@@ -7227,6 +7228,17 @@ export class AgentSession {
 		}
 	}
 
+	/** Notify UI projections after a committed session-identity transition. */
+	async notifySessionIdentityChanged(): Promise<void> {
+		for (const listener of [...this.#sessionIdentityChangeListeners]) {
+			try {
+				await listener();
+			} catch (error) {
+				logger.warn("Session identity change listener failed", { error: String(error) });
+			}
+		}
+	}
+
 	/**
 	 * Emit a UI-only notice to the session. Surfaces in interactive mode as a
 	 * `showWarning` / `showError` / `showStatus` line; non-interactive modes
@@ -10756,6 +10768,12 @@ export class AgentSession {
 				this.#rebuildEventListenerSnapshot();
 			}
 		};
+	}
+
+	/** Subscribe to committed session identity changes that affect UI projections. */
+	subscribeSessionIdentityChanges(listener: () => void | Promise<void>): () => void {
+		this.#sessionIdentityChangeListeners.add(listener);
+		return () => this.#sessionIdentityChangeListeners.delete(listener);
 	}
 
 	/**
@@ -15378,7 +15396,11 @@ export class AgentSession {
 					return { cancelled: true };
 				}
 				if (options?.setup) {
-					await options.setup(this.sessionManager);
+					try {
+						await options.setup(this.sessionManager);
+					} finally {
+						await this.notifySessionIdentityChanged();
+					}
 				}
 				return { cancelled: false };
 			},
@@ -15388,6 +15410,7 @@ export class AgentSession {
 			},
 			navigateTree: async (targetId, options) => {
 				const result = await this.navigateTree(targetId, { summarize: options?.summarize });
+				if (!result.cancelled) await this.notifySessionIdentityChanged();
 				return { cancelled: result.cancelled };
 			},
 			compact: async instructionsOrOptions => {
@@ -15402,6 +15425,7 @@ export class AgentSession {
 			},
 			reload: async () => {
 				await this.reload();
+				await this.notifySessionIdentityChanged();
 			},
 			getSystemPrompt: () => [...this.systemPrompt],
 		};
@@ -18327,10 +18351,13 @@ export class AgentSession {
 	 */
 	newSession(options?: NewSessionOptions): Promise<boolean> {
 		if (this.#newSessionTransition) return this.#newSessionTransition;
-		// Acquire the shared transition lease only when starting a fresh transition
+		// Acquire the shared session-transition lease only when starting a fresh transition
 		// (the dedup above returns the in-flight promise without re-acquiring).
 		this.#beginSessionTransition("new-session");
-		const transition = this.#runNewSessionTransition(options);
+		const previousSessionId = this.sessionId;
+		const transition = this.#runNewSessionTransition(options).finally(async () => {
+			if (this.sessionId !== previousSessionId) await this.notifySessionIdentityChanged();
+		});
 		this.#newSessionTransition = transition;
 		void transition
 			.finally(() => {
@@ -22092,6 +22119,7 @@ export class AgentSession {
 				{ code: "busy" },
 			);
 		}
+		const previousSessionId = this.sessionId;
 		// Acquire the shared session-transition lease so handoff is mutually exclusive
 		// with compact/new/switch/branch/clear/fork/navigateTree in BOTH directions —
 		// a transition that started first and yielded still owns the lease here, and a
@@ -22365,6 +22393,7 @@ export class AgentSession {
 			// enqueue or the next agent yield.
 			this.yieldQueue.rearmIdle();
 			this.#endSessionTransition();
+			if (this.sessionId !== previousSessionId) await this.notifySessionIdentityChanged();
 		}
 	}
 
@@ -28199,6 +28228,7 @@ export class AgentSession {
 		let ownerShutdownTransitionCommitted = false;
 		let ownerShutdownCanDrainResumes = false;
 		let ownerShutdownFinalizationDeferred = false;
+		let sessionIdentityCommitted = false;
 		this.#beginSessionTransition("switch-session");
 		try {
 			const previousSessionFile = this.sessionManager.getSessionFile();
@@ -28572,6 +28602,7 @@ export class AgentSession {
 						throw new Error("Exact MCP control retirement changed before session switch commit");
 					await exactRetirement?.commit();
 					transitionCleanupCommitted = true;
+					sessionIdentityCommitted = true;
 					let ownerShutdownSettled = true;
 					if (ownerShutdownManager && ownerShutdownLease && ownerId) {
 						try {
@@ -28811,6 +28842,7 @@ export class AgentSession {
 				}
 			}
 			this.#endSessionTransition();
+			if (sessionIdentityCommitted) await this.notifySessionIdentityChanged();
 		}
 	}
 
@@ -28827,6 +28859,7 @@ export class AgentSession {
 		selectedText: string;
 		cancelled: boolean;
 	}> {
+		const previousSessionId = this.sessionId;
 		this.#beginSessionTransition("branch");
 		try {
 			const selectedEntry = this.sessionManager.getEntryForFidelity(entryId);
@@ -28952,6 +28985,7 @@ export class AgentSession {
 		} finally {
 			this.#reconnectToAgent();
 			this.#endSessionTransition();
+			if (this.sessionId !== previousSessionId) await this.notifySessionIdentityChanged();
 		}
 	}
 
