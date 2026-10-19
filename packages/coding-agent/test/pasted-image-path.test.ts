@@ -263,3 +263,113 @@ describe("locatePastedImageReferenceAroundCursor", () => {
 		expect(locatePastedImageReferenceAroundCursor(line, first.indexOf("].png") + 1)).toBeNull();
 	});
 });
+
+function mulberry32(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (state + 0x6d2b79f5) | 0;
+		let mixed = Math.imul(state ^ (state >>> 15), 1 | state);
+		mixed = (mixed + Math.imul(mixed ^ (mixed >>> 7), 61 | mixed)) ^ mixed;
+		return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
+	};
+}
+
+/** Independent linear trim. Equivalent to the old end-anchored newline alternation on short inputs. */
+function referenceTrimTrailingTerminalNewlines(text: string): string {
+	let end = text.length;
+	while (end > 0) {
+		const code = text.charCodeAt(end - 1);
+		if (code !== 10 && code !== 13) break;
+		end -= 1;
+	}
+	return end === text.length ? text : text.slice(0, end);
+}
+
+function terminalNewlineCount(text: string): number {
+	let count = 0;
+	for (let index = 0; index < text.length; index += 1) {
+		const code = text.charCodeAt(index);
+		if (code === 10 || code === 13) count += 1;
+	}
+	return count;
+}
+
+describe("trailing terminal newlines", () => {
+	const clipboard = path.join(os.tmpdir(), "clipboard-2026-07-19-123456-Ab3.png");
+
+	it("still allows a clipboard image paste with trailing terminal newlines", () => {
+		for (const suffix of ["", "\n", "\r", "\r\n", "\n\r\n\r"]) {
+			expect(parsePastedImagePaths(clipboard + suffix)).toEqual({
+				kind: "paths",
+				paths: [clipboard],
+				requiresConfirmation: false,
+			});
+			expect(resolvePastedImagePath(clipboard + suffix)).toBe(clipboard);
+		}
+		expect(parsePastedImagePaths(`"${clipboard}"`)).toEqual({
+			kind: "paths",
+			paths: [clipboard],
+			requiresConfirmation: false,
+		});
+		expect(parsePastedImagePaths(`${clipboard} `)).toEqual({
+			kind: "paths",
+			paths: [clipboard],
+			requiresConfirmation: false,
+		});
+	});
+
+	it("bounds a single quoted paste that does not end in a newline", () => {
+		const pairs = 24;
+		const quoted = `'${"\r\n".repeat(pairs)}Y'`;
+		const started = performance.now();
+		expect(parsePastedImagePaths(quoted)).toBeUndefined();
+		expect(resolvePastedImagePath(`X${"\r\n".repeat(pairs)}Y`)).toBeUndefined();
+		expect(performance.now() - started).toBeLessThan(200);
+	});
+
+	it("property: pasted trailing newlines stay idempotent, seed 433, 64 inputs", () => {
+		const random = mulberry32(433);
+		const alphabet = ["a", "b", " ", "/", ".", "\r", "\n", "\t", "'", '"', "Z"];
+		const inputs: string[] = [];
+		for (let index = 0; index < 32; index += 1) {
+			const length = Math.floor(random() * 9);
+			let text = "";
+			for (let cursor = 0; cursor < length; cursor += 1) {
+				text += alphabet[Math.floor(random() * alphabet.length)] ?? "a";
+			}
+			inputs.push(text);
+		}
+		for (let index = 0; index < 32; index += 1) {
+			const length = Math.floor(random() * 7);
+			let suffix = "";
+			for (let cursor = 0; cursor < length; cursor += 1) {
+				suffix += alphabet[Math.floor(random() * alphabet.length)] ?? "a";
+			}
+			inputs.push(clipboard + suffix);
+		}
+		expect(inputs).toHaveLength(64);
+
+		for (const input of inputs) {
+			const trimmed = referenceTrimTrailingTerminalNewlines(input);
+			if (terminalNewlineCount(input) <= 8) {
+				expect(trimmed).toBe(input.replace(/(?:\r\n|\r|\n)+$/, ""));
+			}
+			const resolved = resolvePastedImagePath(input);
+			expect(resolved).toBe(resolvePastedImagePath(trimmed));
+			expect(resolvePastedImagePath(`${input}\n`)).toBe(resolved);
+			expect(resolvePastedImagePath(`${input}\r`)).toBe(resolved);
+			expect(resolvePastedImagePath(`${input}\r\n`)).toBe(resolved);
+			if (terminalNewlineCount(trimmed) > 0) {
+				expect(resolved).toBeUndefined();
+			}
+			if (trimmed === clipboard) {
+				expect(resolved).toBe(clipboard);
+				expect(parsePastedImagePaths(input)).toEqual({
+					kind: "paths",
+					paths: [clipboard],
+					requiresConfirmation: false,
+				});
+			}
+		}
+	});
+});
