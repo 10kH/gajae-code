@@ -471,6 +471,41 @@ function markdownLinkContextKey(): string {
 	return `${cwd}\x00${home}`;
 }
 
+/** Decodes valid `%XX` runs; a `%` that does not start a valid UTF-8 escape stays a literal percent sign. */
+function decodePercentEscapes(value: string): string {
+	return value.replace(/(?:%[0-9a-f]{2})+/giu, escapes => {
+		try {
+			return decodeURIComponent(escapes);
+		} catch {
+			return escapes;
+		}
+	});
+}
+
+/**
+ * Converts a local Markdown link destination to an absolute `file://` URI. The destination is a URI
+ * reference: its path may be percent-encoded, and `?` or `#` starts the query or fragment, which stay
+ * URI components instead of becoming part of the filename.
+ */
+function localFileUri(target: string): string {
+	const suffixStart = target.search(/[?#]/u);
+	const pathPart = suffixStart === -1 ? target : target.slice(0, suffixStart);
+	const suffix = suffixStart === -1 ? "" : target.slice(suffixStart);
+	const filePath = decodePercentEscapes(pathPart);
+	let absolutePath: string;
+	if (path.isAbsolute(filePath)) {
+		absolutePath = filePath;
+	} else if (filePath === "~") {
+		absolutePath = os.homedir();
+	} else if (filePath.startsWith("~/")) {
+		absolutePath = path.resolve(os.homedir(), filePath.slice(2));
+	} else {
+		absolutePath = path.resolve(process.cwd(), filePath);
+	}
+	const fileUrl = url.pathToFileURL(absolutePath);
+	return suffix ? new URL(suffix, fileUrl).href : fileUrl.href;
+}
+
 function formatHyperlink(text: string, target: string): string {
 	if (!TERMINAL.hyperlinks || !target) {
 		return text;
@@ -481,21 +516,11 @@ function formatHyperlink(text: string, target: string): string {
 	}
 
 	let destination = target;
-	if (!target.startsWith("#")) {
-		const absolutePath = path.isAbsolute(target);
-		if (!/^[a-z][a-z\d+.-]*:/iu.test(target) || absolutePath) {
-			try {
-				if (absolutePath) {
-					destination = url.pathToFileURL(target).href;
-				} else {
-					const homeRelative = target === "~" || target.startsWith("~/");
-					const base = homeRelative ? os.homedir() : process.cwd();
-					const relativePath = target === "~" ? "" : homeRelative ? target.slice(2) : target;
-					destination = url.pathToFileURL(path.resolve(base, relativePath)).href;
-				}
-			} catch {
-				return text;
-			}
+	if (!target.startsWith("#") && (path.isAbsolute(target) || !/^[a-z][a-z\d+.-]*:/iu.test(target))) {
+		try {
+			destination = localFileUri(target);
+		} catch {
+			return text;
 		}
 	}
 
