@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from "bun:test";
-import { executeBash } from "../src/exec/bash-executor";
+import { disposeAllShellSessions, executeBash } from "../src/exec/bash-executor";
 
 /**
  * Regression test for #6883: Default bash execution should not impersonate CI.
@@ -19,6 +19,9 @@ describe("bash spawn environment CI regression", () => {
 		delete Bun.env.CI;
 
 		try {
+			// The persistent shell imports the process environment at spawn, so a
+			// prior test's shell would keep the old CI. Start from a fresh shell.
+			await disposeAllShellSessions();
 			// Run bash with a command that checks the CI variable.
 			// If CI is set, it will exit with code 1; if unset, code 0.
 			const result = await executeBash('if [ -z "$CI" ]; then exit 0; else exit 1; fi');
@@ -40,6 +43,7 @@ describe("bash spawn environment CI regression", () => {
 		Bun.env.CI = "true";
 
 		try {
+			await disposeAllShellSessions();
 			// Run bash with a command that checks the CI variable.
 			// If CI is set, it will exit with code 0; if unset, code 1.
 			const result = await executeBash('if [ -n "$CI" ]; then exit 0; else exit 1; fi');
