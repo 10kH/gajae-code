@@ -51,6 +51,7 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
+
 /**
  * Incrementally ingests old/new text and computes an exact line diff on a
  * worker thread once both sides finish.
@@ -2578,6 +2579,7 @@ export declare function ptyTimeoutCount(): bigint
 
 /**
  * Rasterize bounded SVG/SVGZ bytes into a PNG without resolving local files.
+ *
  * DTD/entity declarations and SVG image elements are rejected rather than
  * allowing unbounded expansion or silently returning an incomplete preview.
  *

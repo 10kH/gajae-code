@@ -71,14 +71,14 @@ describe("runMigrate", () => {
 			expect.objectContaining({ type: "instruction", name: "CLAUDE.md", status: "imported" }),
 		);
 		expect(report.actions).toContainEqual(
-			expect.objectContaining({ type: "command", name: "review", status: "imported" }),
+			expect.objectContaining({ type: "command", name: "claude-code:review", status: "imported" }),
 		);
-		expect(renderHuman(report)).toContain("[claude-code] /review: imported");
+		expect(renderHuman(report)).toContain("[claude-code] /claude-code:review: imported");
 		expect(renderHuman(report)).toContain("[claude-code] CLAUDE.md: imported");
 		expect(await exists(path.join(cwd, ".gjc", "mcp.json"))).toBe(false);
 		expect(await exists(path.join(cwd, ".gjc", "skills"))).toBe(false);
 		expect(await exists(path.join(cwd, ".gjc", "AGENTS.md"))).toBe(false);
-		expect(await exists(path.join(cwd, ".gjc", "commands", "review.md"))).toBe(false);
+		expect(await exists(path.join(cwd, ".gjc", "commands", "claude-code", "review.md"))).toBe(false);
 	});
 
 	test("--json report carries taxonomy counts by total/type/source", async () => {
@@ -115,7 +115,9 @@ describe("runMigrate", () => {
 		expect(await exists(path.join(cwd, ".gjc", "mcp.json"))).toBe(true);
 		expect(await exists(path.join(cwd, ".gjc", "skills", "alpha", "SKILL.md"))).toBe(true);
 		expect(await fs.readFile(path.join(cwd, ".gjc", "AGENTS.md"), "utf-8")).toBe("Project instructions.");
-		expect(await fs.readFile(path.join(cwd, ".gjc", "commands", "ship.md"), "utf-8")).toBe("Ship the project.");
+		expect(await fs.readFile(path.join(cwd, ".gjc", "commands", "claude-code", "ship.md"), "utf-8")).toBe(
+			"Ship the project.",
+		);
 	});
 
 	test("user scope writes under the agent dir", async () => {
@@ -136,7 +138,7 @@ describe("runMigrate", () => {
 			expect(await exists(path.join(agentDir, "mcp.json"))).toBe(true);
 			expect(await exists(path.join(agentDir, "skills", "alpha", "SKILL.md"))).toBe(true);
 			expect(await fs.readFile(path.join(agentDir, "AGENTS.md"), "utf-8")).toBe("User instructions.");
-			expect(await fs.readFile(path.join(agentDir, "commands", "summarize.md"), "utf-8")).toBe(
+			expect(await fs.readFile(path.join(agentDir, "commands", "claude-code", "summarize.md"), "utf-8")).toBe(
 				"Summarize $ARGUMENTS.",
 			);
 		} finally {

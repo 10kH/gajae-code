@@ -77,26 +77,25 @@ instructions into `AGENTS.md`. User scope is the default: Claude Code reads
 `~/.claude/CLAUDE.md` and `~/.claude/commands/`, while Codex reads
 `~/.codex/AGENTS.md` and `~/.codex/prompts/`. User instructions go to
 `~/.gjc/agent/AGENTS.md`, and commands go to `~/.gjc/agent/commands/`.
-Codex prompts are namespaced under `/prompts:<name>` (for example,
-`~/.codex/prompts/help.md` becomes `/prompts:help`) so they cannot be shadowed
-by GJC's built-in slash commands.
+Codex prompts are namespaced under `/codex:prompts:<name>` (for example,
+`~/.codex/prompts/help.md` becomes `/codex:prompts:help`).
 
 With `--project`, Claude Code reads the project-root `CLAUDE.md` and
 `.claude/commands/`, writing to `<project>/.gjc/AGENTS.md` and
 `<project>/.gjc/commands/`. A project-root Codex `AGENTS.md` is already a
 native GJC instruction source, so it is left in place rather than copied;
 Codex's user prompts remain the command source for either destination scope.
-They are written beneath the selected scope's `commands/prompts/` directory.
+They are written beneath the selected scope's `commands/codex/prompts/` directory.
+Every imported command is namespaced under its source, because built-in,
+extension, and MCP/custom commands are all resolved before file commands: a bare
+imported name could be shadowed by any registration the user later enables.
 Nested Claude command paths become colon-separated names, so
-`.claude/commands/review/security.md` is imported as `/review:security`.
-Names that collide with a GJC built-in command or alias are namespaced under
-their source; for example, `.claude/commands/help.md` becomes
-`/claude-code:help` instead of shadowing the built-in `/help`.
-Nested names whose first segment is an argument-taking built-in are also
-namespaced; `.claude/commands/provider/login.md` becomes
-`/claude-code:provider:login` so the built-in `/provider` does not consume it.
-Commands in the reserved `/skill:<name>` invocation prefix are also namespaced;
-for example, `.claude/commands/skill/foo.md` becomes `/claude-code:skill:foo`.
+`.claude/commands/review/security.md` is imported as
+`/claude-code:review:security`. Built-in names, argument-taking built-in
+prefixes, and the reserved `/skill:<name>` prefix keep the same treatment:
+`help.md` becomes `/claude-code:help`, `provider/login.md` becomes
+`/claude-code:provider:login`, and `skill/foo.md` becomes
+`/claude-code:skill:foo`.
 Command Markdown and frontmatter are preserved; GJC uses the `description`
 field and its own argument placeholders, but does not translate Claude-specific
 metadata such as tool restrictions or model selection.

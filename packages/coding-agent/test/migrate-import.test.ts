@@ -144,13 +144,13 @@ describe("end-to-end import", () => {
 			"utf-8",
 		);
 
-		const destination = path.join(cwd, ".gjc", "commands", "review", "security.md");
-		const markdownDirectoryDestination = path.join(cwd, ".gjc", "commands", "release.md", "check.md");
+		const destination = path.join(cwd, ".gjc", "commands", "claude-code", "review", "security.md");
+		const markdownDirectoryDestination = path.join(cwd, ".gjc", "commands", "claude-code", "release.md", "check.md");
 		const dryRun = await runMigrate(opts({ from: ["claude-code"], dryRun: true }));
 		expect(dryRun.actions).toContainEqual(
 			expect.objectContaining({
 				type: "command",
-				name: "review:security",
+				name: "claude-code:review:security",
 				status: "imported",
 				destination,
 			}),
@@ -158,7 +158,7 @@ describe("end-to-end import", () => {
 		expect(dryRun.actions).toContainEqual(
 			expect.objectContaining({
 				type: "command",
-				name: "release.md:check",
+				name: "claude-code:release.md:check",
 				status: "imported",
 				destination: markdownDirectoryDestination,
 			}),
@@ -173,12 +173,17 @@ describe("end-to-end import", () => {
 
 		const imported = await runMigrate(opts({ from: ["claude-code"] }));
 		expect(imported.actions).toContainEqual(
-			expect.objectContaining({ type: "command", name: "review:security", status: "imported", destination }),
+			expect.objectContaining({
+				type: "command",
+				name: "claude-code:review:security",
+				status: "imported",
+				destination,
+			}),
 		);
 		expect(imported.actions).toContainEqual(
 			expect.objectContaining({
 				type: "command",
-				name: "release.md:check",
+				name: "claude-code:release.md:check",
 				status: "imported",
 				destination: markdownDirectoryDestination,
 			}),
@@ -188,12 +193,12 @@ describe("end-to-end import", () => {
 
 		const commands = await loadSlashCommands({ cwd });
 		expect(commands).toContainEqual(
-			expect.objectContaining({ name: "review:security", description: "Review security." }),
+			expect.objectContaining({ name: "claude-code:review:security", description: "Review security." }),
 		);
 		expect(commands).toContainEqual(
-			expect.objectContaining({ name: "release.md:check", description: "Check release." }),
+			expect.objectContaining({ name: "claude-code:release.md:check", description: "Check release." }),
 		);
-		expect(expandSlashCommand("/review:security src/auth.ts", commands)).toContain("Review src/auth.ts.");
+		expect(expandSlashCommand("/claude-code:review:security src/auth.ts", commands)).toContain("Review src/auth.ts.");
 	});
 
 	test("Claude commands colliding with built-ins are namespaced", async () => {
@@ -312,10 +317,10 @@ describe("end-to-end import", () => {
 		const report = await runMigrate(opts({ from: ["codex"] }));
 		const config = await readMCPConfigFile(path.join(cwd, ".gjc", "mcp.json"));
 		expect(config.mcpServers?.codexSrv).toMatchObject({ type: "stdio", command: "cdx" });
-		const commandPath = path.join(cwd, ".gjc", "commands", "prompts", "help.md");
+		const commandPath = path.join(cwd, ".gjc", "commands", "codex", "prompts", "help.md");
 		expect(await fs.readFile(commandPath, "utf-8")).toBe(prompt);
 		expect(report.actions).toContainEqual(
-			expect.objectContaining({ type: "command", source: "codex", name: "prompts:help", status: "imported" }),
+			expect.objectContaining({ type: "command", source: "codex", name: "codex:prompts:help", status: "imported" }),
 		);
 		expect(report.summary.byType.skill.imported).toBe(0);
 		expect(
@@ -326,9 +331,9 @@ describe("end-to-end import", () => {
 		).toBe(false);
 		const commands = await loadSlashCommands({ cwd });
 		expect(commands).toContainEqual(
-			expect.objectContaining({ name: "prompts:help", description: "Codex help prompt." }),
+			expect.objectContaining({ name: "codex:prompts:help", description: "Codex help prompt." }),
 		);
-		expect(expandSlashCommand("/prompts:help the project", commands)).toContain("Help the project.");
+		expect(expandSlashCommand("/codex:prompts:help the project", commands)).toContain("Help the project.");
 		expect(await fs.readFile(path.join(cwd, "AGENTS.md"), "utf-8")).toBe("Follow the Codex project instructions.");
 		expect(
 			await fs.access(path.join(cwd, ".gjc", "AGENTS.md")).then(
@@ -345,38 +350,58 @@ describe("end-to-end import", () => {
 			"Imported $ARGUMENTS.",
 			"utf-8",
 		);
-		const destination = path.join(cwd, ".gjc", "commands", "review:security.md");
+		const destination = path.join(cwd, ".gjc", "commands", "claude-code", "review:security.md");
 		await fs.mkdir(path.dirname(destination), { recursive: true });
 		await fs.writeFile(destination, "Existing flat command.", "utf-8");
 
 		const skipped = await runMigrate(opts({ from: ["claude-code"] }));
 		expect(skipped.actions).toContainEqual(
-			expect.objectContaining({ type: "command", name: "review:security", destination, status: "skipped_exists" }),
+			expect.objectContaining({
+				type: "command",
+				name: "claude-code:review:security",
+				destination,
+				status: "skipped_exists",
+			}),
 		);
 		const forced = await runMigrate(opts({ from: ["claude-code"], force: true }));
 		expect(forced.actions).toContainEqual(
-			expect.objectContaining({ type: "command", name: "review:security", destination, status: "updated" }),
+			expect.objectContaining({
+				type: "command",
+				name: "claude-code:review:security",
+				destination,
+				status: "updated",
+			}),
 		);
 		const commands = await loadSlashCommands({ cwd });
-		expect(expandSlashCommand("/review:security this", commands)).toContain("Imported this.");
+		expect(expandSlashCommand("/claude-code:review:security this", commands)).toContain("Imported this.");
 	});
 
 	test("command collisions skip by default and require force to replace", async () => {
 		await fs.mkdir(path.join(cwd, ".claude", "commands"), { recursive: true });
 		await fs.writeFile(path.join(cwd, ".claude", "commands", "review.md"), "Imported command.", "utf-8");
-		const destination = path.join(cwd, ".gjc", "commands", "review.md");
+		const destination = path.join(cwd, ".gjc", "commands", "claude-code", "review.md");
 		await fs.mkdir(path.dirname(destination), { recursive: true });
 		await fs.writeFile(destination, "Keep the current command.", "utf-8");
 
 		const skipped = await runMigrate(opts({ from: ["claude-code"] }));
 		expect(skipped.actions).toContainEqual(
-			expect.objectContaining({ type: "command", name: "review", operation: "skip", status: "skipped_exists" }),
+			expect.objectContaining({
+				type: "command",
+				name: "claude-code:review",
+				operation: "skip",
+				status: "skipped_exists",
+			}),
 		);
 		expect(await fs.readFile(destination, "utf-8")).toBe("Keep the current command.");
 
 		const forced = await runMigrate(opts({ from: ["claude-code"], force: true }));
 		expect(forced.actions).toContainEqual(
-			expect.objectContaining({ type: "command", name: "review", operation: "update", status: "updated" }),
+			expect.objectContaining({
+				type: "command",
+				name: "claude-code:review",
+				operation: "update",
+				status: "updated",
+			}),
 		);
 		expect(await fs.readFile(destination, "utf-8")).toBe("Imported command.");
 	});
@@ -460,16 +485,21 @@ describe("end-to-end import", () => {
 	test("forced case-equivalent command updates report the loaded command name", async () => {
 		await fs.mkdir(path.join(cwd, ".claude", "commands"), { recursive: true });
 		await fs.writeFile(path.join(cwd, ".claude", "commands", "review.md"), "Imported $ARGUMENTS.", "utf-8");
-		const destination = path.join(cwd, ".gjc", "commands", "Review.md");
+		const destination = path.join(cwd, ".gjc", "commands", "claude-code", "Review.md");
 		await fs.mkdir(path.dirname(destination), { recursive: true });
 		await fs.writeFile(destination, "Existing command.", "utf-8");
 
 		const report = await runMigrate(opts({ from: ["claude-code"], force: true }));
 		expect(report.actions).toContainEqual(
-			expect.objectContaining({ type: "command", name: "Review", destination, status: "updated" }),
+			expect.objectContaining({
+				type: "command",
+				name: "claude-code:Review",
+				destination,
+				status: "updated",
+			}),
 		);
 		const commands = await loadSlashCommands({ cwd });
-		expect(commands).toContainEqual(expect.objectContaining({ name: "Review" }));
-		expect(expandSlashCommand("/Review this", commands)).toContain("Imported this.");
+		expect(commands).toContainEqual(expect.objectContaining({ name: "claude-code:Review" }));
+		expect(expandSlashCommand("/claude-code:Review this", commands)).toContain("Imported this.");
 	});
 });

@@ -107,13 +107,14 @@ interface ExistingCommandDestination {
 
 type ExistingCommandNameIndex = Map<string, ExistingCommandDestination[]>;
 
-function avoidReservedSlashCommandName(source: string, name: string): string {
-	const separator = name.indexOf(":");
-	const commandName = separator === -1 ? name : name.slice(0, separator);
-	const builtin = lookupBuiltinSlashCommand(commandName);
-	const consumedByBuiltin = builtin !== undefined && (separator === -1 || builtin.allowArgs === true);
-	if (consumedByBuiltin || name.toLowerCase().startsWith("skill:")) return `${source}:${name}`;
-	return name;
+/**
+ * Imported commands are always namespaced under their source. Built-in,
+ * extension, and MCP/custom commands are all resolved before file commands, so
+ * a bare imported name can be shadowed by any registration the user later
+ * enables. The prefix keeps every imported command addressable.
+ */
+function importedSlashCommandName(source: string, name: string): string {
+	return `${source}:${name}`;
 }
 
 async function indexExistingCommandNames(commandsDir: string): Promise<ExistingCommandNameIndex> {
@@ -529,7 +530,7 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 	const validCommandNameSegment = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 	for (const result of input.results) {
 		for (const candidate of result.slashCommandCandidates) {
-			const name = avoidReservedSlashCommandName(candidate.source, candidate.name);
+			const name = importedSlashCommandName(candidate.source, candidate.name);
 			const nameParts = name.split(":");
 			if (!nameParts.every(part => validCommandNameSegment.test(part))) {
 				actions.push({
