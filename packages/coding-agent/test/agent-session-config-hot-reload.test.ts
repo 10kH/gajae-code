@@ -531,6 +531,7 @@ describe("AgentSession configuration reload", () => {
 		try {
 			await watcher.start({ configPath, modelsPath });
 			await Bun.write(configPath, settingsText({ todoEnabled: true, compactionEnabled: false }));
+			watcher.__testRequestScan();
 			await waitFor(() => publicationFenceEntered);
 
 			const transition = session!.newSession();
@@ -641,6 +642,7 @@ describe("AgentSession configuration reload", () => {
 				baseUrl: "https://before.example/v1",
 			});
 			await Promise.all([Bun.write(configPath, nextConfig), Bun.write(modelsPath, nextModels)]);
+			watcher.__testRequestScan();
 
 			await transitionStarted.promise;
 			await firstAvailabilityCheck.promise;
