@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, it } from "bun:test";
 import { disposeAllShellSessions, executeBash } from "../src/exec/bash-executor";
+import { resetShellConfigCache } from "@gajae-code/utils/shell-config";
 
 /**
  * Regression test for #6883: Default bash execution should not impersonate CI.
@@ -22,6 +23,10 @@ describe("bash spawn environment CI regression", () => {
 			// The persistent shell imports the process environment at spawn, so a
 			// prior test's shell would keep the old CI. Start from a fresh shell.
 			await disposeAllShellSessions();
+			await disposeAllShellSessions();
+			// The spawn environment is memoized in the shell config, so a copy
+			// cached while CI was set would keep injecting it.
+			resetShellConfigCache();
 			// Run bash with a command that checks the CI variable.
 			// If CI is set, it will exit with code 1; if unset, code 0.
 			const result = await executeBash('if [ -z "$CI" ]; then exit 0; else exit 1; fi');
@@ -35,6 +40,7 @@ describe("bash spawn environment CI regression", () => {
 			} else {
 				delete Bun.env.CI;
 			}
+			resetShellConfigCache();
 		}
 	});
 
@@ -44,6 +50,10 @@ describe("bash spawn environment CI regression", () => {
 
 		try {
 			await disposeAllShellSessions();
+			await disposeAllShellSessions();
+			// The spawn environment is memoized in the shell config, so the
+			// inherited CI only reaches the child after the cache is dropped.
+			resetShellConfigCache();
 			// Run bash with a command that checks the CI variable.
 			// If CI is set, it will exit with code 0; if unset, code 1.
 			const result = await executeBash('if [ -n "$CI" ]; then exit 0; else exit 1; fi');
@@ -57,6 +67,7 @@ describe("bash spawn environment CI regression", () => {
 			} else {
 				Bun.env.CI = originalCI;
 			}
+			resetShellConfigCache();
 		}
 	});
 });
