@@ -20,9 +20,11 @@ beforeEach(() => {
 	originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
 	if (!originalPlatform?.configurable) throw new Error("process.platform descriptor is not configurable");
 	Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+	FileLockTestHooks.cleanupPendingStaging = async stagingPath => fs.rm(stagingPath, { recursive: true, force: true });
 });
 
 afterEach(async () => {
+	FileLockTestHooks.cleanupPendingStaging = undefined;
 	FileLockTestHooks.beforeDetachedLockCleanup = undefined;
 	FileLockTestHooks.beforeRemovalRecordUnlink = undefined;
 	FileLockTestHooks.beforeRemovalOwnerPublish = undefined;

@@ -29,6 +29,7 @@ import { resolveLaunchDisposition } from "./cli/launch-disposition";
 import { runListModelsCommand } from "./cli/list-models";
 import { selectSession } from "./cli/session-picker";
 import { findConfigFile } from "./config";
+import { FileLockAcquireError, FileLockStagingCleanupError } from "./config/file-lock";
 import {
 	activateModelProfile,
 	applyModelProfileRuntimeBindings,
@@ -1622,6 +1623,7 @@ type RunPrintMode = (session: AgentSession, options: PrintModeOptions) => Promis
 export interface RunRootCommandDependencies {
 	createAgentSession?: typeof createAgentSession;
 	createSessionManager?: typeof createSessionManager;
+	registerDirectSession?: typeof registerDirectSession;
 	discoverAuthStorage?: typeof discoverAuthStorage;
 	resolveStartupAuthConfig?: typeof resolveStartupAuthConfig;
 	runAcpMode?: (options?: { agentDir?: string }) => Promise<void>;
@@ -1751,6 +1753,10 @@ export async function registerDirectSession(
 					: {}),
 			});
 		} catch (error) {
+			// A lock-release refusal after the row is durable is a real startup failure:
+			// the next process would observe a registered session whose lock generation
+			// this process can no longer prove. Surface it instead of adopting the row.
+			if (error instanceof Error && /^Failed to release file lock:/u.test(error.message)) throw error;
 			// `SessionIndex.append` can reject after its row is already durable (awaited
 			// post-append maintenance), so a rejection does not prove the registration is
 			// missing. Adopt the id when this process already owns a live row for it, so a
@@ -1824,7 +1830,19 @@ export async function registerDirectSession(
 				await register(sessionId);
 				return;
 			} catch (error) {
-				if (attempt >= DIRECT_SESSION_REGISTRATION_ATTEMPTS) throw error;
+				// Only lock contention self-heals. A refused release is an identity
+				// verdict; retrying it would mask a committed registration whose lock
+				// generation no longer matches.
+				const code = (error as NodeJS.ErrnoException | undefined)?.code;
+				const transient =
+					code === "sharing_violation" ||
+					code === "access_denied" ||
+					code === "EBUSY" ||
+					code === "EPERM" ||
+					code === "EACCES" ||
+					code === "ENOTEMPTY" ||
+					code === "removal_record_busy";
+				if (!transient || attempt >= DIRECT_SESSION_REGISTRATION_ATTEMPTS) throw error;
 				await Bun.sleep(50 * attempt);
 			}
 		}
@@ -1896,6 +1914,34 @@ export async function registerDirectSession(
 			return run;
 		},
 	};
+}
+
+function directSessionIndexLockFailureMessage(error: unknown, agentDir: string): string | undefined {
+	if (error instanceof FileLockStagingCleanupError) {
+		return (
+			"Session index lock staging cleanup failed; acquisition stopped instead of retrying with another staging directory.\n" +
+			`Lock: ${error.lockPath}\nStaging: ${error.stagingPath}\nCode: ${error.code ?? "unknown"}\n${error.message}`
+		);
+	}
+	if (error instanceof FileLockAcquireError) {
+		const code = error.publicationFailureCode ?? error.code;
+		if (error.publicationFailureCode === "sharing_violation" || error.holderIsLive)
+			return (
+				"Session index is busy (validated lock-publication contention). Retry in a few seconds.\n" +
+				`Lock: ${error.lockPath}\nCode: ${code}\n${error.message}`
+			);
+		return (
+			"Session index lock acquisition failed; no session was registered.\n" +
+			`Lock: ${error.lockPath}\nCode: ${code}\nHolder: ${error.holder}`
+		);
+	}
+	if (!(error instanceof Error) || !/^Failed to publish file lock:/u.test(error.message)) return undefined;
+	const code =
+		(error as NodeJS.ErrnoException).code ??
+		error.message.match(/^Failed to publish file lock: ([a-z0-9_]+)/u)?.[1] ??
+		"unknown";
+	const lockPath = path.join(agentDir, "sdk", "sessions", "index.jsonl.lock");
+	return `Session index lock publication failed; no session was registered.\nLock: ${lockPath}\nCode: ${code}\n${error.message}`;
 }
 
 export interface ModelRoleOverrides {
@@ -2485,19 +2531,37 @@ export async function runRootCommand(
 	// Register a resumed direct session before constructing the agent: GC holds the
 	// same index lock while deleting artifacts, so startup and deletion are fenced.
 	// Ephemeral sessions have no durable artifacts or liveness authority to fence.
-	const directSessionRegistration = await registerDirectSession(
-		sessionManager,
-		settingsInstance.getAgentDir(),
-		process.env.GJC_LIFECYCLE_REQUEST_ID,
-		{
-			masterRole: masterModeContext
-				? {
-						ownerSessionId: masterModeContext.ownerSessionId,
-						attestationEpoch: masterModeContext.attestationEpoch,
-					}
-				: undefined,
-		},
-	);
+	const sessionAgentDir = settingsInstance.getAgentDir();
+	let directSessionRegistration: DirectSessionRegistration;
+	try {
+		directSessionRegistration = await (deps.registerDirectSession ?? registerDirectSession)(
+			sessionManager,
+			sessionAgentDir,
+			process.env.GJC_LIFECYCLE_REQUEST_ID,
+			{
+				masterRole: masterModeContext
+					? {
+							ownerSessionId: masterModeContext.ownerSessionId,
+							attestationEpoch: masterModeContext.attestationEpoch,
+						}
+					: undefined,
+			},
+		);
+	} catch (error) {
+		const message = directSessionIndexLockFailureMessage(error, sessionAgentDir);
+		if (message === undefined) throw error;
+		process.stderr.write(`${message}\n`);
+		if (!deps.suppressProcessExit) process.exitCode = 1;
+		await sessionManager?.close().catch(closeError => {
+			logger.warn("Failed to close session manager after session-index registration failure", {
+				error: closeError instanceof Error ? closeError.message : String(closeError),
+			});
+		});
+		authStorage.close();
+		stopThemeWatcher();
+		await postmortem.cleanup();
+		return;
+	}
 	// /new, /resume and forks replace the manager's session id in this same process.
 	// Follow it, or the broker index keeps listing the predecessor as live forever.
 	//
@@ -2525,7 +2589,6 @@ export async function runRootCommand(
 			pi.on("agent_end", sync);
 		},
 	];
-
 	const createAgentSessionImpl = deps.createAgentSession ?? createAgentSession;
 	const createSession: CreateSessionForMain = async (options, context): Promise<CreateAgentSessionResult> => {
 		const result = await logger.time("createAgentSession", createAgentSessionImpl, options);

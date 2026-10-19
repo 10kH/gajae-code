@@ -57,8 +57,7 @@ const DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX: readonly Effort[] = [
 	Effort.Max,
 ];
 // Haiku 5.5 supports low, medium, high, xhigh, and max on both Anthropic
-// Messages and Bedrock Converse; neither contract lists minimal. Only the
-// Messages API enables this list here (see inferAnthropicSupportedEfforts).
+// Messages and Bedrock Converse; neither contract lists minimal.
 // https://platform.claude.com/docs/en/build-with-claude/effort#effort-levels
 // https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-haiku-5-5.html
 const ANTHROPIC_HAIKU_5_5_EFFORTS: readonly Effort[] = [
@@ -917,9 +916,12 @@ function inferDefaultEffort<TApi extends Api>(model: ApiModel<TApi>, parsedModel
 	if (
 		parsedModel.family === "anthropic" &&
 		parsedModel.kind === "haiku" &&
-		model.provider === "anthropic" &&
-		model.api === "anthropic-messages" &&
-		semverGte(parsedModel.version, "5.0")
+		((model.provider === "anthropic" &&
+			model.api === "anthropic-messages" &&
+			semverGte(parsedModel.version, "5.0")) ||
+			(model.provider === "amazon-bedrock" &&
+				model.api === "bedrock-converse-stream" &&
+				semverGte(parsedModel.version, "5.5")))
 	) {
 		// Haiku 5.5 defaults to medium adaptive effort instead of the global high.
 		return Effort.Medium;
@@ -1072,7 +1074,7 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 		(model.api === "anthropic-messages" || model.api === "bedrock-converse-stream") &&
 		semverGte(parsedModel.version, "4.6")
 	) {
-		if (parsedModel.kind === "haiku" && semverGte(parsedModel.version, "5.5") && model.api === "anthropic-messages") {
+		if (parsedModel.kind === "haiku" && semverGte(parsedModel.version, "5.5")) {
 			return ANTHROPIC_HAIKU_5_5_EFFORTS;
 		}
 		if (parsedModel.kind === "fable") {
@@ -1153,7 +1155,7 @@ function inferThinkingControlMode<TApi extends Api>(
 			if (parsedModel.family === "anthropic") {
 				if (
 					semverGte(parsedModel.version, "4.6") &&
-					(parsedModel.kind === "opus" || parsedModel.kind === "fable")
+					(parsedModel.kind === "opus" || parsedModel.kind === "fable" || parsedModel.kind === "haiku")
 				) {
 					return "anthropic-adaptive";
 				}
