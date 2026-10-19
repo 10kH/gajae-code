@@ -28,21 +28,37 @@ function isWindowsDrivePath(value: string): boolean {
 	return /^[A-Za-z]:[\\/]/.test(value);
 }
 
-function resolveOpenTarget(urlOrPath: string): string | undefined {
-	if (hasAsciiControl(urlOrPath)) return undefined;
-	const trimmed = stripOuterFormat(urlOrPath.trim());
-	if (trimmed.length === 0 || trimmed.startsWith("-")) return undefined;
-	if (isWindowsDrivePath(trimmed)) return trimmed;
+const SCHEME_PREFIX = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+
+/** http(s) href, "reject" for any other URL, or undefined when `value` is not a URL. */
+function classifyUrl(value: string): string | "reject" | undefined {
+	if (isWindowsDrivePath(value) || isWindowsDrivePath(value.trim())) return undefined;
 	try {
-		const parsed = new URL(trimmed);
-		if (!ALLOWED_OPEN_PROTOCOLS.has(parsed.protocol)) return undefined;
-		if (hasAsciiControl(parsed.href)) return undefined;
+		const parsed = new URL(value);
+		if (!ALLOWED_OPEN_PROTOCOLS.has(parsed.protocol) || hasAsciiControl(parsed.href)) return "reject";
 		return parsed.href;
 	} catch {
-		// Unparsed scheme-shaped tokens are not local paths. A looser opener parser could still accept them.
-		if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(trimmed)) return undefined;
-		return trimmed;
+		return undefined;
 	}
+}
+
+function resolveOpenTarget(raw: string): string | undefined {
+	if (hasAsciiControl(raw) || raw.length === 0) return undefined;
+	// Local paths, including surrounding spaces, are spawned unchanged.
+	if (isWindowsDrivePath(raw)) return raw;
+	const direct = classifyUrl(raw);
+	if (direct === "reject") return undefined;
+	if (direct !== undefined) return direct;
+
+	const peeled = stripOuterFormat(raw.trim());
+	if (peeled.length === 0) return undefined;
+	// Padding can hide a scheme or a flag. Refuse that instead of opening a different string.
+	if (peeled !== raw && !isWindowsDrivePath(peeled)) {
+		const hidden = classifyUrl(peeled);
+		if (hidden !== undefined || peeled.startsWith("-") || SCHEME_PREFIX.test(peeled)) return undefined;
+	}
+	if (raw.startsWith("-") || SCHEME_PREFIX.test(raw)) return undefined;
+	return raw;
 }
 
 export function openPath(urlOrPath: string): void {

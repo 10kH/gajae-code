@@ -81,6 +81,16 @@ const STABLE = [
 	String.raw`C:\Users\Public\report.html`,
 	"C:/Users/Public/report.html",
 	String.raw`\\server\share\report.html`,
+	"/tmp/report ",
+	" report.html ",
+	"\u200Breport.html",
+	"report.html\u200B",
+	" \u200B/tmp/report \u200B",
+	"//srv/share",
+	"/tmp/report/",
+	"~/report.html",
+	"report.html;id",
+	String.raw` C:\Users\Public\report.html`,
 ];
 
 describe("openPath", () => {
@@ -172,13 +182,19 @@ describe("openPath", () => {
 				const host = random() < 0.5 ? "example.com" : "127.0.0.1";
 				const proto = random() < 0.5 ? "https" : "http";
 				generated.push(`${proto}://${host}/p${i}`);
-			} else if (roll < 0.75) {
+			} else if (roll < 0.7) {
 				generated.push(`/tmp/artifact-${i}.svg`);
-			} else {
+			} else if (roll < 0.85) {
 				const len = 1 + Math.floor(random() * 12);
 				let token = "";
 				for (let n = 0; n < len; n++) token += alphabet[Math.floor(random() * alphabet.length)] ?? "a";
 				generated.push(token);
+			} else {
+				const pads = [" ", "\u200B", " \u200B", "\u200B "];
+				const cores = ["/tmp/report", "report.html", "--help", "javascript:alert(1)"];
+				const pad = pads[Math.floor(random() * pads.length)] ?? " ";
+				const core = cores[Math.floor(random() * cores.length)] ?? "report.html";
+				generated.push(`${pad}${core}${pad}`);
 			}
 		}
 		expect(generated).toHaveLength(64);
@@ -192,6 +208,17 @@ describe("openPath", () => {
 			calls.length = 0;
 			openPath(input);
 			expect(calls).toEqual([]);
+		}
+		for (const input of ["\u200B --help", " --help", "\u200Bjavascript:alert(1)", "\u200Bhttps://example.com/a"]) {
+			calls.length = 0;
+			openPath(input);
+			expect(calls.length).toBeLessThanOrEqual(1);
+			if (calls.length !== 1) continue;
+			const argv = calls[0] ?? [];
+			expect(argv[argv.length - 1]).toBe(input);
+			calls.length = 0;
+			openPath(input);
+			expect(calls).toEqual([openerArgv(process.platform, input)]);
 		}
 		for (const input of generated) {
 			calls.length = 0;
