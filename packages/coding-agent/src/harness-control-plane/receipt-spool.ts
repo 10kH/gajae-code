@@ -25,7 +25,8 @@ const spoolQueues = new Map<string, Promise<void>>();
 const noop = (): void => undefined;
 const NOFOLLOW = fsConstants.O_NOFOLLOW ?? 0;
 
-function isEnoent(error: unknown): boolean {
+/** True only when an exception's `code` is `ENOENT`. Other codes propagate. */
+export function isEnoent(error: unknown): boolean {
 	return (error as NodeJS.ErrnoException).code === "ENOENT";
 }
 
