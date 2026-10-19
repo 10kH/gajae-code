@@ -167,6 +167,85 @@ describe("workspace venv interpreter trust", () => {
 		60_000,
 	);
 
+	it("does not execute a repository interpreter when the workspace is HOME", async () => {
+		using tempDir = TempDir.createSync("@gjc-py-venv-home-");
+		const repo = tempDir.join("home");
+		const marker = tempDir.join("planted-python-ran");
+		await fs.promises.mkdir(path.join(repo, ".git"), { recursive: true });
+		await writeScript(interpreterFile(path.join(repo, ".venv")), marker);
+		await writeScript(interpreterFile(path.join(repo, "venv")), marker);
+		await writeCfg(path.join(repo, ".venv"), path.dirname(HOST_PYTHON ?? "."));
+		await writeCfg(path.join(repo, "venv"), path.dirname(HOST_PYTHON ?? "."));
+		const repoRoot = path.resolve(import.meta.dir, "../../..");
+		const probe = path.resolve(import.meta.dir, "../fixtures/python-workspace-venv-home-probe.ts");
+		const env: Record<string, string> = {};
+		for (const [key, value] of Object.entries(process.env)) {
+			if (typeof value === "string" && !ENV_KEYS.includes(key as (typeof ENV_KEYS)[number])) env[key] = value;
+		}
+		env.HOME = repo;
+		env.USERPROFILE = repo;
+		const child = Bun.spawn([process.execPath, probe, repo], {
+			cwd: repoRoot,
+			env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		expect(exitCode, stderr).toBe(0);
+		const reported = JSON.parse(stdout.trim()) as { pythonPath: string | null };
+		expect(fs.existsSync(marker)).toBe(false);
+		expect(under(path.join(repo, ".venv"), reported.pythonPath ?? undefined)).toBe(false);
+		expect(under(path.join(repo, "venv"), reported.pythonPath ?? undefined)).toBe(false);
+	}, 30_000);
+
+	it.skipIf(!HOST_PYTHON || !SYMLINK_OK)(
+		"does not select an outside interpreter symlink without pyvenv.cfg (skipped without python or symlink)",
+		async () => {
+			for (const name of [".venv", "venv"] as const) {
+				using tempDir = TempDir.createSync(`@gjc-py-venv-nocfg-${name}-`);
+				const repo = tempDir.join("repo");
+				await fs.promises.mkdir(path.join(repo, ".git"), { recursive: true });
+				const pythonPath = interpreterFile(path.join(repo, name));
+				await fs.promises.mkdir(path.dirname(pythonPath), { recursive: true });
+				await fs.promises.symlink(HOST_PYTHON as string, pythonPath);
+				await withProbeEnv({}, async () => {
+					const session = sessionFor(repo);
+					await pythonBackend.isAvailable(session);
+					const availability = await checkPythonKernelAvailability(repo, undefined, undefined, session.settings);
+					expect(under(path.join(repo, name), availability.pythonPath)).toBe(false);
+				});
+			}
+		},
+		30_000,
+	);
+
+	it.skipIf(!HOST_PYTHON || !SYMLINK_OK)(
+		"still uses an outside interpreter symlink when pyvenv.cfg exists (skipped without python or symlink)",
+		async () => {
+			for (const name of [".venv", "venv"] as const) {
+				using tempDir = TempDir.createSync(`@gjc-py-venv-cfg-${name}-`);
+				const repo = tempDir.join("repo");
+				await fs.promises.mkdir(path.join(repo, ".git"), { recursive: true });
+				const venv = path.join(repo, name);
+				const pythonPath = interpreterFile(venv);
+				await fs.promises.mkdir(path.dirname(pythonPath), { recursive: true });
+				await fs.promises.symlink(HOST_PYTHON as string, pythonPath);
+				await writeCfg(venv, path.dirname(HOST_PYTHON as string));
+				await withProbeEnv({}, async () => {
+					const session = sessionFor(repo);
+					await pythonBackend.isAvailable(session);
+					const availability = await checkPythonKernelAvailability(repo, undefined, undefined, session.settings);
+					expect(under(venv, availability.pythonPath)).toBe(true);
+				});
+			}
+		},
+		30_000,
+	);
+
 	it.skipIf(!HOST_PYTHON)(
 		"still uses VIRTUAL_ENV over a planted workspace .venv (skipped without python)",
 		async () => {

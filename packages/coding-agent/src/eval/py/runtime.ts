@@ -139,6 +139,15 @@ function resolvePythonCandidateInVenv(venvPath: string): { venvPath: string; pyt
  * it is a real virtualenv (`pyvenv.cfg`) whose interpreter file resolves outside
  * the project. An in-tree script or binary is not an interpreter.
  */
+function resolvesInside(root: string, candidate: string): boolean {
+	const normalize = (value: string): string => {
+		const resolved = path.resolve(value);
+		return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+	};
+	const relative = path.relative(normalize(root), normalize(candidate));
+	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
 function isAutoDetectedWorkspaceVenv(candidate: string, cwd: string): boolean {
 	try {
 		if (!fs.statSync(path.join(candidate, "pyvenv.cfg")).isFile()) return false;
@@ -151,6 +160,15 @@ function isAutoDetectedWorkspaceVenv(candidate: string, cwd: string): boolean {
 	} catch {
 		return false;
 	}
+	// HOME stops project-root discovery, so a workspace that is the home directory
+	// is not project-controlled. Refuse an interpreter that still lives inside cwd.
+	let canonicalCwd = path.resolve(cwd);
+	try {
+		canonicalCwd = fs.realpathSync(cwd);
+	} catch {
+		// Missing cwd keeps the resolved path.
+	}
+	if (resolvesInside(canonicalCwd, canonicalPython)) return false;
 	return !isProjectControlledPath(canonicalPython, cwd);
 }
 
