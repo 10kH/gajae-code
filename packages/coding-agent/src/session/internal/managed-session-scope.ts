@@ -322,6 +322,15 @@ export type ManagedScopeResolution =
 const managedScopeIdentityFailureCodes = new Set(["identity_mismatch", "reparse_point", "not_directory", "not_file"]);
 
 /**
+ * Fixed, path-free tokens from the replacement-cleanup receipt preflight that
+ * runs before every no-replace publish. A stale receipt the preflight refuses
+ * (for example one whose filename encodes a device number that changed after a
+ * reboot, #6820) blocks an otherwise healthy binding publish; reporting it as
+ * `binding_invalid` sends operators to the binding instead of the receipt.
+ */
+const managedScopeReceiptFailureCodes = new Set(["managed_replace_cleanup_receipt_invalid"]);
+
+/**
  * Fixed, path-free errno tokens. A managed scope that fails to prepare because
  * another process holds the object (AV scanners, indexers, cloud-sync agents)
  * is operationally distinct from a corrupted binding, and only the errno
@@ -376,6 +385,7 @@ function isManagedScopeCapacityMessage(message: string): boolean {
 function managedScopeResidualClassification(error: unknown): string | undefined {
 	if (!(error instanceof Error)) return undefined;
 	if (managedScopeIdentityFailureCodes.has(error.message)) return error.message;
+	if (managedScopeReceiptFailureCodes.has(error.message)) return error.message;
 	const errno = (error as NodeJS.ErrnoException).code;
 	return errno !== undefined && managedScopeErrnoFailureCodes.has(errno) ? errno : undefined;
 }
@@ -508,6 +518,7 @@ type NativeIdentity =
 type CanonicalNativeIdentity = Extract<NativeIdentity, { ok: true }>;
 
 type NativeIdentityFailureCode =
+	| "access_denied"
 	| "not_found"
 	| "not_directory"
 	| "not_utf8"
@@ -618,6 +629,12 @@ function nativeFailure(code: NativeIdentityFailureCode): ManagedScopeResolution 
 		return { kind: "error", code: "cwd_missing", message: "The workspace directory does not exist." };
 	if (code === "not_directory")
 		return { kind: "error", code: "cwd_not_directory", message: "The workspace path is not a directory." };
+	if (code === "access_denied")
+		return {
+			kind: "error",
+			code: "permission_denied",
+			message: "Permission was denied while identifying the workspace directory.",
+		};
 	if (code === "network_unsupported") {
 		return {
 			kind: "error",
@@ -626,6 +643,10 @@ function nativeFailure(code: NativeIdentityFailureCode): ManagedScopeResolution 
 		};
 	}
 	return { kind: "error", code: "identity_unavailable", message: "Workspace directory identity is unavailable." };
+}
+
+function nativeIdentityDiagnosticCode(code: NativeIdentityFailureCode): string {
+	return code === "access_denied" ? "permission_denied" : `cwd_${code}`;
 }
 
 function bindingFor(scope: ManagedScope): Binding {
@@ -1107,7 +1128,7 @@ function inspectCandidate(
 		if (header.type !== "session" || typeof header.id !== "string" || typeof header.cwd !== "string")
 			return { code: "invalid_header" };
 		const cwdIdentity = identityFor(header.cwd);
-		if (!cwdIdentity.ok) return { code: `cwd_${cwdIdentity.code}` };
+		if (!cwdIdentity.ok) return { code: nativeIdentityDiagnosticCode(cwdIdentity.code) };
 		const named = fs.lstatSync(filePath, { bigint: true });
 		if (
 			!named.isFile() ||
@@ -1954,7 +1975,7 @@ export function listManagedCandidates(scope: ManagedScope): ManagedCandidateList
 				const candidateIdentity = identityFor(candidate.cwd);
 				if (!candidateIdentity.ok) {
 					invalid.push({
-						code: `cwd_${candidateIdentity.code}`,
+						code: nativeIdentityDiagnosticCode(candidateIdentity.code),
 						...(safeManagedCandidateSessionId(candidate.sessionId) === undefined
 							? {}
 							: { sessionId: candidate.sessionId }),

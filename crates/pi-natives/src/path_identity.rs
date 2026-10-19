@@ -3,6 +3,7 @@
 #[cfg(any(unix, test))]
 use std::io::{self, Read};
 use std::{
+	ffi::{OsStr, OsString},
 	panic::{AssertUnwindSafe, catch_unwind},
 	path::{Component, Path, PathBuf},
 	sync::{
@@ -965,6 +966,25 @@ const STATUS_SHARING_VIOLATION: i32 = 0xc000_0043u32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xc000_0022u32 as i32;
 
 #[cfg(any(windows, test))]
+const WIN32_ERROR_FILE_NOT_FOUND: u32 = 2;
+#[cfg(any(windows, test))]
+const WIN32_ERROR_PATH_NOT_FOUND: u32 = 3;
+#[cfg(any(windows, test))]
+const WIN32_ERROR_ACCESS_DENIED: u32 = 5;
+#[cfg(any(windows, test))]
+const WIN32_ERROR_SHARING_VIOLATION: u32 = 32;
+
+#[cfg(any(windows, test))]
+fn windows_error_code(error: u32) -> &'static str {
+	match error {
+		WIN32_ERROR_FILE_NOT_FOUND | WIN32_ERROR_PATH_NOT_FOUND => "not_found",
+		WIN32_ERROR_ACCESS_DENIED => "access_denied",
+		WIN32_ERROR_SHARING_VIOLATION => "sharing_violation",
+		_ => "io_error",
+	}
+}
+
+#[cfg(any(windows, test))]
 fn ntstatus_code(status: i32) -> &'static str {
 	match status as u32 {
 		0xc000_0034 | 0xc000_003a => "not_found",
@@ -1092,6 +1112,7 @@ mod exact_replace_windows_retry_policy_tests {
 		is_retryable_exact_replace_rename_status, is_retryable_exact_replace_status,
 		native_windows_error_code, ntstatus_code, open_with_transient_retry,
 		publication_rename_error_code, rename_with_transient_retry, retained_replace_error_code,
+		windows_error_code,
 	};
 
 	#[test]
@@ -1132,6 +1153,19 @@ mod exact_replace_windows_retry_policy_tests {
 	#[test]
 	fn windows_error_code_is_hex_and_path_free() {
 		assert_eq!(native_windows_error_code(STATUS_SHARING_VIOLATION), "0xC0000043");
+		assert_eq!(native_windows_error_code(STATUS_ACCESS_DENIED as i32), "0xC0000022");
+	}
+
+	#[test]
+	fn win32_access_denied_stays_distinct_for_exact_cleanup() {
+		assert_eq!(windows_error_code(5), "access_denied");
+		assert_eq!(windows_error_code(32), "sharing_violation");
+		assert_eq!(windows_error_code(2), "not_found");
+		assert_eq!(windows_error_code(5_000), "io_error");
+	}
+
+	#[test]
+	fn status_access_denied_is_distinct_from_owner_mismatch() {
 		assert_eq!(native_windows_error_code(STATUS_ACCESS_DENIED), "0xC0000022");
 		assert_eq!(ntstatus_code(STATUS_ACCESS_DENIED), "owner_mismatch");
 		assert_eq!(
@@ -1247,6 +1281,113 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 	let mut hasher = Sha256::new();
 	hasher.update(bytes);
 	hasher.finalize().into()
+}
+
+const DIRECTORY_TREE_TRANSITION_SUFFIX: &str = ".removing";
+const MAX_DIRECTORY_TREE_COMPONENT_BYTES: usize = 255;
+
+fn directory_tree_transition_name(original_basename: &OsStr) -> Option<OsString> {
+	let original_basename_bytes = original_basename.as_encoded_bytes();
+	if original_basename_bytes.ends_with(DIRECTORY_TREE_TRANSITION_SUFFIX.as_bytes()) {
+		return Some(original_basename.to_os_string());
+	}
+	let derived_length = original_basename_bytes
+		.len()
+		.checked_add(DIRECTORY_TREE_TRANSITION_SUFFIX.len())?;
+	if derived_length <= MAX_DIRECTORY_TREE_COMPONENT_BYTES {
+		let mut transition_name = original_basename.to_os_string();
+		transition_name.push(DIRECTORY_TREE_TRANSITION_SUFFIX);
+		return Some(transition_name);
+	}
+
+	let mut hashed_name = String::with_capacity(10 + 64 + DIRECTORY_TREE_TRANSITION_SUFFIX.len());
+	hashed_name.push_str(".gjc-lock-");
+	for byte in sha256(original_basename_bytes) {
+		hashed_name.push(char::from(b"0123456789abcdef"[usize::from(byte >> 4)]));
+		hashed_name.push(char::from(b"0123456789abcdef"[usize::from(byte & 0x0f)]));
+	}
+	hashed_name.push_str(DIRECTORY_TREE_TRANSITION_SUFFIX);
+	Some(OsString::from(hashed_name))
+}
+
+#[cfg(test)]
+mod directory_tree_transition_name_tests {
+	use std::ffi::{OsStr, OsString};
+
+	use super::{
+		DIRECTORY_TREE_TRANSITION_SUFFIX, MAX_DIRECTORY_TREE_COMPONENT_BYTES,
+		directory_tree_transition_name, sha256,
+	};
+
+	#[test]
+	fn transition_name_preserves_short_names_and_uses_utf8_byte_lengths() {
+		assert_eq!(
+			directory_tree_transition_name(OsStr::new("lock")),
+			Some(OsString::from("lock.removing")),
+		);
+
+		let unicode_at_limit = "é".repeat(123);
+		assert_eq!(unicode_at_limit.len() + DIRECTORY_TREE_TRANSITION_SUFFIX.len(), 255);
+		assert_eq!(
+			directory_tree_transition_name(OsStr::new(&unicode_at_limit)),
+			Some(OsString::from(format!("{unicode_at_limit}{DIRECTORY_TREE_TRANSITION_SUFFIX}"))),
+		);
+
+		let unicode_over_limit = "é".repeat(124);
+		assert_eq!(unicode_over_limit.len(), 248);
+		let hashed = directory_tree_transition_name(OsStr::new(&unicode_over_limit))
+			.expect("long UTF-8 basename should hash");
+		let hashed = hashed.to_str().expect("hash name is UTF-8");
+		assert!(hashed.starts_with(".gjc-lock-"));
+		assert!(hashed.ends_with(DIRECTORY_TREE_TRANSITION_SUFFIX));
+		assert!(hashed.len() <= MAX_DIRECTORY_TREE_COMPONENT_BYTES);
+	}
+
+	#[test]
+	fn basenames_of_255_bytes_get_deterministic_distinct_hashes() {
+		let first = "a".repeat(255);
+		let second = "b".repeat(255);
+		let first_name =
+			directory_tree_transition_name(OsStr::new(&first)).expect("255-byte basename should hash");
+		let repeated_first_name = directory_tree_transition_name(OsStr::new(&first))
+			.expect("same basename should hash deterministically");
+		let second_name = directory_tree_transition_name(OsStr::new(&second))
+			.expect("second 255-byte basename should hash");
+
+		assert_eq!(first_name, repeated_first_name);
+		assert_ne!(first_name, second_name);
+		let digest = sha256(first.as_bytes());
+		let expected_hash: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+		let expected_name = format!(".gjc-lock-{expected_hash}{DIRECTORY_TREE_TRANSITION_SUFFIX}");
+		assert_eq!(first_name.to_str(), Some(expected_name.as_str()));
+		assert!(first_name.to_str().expect("hash name is UTF-8").len() <= 255);
+	}
+
+	#[test]
+	fn transition_name_is_idempotent_for_replay_inputs() {
+		let already_transition = OsStr::new(".gjc-lock-deadbeef.removing");
+		assert_eq!(
+			directory_tree_transition_name(already_transition),
+			Some(OsString::from(already_transition)),
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn transition_name_preserves_short_non_utf8_unix_names() {
+		use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+		let original = OsString::from_vec(vec![b'l', 0xff, b'k']);
+		let mut expected = original.clone();
+		expected.push(DIRECTORY_TREE_TRANSITION_SUFFIX);
+		let derived = directory_tree_transition_name(&original).expect("short name should fit");
+		assert_eq!(derived.as_os_str().as_bytes(), b"l\xffk.removing");
+		assert_eq!(derived, expected);
+
+		let mut already_transitioned = original;
+		already_transitioned.push(DIRECTORY_TREE_TRANSITION_SUFFIX);
+		assert_eq!(directory_tree_transition_name(&already_transitioned), Some(already_transitioned),);
+	}
 }
 
 #[cfg(any(unix, test))]
@@ -1755,6 +1896,25 @@ pub fn exact_unlink(path: String, identity: NativeExactFileIdentity) -> NativeEx
 	platform::exact_unlink(Path::new(&path), &identity)
 }
 
+/// Delete only the empty regular file opened by the caller's retained
+/// descriptor.
+///
+/// This is used when a newly created staging file cannot be statted through the
+/// host API. Native code derives identity from the open descriptor and verifies
+/// the public entry still names that object before using the platform's exact
+/// unlink protocol.
+#[napi]
+pub fn exact_unlink_open_file(
+	path: String,
+	caller_fd: i32,
+	quarantine_name: String,
+) -> NativeExactUnlinkResult {
+	if path.contains('\0') || quarantine_name.contains('\0') {
+		return NativeExactUnlinkResult::failure("invalid_request");
+	}
+	platform::exact_unlink_open_file(Path::new(&path), caller_fd, &quarantine_name)
+}
+
 /// Delete only the regular file that still has the supplied platform identity,
 /// without the exchange/quarantine protocol used by [`exact_unlink`].
 ///
@@ -2083,10 +2243,11 @@ pub fn snapshot_empty_directory(path: String) -> NativeDirectoryTreeResult {
 
 /// Remove a directory tree only when a fresh descriptor-relative snapshot
 #[cfg_attr(clippy, doc = "")]
-/// exactly equals the persisted snapshot. POSIX first no-replace detaches the
-/// verified root to its deterministic `.removing` sibling; the reopened
-/// detached descriptor remains authoritative throughout payload scrubbing and
-/// replay.
+/// exactly equals the persisted snapshot. POSIX removal no-replace detaches the
+/// verified root to its deterministic `.removing` sibling before scrubbing. On
+/// Windows, callers that need retirement semantics must request a detach-only
+/// pass, then replay exact removal at the returned sibling; ordinary Windows
+/// removal never vacates the caller's path before scrubbing completes.
 #[napi]
 pub fn exact_remove_directory_tree(
 	path: String,
@@ -2609,14 +2770,15 @@ pub(crate) mod platform {
 			fd::{AsRawFd, FromRawFd},
 			unix::ffi::OsStrExt,
 		},
-		path::{Component, Path},
+		path::{Component, Path, PathBuf},
 	};
 
 	use super::{
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, digest_reader, io_code,
-		security_io_code, sha256,
+		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, digest_reader,
+		directory_tree_transition_name, io_code, security_io_code, sha256,
+		validate_retained_backup_name,
 	};
 
 	/// Bound on EINTR restarts for the no-replace rename primitive. A signal
@@ -5404,6 +5566,62 @@ pub(crate) mod platform {
 		}
 	}
 
+	pub(super) fn exact_unlink_open_file(
+		path: &Path,
+		caller_fd: i32,
+		quarantine_name: &str,
+	) -> NativeExactUnlinkResult {
+		if caller_fd < 0 || validate_retained_backup_name(quarantine_name).is_none() {
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
+		// SAFETY: zero is valid initialized storage for fstat output; caller_fd is
+		// retained by the host FileHandle for the duration of this synchronous call.
+		let mut file_stat: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: caller_fd remains live through this synchronous call and file_stat is
+		// writable.
+		if unsafe { libc::fstat(caller_fd, &mut file_stat) } != 0 {
+			return NativeExactUnlinkResult::failure(security_code(&std::io::Error::last_os_error()));
+		}
+		if file_stat.st_mode & libc::S_IFMT != libc::S_IFREG
+			|| file_stat.st_size != 0
+			|| file_stat.st_nlink != 1
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		let (parent_fd, _) = match open_parent_no_follow(path) {
+			Ok(parent) => parent,
+			Err(result) => return *result,
+		};
+		// SAFETY: zero is valid initialized storage for fstat output.
+		let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: parent_fd is live and parent_stat is writable initialized output.
+		let parent_stat_result = unsafe { libc::fstat(parent_fd, &mut parent_stat) };
+		// SAFETY: open_parent_no_follow returned ownership of this descriptor.
+		unsafe { libc::close(parent_fd) };
+		if parent_stat_result != 0 {
+			return NativeExactUnlinkResult::failure(security_code(&std::io::Error::last_os_error()));
+		}
+		let Ok(mtime_ns) = i64::try_from(stat_mtime_ns(&file_stat)) else {
+			return NativeExactUnlinkResult::failure("identity_unavailable");
+		};
+		let identity = ExactFileIdentity {
+			dev: file_stat.st_dev as u64,
+			ino: file_stat.st_ino as u64,
+			nlink: Some(file_stat.st_nlink as u64),
+			parent_dev: Some(parent_stat.st_dev as u64),
+			parent_ino: Some(parent_stat.st_ino as u64),
+			size: 0,
+			mtime_ns,
+			directory: false,
+			detach_only: false,
+			quarantine_name: Some(quarantine_name.to_owned()),
+			sha256: Some(sha256(&[])),
+			allow_hard_link: false,
+			require_hard_link: false,
+		};
+		exact_unlink_direct(path, &identity)
+	}
+
 	fn exact_unlink_at(
 		parent_fd: libc::c_int,
 		name: CString,
@@ -7747,7 +7965,6 @@ pub(crate) mod platform {
 		detach_only: bool,
 	) -> NativeExactUnlinkResult {
 		let planned_path = path.to_string_lossy().into_owned();
-		let final_path = format!("{planned_path}.removing");
 		let (parent, name) = match open_parent_no_follow(path) {
 			Ok(value) => value,
 			Err(result) => return *result,
@@ -7765,9 +7982,18 @@ pub(crate) mod platform {
 				return NativeExactUnlinkResult::failure("parent_mismatch");
 			}
 		}
-		let mut final_bytes = name.as_bytes().to_vec();
-		final_bytes.extend_from_slice(b".removing");
-		let Ok(final_name) = CString::new(final_bytes) else {
+		let input_is_final = name.as_bytes().ends_with(b".removing");
+		let Some(final_component) =
+			directory_tree_transition_name(std::ffi::OsStr::from_bytes(name.as_bytes()))
+		else {
+			// SAFETY: this branch owns the live descriptor and closes it exactly once.
+			unsafe { libc::close(parent) };
+			return NativeExactUnlinkResult::failure("io_error");
+		};
+		let mut final_candidate = PathBuf::from(path);
+		final_candidate.set_file_name(&final_component);
+		let final_path = final_candidate.to_string_lossy().into_owned();
+		let Ok(final_name) = CString::new(final_component.as_os_str().as_bytes()) else {
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe { libc::close(parent) };
 			return NativeExactUnlinkResult::failure("io_error");
@@ -7775,7 +8001,6 @@ pub(crate) mod platform {
 		// A crash after the final no-replace rename is replayed from the single,
 		// caller-derivable sibling. This is not a search fallback: it is the only
 		// alternate retained authority for this exact planned root.
-		let input_is_final = name.as_bytes().ends_with(b".removing");
 		let (fd, root_name, retained_path, already_final) = {
 			// SAFETY: the live descriptor, where used, and NUL-terminated path remain
 			// valid.
@@ -10922,8 +11147,7 @@ mod platform {
 	use windows_sys::Win32::{
 		Foundation::{
 			CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_FILE_NOT_FOUND,
-			ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION, GENERIC_ALL, GetLastError, HANDLE,
-			INVALID_HANDLE_VALUE, LocalFree,
+			ERROR_PATH_NOT_FOUND, GENERIC_ALL, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
 		},
 		Security::{
 			ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
@@ -10951,10 +11175,10 @@ mod platform {
 		NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry, NativeDirectoryTreeResult,
 		NativeDirectoryTreeSnapshot, NativeExactUnlinkResult, NativeOwnerOnlySecurityResult,
 		NativePermissionRepairResult, STATUS_INVALID_PARAMETER, STATUS_SHARING_VIOLATION,
-		exact_replace_open_error_code, is_retryable_exact_replace_status, native_windows_error_code,
-		ntstatus_code, open_with_transient_retry, publication_rename_error_code,
-		rename_with_transient_retry, retained_replace_error_code, sha256,
-		volume_case_sensitivity_from_flags,
+		directory_tree_transition_name, exact_replace_open_error_code,
+		is_retryable_exact_replace_status, native_windows_error_code, ntstatus_code,
+		open_with_transient_retry, publication_rename_error_code, rename_with_transient_retry,
+		retained_replace_error_code, sha256, volume_case_sensitivity_from_flags,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
@@ -11056,11 +11280,7 @@ mod platform {
 	}
 
 	fn last_error_code() -> &'static str {
-		match unsafe { GetLastError() } {
-			ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => "not_found",
-			ERROR_SHARING_VIOLATION => "sharing_violation",
-			_ => "io_error",
-		}
+		super::windows_error_code(unsafe { GetLastError() })
 	}
 
 	fn open_path(path: &Path, reparse: bool, desired_access: u32) -> Result<HANDLE, &'static str> {
@@ -12803,6 +13023,78 @@ mod platform {
 		exact_unlink(path, identity)
 	}
 
+	pub(super) fn exact_unlink_open_file(
+		path: &Path,
+		caller_fd: i32,
+		_quarantine_name: &str,
+	) -> NativeExactUnlinkResult {
+		let caller = match retained_caller_handle(caller_fd) {
+			Ok(handle) => handle,
+			Err(result) => {
+				return NativeExactUnlinkResult::failure(
+					result.code.as_deref().unwrap_or("identity_unavailable"),
+				);
+			},
+		};
+		let attributes = match handle_attributes(caller.target) {
+			Ok(attributes) => attributes,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(caller.target, &mut information) } == 0 {
+			return NativeExactUnlinkResult::failure(last_error_code());
+		}
+		let size = (u64::from(information.nFileSizeHigh) << 32) | u64::from(information.nFileSizeLow);
+		if attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+			|| size != 0
+			|| information.nNumberOfLinks != 1
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		let path_handle = match open_exact_with_share(
+			path,
+			"file",
+			FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		) {
+			Ok(handle) => handle,
+			Err(result) => {
+				return NativeExactUnlinkResult::failure(
+					result.code.as_deref().unwrap_or("identity_unavailable"),
+				);
+			},
+		};
+		match same_file_identity(path_handle.target, caller.target) {
+			Ok(true) => {},
+			Ok(false) => return NativeExactUnlinkResult::failure("identity_mismatch"),
+			Err(result) => {
+				return NativeExactUnlinkResult::failure(
+					result.code.as_deref().unwrap_or("identity_unavailable"),
+				);
+			},
+		}
+		let attributes = match handle_attributes(path_handle.target) {
+			Ok(attributes) => attributes,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		let mut path_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(path_handle.target, &mut path_information) } == 0 {
+			return NativeExactUnlinkResult::failure(last_error_code());
+		}
+		let path_size = (u64::from(path_information.nFileSizeHigh) << 32)
+			| u64::from(path_information.nFileSizeLow);
+		if attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+			|| path_size != 0
+			|| path_information.nNumberOfLinks != 1
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		match delete_handle(path_handle.target) {
+			Ok(()) => NativeExactUnlinkResult::success(),
+			Err(code) => NativeExactUnlinkResult::failure(code),
+		}
+	}
+
 	pub(super) fn exact_restore(
 		detached_path: &Path,
 		original_path: &Path,
@@ -13637,7 +13929,37 @@ mod platform {
 	}
 	#[cfg(test)]
 	mod tests {
-		use super::{FILE_ALL_ACCESS, FILE_READ_DATA, GENERIC_ALL, owner_only_ace_mask_is_safe};
+		use std::{
+			path::PathBuf,
+			sync::atomic::{AtomicU64, Ordering},
+		};
+
+		use super::{
+			FILE_ALL_ACCESS, FILE_READ_DATA, GENERIC_ALL, exact_remove_directory_tree_with_mode,
+			owner_only_ace_mask_is_safe, snapshot_directory_tree,
+		};
+
+		static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+		struct TempDir(PathBuf);
+
+		impl TempDir {
+			fn new() -> Self {
+				let path = std::env::temp_dir().join(format!(
+					"gjc-lock-retirement-collision-{}-{}",
+					std::process::id(),
+					NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+				));
+				std::fs::create_dir(&path).expect("create lock-retirement temp directory");
+				Self(path)
+			}
+		}
+
+		impl Drop for TempDir {
+			fn drop(&mut self) {
+				let _ = std::fs::remove_dir_all(&self.0);
+			}
+		}
 
 		#[test]
 		fn owner_only_ace_mask_accepts_legacy_and_current_full_access_masks() {
@@ -13649,6 +13971,57 @@ mod platform {
 		fn owner_only_ace_mask_rejects_partial_and_combined_masks() {
 			assert!(!owner_only_ace_mask_is_safe(FILE_ALL_ACCESS & !FILE_READ_DATA));
 			assert!(!owner_only_ace_mask_is_safe(GENERIC_ALL | FILE_READ_DATA));
+		}
+
+		#[test]
+		fn retirement_collision_preserves_canonical_owner_metadata() {
+			let root = TempDir::new();
+			let canonical = root.0.join("index.jsonl.lock");
+			let retired = root.0.join("index.jsonl.lock.removing");
+			std::fs::create_dir(&canonical).expect("create canonical lock");
+			std::fs::write(canonical.join("info"), b"canonical-owner").expect("write canonical owner");
+			std::fs::create_dir(&retired).expect("create occupied retirement path");
+			std::fs::write(retired.join("info"), b"predecessor-owner")
+				.expect("write predecessor owner");
+
+			let snapshot = snapshot_directory_tree(&canonical)
+				.snapshot
+				.expect("snapshot canonical lock");
+			let result = exact_remove_directory_tree_with_mode(&canonical, &snapshot, None, true);
+			assert!(!result.ok);
+			assert_eq!(result.code.as_deref(), Some("quarantine_collision"));
+			assert_eq!(
+				std::fs::read(canonical.join("info")).expect("canonical owner remains"),
+				b"canonical-owner"
+			);
+			assert_eq!(
+				std::fs::read(retired.join("info")).expect("predecessor owner remains"),
+				b"predecessor-owner"
+			);
+		}
+
+		#[test]
+		fn generic_removal_does_not_reserve_the_lock_retirement_name() {
+			let root = TempDir::new();
+			let canonical = root.0.join("plugin");
+			let retired = root.0.join("plugin.removing");
+			std::fs::create_dir(&canonical).expect("create generic tree");
+			std::fs::write(canonical.join("payload"), b"generic payload")
+				.expect("write generic payload");
+			std::fs::create_dir(&retired).expect("create occupied retirement path");
+			std::fs::write(retired.join("payload"), b"unrelated retirement")
+				.expect("write unrelated payload");
+
+			let snapshot = snapshot_directory_tree(&canonical)
+				.snapshot
+				.expect("snapshot generic tree");
+			let result = exact_remove_directory_tree_with_mode(&canonical, &snapshot, None, false);
+			assert!(result.ok);
+			assert!(!canonical.exists());
+			assert_eq!(
+				std::fs::read(retired.join("payload")).expect("unrelated payload remains"),
+				b"unrelated retirement"
+			);
 		}
 	}
 	fn hex_digest(digest: [u8; 32]) -> String {
@@ -14214,17 +14587,14 @@ mod platform {
 		detach_only: bool,
 	) -> NativeExactUnlinkResult {
 		let planned_path = path.to_string_lossy().into_owned();
-		let final_path = format!("{planned_path}.removing");
-		let final_name: Vec<u16> = match path.file_name() {
-			Some(name) => {
-				let mut value: Vec<u16> = name.encode_wide().collect();
-				value.extend(".removing".encode_utf16());
-				value
-			},
+		let final_component = match path.file_name().and_then(directory_tree_transition_name) {
+			Some(name) => name,
 			None => return NativeExactUnlinkResult::failure("io_error"),
 		};
+		let final_name: Vec<u16> = final_component.encode_wide().collect();
 		let mut final_candidate = PathBuf::from(path);
-		final_candidate.set_file_name(OsString::from_wide(&final_name));
+		final_candidate.set_file_name(&final_component);
+		let final_path = final_candidate.to_string_lossy().into_owned();
 		let input_is_final = planned_path.ends_with(".removing");
 		let (root, retained_path, already_final) = match open_exact(
 			path,
@@ -14321,20 +14691,23 @@ mod platform {
 				&identity,
 			);
 		}
-		match remove_tree_handle(root.target, "", &expected.entries) {
-			Ok(()) if !already_final => match rename_handle(root.target, parent, &final_name, false) {
-				Ok(()) => match tree_entry(root.target, String::new(), "directory") {
-					Ok(entry) if entry.dev == expected.root_dev && entry.ino == expected.root_ino => {
-						match delete_handle(root.target) {
-							Ok(()) => NativeExactUnlinkResult::success(),
-							Err(code) => NativeExactUnlinkResult::detached_failure(code, final_path),
-						}
-					},
-					Ok(_) => NativeExactUnlinkResult::detached_failure("identity_mismatch", final_path),
-					Err(code) => NativeExactUnlinkResult::detached_failure(code, final_path),
-				},
-				Err(code) => NativeExactUnlinkResult::detached_failure(code, planned_path),
+		// Keep generic Windows removal at its caller-visible name if payload
+		// scrubbing fails. File-lock retirement requests detach_only first and
+		// replays this exact removal at `.removing` after the canonical name is
+		// safely vacant.
+		let retained_path = if already_final {
+			retained_path
+		} else {
+			planned_path
+		};
+		match tree_entry(root.target, String::new(), "directory") {
+			Ok(entry) if entry.dev == expected.root_dev && entry.ino == expected.root_ino => {},
+			Ok(_) => {
+				return NativeExactUnlinkResult::detached_failure("identity_mismatch", retained_path);
 			},
+			Err(code) => return NativeExactUnlinkResult::detached_failure(code, retained_path),
+		}
+		match remove_tree_handle(root.target, "", &expected.entries) {
 			Ok(()) => match delete_handle(root.target) {
 				Ok(()) => NativeExactUnlinkResult::success(),
 				Err(code) => NativeExactUnlinkResult::detached_failure(code, retained_path),
@@ -14395,6 +14768,9 @@ mod platform {
 		NativeExactUnlinkResult::failure("identity_unavailable")
 	}
 	pub(super) fn exact_unlink_direct(_: &Path, _: &ExactFileIdentity) -> NativeExactUnlinkResult {
+		NativeExactUnlinkResult::failure("identity_unavailable")
+	}
+	pub(super) fn exact_unlink_open_file(_: &Path, _: i32, _: &str) -> NativeExactUnlinkResult {
 		NativeExactUnlinkResult::failure("identity_unavailable")
 	}
 	pub(super) fn exact_restore(
