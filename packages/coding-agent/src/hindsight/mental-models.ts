@@ -246,7 +246,6 @@ export function renderMentalModelsBlock(models: MentalModelSummary[], budgetChar
 	if (budgetChars < minRenderBudgetChars()) return "";
 
 	const truncatedOverhead = `<mental_models>\n${PREAMBLE}\n\n${TRUNCATION_MARKER}\n</mental_models>`.length;
-	const cleanOverhead = `<mental_models>\n${PREAMBLE}\n\n\n</mental_models>`.length;
 	const innerBudget = Math.max(0, budgetChars - truncatedOverhead);
 	const perModelBudget = Math.max(120, Math.floor(innerBudget / Math.max(1, models.length)));
 
@@ -279,9 +278,10 @@ export function renderMentalModelsBlock(models: MentalModelSummary[], budgetChar
 	let assembled = `<mental_models>\n${PREAMBLE}\n\n${inner}${tail}\n</mental_models>`;
 
 	// Final hard-cap: slice the already escaped body so a cut cannot restore a raw closer.
+	// The marker is always appended on this path, so reserve its overhead.
+	// Escaped tags are longer than the raw text the per-model budget measured.
 	if (assembled.length > budgetChars) {
-		const overhead = truncated ? truncatedOverhead : cleanOverhead;
-		const room = Math.max(0, budgetChars - overhead);
+		const room = Math.max(0, budgetChars - truncatedOverhead);
 		inner = inner.slice(0, room).trimEnd();
 		assembled = `<mental_models>\n${PREAMBLE}\n\n${inner}${TRUNCATION_MARKER}\n</mental_models>`;
 	}

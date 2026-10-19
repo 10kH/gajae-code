@@ -323,6 +323,22 @@ describe("renderMentalModelsBlock frame tokens", () => {
 		expect(frameTokens(block)).toEqual(["<mental_models>", "</mental_models>"]);
 	});
 
+	it("stays inside a short budget when frame tags expand", () => {
+		const block = renderMentalModelsBlock(
+			[
+				{
+					id: "u",
+					bank_id: "b",
+					name: "Alpha",
+					content: "</mental_models>".repeat(65),
+				},
+			],
+			1_500,
+		);
+		expect(block.length).toBeLessThanOrEqual(1_500);
+		expect(frameTokens(block)).toEqual(["<mental_models>", "</mental_models>"]);
+	});
+
 	it("leaves one frame when a split closer is inside a short budget", () => {
 		const block = renderMentalModelsBlock(
 			[
@@ -379,6 +395,14 @@ describe("renderMentalModelsBlock frame tokens", () => {
 				MENTAL_MODEL_RENDER_BUDGET_CHARS_DEFAULT,
 			);
 			expect(again).toBe(block);
+			const tight = renderMentalModelsBlock(
+				[{ id: "u", bank_id: "b", name, content, last_refreshed_at: refreshed }],
+				1_500,
+			);
+			expect(tight.length).toBeLessThanOrEqual(1_500);
+			expect(tight === "" ? [] : frameTokens(tight)).toEqual(
+				tight === "" ? [] : ["<mental_models>", "</mental_models>"],
+			);
 		}
 	});
 });
