@@ -24,6 +24,7 @@ export const opencodeAdapter: Adapter = {
 			slashCommandCandidates: [],
 			agentCandidates: [],
 			instructionCandidates: [],
+			hookCandidates: [],
 			diagnostics: [],
 			manualActions: [],
 		};

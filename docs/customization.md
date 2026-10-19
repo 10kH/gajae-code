@@ -123,6 +123,15 @@ reported. An agent whose name collides with a bundled role (`executor`,
 bundled role stays authoritative. Frontmatter other than `name`, `description`,
 and `tools` — including Claude's `model` — is not translated.
 
+Hooks whose semantics translate are imported: supported Claude Code events
+become a generated `.gjc/hooks/migrated-claude-code.ts` module that reproduces
+the origin contract (`PreToolUse` -> `tool_call` with exit-code-2 blocking and
+stderr as the reason, `PostToolUse` -> `tool_result`, `SessionStart` ->
+`session_start`, `Stop` -> `turn_end`, matchers preserved). Events with no
+faithful equivalent (`Notification`, `SubagentStop`, `PreCompact`,
+`UserPromptSubmit`) are reported as `skipped_unmappable` instead of being
+silently dropped.
+
 Still manual: extensions, and optional session history. This is not a
 replacement for the all-surface `/extensions` preview.
 

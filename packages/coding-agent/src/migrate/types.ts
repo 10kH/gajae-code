@@ -16,7 +16,7 @@ export const MIGRATE_SOURCES: readonly MigrateSource[] = ["claude-code", "codex"
 export const CANONICAL_SOURCE_ORDER: readonly MigrateSource[] = MIGRATE_SOURCES;
 
 /** What kind of thing an action/coverage row is about. */
-export type MigrateItemType = "mcp" | "skill" | "command" | "agent" | "instruction" | "source";
+export type MigrateItemType = "mcp" | "skill" | "command" | "agent" | "hook" | "instruction" | "source";
 
 /**
  * Per-item outcome taxonomy.
@@ -115,6 +115,24 @@ export interface SourceDiagnostic {
 }
 
 /**
+ * A foreign hook command that maps onto a gjc hook event.
+ *
+ * Claude Code hooks are shell commands that receive a JSON payload on stdin and
+ * signal a block with exit code 2; gjc hooks are TypeScript modules. The
+ * importer generates a module that reproduces that contract for the events whose
+ * semantics are unambiguous.
+ */
+export interface HookCandidate {
+	source: MigrateSource;
+	/** Foreign event name, e.g. `PreToolUse`. */
+	event: string;
+	/** Tool-name matcher; empty or absent means every tool. */
+	matcher?: string;
+	/** Shell command exactly as the source declared it. */
+	command: string;
+}
+
+/**
  * A source setting the migration cannot express in gjc. Reported instead of
  * guessed at: silently translating an approval or hook policy would change what
  * the agent is allowed to do. Secret values are never read, so detail may name
@@ -134,6 +152,7 @@ export interface AdapterResult {
 	skillCandidates: SkillCandidate[];
 	slashCommandCandidates: SlashCommandCandidate[];
 	agentCandidates: AgentCandidate[];
+	hookCandidates: HookCandidate[];
 	instructionCandidates: InstructionCandidate[];
 	diagnostics: SourceDiagnostic[];
 	manualActions: ManualAction[];
@@ -157,6 +176,7 @@ export interface MigrateAction {
 	skill?: { content: string };
 	command?: { content: string };
 	agent?: { content: string };
+	hook?: { content: string };
 	instruction?: { content: string };
 }
 
@@ -174,6 +194,8 @@ export interface MigrateDestinations {
 	skillsDir: string;
 	commandsDir: string;
 	agentsDir: string;
+	/** Directory that receives generated hook modules. */
+	hooksDir: string;
 	instructionsPath: string;
 }
 
@@ -192,6 +214,7 @@ export interface MigrateReport {
 			skill: StatusCounts;
 			command: StatusCounts;
 			agent: StatusCounts;
+			hook: StatusCounts;
 			instruction: StatusCounts;
 			source: StatusCounts;
 		};
