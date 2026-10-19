@@ -3020,6 +3020,7 @@ export class AgentSession {
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
 	#eventListeners: AgentSessionEventListener[] = [];
+	#sessionIdentityChangeListeners = new Set<() => void | Promise<void>>();
 	#eventListenerSnapshot: readonly AgentSessionEventListener[] = Object.freeze([]);
 	/** Resolution-time switches that occur before a consumer can subscribe. */
 	#pendingFallbackSwitches: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>[] = [];
@@ -7227,6 +7228,17 @@ export class AgentSession {
 		}
 	}
 
+	/** Notify UI projections after a committed session-identity transition. */
+	async notifySessionIdentityChanged(): Promise<void> {
+		for (const listener of [...this.#sessionIdentityChangeListeners]) {
+			try {
+				await listener();
+			} catch (error) {
+				logger.warn("Session identity change listener failed", { error: String(error) });
+			}
+		}
+	}
+
 	/**
 	 * Emit a UI-only notice to the session. Surfaces in interactive mode as a
 	 * `showWarning` / `showError` / `showStatus` line; non-interactive modes
@@ -10756,6 +10768,12 @@ export class AgentSession {
 				this.#rebuildEventListenerSnapshot();
 			}
 		};
+	}
+
+	/** Subscribe to committed session identity changes that affect UI projections. */
+	subscribeSessionIdentityChanges(listener: () => void | Promise<void>): () => void {
+		this.#sessionIdentityChangeListeners.add(listener);
+		return () => this.#sessionIdentityChangeListeners.delete(listener);
 	}
 
 	/**
@@ -15378,7 +15396,11 @@ export class AgentSession {
 					return { cancelled: true };
 				}
 				if (options?.setup) {
-					await options.setup(this.sessionManager);
+					try {
+						await options.setup(this.sessionManager);
+					} finally {
+						await this.notifySessionIdentityChanged();
+					}
 				}
 				return { cancelled: false };
 			},
@@ -15388,6 +15410,7 @@ export class AgentSession {
 			},
 			navigateTree: async (targetId, options) => {
 				const result = await this.navigateTree(targetId, { summarize: options?.summarize });
+				if (!result.cancelled) await this.notifySessionIdentityChanged();
 				return { cancelled: result.cancelled };
 			},
 			compact: async instructionsOrOptions => {
@@ -15402,6 +15425,7 @@ export class AgentSession {
 			},
 			reload: async () => {
 				await this.reload();
+				await this.notifySessionIdentityChanged();
 			},
 			getSystemPrompt: () => [...this.systemPrompt],
 		};
@@ -18327,10 +18351,13 @@ export class AgentSession {
 	 */
 	newSession(options?: NewSessionOptions): Promise<boolean> {
 		if (this.#newSessionTransition) return this.#newSessionTransition;
-		// Acquire the shared transition lease only when starting a fresh transition
+		// Acquire the shared session-transition lease only when starting a fresh transition
 		// (the dedup above returns the in-flight promise without re-acquiring).
 		this.#beginSessionTransition("new-session");
-		const transition = this.#runNewSessionTransition(options);
+		const previousSessionId = this.sessionId;
+		const transition = this.#runNewSessionTransition(options).finally(async () => {
+			if (this.sessionId !== previousSessionId) await this.notifySessionIdentityChanged();
+		});
 		this.#newSessionTransition = transition;
 		void transition
 			.finally(() => {
@@ -22092,6 +22119,7 @@ export class AgentSession {
 				{ code: "busy" },
 			);
 		}
+		const previousSessionId = this.sessionId;
 		// Acquire the shared session-transition lease so handoff is mutually exclusive
 		// with compact/new/switch/branch/clear/fork/navigateTree in BOTH directions —
 		// a transition that started first and yielded still owns the lease here, and a
@@ -22365,6 +22393,7 @@ export class AgentSession {
 			// enqueue or the next agent yield.
 			this.yieldQueue.rearmIdle();
 			this.#endSessionTransition();
+			if (this.sessionId !== previousSessionId) await this.notifySessionIdentityChanged();
 		}
 	}
 
@@ -23852,12 +23881,179 @@ export class AgentSession {
 			});
 		}
 	}
+	/**
+	 * Move a compaction off a credential row that reported a usage limit, the way the
+	 * turn path does through `#markFailedCredential`. Without this, compaction retried
+	 * the exhausted row until its retries ran out, and because compaction gates the next
+	 * request, the session never reached the turn path's rotation while other rows still
+	 * had quota. Returns the rotated row's key, or undefined to fall back to the normal
+	 * retry policy: when the candidate is not on the session model's provider (the mark
+	 * acts on that provider's session credential), the provider is pinned, or the
+	 * rotation lands on a row this candidate's rotation phase already failed on. All rows
+	 * resolving to the failed key are marked because they share the same provider quota.
+	 * The dispatched row ID is retained even if OAuth refresh changes the key before the
+	 * usage-limit response is handled.
+	 */
+	async #rotateCompactionCredentialAfterUsageLimit(
+		candidate: Model,
+		apiKey: string,
+		credentialRowId: number | undefined,
+		retryAfterMs: number | undefined,
+		failedRowIds: Set<number>,
+		signal: AbortSignal,
+	): Promise<{ apiKey: string; credentialRowId: number } | undefined> {
+		if (candidate.provider !== this.model?.provider) return undefined;
+		if (this.#hasManagedFallbackCredentialPin(candidate.provider)) return undefined;
+		const authStorage = this.#modelRegistry.authStorage;
+		const matchingRowIds = await authStorage.getCredentialRowIdsMatchingApiKey(candidate.provider, apiKey);
+		if (this.#hasManagedFallbackCredentialPin(candidate.provider)) return undefined;
+		if (credentialRowId !== undefined && !matchingRowIds.includes(credentialRowId)) {
+			matchingRowIds.unshift(credentialRowId);
+		}
+		if (matchingRowIds.length === 0) return undefined;
+		const initialInventory = authStorage.listCredentialInventory(candidate.provider);
+		const failedCredential =
+			initialInventory.find(credential => credential.id === credentialRowId) ??
+			initialInventory.find(credential => matchingRowIds.includes(credential.id));
+		const credentialKind =
+			failedCredential?.credentialKind ??
+			authStorage.getSessionCredentialType(candidate.provider, this.credentialSessionId);
+		if (credentialKind === undefined) return undefined;
+		for (const failedRowId of matchingRowIds) {
+			if (this.#hasManagedFallbackCredentialPin(candidate.provider)) return undefined;
+			if (failedRowIds.has(failedRowId)) continue;
+			failedRowIds.add(failedRowId);
+			await authStorage.markUsageLimitReached(candidate.provider, this.credentialSessionId, {
+				retryAfterMs,
+				signal,
+				owner: this.#modelRegistry.getAuthStorageOwner(),
+				rowId: failedRowId,
+			});
+		}
+		const inventory = authStorage.listCredentialInventory(candidate.provider);
+		// A row's backoff can expire while compaction is in flight and move the
+		// sticky pointer back to a row this rotation already tried. Scan the live
+		// inventory and exclude every failed row instead of trusting that pointer.
+		for (const peer of inventory) {
+			if (this.#hasManagedFallbackCredentialPin(candidate.provider)) return undefined;
+			if (
+				peer.credentialKind !== credentialKind ||
+				failedRowIds.has(peer.id) ||
+				peer.disabled ||
+				!authStorage.isCredentialAvailable(candidate.provider, peer.id)
+			) {
+				continue;
+			}
+			let resolved: { apiKey: string | undefined; credentialRowId: number | undefined };
+			try {
+				resolved = await this.#modelRegistry.getApiKeyWithCredentialRowId(candidate, this.credentialSessionId, {
+					credentialSelector: { kind: "id", value: String(peer.id) },
+				});
+			} catch (error) {
+				logger.warn("Failed to resolve stored credential while rotating auto-compaction", {
+					provider: candidate.provider,
+					credentialId: peer.id,
+					errorType: error instanceof Error ? error.name : typeof error,
+				});
+				continue;
+			}
+			if (this.#hasManagedFallbackCredentialPin(candidate.provider)) return undefined;
+			if (resolved.credentialRowId !== peer.id || !isAuthenticated(resolved.apiKey)) continue;
+			if (resolved.apiKey === apiKey) {
+				failedRowIds.add(peer.id);
+				await authStorage.markUsageLimitReached(candidate.provider, this.credentialSessionId, {
+					retryAfterMs,
+					signal,
+					owner: this.#modelRegistry.getAuthStorageOwner(),
+					rowId: peer.id,
+				});
+				continue;
+			}
+			if (authStorage.isCredentialAvailable(candidate.provider, peer.id)) {
+				return { apiKey: resolved.apiKey, credentialRowId: peer.id };
+			}
+		}
+		return undefined;
+	}
+
 	async #resolveCompactionCandidate(
 		candidate: Model,
 		previousCandidate: Model | undefined,
 		previousFailure: unknown,
-	): Promise<{ apiKey: string; authError?: undefined } | { apiKey: undefined; authError: Error }> {
-		const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId);
+	): Promise<
+		| { apiKey: string; credentialRowId: number | undefined; authError?: undefined }
+		| { apiKey: undefined; authError: Error }
+	> {
+		const authStorage = this.#modelRegistry.authStorage;
+		const resolveCurrentSelection = () =>
+			this.#modelRegistry.getApiKeyWithCredentialRowId(candidate, this.credentialSessionId);
+		let resolved = await resolveCurrentSelection();
+		if (this.#hasManagedFallbackCredentialPin(candidate.provider)) {
+			// A selector can be installed while the initial resolver is awaiting token
+			// refresh. Resolve again without an explicit peer selector so the new pin
+			// owns the credential used for this compaction.
+			resolved = await resolveCurrentSelection();
+		}
+		if (
+			resolved.credentialRowId !== undefined &&
+			!authStorage.isCredentialAvailable(candidate.provider, resolved.credentialRowId)
+		) {
+			if (!this.#hasManagedFallbackCredentialPin(candidate.provider)) {
+				for (const credential of authStorage.listCredentialInventory(candidate.provider)) {
+					if (this.#hasManagedFallbackCredentialPin(candidate.provider)) {
+						resolved = await resolveCurrentSelection();
+						break;
+					}
+					if (credential.disabled || !authStorage.isCredentialAvailable(candidate.provider, credential.id)) continue;
+					let alternative: { apiKey: string | undefined; credentialRowId: number | undefined };
+					try {
+						alternative = await this.#modelRegistry.getApiKeyWithCredentialRowId(
+							candidate,
+							this.credentialSessionId,
+							{
+								credentialSelector: { kind: "id", value: String(credential.id) },
+							},
+						);
+					} catch (error) {
+						if (this.#hasManagedFallbackCredentialPin(candidate.provider)) {
+							resolved = await resolveCurrentSelection();
+							break;
+						}
+						logger.warn("Failed to resolve stored credential while selecting auto-compaction candidate", {
+							provider: candidate.provider,
+							credentialId: credential.id,
+							errorType: error instanceof Error ? error.name : typeof error,
+						});
+						continue;
+					}
+					if (this.#hasManagedFallbackCredentialPin(candidate.provider)) {
+						// The explicit selector above would override a session pin installed
+						// during resolution. Discard that result and honor the current pin.
+						resolved = await resolveCurrentSelection();
+						break;
+					}
+					if (
+						!alternative.apiKey ||
+						alternative.credentialRowId !== credential.id ||
+						!authStorage.isCredentialAvailable(candidate.provider, credential.id)
+					) {
+						continue;
+					}
+					resolved = alternative;
+					break;
+				}
+			}
+			if (
+				resolved.credentialRowId !== undefined &&
+				!authStorage.isCredentialAvailable(candidate.provider, resolved.credentialRowId)
+			) {
+				return {
+					apiKey: undefined,
+					authError: new Error(`No available stored credential for ${candidate.provider}.`),
+				};
+			}
+		}
+		const apiKey = resolved.apiKey;
 		if (!apiKey) return { apiKey: undefined, authError: this.#buildCompactionAuthError(candidate) };
 		if (previousCandidate) {
 			await this.#emitCompactionModelSubstitution(
@@ -23866,7 +24062,7 @@ export class AgentSession {
 				this.#compactionFailureReason(previousFailure),
 			);
 		}
-		return { apiKey, authError: undefined };
+		return { apiKey, credentialRowId: resolved.credentialRowId, authError: undefined };
 	}
 	#isCompactionAuthFailure(error: unknown): boolean {
 		if (!(error instanceof Error)) return false;
@@ -24460,21 +24656,23 @@ export class AgentSession {
 				let previousFailure: unknown;
 
 				for (const candidate of candidates) {
-					const { apiKey, authError } = await this.#resolveCompactionCandidate(
-						candidate,
-						previousCandidate,
-						previousFailure,
-					);
-					if (apiKey === undefined) {
-						lastError = authError;
+					const resolved = await this.#resolveCompactionCandidate(candidate, previousCandidate, previousFailure);
+					if (resolved.apiKey === undefined) {
+						lastError = resolved.authError;
 						previousCandidate = candidate;
-						previousFailure = authError;
+						previousFailure = resolved.authError;
 						candidateFailures.push({
 							model: `${candidate.provider}/${candidate.id}`,
-							message: authError.message,
+							message: resolved.authError.message,
 						});
 						continue;
 					}
+					let apiKey = resolved.apiKey;
+					let credentialRowId = resolved.credentialRowId;
+					const usageLimitedRowIds = new Set<number>();
+					// Rows can resolve to the same key (two env references to one secret), so
+					// a rotation is accepted only when it brings a key that has not failed yet.
+					const usageLimitedApiKeys = new Set<string>();
 
 					let attempt = 0;
 					while (true) {
@@ -24514,6 +24712,26 @@ export class AgentSession {
 								break;
 							}
 							const retryAfterMs = this.#parseRetryAfterMsFromError(message);
+							if (isUsageLimitError(message)) {
+								usageLimitedApiKeys.add(apiKey);
+								const rotatedCredential = await this.#rotateCompactionCredentialAfterUsageLimit(
+									candidate,
+									apiKey,
+									credentialRowId,
+									retryAfterMs,
+									usageLimitedRowIds,
+									autoCompactionSignal,
+								);
+								if (rotatedCredential !== undefined && !usageLimitedApiKeys.has(rotatedCredential.apiKey)) {
+									apiKey = rotatedCredential.apiKey;
+									credentialRowId = rotatedCredential.credentialRowId;
+									logger.warn("Auto-compaction hit a usage limit, retrying on another credential", {
+										error: message,
+										model: `${candidate.provider}/${candidate.id}`,
+									});
+									continue;
+								}
+							}
 							const shouldRetry =
 								!this.#isTerminalProviderCompactionTimeout(candidate, message) &&
 								retrySettings.enabled &&
@@ -26053,7 +26271,7 @@ export class AgentSession {
 			authStorage.hasRuntimeApiKey(provider) ||
 			authStorage.hasRuntimeCredentialSelector(provider) ||
 			authStorage.hasSessionCredentialSelector(provider, this.credentialSessionId) ||
-			authStorage.hasConfigApiKey(provider, this.#modelRegistry.getAuthStorageOwner())
+			authStorage.hasLiteralConfigApiKey(provider, this.#modelRegistry.getAuthStorageOwner())
 		);
 	}
 
@@ -26099,7 +26317,14 @@ export class AgentSession {
 		const authStorage = this.#modelRegistry.authStorage;
 		const provider = model.provider;
 		// (1) Pin guard, before any mutation and for every branch.
-		if (this.#hasManagedFallbackCredentialPin(provider)) {
+		if (
+			this.#hasManagedFallbackCredentialPin(provider) ||
+			authStorage.hasConfigApiKey(provider, this.#modelRegistry.getAuthStorageOwner())
+		) {
+			// Ordinary turn failures do not carry request-scoped row identity. Treat
+			// every config override, including apiKeyEnv, as a pin here so an env key
+			// cannot back off an unrelated sticky stored credential. Auto-compaction
+			// has its own row-aware usage-limit rotation path.
 			return "unchanged";
 		}
 
@@ -26152,8 +26377,8 @@ export class AgentSession {
 						credentialSelector: { kind: "id", value: String(peerId) },
 					});
 				} catch (error) {
-					if (authStorage.isCredentialAvailable(provider, peerId)) throw error;
-					continue;
+					if (!authStorage.isCredentialAvailable(provider, peerId)) continue;
+					throw error;
 				}
 				if (!isAuthenticated(peerApiKey)) continue;
 				const selectedRowId = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
@@ -28199,6 +28424,7 @@ export class AgentSession {
 		let ownerShutdownTransitionCommitted = false;
 		let ownerShutdownCanDrainResumes = false;
 		let ownerShutdownFinalizationDeferred = false;
+		let sessionIdentityCommitted = false;
 		this.#beginSessionTransition("switch-session");
 		try {
 			const previousSessionFile = this.sessionManager.getSessionFile();
@@ -28572,6 +28798,7 @@ export class AgentSession {
 						throw new Error("Exact MCP control retirement changed before session switch commit");
 					await exactRetirement?.commit();
 					transitionCleanupCommitted = true;
+					sessionIdentityCommitted = true;
 					let ownerShutdownSettled = true;
 					if (ownerShutdownManager && ownerShutdownLease && ownerId) {
 						try {
@@ -28811,6 +29038,7 @@ export class AgentSession {
 				}
 			}
 			this.#endSessionTransition();
+			if (sessionIdentityCommitted) await this.notifySessionIdentityChanged();
 		}
 	}
 
@@ -28827,6 +29055,7 @@ export class AgentSession {
 		selectedText: string;
 		cancelled: boolean;
 	}> {
+		const previousSessionId = this.sessionId;
 		this.#beginSessionTransition("branch");
 		try {
 			const selectedEntry = this.sessionManager.getEntryForFidelity(entryId);
@@ -28952,6 +29181,7 @@ export class AgentSession {
 		} finally {
 			this.#reconnectToAgent();
 			this.#endSessionTransition();
+			if (this.sessionId !== previousSessionId) await this.notifySessionIdentityChanged();
 		}
 	}
 
