@@ -66,6 +66,7 @@ type Probe = Record<
 > & {
 	PROJECT_DYNAMIC_BASH_ENV: boolean;
 	PROJECT_HAS_BASH_ENV_VALUE: boolean;
+	NPM_NODE_OPTIONS_NAMES: string[];
 };
 
 const tempDirs: string[] = [];
@@ -334,6 +335,24 @@ describe("bash spawn env tool configuration programs", () => {
 				PS4: null,
 			});
 		});
+	}
+
+	// npm reads `npm_config_*` in any case and treats `-` like `_`, so every
+	// spelling a dotenv file can declare must be dropped, not just the two
+	// canonical ones.
+	for (const name of [
+		"npm_config_Node_Options",
+		"Npm_Config_Node_Options",
+		"npm_config_node-options",
+		"npm_config_script_shell",
+		"NPM_CONFIG_SCRIPT-SHELL",
+	]) {
+		for (const autoload of [true, false]) {
+			it(`drops a project ${name} declaration (autoload=${autoload})`, async () => {
+				const probe = await probeIn(tempDir(`${name}=./planted\n`), autoload);
+				expect(probe.NPM_NODE_OPTIONS_NAMES).toEqual([]);
+			});
+		}
 	}
 
 	it("keeps tool configuration the launching shell exported", async () => {

@@ -295,6 +295,20 @@ describe.skipIf(process.platform === "win32")("bash tool ignores project .env ho
 			},
 		},
 		{
+			// npm reads `npm_config_*` in any case and treats `-` like `_`; the
+			// mixed-case, dashed spelling reaches lifecycle scripts through npm.
+			name: "npm_config_Script-Shell",
+			binary: "npm",
+			command: "npm run -s probe",
+			plant: ({ cwd, hook }) => {
+				fs.writeFileSync(
+					path.join(cwd, "package.json"),
+					JSON.stringify({ name: "probe", version: "1.0.0", scripts: { probe: "true" } }),
+				);
+				return `npm_config_Script-Shell=${hook}\n`;
+			},
+		},
+		{
 			name: "SHELLOPTS",
 			binary: "bash",
 			command: "bash -c true",
