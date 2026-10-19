@@ -725,6 +725,44 @@ describe("memories runtime", () => {
 		});
 	});
 
+	test.skipIf(path.sep === "\\")(
+		"phase2 prunes an existing in-directory summary name that contains a backslash",
+		async () => {
+			const fx = await createFixture();
+			const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
+			const summariesDir = path.join(memoryRoot, "rollout_summaries");
+			await fs.mkdir(summariesDir, { recursive: true });
+			const backslashName = "stale\\name.md";
+			await fs.writeFile(path.join(summariesDir, backslashName), "stale-backslash");
+			await fs.writeFile(path.join(summariesDir, "old.md"), "stale-plain");
+			vi.spyOn(ai, "completeSimple").mockResolvedValue(
+				createAssistantMessage(
+					JSON.stringify({
+						memory_md: "# Memory\n\nMerged",
+						memory_summary: "Merged summary",
+						skills: [{ name: "ops", content: "# Ops\nRunbook" }],
+					}),
+				),
+			);
+			await seedPhase2Thread(fx, "thread-ok", null, "plain-summary");
+			startMemoryStartupTask({
+				session: fx.session,
+				settings: fx.settings,
+				modelRegistry: fx.modelRegistry,
+				agentDir: fx.agentDir,
+				taskDepth: 0,
+			});
+
+			await waitFor(async () => {
+				const text = await fs.readFile(path.join(summariesDir, "thread-ok.md"), "utf8");
+				expect(text).toContain("plain-summary");
+			});
+			const names = await fs.readdir(summariesDir);
+			expect(names.includes("old.md")).toBe(false);
+			expect(names.includes(backslashName)).toBe(false);
+		},
+	);
+
 	test("property: rollout summary filename containment seed 468", async () => {
 		const memories = await import("@gajae-code/coding-agent/memories");
 		const destination = (
@@ -743,7 +781,7 @@ describe("memories runtime", () => {
 		const root = path.resolve(summariesDir);
 		const rand = mulberry32(468);
 		const safeAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-";
-		const unsafe: Array<[string, string | null]> = [
+		const fixed: Array<[string, string | null]> = [
 			["../../../../outside/evil", null],
 			["../outside/evil", "Hello"],
 			["/outside/evil", null],
@@ -753,19 +791,19 @@ describe("memories runtime", () => {
 			["..\\outside\\evil", "slug"],
 			["thread/../../outside", null],
 		];
-		const cases: Array<[string, string | null]> = [];
-		for (const item of unsafe) cases.push(item);
-		while (cases.length < 64) {
+		const generated: Array<[string, string | null]> = [];
+		while (generated.length < 64) {
 			const length = 1 + Math.floor(rand() * 16);
 			let threadId = "";
 			for (let i = 0; i < length; i += 1) {
 				threadId += safeAlphabet[Math.floor(rand() * safeAlphabet.length)];
 			}
 			const slug = rand() < 0.5 ? null : `S${Math.floor(rand() * 1000)} x`;
-			cases.push([threadId, slug]);
+			generated.push([threadId, slug]);
 		}
-		expect(cases.length).toBe(64);
-		for (const [threadId, rolloutSlug] of cases) {
+		expect(fixed.length).toBe(8);
+		expect(generated.length).toBe(64);
+		for (const [threadId, rolloutSlug] of [...fixed, ...generated]) {
 			const target = destination(summariesDir, threadId, rolloutSlug);
 			const stem = legacyRolloutStem(threadId, rolloutSlug);
 			const filename = `${stem}.md`;

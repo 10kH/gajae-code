@@ -699,7 +699,7 @@ async function syncPhase2Artifacts(memoryRoot: string, outputs: Stage1OutputRow[
 	for (const file of currentFiles) {
 		if (!file.endsWith(".md")) continue;
 		if (keepFiles.has(file)) continue;
-		const target = containedSummaryFilename(summariesRoot, file);
+		const target = containedExistingSummary(summariesRoot, file);
 		if (!target) continue;
 		await fs.rm(target, { force: true });
 	}
@@ -929,10 +929,9 @@ function formatRolloutFilename(threadId: string, rolloutSlug: string | null): st
 	return `${threadId}-${normalized}`;
 }
 
-/** Single file name under rollout_summaries, or undefined when the name would leave that directory. */
-function containedSummaryFilename(summariesRoot: string, filename: string): string | undefined {
-	if (filename.length === 0 || filename.includes("\0")) return undefined;
-	if (filename.includes("/") || filename.includes("\\")) return undefined;
+/** Lexical containment for one summary file name. A backslash is a separator only when the platform says so. */
+function lexicalSummaryTarget(summariesRoot: string, filename: string): string | undefined {
+	if (filename.length === 0 || filename.includes("\0") || filename.includes("/")) return undefined;
 	if (filename === "." || filename === "..") return undefined;
 	if (path.basename(filename) !== filename) return undefined;
 	const target = path.resolve(summariesRoot, filename);
@@ -941,12 +940,25 @@ function containedSummaryFilename(summariesRoot: string, filename: string): stri
 		relative.length === 0 ||
 		relative === ".." ||
 		relative.startsWith(`..${path.sep}`) ||
-		path.isAbsolute(relative)
+		path.isAbsolute(relative) ||
+		relative !== filename
 	) {
 		return undefined;
 	}
-	if (relative !== filename) return undefined;
 	return target;
+}
+
+/** New summary names stay portable: reject separators, including backslash. */
+function containedSummaryFilename(summariesRoot: string, filename: string): string | undefined {
+	if (filename.includes("\\")) return undefined;
+	return lexicalSummaryTarget(summariesRoot, filename);
+}
+
+/** Existing directory entries may contain a backslash on POSIX. Still refuse a name that leaves the directory. */
+function containedExistingSummary(summariesRoot: string, filename: string): string | undefined {
+	if (!filename.endsWith(".md")) return undefined;
+	if (path.sep === "\\" && filename.includes("\\")) return undefined;
+	return lexicalSummaryTarget(summariesRoot, filename);
 }
 
 function rolloutSummaryDestination(
