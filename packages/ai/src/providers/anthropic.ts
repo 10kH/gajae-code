@@ -1588,92 +1588,46 @@ function wrapAnthropicFetchForBoundedRateLimits(baseFetch: FetchImpl, maxRetryDe
 	);
 }
 
-/**
- * Compresses request bodies with gzip for first-party Anthropic endpoints.
- * Preserves uncompressed form in debug logging and all other request properties.
- */
-function wrapAnthropicFetchForGzip(baseFetch: FetchImpl): FetchImpl {
+/** Body bytes for a request `BodyInit`, or `undefined` when the body cannot be inspected. */
+function requestBodyBuffer(body: RequestInit["body"]): Buffer | undefined {
+	if (typeof body === "string") return Buffer.from(body, "utf-8");
+	if (body instanceof ArrayBuffer) return Buffer.from(body);
+	if (ArrayBuffer.isView(body)) return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+	return undefined;
+}
+
+/** Compresses request bodies with gzip for first-party Anthropic endpoints only. */
+export function wrapAnthropicFetchForGzip(baseFetch: FetchImpl): FetchImpl {
 	return Object.assign(
 		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-			// Only compress requests to first-party Anthropic API
 			const url = new URL(input instanceof Request ? input.url : String(input), "https://api.anthropic.com");
 			const isFirstPartyAnthropicApi =
 				url.protocol.toLowerCase() === "https:" &&
 				url.hostname.toLowerCase() === "api.anthropic.com" &&
 				(url.port === "" || url.port === "443");
+			const bodyBuffer = init?.body ? requestBodyBuffer(init.body) : undefined;
+			if (!isFirstPartyAnthropicApi || !bodyBuffer) return baseFetch(input, init);
 
-			if (!isFirstPartyAnthropicApi || !init?.body) {
-				return baseFetch(input, init);
-			}
-
+			let compressedBody: Buffer;
 			try {
-				// Get uncompressed body as string for logging
-				const uncompressedBody =
-					init.body instanceof ReadableStream
-						? undefined // Can't inspect streams
-						: typeof init.body === "string"
-							? init.body
-							: init.body instanceof ArrayBuffer || ArrayBuffer.isView(init.body)
-								? new TextDecoder().decode(init.body)
-								: String(init.body);
-
-				// Log uncompressed body for debugging
-				if (uncompressedBody && typeof uncompressedBody === "string") {
-					logger.debug("anthropic: sending gzip-compressed request", {
-						uncompressedBodySize: uncompressedBody.length,
-					});
-				}
-
-				// Compress the body
-				let bodyBuffer: Buffer | undefined;
-				if (typeof init.body === "string") {
-					bodyBuffer = Buffer.from(init.body, "utf-8");
-				} else if (init.body instanceof ArrayBuffer) {
-					bodyBuffer = Buffer.from(init.body);
-				} else if (
-					init.body instanceof Uint8Array ||
-					init.body instanceof Int8Array ||
-					init.body instanceof Uint8ClampedArray ||
-					init.body instanceof Uint16Array ||
-					init.body instanceof Int16Array ||
-					init.body instanceof Uint32Array ||
-					init.body instanceof Int32Array ||
-					init.body instanceof Float32Array ||
-					init.body instanceof Float64Array
-				) {
-					bodyBuffer = Buffer.from(init.body);
-				}
-
-				if (!bodyBuffer) {
-					return baseFetch(input, init);
-				}
-
-				const compressedBody = gzipSync(bodyBuffer);
-
-				// Create modified init with compressed body and updated headers
-				const modifiedInit: RequestInit = {
-					...init,
-					body: compressedBody,
-					headers: new Headers(init.headers ?? {}),
-				};
-
-				// Set Content-Encoding header
-				(modifiedInit.headers as Headers).set("Content-Encoding", "gzip");
-
-				logger.debug("anthropic: gzip compression ratio", {
-					uncompressed: bodyBuffer.length,
-					compressed: compressedBody.length,
-					ratio: (compressedBody.length / bodyBuffer.length).toFixed(2),
-				});
-
-				return baseFetch(input, modifiedInit);
+				compressedBody = gzipSync(bodyBuffer);
 			} catch (error) {
-				// If compression fails, fall back to uncompressed
 				logger.debug("anthropic: gzip compression failed, falling back to uncompressed", {
 					error: error instanceof Error ? error.message : String(error),
 				});
 				return baseFetch(input, init);
 			}
+
+			// The caller's Content-Length describes the uncompressed body; drop it so
+			// fetch recomputes the length for the compressed payload.
+			const headers = new Headers(init?.headers ?? {});
+			headers.set("Content-Encoding", "gzip");
+			headers.delete("Content-Length");
+			logger.debug("anthropic: gzip compression", {
+				uncompressed: bodyBuffer.length,
+				compressed: compressedBody.length,
+			});
+			return baseFetch(input, { ...init, body: compressedBody, headers });
 		},
 		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
 	);
