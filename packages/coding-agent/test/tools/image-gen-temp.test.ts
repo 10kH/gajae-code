@@ -79,7 +79,10 @@ function stubFetch(): void {
 		output: [{ type: "image_generation_call", result: png.toString("base64"), status: "completed" }],
 	});
 	const fetchMock = (async () =>
-		new Response(body, { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch;
+		new Response(body, {
+			status: 200,
+			headers: { "content-type": "application/json" },
+		})) as unknown as typeof fetch;
 	fetchMock.preconnect = originalFetch.preconnect;
 	global.fetch = fetchMock;
 }
