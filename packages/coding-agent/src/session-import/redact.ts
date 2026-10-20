@@ -121,10 +121,14 @@ function csiSequenceEnd(input: string, j: number): number {
 }
 
 function oscSequenceEnd(input: string, index: number): number {
-	const bel = input.indexOf("\u0007", index);
-	if (bel >= 0) return bel + 1;
-	const st = input.lastIndexOf("\u001b\\");
-	return st >= index ? st + 2 : -1;
+	// One forward scan. A second search to the end of the suffix is quadratic for repeated OSC sequences.
+	const n = input.length;
+	for (let j = index; j < n; j++) {
+		const code = input.charCodeAt(j);
+		if (code === 0x07) return j + 1;
+		if (code === 0x1b && j + 1 < n && input.charCodeAt(j + 1) === 0x5c) return j + 2;
+	}
+	return -1;
 }
 
 export interface ImportRedactionResult {

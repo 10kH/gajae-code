@@ -8,7 +8,8 @@ import { describe, expect, it } from "bun:test";
 import fc from "fast-check";
 import { sanitizeImportedString } from "../src/session-import/redact";
 
-const ANSI_ESCAPE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/gu;
+// OSC stops at the first BEL or ST so text between sequences stays.
+const ANSI_ESCAPE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\](?:(?!\x1b\\)[^\x07])*(?:\x07|\x1b\\))/gu;
 const UNSAFE_CONTROL =
 	/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/gu;
 const PROPERTY_SEED = 5472026;
@@ -40,6 +41,22 @@ describe("imported OSC stripping", () => {
 		const plain = "oversized artifact body without a control sequence";
 		expect(sanitizeImportedString(plain)).toBe(plain);
 	});
+
+	it("preserves ordinary text between two or more terminated OSC sequences", () => {
+		const between = "plan: keep this sentence";
+		const input = `\u001b]0;one\u001b\\${between}\u001b]8;;https://example.com/a\u001b\\ tail \u001b]2;two\u0007`;
+		expect(sanitizeImportedString(input)).toBe(`${between} tail `);
+	});
+
+	it("a long run of terminated OSC sequences stays cheap", () => {
+		const count = 160_000;
+		const started = performance.now();
+		const belValue = sanitizeImportedString(`${"\u001b]x\u0007".repeat(count)}TAIL`);
+		const stValue = sanitizeImportedString(`${"\u001b]x\u001b\\".repeat(count)}TAIL`);
+		expect(performance.now() - started).toBeLessThan(1_000);
+		expect(belValue).toBe("TAIL");
+		expect(stValue).toBe("TAIL");
+	}, 30_000);
 
 	it("property: OSC and CSI stripping matches bounded sequences, seed 5472026, 64 inputs", () => {
 		const text = fc

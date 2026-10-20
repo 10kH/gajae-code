@@ -592,4 +592,41 @@ describe("ralplan OSC strip on the write path", () => {
 		expect(performance.now() - started).toBeLessThan(1_000);
 		expect(stored).toBe(`${"]".repeat(count)}TAIL\n`);
 	}, 30_000);
+
+	it("a file of repeated terminated OSC sequences stays cheap on write", async () => {
+		const root = await tempDir();
+		try {
+			const count = 120_000;
+			const between = "plan: keep this sentence";
+			const artifactPath = path.join(root, "planner.md");
+			await fs.writeFile(
+				artifactPath,
+				`${"\u001b]x\u0007".repeat(count)}${between}${"\u001b]y\u001b\\".repeat(count)}`,
+			);
+			const started = performance.now();
+			const written = await runRalplanCliCommand(
+				[
+					"--write",
+					"--stage",
+					"planner",
+					"--stage_n",
+					"1",
+					"--artifact",
+					artifactPath,
+					"--run-id",
+					"osc-repeat",
+					"--json",
+				],
+				root,
+			);
+			expect(performance.now() - started).toBeLessThan(1_000);
+			expect(written.status).toBe(0);
+			const payload = JSON.parse(written.stdout ?? "{}") as { path: string };
+			const stored = await fs.readFile(payload.path, "utf8");
+			expect(stored).toContain(between);
+			expect(stored).not.toContain("\u001b]");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	}, 30_000);
 });
