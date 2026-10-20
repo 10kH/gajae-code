@@ -25,7 +25,12 @@ import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import type { ToolSession } from ".";
 import { wrapUntrustedContent } from "./fetch";
-import { formatStyledTruncationWarning, type OutputMeta, stripOutputNotice } from "./output-meta";
+import {
+	formatFullOutputReference,
+	formatStyledTruncationWarning,
+	type OutputMeta,
+	stripOutputNotice,
+} from "./output-meta";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
@@ -107,18 +112,33 @@ function settingNumber(settings: Settings | undefined, path: OutputBudgetPath): 
 	return settings?.get(path) ?? getDefault(path);
 }
 
-type RemoteFrame = { text: string; truncation?: TruncationResult; direction?: "tail" | "middle" };
+type RemoteFrame = {
+	text: string;
+	truncation?: TruncationResult;
+	direction?: "tail" | "middle";
+	/** True only after the full remote text is already stored. */
+	shrunk: boolean;
+	visibleLines: number;
+	visibleBytes: number;
+};
+
+function exceedsInlineCap(output: string, settings: Settings | undefined): boolean {
+	const cap = settingNumber(settings, "tools.maxInlineResultBytes") * 1024;
+	if (cap <= 0) return false;
+	return Buffer.byteLength(output, "utf-8") + UNTRUSTED_FENCE_OVERHEAD > cap;
+}
+
+function frameFullRemoteOutput(output: string): RemoteFrame {
+	return { text: wrapUntrustedContent(output), shrunk: false, visibleLines: 0, visibleBytes: 0 };
+}
 
 /**
- * Fit remote text to the inline model window, then frame that excerpt.
- * A later tail cut would drop the opening fence, so the fence is last.
- * Local status strings stay outside the frame.
+ * Cut to the inline window, then frame that excerpt. Call only when the full
+ * remote text is already stored, so a tail cut cannot drop the opening fence
+ * or the only copy of the output.
  */
-function frameSshRemoteOutput(output: string, settings?: Settings): RemoteFrame {
+function frameShrunkRemoteOutput(output: string, settings: Settings | undefined): RemoteFrame {
 	const cap = settingNumber(settings, "tools.maxInlineResultBytes") * 1024;
-	if (cap <= 0 || Buffer.byteLength(output, "utf-8") + UNTRUSTED_FENCE_OVERHEAD <= cap) {
-		return { text: wrapUntrustedContent(output) };
-	}
 	const budget = Math.max(1, cap - UNTRUSTED_FENCE_OVERHEAD - INLINE_MARKER_RESERVE);
 	const headBytes = settingNumber(settings, "tools.artifactHeadBytes") * 1024;
 	const tailLines = settingNumber(settings, "tools.artifactTailLines");
@@ -131,11 +151,27 @@ function frameSshRemoteOutput(output: string, settings?: Settings): RemoteFrame 
 					maxHeadLines: tailLines,
 				})
 			: truncateTail(output, { maxBytes: budget, maxLines: tailLines });
+	if (!truncation.truncated) return frameFullRemoteOutput(output);
 	return {
 		text: wrapUntrustedContent(truncation.content),
 		truncation,
 		direction: headBytes > 0 ? "middle" : "tail",
+		shrunk: true,
+		visibleLines: truncation.outputLines ?? truncation.content.split("\n").length,
+		visibleBytes: truncation.outputBytes ?? Buffer.byteLength(truncation.content, "utf-8"),
 	};
+}
+
+/** Store the full remote text. Never write an already-shortened excerpt. */
+async function storeFullRemoteOutput(session: ToolSession, output: string): Promise<string | undefined> {
+	const allocated = await session.allocateOutputArtifact?.("ssh");
+	if (!allocated?.path || !allocated.id) return undefined;
+	try {
+		await Bun.write(allocated.path, output);
+	} catch {
+		return undefined;
+	}
+	return allocated.id;
 }
 
 function buildRemoteCommand(command: string, cwd: string | undefined, info: SSHHostInfo): string {
@@ -224,18 +260,33 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 			onChunk: streamTailUpdates(tailBuffer, onUpdate),
 		});
 
-		const framed = result.output ? frameSshRemoteOutput(result.output, _ctx?.settings) : undefined;
+		const remote = result.output ?? "";
+		let storedArtifactId = result.artifactId;
+		let framed: RemoteFrame | undefined;
+		if (!remote) {
+			framed = undefined;
+		} else if (!exceedsInlineCap(remote, _ctx?.settings)) {
+			framed = frameFullRemoteOutput(remote);
+		} else {
+			if (!storedArtifactId) storedArtifactId = await storeFullRemoteOutput(this.session, remote);
+			framed = storedArtifactId ? frameShrunkRemoteOutput(remote, _ctx?.settings) : frameFullRemoteOutput(remote);
+		}
+		const modelText = framed
+			? framed.shrunk && storedArtifactId
+				? `${framed.text}\n\n${formatFullOutputReference(storedArtifactId)}`
+				: framed.text
+			: undefined;
 		if (result.cancelled) {
-			throw new ToolError(framed ? framed.text : "Command aborted");
+			throw new ToolError(modelText ?? "Command aborted");
 		}
 
-		const outputText = framed ? framed.text : "(no output)";
+		const outputText = modelText ?? "(no output)";
 		const details: SSHToolDetails = {};
 		const resultBuilder = toolResult(details).text(outputText);
-		if (framed?.truncation?.truncated) {
+		if (framed?.shrunk && framed.truncation && storedArtifactId) {
 			resultBuilder.truncation(framed.truncation, {
 				direction: framed.direction ?? "tail",
-				artifactId: result.artifactId,
+				artifactId: storedArtifactId,
 			});
 		} else {
 			resultBuilder.truncationFromSummary(result, { direction: "tail" });
@@ -245,7 +296,26 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 			throw new ToolError(`${outputText}\n\nCommand exited with code ${result.exitCode}`);
 		}
 
-		return resultBuilder.done();
+		const built = resultBuilder.done();
+		const truncation = built.details?.meta?.truncation;
+		if (framed?.shrunk && truncation) {
+			// The cut is a window of an earlier excerpt. Keep the stream totals
+			// and do not present that window's coordinates as the original range.
+			truncation.totalLines = result.totalLines;
+			truncation.totalBytes = result.totalBytes;
+			truncation.outputLines = framed.visibleLines;
+			truncation.outputBytes = framed.visibleBytes;
+			truncation.artifactId = storedArtifactId;
+			delete truncation.shownRange;
+			delete truncation.headRange;
+			delete truncation.tailRange;
+			delete truncation.nextOffset;
+			if (framed.direction === "middle") {
+				truncation.elidedLines = Math.max(0, result.totalLines - framed.visibleLines);
+				truncation.elidedBytes = Math.max(0, result.totalBytes - framed.visibleBytes);
+			}
+		}
+		return built;
 	}
 }
 

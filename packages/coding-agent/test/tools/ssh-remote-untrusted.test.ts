@@ -70,13 +70,13 @@ function sshResult(output: string, exitCode: number | undefined, cancelled = fal
 	};
 }
 
-function tool(): SshTool {
+function tool(session: ToolSession = {} as ToolSession): SshTool {
 	const host: SSHHost = {
 		name: "box",
 		host: "10.0.0.8",
 		_source: { provider: "test", providerName: "test", path: "hosts.json", level: "user" },
 	};
-	return new SshTool({} as ToolSession, [host.name], new Map([[host.name, host]]), "ssh");
+	return new SshTool(session, [host.name], new Map([[host.name, host]]), "ssh");
 }
 
 function textOf(result: { content: Array<{ type: string; text?: string }> }): string {
@@ -290,6 +290,80 @@ describe("ssh remote output trust boundary", () => {
 		const result = await executeWrapped(overlongRemote(headMarker, tailMarker), { "tools.artifactHeadBytes": 0 });
 		const { raw, excerpt } = modelExcerpt(result);
 		expectFenceAroundTail(raw, excerpt, tailMarker, headMarker, false);
+	});
+
+	it("ssh execute returns the full framed remote output when no artifact can be stored", async () => {
+		const headMarker = "HEADMARKER";
+		const tailMarker = "TAILMARKER";
+		const remote = overlongRemote(headMarker, tailMarker);
+		stubRemote(remote, 0);
+		const result = await settle(tool().execute("ssh-no-artifact", { host: "box", command: "cat", timeout: 1 }));
+		const text = textOf(result);
+		expect(text).toBe(referenceFrame(remote));
+		expect(text).toContain(headMarker);
+		expect(text).toContain(tailMarker);
+		expect(Buffer.byteLength(text, "utf-8")).toBeGreaterThan(12 * 1024);
+		expect(result.details?.meta?.truncation?.artifactId).toBeUndefined();
+	});
+
+	it("ssh execute stores the full remote output before a shorter inline frame", async () => {
+		const headMarker = "HEADMARKER";
+		const tailMarker = "TAILMARKER";
+		const remote = overlongRemote(headMarker, tailMarker);
+		const stored: string[] = [];
+		stubRemote(remote, 0);
+		const session = {
+			allocateOutputArtifact: async () => ({ id: "ssh-full", path: "ssh-full.log" }),
+		} as ToolSession;
+		const write = vi.spyOn(Bun, "write").mockImplementation(async (_path, data) => {
+			stored.push(String(data));
+			return stored[stored.length - 1]?.length ?? 0;
+		});
+		try {
+			const result = await settle(
+				tool(session).execute("ssh-store-full", { host: "box", command: "cat", timeout: 1 }, undefined, undefined, {
+					settings: Settings.isolated({ "tools.artifactHeadBytes": 0 }),
+				} as AgentToolContext),
+			);
+			const { excerpt } = modelExcerpt(result);
+			const fenced = excerpt.slice(0, excerpt.lastIndexOf(`\n${CLOSE}`) + `\n${CLOSE}`.length);
+			expect(stored).toEqual([remote]);
+			expect(fenced.startsWith("<untrusted-content>\n")).toBe(true);
+			expect(fenced.endsWith(`\n${CLOSE}`)).toBe(true);
+			expect(fenced).toContain(tailMarker);
+			expect(fenced).not.toContain(headMarker);
+			expect(excerpt).toContain("artifact://ssh-full");
+			expect(result.details?.meta?.truncation?.artifactId).toBe("ssh-full");
+			expect(Buffer.byteLength(fenced, "utf-8")).toBeLessThan(Buffer.byteLength(remote, "utf-8"));
+		} finally {
+			write.mockRestore();
+		}
+	});
+
+	it("ssh execute preserves original stream totals when the inline window is shorter", async () => {
+		const remote = overlongRemote("HEADMARKER", "TAILMARKER");
+		ensureHostInfoImpl = async () => linuxHostInfo();
+		executeSSHImpl = async () => ({
+			...sshResult(remote, 0),
+			truncated: true,
+			totalLines: 10000,
+			totalBytes: 900000,
+			outputLines: 400,
+			outputBytes: remote.length,
+			artifactId: "full-original",
+		});
+		const result = await settle(tool().execute("ssh-totals", { host: "box", command: "cat", timeout: 1 }));
+		const truncation = result.details?.meta?.truncation;
+		expect(truncation?.artifactId).toBe("full-original");
+		expect(truncation?.totalLines).toBe(10000);
+		expect(truncation?.totalBytes).toBe(900000);
+		expect(truncation?.shownRange).toBeUndefined();
+		expect(truncation?.outputLines).toBeLessThan(10000);
+		const { excerpt } = modelExcerpt(result);
+		const fenced = excerpt.slice(0, excerpt.lastIndexOf(`\n${CLOSE}`) + `\n${CLOSE}`.length);
+		expect(fenced.startsWith("<untrusted-content>\n")).toBe(true);
+		expect(fenced.endsWith(`\n${CLOSE}`)).toBe(true);
+		expect(excerpt).toContain("artifact://full-original");
 	});
 
 	it("ssh execute frames a head-and-tail inline excerpt", async () => {
