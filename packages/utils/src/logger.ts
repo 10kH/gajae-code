@@ -17,28 +17,69 @@ import { getEffectiveLogsDir } from "./dirs";
 const LOG_DIR_MODE = 0o700;
 const LOG_FILE_MODE = 0o600;
 
-/**
- * Clear group and world bits on a real file or directory.
- * Symlinks are left untouched so a mode repair cannot change another path.
- */
-function tightenOwnerOnly(target: string, mode: number): void {
+/** Drop a trailing separator without turning a filesystem root into a relative path. */
+function lexicalLogPath(target: string): string {
+	if (target.length <= 1) return target;
+	let end = target.length;
+	while (end > 1 && (target[end - 1] === "/" || target[end - 1] === "\\")) end -= 1;
+	if (process.platform === "win32" && /^[A-Za-z]:$/.test(target.slice(0, end))) return `${target.slice(0, end)}\\`;
+	return target.slice(0, end);
+}
+
+function isFsRoot(target: string): boolean {
+	return target === "/" || target === "\\" || /^[A-Za-z]:\\$/.test(target);
+}
+
+function isFinalSymlink(target: string): boolean {
 	try {
-		const stat = fs.lstatSync(target);
-		if (!stat.isFile() && !stat.isDirectory()) return;
-		if ((stat.mode & 0o077) === 0) return;
-		fs.chmodSync(target, mode);
+		return fs.lstatSync(lexicalLogPath(target)).isSymbolicLink();
 	} catch {
-		// A mode repair must not take logging down.
+		return false;
 	}
 }
 
-/** Ensure a logs directory exists at mode 0700; return the resolved path. */
-function ensureDir(dir: string): string {
-	if (!fs.existsSync(dir)) {
-		fs.mkdirSync(dir, { recursive: true, mode: LOG_DIR_MODE });
+/**
+ * Clear group and world bits on the inode opened from this path.
+ * A symlink, including one spelled with a trailing separator, is not opened.
+ * `O_NOFOLLOW` plus `fchmod` keeps the repair on that inode if the path is replaced.
+ */
+function tightenOwnerOnly(target: string, mode: number, kind: "directory" | "file"): void {
+	const lexical = lexicalLogPath(target);
+	if (isFsRoot(lexical) || isFinalSymlink(lexical)) return;
+	let fd: number | undefined;
+	try {
+		const listed = fs.lstatSync(lexical);
+		if (kind === "directory" ? !listed.isDirectory() : !listed.isFile()) return;
+		if ((listed.mode & 0o077) === 0) return;
+		const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+		const directoryFlag = kind === "directory" ? (fs.constants.O_DIRECTORY ?? 0) : 0;
+		fd = fs.openSync(lexical, fs.constants.O_RDONLY | noFollow | directoryFlag);
+		const opened = fs.fstatSync(fd);
+		if (kind === "directory" ? !opened.isDirectory() : !opened.isFile()) return;
+		if ((opened.mode & 0o077) === 0) return;
+		fs.fchmodSync(fd, mode);
+	} catch {
+		// A mode repair must not take logging down.
+	} finally {
+		if (fd !== undefined) {
+			try {
+				fs.closeSync(fd);
+			} catch {
+				// The mode was already repaired, or the close raced an exit.
+			}
+		}
 	}
-	tightenOwnerOnly(dir, LOG_DIR_MODE);
-	return dir;
+}
+
+/** Ensure a logs directory exists at mode 0700; return the path the transport should use. */
+function ensureDir(dir: string): string {
+	const lexical = lexicalLogPath(dir);
+	if (isFsRoot(lexical) || isFinalSymlink(lexical)) return lexical;
+	if (!fs.existsSync(lexical)) {
+		fs.mkdirSync(lexical, { recursive: true, mode: LOG_DIR_MODE });
+	}
+	tightenOwnerOnly(lexical, LOG_DIR_MODE, "directory");
+	return lexical;
 }
 
 type WinstonModule = typeof import("winston");
@@ -106,8 +147,10 @@ function makeLogFormat(winston: WinstonModule): winston.Logform.Format {
  * is what let the transport write somewhere the readers never looked.
  */
 function makeFileTransport(DailyRotateFile: DailyRotateFileCtor, dir?: string): Transport {
+	const dirname = ensureDir(dir ?? getEffectiveLogsDir());
+	const skipFileMode = isFinalSymlink(dirname);
 	const transport = new DailyRotateFile({
-		dirname: ensureDir(dir ?? getEffectiveLogsDir()),
+		dirname,
 		filename: "gjc.%DATE%.log",
 		datePattern: "YYYY-MM-DD",
 		maxSize: "10m",
@@ -124,7 +167,8 @@ function makeFileTransport(DailyRotateFile: DailyRotateFileCtor, dir?: string): 
 	const stream = transport.logStream as unknown as NodeJS.EventEmitter;
 	let currentLog: string | undefined;
 	const repairLog = (): void => {
-		if (currentLog) tightenOwnerOnly(currentLog, LOG_FILE_MODE);
+		if (skipFileMode || !currentLog) return;
+		tightenOwnerOnly(currentLog, LOG_FILE_MODE, "file");
 	};
 	// `new` names the active file (including one that already existed at 0666).
 	// `open` runs after a newly created file exists, so a late create is covered.

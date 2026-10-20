@@ -111,6 +111,38 @@ describe.skipIf(process.platform === "win32")("rotating log owner-only mode", ()
 		}
 	}, 20_000);
 
+	async function expectSymlinkTargetUnchanged(logDir: string): Promise<void> {
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-home-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
+		const target = path.join(root, "target");
+		const link = path.join(root, "link");
+		try {
+			fs.mkdirSync(target);
+			fs.chmodSync(target, 0o755);
+			fs.symlinkSync(target, link);
+			await runProbe(logDir(link), home);
+			expect(fs.lstatSync(target).mode & 0o777).toBe(0o755);
+			expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+			const text = fs
+				.readdirSync(target)
+				.filter(name => name.endsWith(".log"))
+				.map(name => fs.readFileSync(path.join(target, name), "utf8"))
+				.join("");
+			expect(text).toContain("rotating-log-mode-marker");
+		} finally {
+			fs.rmSync(home, { recursive: true, force: true });
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	}
+
+	it("still reads through a symlink log directory and leaves the target mode", async () => {
+		await expectSymlinkTargetUnchanged(link => link);
+	}, 20_000);
+
+	it("still reads through a trailing-slash symlink log directory and leaves the target mode", async () => {
+		await expectSymlinkTargetUnchanged(link => `${link}/`);
+	}, 20_000);
+
 	it("tightens an existing 0755 directory and 0666 log file", async () => {
 		const home = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-home-"));
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
