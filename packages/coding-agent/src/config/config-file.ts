@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getAgentDir, isEnoent, logger } from "@gajae-code/utils";
+import { getAgentDir, isEnoent, isFsError, logger } from "@gajae-code/utils";
 import { JSONC, YAML } from "bun";
 import type { ZodType } from "zod/v4";
 
@@ -10,9 +10,43 @@ interface ConfigSchemaError {
 	message: string | undefined;
 }
 
+/** True when the final path component exists, including a dangling symlink. */
+function ymlPathPresent(ymlPath: string): boolean {
+	try {
+		fs.lstatSync(ymlPath);
+		return true;
+	} catch (error) {
+		if (isEnoent(error)) return false;
+		throw error;
+	}
+}
+
+/**
+ * Create a new regular file as mode 0600. O_EXCL plus O_NOFOLLOW refuses a
+ * symlink that appears after the lstat check, so a dangling link is not
+ * followed into a newly created target.
+ */
+function writeNewOwnerOnlyNoFollow(ymlPath: string, content: string): void {
+	const noFollow = process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0);
+	let fd: number;
+	try {
+		fd = fs.openSync(ymlPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
+	} catch (error) {
+		// The destination appeared, or the final component is a symlink.
+		if (isFsError(error) && (error.code === "EEXIST" || error.code === "ELOOP")) return;
+		throw error;
+	}
+	try {
+		if (process.platform !== "win32") fs.fchmodSync(fd, 0o600);
+		fs.writeFileSync(fd, content);
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
 function migrateJsonToYml(jsonPath: string, ymlPath: string) {
 	try {
-		if (fs.existsSync(ymlPath)) return;
+		if (ymlPathPresent(ymlPath)) return;
 		if (!fs.existsSync(jsonPath)) return;
 
 		const content = fs.readFileSync(jsonPath, "utf-8");
@@ -21,7 +55,7 @@ function migrateJsonToYml(jsonPath: string, ymlPath: string) {
 			logger.warn("migrateJsonToYml: invalid json structure", { path: jsonPath });
 			return;
 		}
-		fs.writeFileSync(ymlPath, YAML.stringify(parsed, null, 2));
+		writeNewOwnerOnlyNoFollow(ymlPath, YAML.stringify(parsed, null, 2));
 	} catch (error) {
 		logger.warn("migrateJsonToYml: migration failed", { error: String(error) });
 	}
