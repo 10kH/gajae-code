@@ -267,11 +267,17 @@ describe("AgentSession startup continuation lifecycle", () => {
 
 	it("emits one cancelled agent_end when startup continuation is aborted", async () => {
 		const pending = new AssistantMessageEventStream();
-		await createManagedSession(() => pending);
+		const streamStarted = Promise.withResolvers<void>();
+		await createManagedSession(() => {
+			streamStarted.resolve();
+			return pending;
+		});
 		const events: AgentSessionEvent[] = [];
 		session!.subscribe(event => events.push(event));
 		const continuation = session!.continuePersistedHistory();
-		for (let index = 0; index < 20 && session!.agent.activeRunId === undefined; index += 1) await Bun.sleep(1);
+		// Wait for the stream to actually start being consumed, not just for activeRunId to be set.
+		// This ensures the run is accepted before we abort.
+		await streamStarted.promise;
 
 		await session!.abort();
 		await continuation;
