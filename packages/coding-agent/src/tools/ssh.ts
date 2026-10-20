@@ -103,8 +103,13 @@ function quoteCmdPath(value: string): string {
 	return `"${escaped}"`;
 }
 
-const UNTRUSTED_FENCE_OVERHEAD = Buffer.byteLength("<untrusted-content>\n\n</untrusted-content>", "utf-8");
+const FENCE_OPEN = "<untrusted-content>\n";
+const FENCE_CLOSE = "\n</untrusted-content>";
+const UNTRUSTED_FENCE_OVERHEAD = Buffer.byteLength(`${FENCE_OPEN}${FENCE_CLOSE}`, "utf-8");
 const INLINE_MARKER_RESERVE = 256;
+/** `</untrusted-content>` grows when `wrapUntrustedContent` escapes it. */
+const CLOSER_RAW_BYTES = "</untrusted-content>".length;
+const CLOSER_ESCAPED_BYTES = "&lt;/untrusted-content&gt;".length;
 
 type OutputBudgetPath = "tools.maxInlineResultBytes" | "tools.artifactHeadBytes" | "tools.artifactTailLines";
 
@@ -122,10 +127,43 @@ type RemoteFrame = {
 	visibleBytes: number;
 };
 
+function inlineCapBytes(settings: Settings | undefined): number {
+	return settingNumber(settings, "tools.maxInlineResultBytes") * 1024;
+}
+
 function exceedsInlineCap(output: string, settings: Settings | undefined): boolean {
-	const cap = settingNumber(settings, "tools.maxInlineResultBytes") * 1024;
+	const cap = inlineCapBytes(settings);
 	if (cap <= 0) return false;
-	return Buffer.byteLength(output, "utf-8") + UNTRUSTED_FENCE_OVERHEAD > cap;
+	// Measure the escaped frame. A raw-size check misses closer expansion.
+	return Buffer.byteLength(wrapUntrustedContent(output), "utf-8") > cap;
+}
+
+/**
+ * The inline window is measured before escaping. Re-cut the escaped excerpt so
+ * the framed text still fits, and put the fence back around that cut.
+ */
+function fitEscapedFrame(excerpt: string, cap: number, tailLines: number, headBytes: number): string {
+	const wrapped = wrapUntrustedContent(excerpt);
+	if (cap <= 0 || Buffer.byteLength(wrapped, "utf-8") <= cap) return wrapped;
+	const inner =
+		wrapped.startsWith(FENCE_OPEN) && wrapped.endsWith(FENCE_CLOSE)
+			? wrapped.slice(FENCE_OPEN.length, wrapped.length - FENCE_CLOSE.length)
+			: excerpt;
+	const innerCap = Math.max(1, cap - UNTRUSTED_FENCE_OVERHEAD);
+	const scaledHead = Math.max(1, Math.floor((headBytes * CLOSER_RAW_BYTES) / CLOSER_ESCAPED_BYTES));
+	const cut =
+		headBytes > 0
+			? truncateMiddle(inner, {
+					maxBytes: innerCap,
+					maxLines: tailLines * 2,
+					maxHeadBytes: Math.min(scaledHead, Math.floor(innerCap / 2)),
+					maxHeadLines: tailLines,
+				})
+			: truncateTail(inner, { maxBytes: innerCap, maxLines: tailLines });
+	const fitted = `${FENCE_OPEN}${cut.content}${FENCE_CLOSE}`;
+	if (Buffer.byteLength(fitted, "utf-8") <= cap) return fitted;
+	const tail = truncateTail(cut.content, { maxBytes: innerCap, maxLines: tailLines });
+	return `${FENCE_OPEN}${tail.content}${FENCE_CLOSE}`;
 }
 
 function frameFullRemoteOutput(output: string): RemoteFrame {
@@ -138,27 +176,45 @@ function frameFullRemoteOutput(output: string): RemoteFrame {
  * or the only copy of the output.
  */
 function frameShrunkRemoteOutput(output: string, settings: Settings | undefined): RemoteFrame {
-	const cap = settingNumber(settings, "tools.maxInlineResultBytes") * 1024;
-	const budget = Math.max(1, cap - UNTRUSTED_FENCE_OVERHEAD - INLINE_MARKER_RESERVE);
+	const cap = inlineCapBytes(settings);
+	const escapedRoom = Math.max(1, cap - UNTRUSTED_FENCE_OVERHEAD - INLINE_MARKER_RESERVE);
+	// Reserve the closer-escape expansion up front, then fit again on the escaped text.
+	const budget = Math.max(1, Math.floor((escapedRoom * CLOSER_RAW_BYTES) / CLOSER_ESCAPED_BYTES));
 	const headBytes = settingNumber(settings, "tools.artifactHeadBytes") * 1024;
 	const tailLines = settingNumber(settings, "tools.artifactTailLines");
+	const headBudget = Math.max(
+		1,
+		Math.floor((Math.min(headBytes, escapedRoom / 2) * CLOSER_RAW_BYTES) / CLOSER_ESCAPED_BYTES),
+	);
 	const truncation =
 		headBytes > 0
 			? truncateMiddle(output, {
 					maxBytes: budget,
 					maxLines: tailLines * 2,
-					maxHeadBytes: Math.min(headBytes, Math.floor(budget / 2)),
+					maxHeadBytes: Math.min(headBudget, Math.floor(budget / 2)),
 					maxHeadLines: tailLines,
 				})
 			: truncateTail(output, { maxBytes: budget, maxLines: tailLines });
-	if (!truncation.truncated) return frameFullRemoteOutput(output);
+	const excerpt = truncation.truncated ? truncation.content : output;
+	const text = fitEscapedFrame(excerpt, cap, tailLines, headBytes);
+	if (text === wrapUntrustedContent(output)) return frameFullRemoteOutput(output);
+	const recorded = truncation.truncated
+		? truncation
+		: {
+				...truncation,
+				truncated: true,
+				truncatedBy: "bytes" as const,
+				content: excerpt,
+				outputLines: text.split("\n").length,
+				outputBytes: Buffer.byteLength(text, "utf-8"),
+			};
 	return {
-		text: wrapUntrustedContent(truncation.content),
-		truncation,
+		text,
+		truncation: recorded,
 		direction: headBytes > 0 ? "middle" : "tail",
 		shrunk: true,
-		visibleLines: truncation.outputLines ?? truncation.content.split("\n").length,
-		visibleBytes: truncation.outputBytes ?? Buffer.byteLength(truncation.content, "utf-8"),
+		visibleLines: text.split("\n").length,
+		visibleBytes: Buffer.byteLength(text, "utf-8"),
 	};
 }
 
@@ -271,13 +327,12 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 			if (!storedArtifactId) storedArtifactId = await storeFullRemoteOutput(this.session, remote);
 			framed = storedArtifactId ? frameShrunkRemoteOutput(remote, _ctx?.settings) : frameFullRemoteOutput(remote);
 		}
-		const modelText = framed
-			? framed.shrunk && storedArtifactId
-				? `${framed.text}\n\n${formatFullOutputReference(storedArtifactId)}`
-				: framed.text
-			: undefined;
+		// The artifact id stays in truncation metadata. A line after the closing
+		// fence makes the inline backstop drop the opening fence.
+		const modelText = framed?.text;
+		const storedNote = framed?.shrunk && storedArtifactId ? `\n\n${formatFullOutputReference(storedArtifactId)}` : "";
 		if (result.cancelled) {
-			throw new ToolError(modelText ?? "Command aborted");
+			throw new ToolError(modelText ? `${modelText}${storedNote}` : "Command aborted");
 		}
 
 		const outputText = modelText ?? "(no output)";
@@ -293,7 +348,7 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 		}
 
 		if (result.exitCode !== 0 && result.exitCode !== undefined) {
-			throw new ToolError(`${outputText}\n\nCommand exited with code ${result.exitCode}`);
+			throw new ToolError(`${outputText}${storedNote}\n\nCommand exited with code ${result.exitCode}`);
 		}
 
 		const built = resultBuilder.done();
