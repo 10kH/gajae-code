@@ -13,6 +13,7 @@ import {
 	getWorkflowMutationDecision,
 	readWorkflowGuardContext,
 } from "@gajae-code/coding-agent/skill-state/workflow-mutation-guard";
+import fc from "fast-check";
 
 const roots: string[] = [];
 const sessionId = "session-a";
@@ -137,17 +138,67 @@ describe("hardlink guard entry points", () => {
 		}
 		await assertWorkflowMutationRawPathsAllowed({ cwd, sessionId, rawPaths: [target] });
 	});
-	it("blocks a multiply linked autoresearch harness", async () => {
+	it("blocks a multiply linked autoresearch harness through the write tool", async () => {
 		const { cwd, product } = await fixture("autoresearch");
 		await fs.link(product, path.join(cwd, "autoresearch.sh"));
-		expect((await decision(cwd, "printf CHANGED > autoresearch.sh")).blocked).toBe(true);
+		const result = await getWorkflowMutationDecision({
+			cwd,
+			sessionId,
+			tool: tool("write"),
+			args: { path: "autoresearch.sh", content: "CHANGED" },
+		});
+		expect(result.blocked).toBe(true);
 		expect(await Bun.file(product).text()).toBe("ORIGINAL");
 	});
-	it("still allows new and single-link autoresearch harness writes", async () => {
+	it("still allows new and single-link autoresearch harness writes through file tools", async () => {
 		const { cwd } = await fixture("autoresearch");
-		expect((await decision(cwd, "printf CHANGED > autoresearch.sh")).blocked).toBe(false);
+		const created = await getWorkflowMutationDecision({
+			cwd,
+			sessionId,
+			tool: tool("write"),
+			args: { path: "autoresearch.sh", content: "CHANGED" },
+		});
+		expect(created.blocked).toBe(false);
 		await Bun.write(path.join(cwd, "autoresearch.sh"), "scratch");
-		expect((await decision(cwd, "printf CHANGED > autoresearch.sh")).blocked).toBe(false);
+		expect((await fs.stat(path.join(cwd, "autoresearch.sh"))).nlink).toBe(1);
+		const edited = await getWorkflowMutationDecision({
+			cwd,
+			sessionId,
+			tool: tool("edit"),
+			args: { path: "autoresearch.sh", edits: [] },
+		});
+		expect(edited.blocked).toBe(false);
+	});
+	it("still blocks bash writes to the autoresearch harness", async () => {
+		const { cwd } = await fixture("autoresearch");
+		expect((await decision(cwd, "printf CHANGED > autoresearch.sh")).blocked).toBe(true);
+		await Bun.write(path.join(cwd, "autoresearch.sh"), "scratch");
+		expect((await decision(cwd, "printf CHANGED > autoresearch.sh")).blocked).toBe(true);
+	});
+	it("still blocks a temp symlink that points at product code", async () => {
+		const { cwd, scratch, product } = await fixture();
+		const link = path.join(scratch, "symlink");
+		await fs.symlink(product, link);
+		expect((await bashWrite(cwd, link)).blocked).toBe(true);
+		expect(await Bun.file(product).text()).toBe("ORIGINAL");
+	});
+	it("property: scratch link count decides the planning bash write", async () => {
+		const { cwd, scratch, product } = await fixture();
+		const names = fc.stringMatching(/^[a-z0-9]{1,12}$/);
+		const kinds = fc.constantFrom("missing" as const, "single" as const, "hardlink" as const);
+		await fc.assert(
+			fc.asyncProperty(names, kinds, async (name, kind) => {
+				const target = path.join(scratch, name);
+				await fs.rm(target, { force: true });
+				if (kind === "single") await Bun.write(target, "scratch");
+				if (kind === "hardlink") await fs.link(product, target);
+				const result = await decision(cwd, `printf CHANGED > '${target}'`);
+				expect(result.blocked).toBe(kind === "hardlink");
+				if (kind === "hardlink") expect(await Bun.file(product).text()).toBe("ORIGINAL");
+				await fs.rm(target, { force: true });
+			}),
+			{ seed: 296202610, numRuns: 64 },
+		);
 	});
 	it("fails closed on filesystem errors while retaining ENOENT new-file writes", async () => {
 		const { cwd, scratch } = await fixture();
