@@ -1,9 +1,13 @@
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { renameNoReplacePath } from "@gajae-code/natives";
 import { getAgentDir, isEnoent, isFsError, logger } from "@gajae-code/utils";
 import { JSONC, YAML } from "bun";
 import type { ZodType } from "zod/v4";
+
+// Volumes without hard links fail `link`. Windows maps FAT ERROR_INVALID_FUNCTION to EISDIR.
+const HARD_LINK_UNAVAILABLE = new Set(["EACCES", "EISDIR", "ENOSYS", "ENOTSUP", "EOPNOTSUPP", "EPERM", "EXDEV"]);
 
 /** Minimal subset of the AJV ConfigSchemaError shape this module actually relies on. */
 interface ConfigSchemaError {
@@ -22,14 +26,47 @@ function ymlPathPresent(ymlPath: string): boolean {
 	}
 }
 
+function hardLinkUnavailable(error: unknown): boolean {
+	return isFsError(error) && HARD_LINK_UNAVAILABLE.has(error.code);
+}
+
+function stagedRegularFile(tmpPath: string): boolean {
+	try {
+		return fs.lstatSync(tmpPath).isFile();
+	} catch {
+		return false;
+	}
+}
+
+function discardStaged(tmpPath: string): void {
+	try {
+		fs.unlinkSync(tmpPath);
+	} catch {
+		// Unpublished, or the no-replace rename already moved this name.
+	}
+}
+
+/** Publish the completed private file when `link` is not supported. Never replaces `ymlPath`. */
+function publishStagedWithoutHardLink(tmpPath: string, ymlPath: string): void {
+	const published = renameNoReplacePath(tmpPath, ymlPath);
+	if (!published.ok && published.reason !== "destination_exists") {
+		discardStaged(tmpPath);
+		throw new Error(`config migration could not publish without a hard link (${published.reason})`);
+	}
+	discardStaged(tmpPath);
+}
+
 /**
  * Publish a new regular file as mode 0600. The bytes go to a private inode
- * opened with O_EXCL and O_NOFOLLOW, then `link` attaches that inode to
- * `ymlPath`. `link` fails when the name exists, so a final-component symlink
- * is not followed and an existing file is not replaced. The destination name
- * stays absent until the write has finished.
+ * opened with O_EXCL and O_NOFOLLOW. `link` then attaches that inode to
+ * `ymlPath` and fails when the name exists, so a final-component symlink is
+ * not followed and an existing file is not replaced. A volume without hard
+ * links publishes that same completed file with a no-replace rename. The
+ * destination name stays absent until the bytes are complete.
  */
 function writeNewOwnerOnlyNoFollow(ymlPath: string, content: string): void {
+	// Ancestor symlinks only. The final component stays unresolved so no-follow still applies.
+	ymlPath = path.join(fs.realpathSync(path.dirname(ymlPath)), path.basename(ymlPath));
 	const noFollow = process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0);
 	const tmpPath = path.join(
 		path.dirname(ymlPath),
@@ -61,20 +98,19 @@ function writeNewOwnerOnlyNoFollow(ymlPath: string, content: string): void {
 	try {
 		fs.linkSync(tmpPath, ymlPath);
 	} catch (error) {
-		try {
-			fs.unlinkSync(tmpPath);
-		} catch {
-			// The destination name was not replaced.
-		}
 		// The name is already present: a finished peer publish, or a file or symlink we must not replace.
-		if (isFsError(error) && (error.code === "EEXIST" || error.code === "ELOOP")) return;
+		if (isFsError(error) && (error.code === "EEXIST" || error.code === "ELOOP")) {
+			discardStaged(tmpPath);
+			return;
+		}
+		if (hardLinkUnavailable(error) && stagedRegularFile(tmpPath)) {
+			publishStagedWithoutHardLink(tmpPath, ymlPath);
+			return;
+		}
+		discardStaged(tmpPath);
 		throw error;
 	}
-	try {
-		fs.unlinkSync(tmpPath);
-	} catch {
-		// The destination name already refers to the completed inode.
-	}
+	discardStaged(tmpPath);
 }
 
 function migrateJsonToYml(jsonPath: string, ymlPath: string) {
