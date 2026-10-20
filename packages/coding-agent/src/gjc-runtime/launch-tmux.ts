@@ -71,6 +71,7 @@ import {
 } from "./tmux-owner-isolation";
 import { assertGjcTmuxStagedMutationAuthoritySync } from "./tmux-provider-context";
 import {
+	childGjcSessionIdAssignment,
 	findGjcTmuxSessionByName,
 	findGjcTmuxSessionByScope,
 	type GjcTmuxSessionStatus,
@@ -1158,6 +1159,7 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 			execPath: context.execPath ?? process.execPath,
 			extraEnv: {
 				...childSigningEnv,
+				...childGjcSessionIdAssignment(env, identityEnv, cwd, gjcSessionId),
 				[GJC_COORDINATOR_SESSION_ID_ENV]: sessionId,
 				[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: sessionStateFile,
 				// Carry the GJC-managed session name into the child so tmux-backed
@@ -1214,6 +1216,9 @@ function trustedReplacementAuthority(
 function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchContext): void {
 	if (plan.ownerGeneration) return;
 	const sessionId = plan.sessionId ?? plan.sessionName;
+	const launchEnv = context.env ?? process.env;
+	const identityEnv = tmuxLaunchIdentityEnv(launchEnv, plan.cwd);
+	const gjcSessionId = identityEnv.GJC_SESSION_ID?.trim() || sessionId;
 	const stateDir = path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime"));
 	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
 	const replacement = trustedReplacementAuthority(stateDir, sessionId, baseline);
@@ -1238,6 +1243,7 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 							[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]: plan.coordinatorSidecarBootstrap.keyId,
 						}
 					: {}),
+				...childGjcSessionIdAssignment(launchEnv, identityEnv, plan.cwd, gjcSessionId),
 				[GJC_COORDINATOR_SESSION_ID_ENV]: sessionId,
 				[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: plan.sessionStateFile ?? "",
 				// The tmux server inherits the bootstrap secret as child environment;

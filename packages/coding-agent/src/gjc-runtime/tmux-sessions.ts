@@ -5,7 +5,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Process } from "@gajae-code/natives";
 import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
-import { type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
+import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { managedSecurityFailureClassification } from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTime, readLinuxProcStartTimeSync } from "./linux-proc";
@@ -287,6 +287,42 @@ export function trustedTmuxLaunchIdentityEnv(
 
 export function tmuxLaunchIdentityEnv(env: NodeJS.ProcessEnv, cwd: string): NodeJS.ProcessEnv {
 	return trustedTmuxLaunchIdentityEnv(env, [projectEnvSnapshot(cwd), startupProjectEnvSnapshot()]);
+}
+
+/**
+ * Session id the launched child must see. A trusted pin is passed through.
+ * A rejected project pin is replaced by the same fallback the launch plan uses
+ * for the session root, which also stops Bun from reloading that dotenv value
+ * (`GJC_TMUX_LAUNCHED=1` skips the planner filter). An omitted id stays omitted.
+ */
+export function resolvedChildGjcSessionId(input: {
+	trusted: string | undefined;
+	inherited: string | undefined;
+	projectDeclared: boolean;
+	fallback: string;
+}): string | undefined {
+	const trusted = input.trusted?.trim();
+	if (trusted) return trusted;
+	if (!input.inherited?.trim() && !input.projectDeclared) return undefined;
+	const fallback = input.fallback.trim();
+	return fallback.length > 0 ? fallback : undefined;
+}
+
+export function childGjcSessionIdAssignment(
+	env: NodeJS.ProcessEnv,
+	identityEnv: NodeJS.ProcessEnv,
+	cwd: string,
+	fallbackSessionId: string,
+): Record<string, string> {
+	const snapshot = projectEnvSnapshot(cwd);
+	const key = canonicalEnvKey("GJC_SESSION_ID");
+	const value = resolvedChildGjcSessionId({
+		trusted: identityEnv.GJC_SESSION_ID,
+		inherited: env.GJC_SESSION_ID,
+		projectDeclared: snapshot.values[key] !== undefined || snapshot.dynamic.has(key),
+		fallback: fallbackSessionId,
+	});
+	return value === undefined ? {} : { GJC_SESSION_ID: value };
 }
 
 function psmuxAuthorityFromEnv(env: NodeJS.ProcessEnv): ProviderAuthority | null {
@@ -719,13 +755,10 @@ export function createGjcTmuxSession(
 	const launchEnvironment = launch ? { ...identityEnv, GJC_TMUX_SESSION: launch.childSessionId } : identityEnv;
 	const sessionName = buildGjcTmuxSessionName(launchEnvironment);
 	const sessionId = launch?.childSessionId ?? (identityEnv[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || sessionName);
+	const filteredGjcSessionId = identityEnv.GJC_SESSION_ID?.trim() || sessionId;
 	const stateFile =
 		(!launch ? identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() : undefined) ||
-		tmuxRuntimeSessionPath(
-			cwd,
-			launch?.childSessionId ?? (identityEnv.GJC_SESSION_ID?.trim() || sessionId),
-			buildGjcTmuxSessionSlug(sessionName),
-		);
+		tmuxRuntimeSessionPath(cwd, launch?.childSessionId ?? filteredGjcSessionId, buildGjcTmuxSessionSlug(sessionName));
 	const stateDir = (platform === "win32" ? path.win32 : path).dirname(stateFile);
 	const generation = crypto.randomUUID();
 	const authority = bindGjcTmuxProviderAuthority(provider, { stateDir, sessionId, generation });
@@ -736,6 +769,7 @@ export function createGjcTmuxSession(
 		[GJC_TMUX_OWNER_SERVER_KEY_ENV]: tmuxCommand,
 		[GJC_COORDINATOR_SESSION_ID_ENV]: sessionId,
 		[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: stateFile,
+		...childGjcSessionIdAssignment(env, identityEnv, cwd, filteredGjcSessionId),
 		...(launch
 			? {
 					[MANAGED_OWNER_RUN_ID_ENV]: crypto.randomUUID(),

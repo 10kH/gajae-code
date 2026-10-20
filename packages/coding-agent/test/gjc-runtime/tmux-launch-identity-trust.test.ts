@@ -68,6 +68,10 @@ function newSessionArgs(calls: string[][]): string[] {
 	return found;
 }
 
+function childSessionAssignment(inner: string): string | undefined {
+	return inner.match(/GJC_SESSION_ID='([^']*)'/)?.[1];
+}
+
 function launchPins(cwd: string, env: NodeJS.ProcessEnv): { sessionName: string; inner: string } {
 	const calls: string[][] = [];
 	const handled = launchDefaultTmuxIfNeeded({
@@ -146,6 +150,22 @@ describe("tmux launch identity provenance", () => {
 			expect(launched.inner).not.toContain(PLANTED_GJC_SESSION);
 			expect(launched.inner).not.toContain(PLANTED_COORDINATOR);
 			expect(launched.inner).not.toContain(path.join(path.dirname(victimState), "tmux-exit.json"));
+			expect(childSessionAssignment(launched.inner)).toBe(launched.sessionName);
+		});
+	});
+
+	it("masks a project dotenv session id the parent environment does not carry", async () => {
+		await withRepo(`GJC_SESSION_ID=${PLANTED_GJC_SESSION}\n`, async cwd => {
+			const launched = launchPins(cwd, {});
+			expect(launched.inner).not.toContain(PLANTED_GJC_SESSION);
+			expect(childSessionAssignment(launched.inner)).toBe(launched.sessionName);
+		});
+	});
+
+	it("leaves the child session id unset when the operator and the project omit it", async () => {
+		await withRepo(undefined, async cwd => {
+			const launched = launchPins(cwd, {});
+			expect(launched.inner).not.toContain("GJC_SESSION_ID=");
 		});
 	});
 
@@ -162,6 +182,22 @@ describe("tmux launch identity provenance", () => {
 			expect(launched.inner).toContain(OPERATOR_COORDINATOR);
 			expect(launched.inner).toContain(stateFile);
 			expect(launched.inner).toContain(path.join(cwd, "tmux-exit.json"));
+		});
+	});
+
+	it("still uses an operator GJC session id the project does not declare for the session root", async () => {
+		await withRepo(undefined, async cwd => {
+			const launched = launchPins(cwd, { GJC_SESSION_ID: OPERATOR_GJC_SESSION });
+			expect(launched.inner).toContain(`_session-${OPERATOR_GJC_SESSION}`);
+			expect(launched.inner).not.toContain(PLANTED_GJC_SESSION);
+		});
+	});
+
+	it("passes a trusted operator session id into the launched child", async () => {
+		await withRepo(undefined, async cwd => {
+			const launched = launchPins(cwd, { GJC_SESSION_ID: OPERATOR_GJC_SESSION });
+			expect(childSessionAssignment(launched.inner)).toBe(OPERATOR_GJC_SESSION);
+			expect(launched.inner).not.toContain(PLANTED_GJC_SESSION);
 		});
 	});
 
@@ -364,8 +400,76 @@ describe("tmux launch identity provenance", () => {
 		}
 		expect(planned).toBeDefined();
 		const nameIndex = planned?.indexOf("-s") ?? -1;
-		expect(planned?.[nameIndex + 1]).not.toBe(PLANTED_SESSION);
+		const sessionName = planned?.[nameIndex + 1];
+		expect(sessionName).not.toBe(PLANTED_SESSION);
 		expect(planned?.at(-1) ?? "").not.toContain(victimState);
 		expect(planned?.at(-1) ?? "").not.toContain(PLANTED_GJC_SESSION);
+		expect(childSessionAssignment(planned?.at(-1) ?? "")).toBe(sessionName);
+	});
+
+	it("session create still passes an operator session id the project does not declare", async () => {
+		const root = await mkdtemp(path.join(tmpdir(), "tmux-create-operator-"));
+		const cwd = path.join(root, "repo");
+		await mkdir(cwd, { recursive: true });
+		const previous = process.cwd();
+		let planned: string[] | undefined;
+		__setCreateOwnerIsolationForTests({
+			execute: plan => {
+				if (!plan.ok) throw new Error(`plan failed: ${plan.diagnostic}`);
+				planned = plan.execution.argv;
+				return { ok: false, code: "scope_bootstrap_failed", diagnostic: "test-stop" };
+			},
+		});
+		try {
+			process.chdir(cwd);
+			expect(() =>
+				createGjcTmuxSession(
+					{
+						GJC_PSMUX_DETECTION: "off",
+						GJC_TMUX_COMMAND: "tmux",
+						GJC_SESSION_ID: OPERATOR_GJC_SESSION,
+					},
+					{ platform: "darwin" },
+				),
+			).toThrow("test-stop");
+		} finally {
+			process.chdir(previous);
+			__setCreateOwnerIsolationForTests(null);
+			await rm(root, { recursive: true, force: true });
+		}
+		expect(planned?.at(-1) ?? "").toContain(`_session-${OPERATOR_GJC_SESSION}`);
+	});
+});
+
+describe("resolved child session id", () => {
+	it("property: filtered child id agrees with the launch fallback, seed 493, 64 inputs", async () => {
+		const mod = await import("@gajae-code/coding-agent/gjc-runtime/tmux-sessions");
+		const resolved = mod.resolvedChildGjcSessionId;
+		if (typeof resolved !== "function") throw new Error("resolvedChildGjcSessionId is required");
+		let seed = 493;
+		const next = (): number => {
+			seed = (seed + 0x6d2b79f5) | 0;
+			let value = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+			value = (value + Math.imul(value ^ (value >>> 7), 61 | value)) ^ value;
+			return (value ^ (value >>> 14)) >>> 0;
+		};
+		const alphabet = ["", " ", "operator-session-493", " victim-session-493 ", "generated-493"];
+		for (let index = 0; index < 64; index += 1) {
+			const trusted = alphabet[next() % alphabet.length];
+			const inherited = alphabet[next() % alphabet.length];
+			const fallback = alphabet[next() % alphabet.length] ?? "";
+			const projectDeclared = next() % 2 === 0;
+			const result = resolved({ trusted, inherited, projectDeclared, fallback });
+			const trustedTrim = trusted?.trim() ?? "";
+			if (trustedTrim) {
+				expect(result).toBe(trustedTrim);
+				continue;
+			}
+			if (!inherited?.trim() && !projectDeclared) {
+				expect(result).toBeUndefined();
+				continue;
+			}
+			expect(result).toBe(fallback.trim() || undefined);
+		}
 	});
 });
