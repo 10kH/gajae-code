@@ -8,7 +8,7 @@ import { createReadonlySessionManager, SessionManager } from "../../src/session/
 import * as connectionManager from "../../src/ssh/connection-manager";
 import type { SSHResult } from "../../src/ssh/ssh-executor";
 import * as sshExecutor from "../../src/ssh/ssh-executor";
-import { stripOutputNotice, wrapToolWithMetaNotice } from "../../src/tools/output-meta";
+import { formatTruncationMetaNotice, stripOutputNotice, wrapToolWithMetaNotice } from "../../src/tools/output-meta";
 import { SshTool } from "../../src/tools/ssh";
 import { ToolError } from "../../src/tools/tool-errors";
 
@@ -371,6 +371,43 @@ describe("ssh remote output trust boundary", () => {
 		expect(fenced.startsWith("<untrusted-content>\n")).toBe(true);
 		expect(fenced.endsWith(`\n${CLOSE}`)).toBe(true);
 		expect(excerpt).not.toContain("artifact://");
+	});
+
+	it("ssh execute keeps artifact incompleteness in the framed truncation notice", async () => {
+		const remote = overlongRemote("HEADMARKER", "TAILMARKER");
+		ensureHostInfoImpl = async () => linuxHostInfo();
+		executeSSHImpl = async () => ({
+			...sshResult(remote, 0),
+			truncated: true,
+			artifactId: "ssh-capped",
+			artifactTruncatedBytes: 4096,
+			artifactFailureDiagnostic: "write: storage unavailable",
+		});
+
+		const result = await settle(tool().execute("ssh-capped", { host: "box", command: "cat", timeout: 1 }));
+		const truncation = result.details?.meta?.truncation;
+		expect(truncation?.artifactId).toBe("ssh-capped");
+		expect(truncation?.artifactTruncatedBytes).toBe(4096);
+		expect(truncation?.artifactFailureDiagnostic).toBe("write: storage unavailable");
+		const notice = formatTruncationMetaNotice(truncation!);
+		expect(notice).toContain("omitted by the artifact storage cap");
+		expect(notice).toContain("Artifact storage failed: write: storage unavailable");
+	});
+
+	it("ssh execute reports tail fallback counts in remote-output units", async () => {
+		const remote = `${"x".repeat(20 * 1024)}${CLOSE}`;
+		ensureHostInfoImpl = async () => linuxHostInfo();
+		executeSSHImpl = async () => ({ ...sshResult(remote, 0), artifactId: "ssh-long-line" });
+		const context = { settings: Settings.isolated({ "tools.artifactHeadBytes": 1 }) } as AgentToolContext;
+		const result = await settle(
+			tool().execute("ssh-long-line", { host: "box", command: "cat", timeout: 1 }, undefined, undefined, context),
+		);
+		const truncation = result.details?.meta?.truncation;
+		expect(truncation?.direction).toBe("tail");
+		expect(truncation?.totalLines).toBe(1);
+		expect(truncation?.outputLines).toBe(1);
+		expect(truncation?.outputBytes).toBeLessThan(truncation?.totalBytes ?? 0);
+		expect(truncation?.outputBytes).toBeLessThan(Buffer.byteLength(textOf(result), "utf-8"));
 	});
 
 	function hostileInlineOutput(token: string): string {

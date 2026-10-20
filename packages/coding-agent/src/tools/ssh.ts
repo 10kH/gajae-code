@@ -16,6 +16,7 @@ import {
 	TailBuffer,
 	type TruncationResult,
 	truncateMiddle,
+	truncateMiddleWindows,
 	truncateTail,
 } from "../session/streaming-output";
 import type { SSHHostInfo } from "../ssh/connection-manager";
@@ -26,7 +27,7 @@ import { CachedOutputBlock } from "../tui/output-block";
 import type { ToolSession } from ".";
 import { wrapUntrustedContent } from "./fetch";
 import {
-	formatFullOutputReference,
+	formatArtifactReference,
 	formatStyledTruncationWarning,
 	type OutputMeta,
 	stripOutputNotice,
@@ -120,7 +121,7 @@ function settingNumber(settings: Settings | undefined, path: OutputBudgetPath): 
 type RemoteFrame = {
 	text: string;
 	truncation?: TruncationResult;
-	direction?: "tail" | "middle";
+	direction?: "head" | "tail" | "middle";
 	/** True only after the full remote text is already stored. */
 	shrunk: boolean;
 	visibleLines: number;
@@ -138,34 +139,6 @@ function exceedsInlineCap(output: string, settings: Settings | undefined): boole
 	return Buffer.byteLength(wrapUntrustedContent(output), "utf-8") > cap;
 }
 
-/**
- * The inline window is measured before escaping. Re-cut the escaped excerpt so
- * the framed text still fits, and put the fence back around that cut.
- */
-function fitEscapedFrame(excerpt: string, cap: number, tailLines: number, headBytes: number): string {
-	const wrapped = wrapUntrustedContent(excerpt);
-	if (cap <= 0 || Buffer.byteLength(wrapped, "utf-8") <= cap) return wrapped;
-	const inner =
-		wrapped.startsWith(FENCE_OPEN) && wrapped.endsWith(FENCE_CLOSE)
-			? wrapped.slice(FENCE_OPEN.length, wrapped.length - FENCE_CLOSE.length)
-			: excerpt;
-	const innerCap = Math.max(1, cap - UNTRUSTED_FENCE_OVERHEAD);
-	const scaledHead = Math.max(1, Math.floor((headBytes * CLOSER_RAW_BYTES) / CLOSER_ESCAPED_BYTES));
-	const cut =
-		headBytes > 0
-			? truncateMiddle(inner, {
-					maxBytes: innerCap,
-					maxLines: tailLines * 2,
-					maxHeadBytes: Math.min(scaledHead, Math.floor(innerCap / 2)),
-					maxHeadLines: tailLines,
-				})
-			: truncateTail(inner, { maxBytes: innerCap, maxLines: tailLines });
-	const fitted = `${FENCE_OPEN}${cut.content}${FENCE_CLOSE}`;
-	if (Buffer.byteLength(fitted, "utf-8") <= cap) return fitted;
-	const tail = truncateTail(cut.content, { maxBytes: innerCap, maxLines: tailLines });
-	return `${FENCE_OPEN}${tail.content}${FENCE_CLOSE}`;
-}
-
 function frameFullRemoteOutput(output: string): RemoteFrame {
 	return { text: wrapUntrustedContent(output), shrunk: false, visibleLines: 0, visibleBytes: 0 };
 }
@@ -178,43 +151,56 @@ function frameFullRemoteOutput(output: string): RemoteFrame {
 function frameShrunkRemoteOutput(output: string, settings: Settings | undefined): RemoteFrame {
 	const cap = inlineCapBytes(settings);
 	const escapedRoom = Math.max(1, cap - UNTRUSTED_FENCE_OVERHEAD - INLINE_MARKER_RESERVE);
-	// Reserve the closer-escape expansion up front, then fit again on the escaped text.
-	const budget = Math.max(1, Math.floor((escapedRoom * CLOSER_RAW_BYTES) / CLOSER_ESCAPED_BYTES));
+	// Budget in remote-output bytes so framing and closer escaping cannot distort
+	// the source coordinates reported by truncation metadata.
+	let budget = Math.max(1, Math.floor((escapedRoom * CLOSER_RAW_BYTES) / CLOSER_ESCAPED_BYTES));
 	const headBytes = settingNumber(settings, "tools.artifactHeadBytes") * 1024;
 	const tailLines = settingNumber(settings, "tools.artifactTailLines");
 	const headBudget = Math.max(
 		1,
 		Math.floor((Math.min(headBytes, escapedRoom / 2) * CLOSER_RAW_BYTES) / CLOSER_ESCAPED_BYTES),
 	);
-	const truncation =
-		headBytes > 0
-			? truncateMiddle(output, {
-					maxBytes: budget,
-					maxLines: tailLines * 2,
-					maxHeadBytes: Math.min(headBudget, Math.floor(budget / 2)),
-					maxHeadLines: tailLines,
-				})
-			: truncateTail(output, { maxBytes: budget, maxLines: tailLines });
-	const excerpt = truncation.truncated ? truncation.content : output;
-	const text = fitEscapedFrame(excerpt, cap, tailLines, headBytes);
-	if (text === wrapUntrustedContent(output)) return frameFullRemoteOutput(output);
-	const recorded = truncation.truncated
-		? truncation
-		: {
-				...truncation,
-				truncated: true,
-				truncatedBy: "bytes" as const,
-				content: excerpt,
-				outputLines: text.split("\n").length,
-				outputBytes: Buffer.byteLength(text, "utf-8"),
+	const cutRemoteOutput = (maxBytes: number) => {
+		if (headBytes > 0) {
+			const options = {
+				maxBytes,
+				maxLines: tailLines * 2,
+				maxHeadBytes: Math.min(headBudget, Math.floor(maxBytes / 2)),
+				maxHeadLines: tailLines,
 			};
+			return {
+				truncation: truncateMiddle(output, options),
+				windows: truncateMiddleWindows(output, options),
+			};
+		}
+		const options = { maxBytes, maxLines: tailLines };
+		return {
+			truncation: truncateTail(output, options),
+			windows: truncateMiddleWindows(output, { ...options, maxHeadBytes: 0, maxHeadLines: 0 }),
+		};
+	};
+	let { truncation, windows } = cutRemoteOutput(budget);
+	let excerpt = truncation.truncated ? truncation.content : output;
+	let text = wrapUntrustedContent(excerpt);
+	let textBytes = Buffer.byteLength(text, "utf-8");
+	while (textBytes > cap && budget > 1) {
+		const scaledBudget = Math.floor((budget * cap) / textBytes);
+		budget = Math.max(1, Math.min(budget - 1, scaledBudget));
+		({ truncation, windows } = cutRemoteOutput(budget));
+		excerpt = truncation.truncated ? truncation.content : output;
+		text = wrapUntrustedContent(excerpt);
+		textBytes = Buffer.byteLength(text, "utf-8");
+	}
+	if (text === wrapUntrustedContent(output)) return frameFullRemoteOutput(output);
+	if (windows.kind === "full") return frameFullRemoteOutput(output);
+	const direction = windows.kind === "middle" ? "middle" : windows.kind === "head-only" ? "head" : "tail";
 	return {
 		text,
-		truncation: recorded,
-		direction: headBytes > 0 ? "middle" : "tail",
+		truncation,
+		direction,
 		shrunk: true,
-		visibleLines: text.split("\n").length,
-		visibleBytes: Buffer.byteLength(text, "utf-8"),
+		visibleLines: (windows.head?.lines ?? 0) + (windows.tail?.lines ?? 0),
+		visibleBytes: (windows.head?.bytes ?? 0) + (windows.tail?.bytes ?? 0),
 	};
 }
 
@@ -330,7 +316,10 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 		// The artifact id stays in truncation metadata. A line after the closing
 		// fence makes the inline backstop drop the opening fence.
 		const modelText = framed?.text;
-		const storedNote = framed?.shrunk && storedArtifactId ? `\n\n${formatFullOutputReference(storedArtifactId)}` : "";
+		const storedNote =
+			framed?.shrunk && storedArtifactId
+				? `\n\n${formatArtifactReference(storedArtifactId, result.artifactTruncatedBytes)}`
+				: "";
 		if (result.cancelled) {
 			throw new ToolError(modelText ? `${modelText}${storedNote}` : "Command aborted");
 		}
@@ -361,6 +350,8 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 			truncation.outputLines = framed.visibleLines;
 			truncation.outputBytes = framed.visibleBytes;
 			truncation.artifactId = storedArtifactId;
+			truncation.artifactTruncatedBytes = result.artifactTruncatedBytes;
+			truncation.artifactFailureDiagnostic = result.artifactFailureDiagnostic;
 			delete truncation.shownRange;
 			delete truncation.headRange;
 			delete truncation.tailRange;
