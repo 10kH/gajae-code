@@ -259,8 +259,8 @@ async function chmodRealDiagnosticsDirectory(dir: string): Promise<void> {
 	if (stat.isSymbolicLink() || !stat.isDirectory()) {
 		throw new Error("crash diagnostics path is not a private directory");
 	}
-	// A read-only open cannot chmod a directory the owner cannot read (0300 or 0000).
-	// lchmod and O_PATH change that directory without following a symlink and without read permission.
+	// macOS lchmod sets the mode without read permission and without following a symlink.
+	// Linux has no equivalent here, so an unreadable directory is left unchanged. A path chmod would follow a swapped symlink.
 	if (process.platform === "darwin" && typeof fs.lchmod === "function") {
 		await fs.lchmod(dir, DIRECTORY_MODE);
 		return;

@@ -12,6 +12,10 @@ import fc from "fast-check";
 
 const tempDirs: string[] = [];
 
+function isPrivilegedUser(): boolean {
+	return typeof process.getuid === "function" && process.getuid() === 0;
+}
+
 async function makeTempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-crash-diagnostics-test-"));
 	tempDirs.push(dir);
@@ -209,30 +213,59 @@ describe("crash diagnostics", () => {
 		},
 	);
 
-	it.skipIf(process.platform === "win32")("still allows an owner directory without read permission", async () => {
-		const root = await makeTempDir();
-		for (const [index, mode] of [0o300, 0o000].entries()) {
-			const dir = path.join(root, `locked-${mode.toString(8)}`);
-			await fs.mkdir(dir, { mode: 0o700 });
-			await fs.chmod(dir, mode);
-			try {
-				const crashed = await writeCrashReport(
-					{ kind: "python", exitCode: 1, stderr: "secret-token" },
-					{
-						env: { GJC_CRASH_DIAGNOSTICS: "1", GJC_CRASH_DIAGNOSTICS_DIR: dir } as NodeJS.ProcessEnv,
-						cwd: root,
-						now: new Date(`2026-06-04T00:05:0${index}.000Z`),
-					},
-				);
-				expect(crashed.path).not.toBeNull();
-				expect((await fs.lstat(dir)).mode & 0o777).toBe(0o700);
-				expect(path.dirname(crashed.path as string)).toBe(dir);
-				expect((await fs.readdir(dir)).includes(path.basename(crashed.path as string))).toBe(true);
-			} finally {
-				await fs.chmod(dir, 0o700);
+	it.skipIf(process.platform !== "darwin" || isPrivilegedUser())(
+		"still allows an owner directory without read permission",
+		async () => {
+			const root = await makeTempDir();
+			for (const [index, mode] of [0o300, 0o000].entries()) {
+				const dir = path.join(root, `locked-${mode.toString(8)}`);
+				await fs.mkdir(dir, { mode: 0o700 });
+				await fs.chmod(dir, mode);
+				try {
+					const crashed = await writeCrashReport(
+						{ kind: "python", exitCode: 1, stderr: "secret-token" },
+						{
+							env: { GJC_CRASH_DIAGNOSTICS: "1", GJC_CRASH_DIAGNOSTICS_DIR: dir } as NodeJS.ProcessEnv,
+							cwd: root,
+							now: new Date(`2026-06-04T00:05:0${index}.000Z`),
+						},
+					);
+					expect(crashed.path).not.toBeNull();
+					expect((await fs.lstat(dir)).mode & 0o777).toBe(0o700);
+					expect(path.dirname(crashed.path as string)).toBe(dir);
+					expect((await fs.readdir(dir)).includes(path.basename(crashed.path as string))).toBe(true);
+				} finally {
+					await fs.chmod(dir, 0o700);
+				}
 			}
-		}
-	});
+		},
+	);
+
+	it.skipIf(process.platform !== "linux" || isPrivilegedUser())(
+		"refuses an owner directory without read permission on linux",
+		async () => {
+			const root = await makeTempDir();
+			for (const [index, mode] of [0o300, 0o000].entries()) {
+				const dir = path.join(root, `locked-${mode.toString(8)}`);
+				await fs.mkdir(dir, { mode: 0o700 });
+				await fs.chmod(dir, mode);
+				try {
+					const crashed = await writeCrashReport(
+						{ kind: "python", exitCode: 1, stderr: "secret-token" },
+						{
+							env: { GJC_CRASH_DIAGNOSTICS: "1", GJC_CRASH_DIAGNOSTICS_DIR: dir } as NodeJS.ProcessEnv,
+							cwd: root,
+							now: new Date(`2026-06-04T00:06:0${index}.000Z`),
+						},
+					);
+					expect(crashed.path).toBeNull();
+					expect((await fs.lstat(dir)).mode & 0o777).toBe(mode);
+				} finally {
+					await fs.chmod(dir, 0o700);
+				}
+			}
+		},
+	);
 
 	it.skipIf(process.platform === "win32")(
 		"still allows a directory whose name looks like a drive letter",
