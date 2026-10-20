@@ -21,9 +21,10 @@ import { classifyProviderHttpError, withHardTimeout } from "./utils";
 
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const CODEX_RESPONSES_PATH = "/codex/responses";
-const FALLBACK_MODEL = "gpt-5.5";
+const FALLBACK_MODEL = "gpt-6.1-sol";
 const DEFAULT_MODEL_PREFERENCES = [
-	"gpt-5.5",
+	"gpt-6.1-sol",
+	"gpt-6-luna",
 	"gpt-5.4",
 	"gpt-5-codex",
 	"gpt-5",
@@ -50,12 +51,8 @@ function getDefaultModelCandidates(): string[] {
 		return candidates;
 	}
 
-	const nonMini = bundledModels.find(model => !model.id.includes("mini") && !model.id.includes("spark"));
-	if (nonMini) {
-		return [nonMini.id];
-	}
-
-	return bundledModels[0]?.id ? [bundledModels[0].id] : [FALLBACK_MODEL];
+	// A catalog entry alone does not establish hosted web_search compatibility.
+	return [FALLBACK_MODEL];
 }
 
 function shouldRetryWithNextDefaultModel(error: unknown): boolean {
@@ -337,10 +334,11 @@ async function callCodexSearch(
  * Executes a web search using OpenAI code provider's built-in web search tool.
  *
  * Default-model behavior:
- * - If `PI_CODEX_WEB_SEARCH_MODEL` is set, use it exactly once and surface any
- *   upstream error verbatim.
- * - Otherwise prefer ChatGPT-account-safe bundled defaults (GPT-5.5, GPT-5.4,
- *   GPT-5 code backend, …) and retry the next candidate only when OpenAI code backend returns the
+ * - Use `GJC_OPENAI_CODE_WEB_SEARCH_MODEL` (then `PI_CODEX_WEB_SEARCH_MODEL`)
+ *   exactly once when configured and surface upstream errors without model retries.
+ * - Otherwise prefer bundled GPT-6.1 Sol, then GPT-6 Luna, before older defaults.
+ *   Both publish web_search_tool_type in OpenAI Codex's models-manager/models.json.
+ *   Retry the next candidate only when OpenAI code backend returns the
  *   known 400 "model is not supported" family. This avoids selecting
  *   `gpt-5-codex-mini` first on ChatGPT accounts, which OpenAI rejects.
  */
