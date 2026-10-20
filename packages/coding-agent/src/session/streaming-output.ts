@@ -1,4 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { AgentToolUpdateCallback } from "@gajae-code/agent-core";
 
 import { sanitizeText } from "@gajae-code/utils";
@@ -1065,6 +1068,146 @@ export class TailBuffer {
 // OutputSink — line-buffered output with file spill support
 // =============================================================================
 
+const ARTIFACT_PUBLISH_MODE = 0o600;
+
+type ArtifactByteSink = {
+	write(chunk: string | Uint8Array): number;
+	end(): Promise<void>;
+};
+
+function artifactNoFollowFlag(): number {
+	return process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0);
+}
+
+function unlinkStagingIfSame(stagingPath: string, staged: { dev: bigint; ino: bigint }): void {
+	try {
+		const leftover = fs.lstatSync(stagingPath, { bigint: true });
+		if (leftover.isSymbolicLink() || leftover.dev !== staged.dev || leftover.ino !== staged.ino) return;
+		fs.unlinkSync(stagingPath);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+}
+
+/**
+ * Publish a 0600 staging inode onto `destination`.
+ * `rename` replaces the directory entry and does not follow a symlink there.
+ */
+function publishArtifactStaging(stagingPath: string, destination: string, staged: { dev: bigint; ino: bigint }): void {
+	let existing: fs.Stats | undefined;
+	try {
+		existing = fs.lstatSync(destination);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	if (existing && !existing.isFile() && !existing.isSymbolicLink()) {
+		throw new Error("artifact destination is not a regular file");
+	}
+	try {
+		fs.renameSync(stagingPath, destination);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (process.platform !== "win32" || (code !== "EEXIST" && code !== "EPERM") || !existing) throw error;
+		const again = fs.lstatSync(destination);
+		if (again.isSymbolicLink() !== existing.isSymbolicLink() || again.ino !== existing.ino) {
+			throw new Error("artifact destination changed");
+		}
+		fs.unlinkSync(destination);
+		fs.renameSync(stagingPath, destination);
+	}
+	const named = fs.lstatSync(destination, { bigint: true });
+	if (named.isSymbolicLink() || !named.isFile() || named.dev !== staged.dev || named.ino !== staged.ino) {
+		throw new Error("artifact destination changed");
+	}
+	if (process.platform !== "win32" && (Number(named.mode) & 0o777) !== ARTIFACT_PUBLISH_MODE) {
+		throw new Error("artifact mode");
+	}
+}
+
+class ArtifactStagingSink implements ArtifactByteSink {
+	#fd: number | undefined;
+	#ended = false;
+	readonly #stagingPath: string;
+	readonly #destination: string;
+
+	constructor(fd: number, stagingPath: string, destination: string) {
+		this.#fd = fd;
+		this.#stagingPath = stagingPath;
+		this.#destination = destination;
+	}
+
+	write(chunk: string | Uint8Array): number {
+		const fd = this.#fd;
+		if (fd === undefined) throw new Error("artifact sink closed");
+		const buffer = typeof chunk === "string" ? Buffer.from(chunk) : Buffer.from(chunk);
+		let offset = 0;
+		while (offset < buffer.length) {
+			const wrote = fs.writeSync(fd, buffer, offset, buffer.length - offset);
+			if (wrote <= 0) throw new Error("artifact write failed");
+			offset += wrote;
+		}
+		return offset;
+	}
+
+	async end(): Promise<void> {
+		if (this.#ended) return;
+		this.#ended = true;
+		const fd = this.#fd;
+		this.#fd = undefined;
+		let staged: { dev: bigint; ino: bigint } | undefined;
+		let closeError: unknown;
+		try {
+			if (fd === undefined) return;
+			if (process.platform !== "win32") fs.fchmodSync(fd, ARTIFACT_PUBLISH_MODE);
+			fs.fsyncSync(fd);
+			const stat = fs.fstatSync(fd, { bigint: true });
+			if (!stat.isFile()) throw new Error("artifact staging is not a regular file");
+			if (process.platform !== "win32" && (Number(stat.mode) & 0o777) !== ARTIFACT_PUBLISH_MODE) {
+				throw new Error("artifact mode");
+			}
+			staged = { dev: stat.dev, ino: stat.ino };
+		} finally {
+			if (fd !== undefined) {
+				try {
+					fs.closeSync(fd);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "EBADF") closeError = error;
+				}
+			}
+		}
+		if (closeError) throw closeError;
+		if (!staged) return;
+		try {
+			publishArtifactStaging(this.#stagingPath, this.#destination, staged);
+		} catch (error) {
+			unlinkStagingIfSame(this.#stagingPath, staged);
+			throw error;
+		}
+	}
+}
+
+function openArtifactStaging(destination: string): ArtifactStagingSink {
+	const stagingPath = path.join(path.dirname(destination), `.${randomUUID()}.staging`);
+	const flags = fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | artifactNoFollowFlag();
+	const fd = fs.openSync(stagingPath, flags, ARTIFACT_PUBLISH_MODE);
+	try {
+		if (process.platform !== "win32") fs.fchmodSync(fd, ARTIFACT_PUBLISH_MODE);
+		return new ArtifactStagingSink(fd, stagingPath, destination);
+	} catch (error) {
+		try {
+			fs.closeSync(fd);
+		} catch {
+			// The original open error is the one callers record.
+		}
+		try {
+			if (!fs.lstatSync(stagingPath).isSymbolicLink()) fs.unlinkSync(stagingPath);
+		} catch {
+			// Staging is already gone.
+		}
+		throw error;
+	}
+}
+
 export class OutputSink {
 	#buffer = "";
 	#bufferBytes = 0;
@@ -1101,7 +1244,7 @@ export class OutputSink {
 	#file?: {
 		path: string;
 		artifactId?: string;
-		sink: Bun.FileSink;
+		sink: ArtifactByteSink;
 	};
 
 	// Raw prefix chunks not yet confirmed written to the file sink. This queue is
@@ -1508,7 +1651,7 @@ export class OutputSink {
 	}
 
 	// A failed write may have committed only a prefix, so the replay queue is no longer trustworthy.
-	#failArtifact(phase: "create" | "write" | "end", error: unknown, sink?: Bun.FileSink): void {
+	#failArtifact(phase: "create" | "write" | "end", error: unknown, sink?: ArtifactByteSink): void {
 		this.#recordArtifactFailure(phase, error);
 		this.#artifactFinalizationFailed = true;
 		this.#file = undefined;
@@ -1604,9 +1747,9 @@ export class OutputSink {
 		if (!this.#artifactPath) return false;
 		if (this.#fileReady) return this.#file != null;
 
-		let sink: Bun.FileSink;
+		let sink: ArtifactByteSink;
 		try {
-			sink = Bun.file(this.#artifactPath).writer();
+			sink = openArtifactStaging(this.#artifactPath);
 		} catch (error) {
 			this.#recordArtifactFailure("create", error);
 			return false;

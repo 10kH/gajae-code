@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -485,28 +486,49 @@ describe("OutputSink", () => {
 		const dir = await createTempDir();
 		const artifactPath = path.join(dir, "partial-write.log");
 		const originalFile = Bun.file;
+		const originalWriteSync = nodeFs.writeSync;
 		let writes = 0;
 		let failed = false;
+		let insideBunWriter = false;
+		const noteWrite = (text: string) => {
+			if (!text.includes("abcde") && !text.includes("fghij") && !text.includes("klmno")) return;
+			writes++;
+			if (!failed && writes === 2) {
+				failed = true;
+				throw new Error("simulated write failure");
+			}
+		};
+		const writeSyncSpy = spyOn(nodeFs, "writeSync").mockImplementation(((...args: unknown[]) => {
+			if (!insideBunWriter) {
+				const buffer = args[1];
+				const text = typeof buffer === "string" ? buffer : Buffer.from(buffer as Uint8Array).toString("utf8");
+				noteWrite(text);
+			}
+			return Reflect.apply(originalWriteSync, nodeFs, args) as number;
+		}) as typeof nodeFs.writeSync);
 		try {
 			Bun.file = ((filePath: string | URL, ...args: unknown[]) => {
 				const file = originalFile(filePath, ...(args as []));
-				if (String(filePath) !== artifactPath) return file;
+				const target = String(filePath);
+				if (target !== artifactPath && !target.includes(`${path.basename(artifactPath)}.`)) return file;
 				return new Proxy(file, {
-					get(target, prop, _receiver) {
-						if (prop !== "writer") return Reflect.get(target, prop, target);
+					get(targetObj, prop, _receiver) {
+						if (prop !== "writer") return Reflect.get(targetObj, prop, targetObj);
 						return () => {
-							const sink = target.writer();
+							const sink = targetObj.writer();
 							return new Proxy(sink, {
 								get(sinkTarget, sinkProp, _sinkReceiver) {
 									if (sinkProp === "end") return sinkTarget.end.bind(sinkTarget);
 									if (sinkProp !== "write") return Reflect.get(sinkTarget, sinkProp, sinkTarget);
 									return (chunk: string | Uint8Array) => {
-										writes++;
-										if (!failed && writes === 2) {
-											failed = true;
-											throw new Error("simulated write failure");
+										const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+										noteWrite(text);
+										insideBunWriter = true;
+										try {
+											return sinkTarget.write.call(sinkTarget, chunk as string);
+										} finally {
+											insideBunWriter = false;
 										}
-										return sinkTarget.write.call(sinkTarget, chunk as string);
 									};
 								},
 							});
@@ -520,12 +542,12 @@ describe("OutputSink", () => {
 			for (let offset = 0; offset < input.length; offset += 5) sink.push(input.slice(offset, offset + 5));
 			const summary = await sink.dump();
 
-			Bun.file = originalFile;
 			expect(writes).toBe(2);
 			expect(summary.artifactId).toBeUndefined();
 			expect(summary.output).not.toContain("artifact://partial-write");
 			expect(summary.artifactFailureDiagnostic).toBe("write: simulated write failure");
 		} finally {
+			writeSyncSpy.mockRestore();
 			Bun.file = originalFile;
 		}
 	});
@@ -543,6 +565,80 @@ describe("OutputSink", () => {
 		const artifactText = await Bun.file(artifactPath).text();
 		expect(input.startsWith(artifactText)).toBe(true);
 		expect(artifactText).toBe(input.slice(0, 77));
+	});
+
+	test.skipIf(process.platform === "win32")("does not follow a symlink planted at the artifact path", async () => {
+		const dir = await createTempDir();
+		const victim = path.join(dir, "victim");
+		await fs.writeFile(victim, "VICTIM-ORIGINAL", { mode: 0o600 });
+		const artifactPath = path.join(dir, "artifact.log");
+		await fs.symlink(victim, artifactPath);
+		const sink = new OutputSink({ artifactPath, artifactId: "symlink", spillThreshold: 4 });
+		sink.push("SECRET-BYTES");
+		const dumped = await sink.dump();
+
+		expect(await fs.readFile(victim, "utf8")).toBe("VICTIM-ORIGINAL");
+		expect((await fs.lstat(victim)).mode & 0o777).toBe(0o600);
+		expect(dumped.artifactId).toBe("symlink");
+		const published = await fs.lstat(artifactPath);
+		expect(published.isSymbolicLink()).toBe(false);
+		expect(published.isFile()).toBe(true);
+		expect(published.mode & 0o777).toBe(0o600);
+		expect(await fs.readFile(artifactPath, "utf8")).toBe("SECRET-BYTES");
+	});
+
+	test.skipIf(process.platform === "win32")("corrects an existing mode 0644 artifact file to mode 0600", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "exist.log");
+		await fs.writeFile(artifactPath, "OLD", { mode: 0o644 });
+		const sink = new OutputSink({ artifactPath, artifactId: "mode", spillThreshold: 4 });
+		sink.push("NEWCONTENT");
+		const dumped = await sink.dump();
+
+		expect(dumped.artifactId).toBe("mode");
+		expect(await fs.readFile(artifactPath, "utf8")).toBe("NEWCONTENT");
+		expect((await fs.lstat(artifactPath)).isSymbolicLink()).toBe(false);
+		expect((await fs.lstat(artifactPath)).mode & 0o777).toBe(0o600);
+	});
+
+	test("still allows a long regular artifact basename", async () => {
+		const dir = await createTempDir();
+		const payload = "NEW-CONTENT";
+		const fresh = path.join(dir, "a".repeat(220));
+		const freshSink = new OutputSink({ artifactPath: fresh, artifactId: "long-fresh", spillThreshold: 4 });
+		freshSink.push(payload);
+		const freshDump = await freshSink.dump();
+		expect(freshDump.artifactId).toBe("long-fresh");
+		expect(freshDump.artifactFailureDiagnostic).toBeUndefined();
+		expect(await fs.readFile(fresh, "utf8")).toBe(payload);
+
+		const existing = path.join(dir, "b".repeat(220));
+		await fs.writeFile(existing, "OLD");
+		const existingSink = new OutputSink({
+			artifactPath: existing,
+			artifactId: "long-existing",
+			spillThreshold: 4,
+		});
+		existingSink.push(payload);
+		const existingDump = await existingSink.dump();
+		expect(existingDump.artifactId).toBe("long-existing");
+		expect(existingDump.artifactFailureDiagnostic).toBeUndefined();
+		expect(await fs.readFile(existing, "utf8")).toBe(payload);
+	});
+
+	test("still allows a fresh regular artifact path to receive the full stream", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "fresh.log");
+		const sink = new OutputSink({ artifactPath, artifactId: "fresh", spillThreshold: 4 });
+		sink.push("hello-fresh");
+		const dumped = await sink.dump();
+
+		expect(dumped.artifactId).toBe("fresh");
+		expect(dumped.artifactFailureDiagnostic).toBeUndefined();
+		const published = await fs.lstat(artifactPath);
+		expect(published.isSymbolicLink()).toBe(false);
+		expect(published.isFile()).toBe(true);
+		expect(await fs.readFile(artifactPath, "utf8")).toBe("hello-fresh");
 	});
 
 	test("createInput decodes streamed UTF-8 chunks correctly", async () => {
