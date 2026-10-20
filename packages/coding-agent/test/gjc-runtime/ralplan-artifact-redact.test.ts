@@ -581,3 +581,15 @@ describe("scrubRalplanPersistedBody property", () => {
 		);
 	});
 });
+
+describe("ralplan OSC strip on the write path", () => {
+	it("a long run of unterminated ESC prefixes stays cheap before persistence", async () => {
+		const { scrubRalplanPersistedBody } = await import("../../src/gjc-runtime/ralplan-runtime");
+		const count = 80_000;
+		const body = `${"\u001b]".repeat(count)}TAIL`;
+		const started = performance.now();
+		const stored = scrubRalplanPersistedBody("planner", body);
+		expect(performance.now() - started).toBeLessThan(1_000);
+		expect(stored).toBe(`${"]".repeat(count)}TAIL\n`);
+	}, 30_000);
+});
