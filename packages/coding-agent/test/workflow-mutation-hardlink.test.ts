@@ -182,6 +182,14 @@ describe("hardlink guard entry points", () => {
 		expect((await bashWrite(cwd, link)).blocked).toBe(true);
 		expect(await Bun.file(product).text()).toBe("ORIGINAL");
 	});
+	it("still allows an allowlisted plan symlink to a single-link product file", async () => {
+		const { cwd, product } = await fixture();
+		const link = path.join(cwd, ".gjc", "plans", "link");
+		await fs.mkdir(path.dirname(link), { recursive: true });
+		await fs.symlink(product, link);
+		expect((await fs.stat(product)).nlink).toBe(1);
+		expect((await decision(cwd, `printf x > '${link}'`)).blocked).toBe(false);
+	});
 	it("property: scratch link count decides the planning bash write", async () => {
 		const { cwd, scratch, product } = await fixture();
 		const names = fc.stringMatching(/^[a-z0-9]{1,12}$/);
