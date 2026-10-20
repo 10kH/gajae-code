@@ -37,6 +37,7 @@ import {
 } from "../../runtime-mcp/smithery-registry";
 import type { MCPAuthConfig, MCPServerConfig } from "../../runtime-mcp/types";
 import type { OAuthCredential } from "../../session/auth-storage";
+import { mcpTerminalLabel } from "../../slash-commands/helpers/mcp";
 import { shortenPath } from "../../tools/render-utils";
 import { openPath } from "../../utils/open";
 import { CommandPalette, type CommandPaletteEntry } from "../components/command-palette";
@@ -1150,7 +1151,7 @@ export class MCPCommandController {
 								: state === "connecting"
 									? theme.fg("muted", " ◌ connecting")
 									: theme.fg("muted", " ○ not connected");
-					lines.push(`  ${theme.fg("accent", name)}${status} ${theme.fg("dim", `[${type}]`)}`);
+					lines.push(`  ${theme.fg("accent", mcpTerminalLabel(name))}${status} ${theme.fg("dim", `[${type}]`)}`);
 				}
 				lines.push("");
 			}
@@ -1173,7 +1174,7 @@ export class MCPCommandController {
 								: state === "connecting"
 									? theme.fg("muted", " ◌ connecting")
 									: theme.fg("muted", " ○ not connected");
-					lines.push(`  ${theme.fg("accent", name)}${status} ${theme.fg("dim", `[${type}]`)}`);
+					lines.push(`  ${theme.fg("accent", mcpTerminalLabel(name))}${status} ${theme.fg("dim", `[${type}]`)}`);
 				}
 				lines.push("");
 			}
@@ -1190,7 +1191,7 @@ export class MCPCommandController {
 								: state === "connecting"
 									? theme.fg("muted", " ◌ connecting")
 									: theme.fg("muted", " ○ not connected");
-						lines.push(`  ${theme.fg("accent", name)}${status}`);
+						lines.push(`  ${theme.fg("accent", mcpTerminalLabel(name))}${status}`);
 					}
 					lines.push("");
 				}
@@ -1201,7 +1202,7 @@ export class MCPCommandController {
 			if (relevantDisabled.length > 0) {
 				lines.push(theme.fg("accent", "Disabled") + theme.fg("muted", " (discovered servers):"));
 				for (const name of relevantDisabled) {
-					lines.push(`  ${theme.fg("accent", name)}${theme.fg("warning", " ◌ disabled")}`);
+					lines.push(`  ${theme.fg("accent", mcpTerminalLabel(name))}${theme.fg("warning", " ◌ disabled")}`);
 				}
 				lines.push("");
 			}
@@ -1310,13 +1311,13 @@ export class MCPCommandController {
 						"",
 						theme.fg("success", `✓ Successfully connected to "${name}"`),
 						"",
-						`  Server: ${connection.serverInfo.name} v${connection.serverInfo.version}`,
+						`  Server: ${mcpTerminalLabel(connection.serverInfo.name)} v${mcpTerminalLabel(connection.serverInfo.version)}`,
 						`  Tools: ${tools.length}`,
 					];
 
 					if (tools.length > 0 && tools.length <= 10) {
 						lines.push("", "  Available tools:");
-						for (const tool of tools) lines.push(`    • ${tool.name}`);
+						for (const tool of tools) lines.push(`    • ${mcpTerminalLabel(tool.name)}`);
 					}
 
 					lines.push("");
