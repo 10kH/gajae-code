@@ -284,7 +284,7 @@ describe("ssh remote output trust boundary", () => {
 		expect(Buffer.byteLength(excerpt, "utf-8")).toBeLessThanOrEqual(12 * 1024);
 	}
 
-	it("ssh execute keeps the opening fence on a tail-only inline excerpt", async () => {
+	it("ssh execute frames a tail-only inline excerpt with the opening fence", async () => {
 		const headMarker = "HEADMARKER";
 		const tailMarker = "TAILMARKER";
 		const result = await executeWrapped(overlongRemote(headMarker, tailMarker), { "tools.artifactHeadBytes": 0 });
@@ -292,7 +292,7 @@ describe("ssh remote output trust boundary", () => {
 		expectFenceAroundTail(raw, excerpt, tailMarker, headMarker, false);
 	});
 
-	it("ssh execute keeps both fences on a head-and-tail inline excerpt", async () => {
+	it("ssh execute frames a head-and-tail inline excerpt", async () => {
 		const headMarker = "HEADMARKER";
 		const tailMarker = "TAILMARKER";
 		const result = await executeWrapped(overlongRemote(headMarker, tailMarker), { "tools.artifactHeadBytes": 1 });
