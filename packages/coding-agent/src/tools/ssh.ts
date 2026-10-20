@@ -5,11 +5,19 @@ import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import type { SSHHost } from "../capability/ssh";
 import { sshCapability } from "../capability/ssh";
+import { getDefault, type Settings } from "../config/settings";
 import { loadCapability } from "../discovery";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import sshDescriptionBase from "../prompts/tools/ssh.md" with { type: "text" };
-import { DEFAULT_MAX_BYTES, streamTailUpdates, TailBuffer } from "../session/streaming-output";
+import {
+	DEFAULT_MAX_BYTES,
+	streamTailUpdates,
+	TailBuffer,
+	type TruncationResult,
+	truncateMiddle,
+	truncateTail,
+} from "../session/streaming-output";
 import type { SSHHostInfo } from "../ssh/connection-manager";
 import { ensureHostInfo, getHostInfoForHost } from "../ssh/connection-manager";
 import { executeSSH } from "../ssh/ssh-executor";
@@ -90,9 +98,44 @@ function quoteCmdPath(value: string): string {
 	return `"${escaped}"`;
 }
 
-/** Remote stdout/stderr is external content. Local status strings stay outside the frame. */
-function frameSshRemoteOutput(output: string): string {
-	return wrapUntrustedContent(output);
+const UNTRUSTED_FENCE_OVERHEAD = Buffer.byteLength("<untrusted-content>\n\n</untrusted-content>", "utf-8");
+const INLINE_MARKER_RESERVE = 256;
+
+type OutputBudgetPath = "tools.maxInlineResultBytes" | "tools.artifactHeadBytes" | "tools.artifactTailLines";
+
+function settingNumber(settings: Settings | undefined, path: OutputBudgetPath): number {
+	return settings?.get(path) ?? getDefault(path);
+}
+
+type RemoteFrame = { text: string; truncation?: TruncationResult; direction?: "tail" | "middle" };
+
+/**
+ * Fit remote text to the inline model window, then frame that excerpt.
+ * A later tail cut would drop the opening fence, so the fence is last.
+ * Local status strings stay outside the frame.
+ */
+function frameSshRemoteOutput(output: string, settings?: Settings): RemoteFrame {
+	const cap = settingNumber(settings, "tools.maxInlineResultBytes") * 1024;
+	if (cap <= 0 || Buffer.byteLength(output, "utf-8") + UNTRUSTED_FENCE_OVERHEAD <= cap) {
+		return { text: wrapUntrustedContent(output) };
+	}
+	const budget = Math.max(1, cap - UNTRUSTED_FENCE_OVERHEAD - INLINE_MARKER_RESERVE);
+	const headBytes = settingNumber(settings, "tools.artifactHeadBytes") * 1024;
+	const tailLines = settingNumber(settings, "tools.artifactTailLines");
+	const truncation =
+		headBytes > 0
+			? truncateMiddle(output, {
+					maxBytes: budget,
+					maxLines: tailLines * 2,
+					maxHeadBytes: Math.min(headBytes, Math.floor(budget / 2)),
+					maxHeadLines: tailLines,
+				})
+			: truncateTail(output, { maxBytes: budget, maxLines: tailLines });
+	return {
+		text: wrapUntrustedContent(truncation.content),
+		truncation,
+		direction: headBytes > 0 ? "middle" : "tail",
+	};
 }
 
 function buildRemoteCommand(command: string, cwd: string | undefined, info: SSHHostInfo): string {
@@ -181,13 +224,22 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 			onChunk: streamTailUpdates(tailBuffer, onUpdate),
 		});
 
+		const framed = result.output ? frameSshRemoteOutput(result.output, _ctx?.settings) : undefined;
 		if (result.cancelled) {
-			throw new ToolError(result.output ? frameSshRemoteOutput(result.output) : "Command aborted");
+			throw new ToolError(framed ? framed.text : "Command aborted");
 		}
 
-		const outputText = result.output ? frameSshRemoteOutput(result.output) : "(no output)";
+		const outputText = framed ? framed.text : "(no output)";
 		const details: SSHToolDetails = {};
-		const resultBuilder = toolResult(details).text(outputText).truncationFromSummary(result, { direction: "tail" });
+		const resultBuilder = toolResult(details).text(outputText);
+		if (framed?.truncation?.truncated) {
+			resultBuilder.truncation(framed.truncation, {
+				direction: framed.direction ?? "tail",
+				artifactId: result.artifactId,
+			});
+		} else {
+			resultBuilder.truncationFromSummary(result, { direction: "tail" });
+		}
 
 		if (result.exitCode !== 0 && result.exitCode !== undefined) {
 			throw new ToolError(`${outputText}\n\nCommand exited with code ${result.exitCode}`);
