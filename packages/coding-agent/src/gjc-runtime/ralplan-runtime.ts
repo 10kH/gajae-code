@@ -2324,6 +2324,18 @@ function scrubImported(value: string): string {
 	return sanitizeImportedString(value);
 }
 
+/** Scrub, then trim the same way the disposition parser does. An empty result is not an id. */
+function canonicalDispositionId(value: string): string {
+	const canonical = scrubImported(value).trim();
+	if (canonical === "") {
+		throw new RalplanCommandError(
+			2,
+			"refusing to persist ralplan disposition: credential scrub removed an identifier",
+		);
+	}
+	return canonical;
+}
+
 /**
  * Scrub a validated disposition, then rebuild conflict ids from the scrubbed
  * finding and target ids. Only `sourceReceipt.path` and `sourceReceipt.sha256`
@@ -2331,8 +2343,23 @@ function scrubImported(value: string): string {
  */
 function scrubDispositionDocument(normalized: string): string {
 	const doc = parseReviewConflictDocument(normalized);
-	const findingIds = new Map(doc.findings.map(finding => [finding.findingId, scrubImported(finding.findingId)]));
-	const targetIds = new Map(doc.findings.map(finding => [finding.targetId, scrubImported(finding.targetId)]));
+	const findingIds = new Map(
+		doc.findings.map(finding => [finding.findingId, canonicalDispositionId(finding.findingId)]),
+	);
+	const targetIds = new Map<string, string>();
+	const originalsByScrubbedTarget = new Map<string, string>();
+	for (const finding of doc.findings) {
+		const canonical = canonicalDispositionId(finding.targetId);
+		const prior = originalsByScrubbedTarget.get(canonical);
+		if (prior !== undefined && prior !== finding.targetId) {
+			throw new RalplanCommandError(
+				2,
+				"refusing to persist ralplan disposition: distinct target ids collapse after credential scrub",
+			);
+		}
+		originalsByScrubbedTarget.set(canonical, finding.targetId);
+		targetIds.set(finding.targetId, canonical);
+	}
 	const priorConflicts = doc.conflicts.map(conflict => ({
 		conflictId: conflict.conflictId,
 		targetId: conflict.targetId,
@@ -2349,8 +2376,8 @@ function scrubDispositionDocument(normalized: string): string {
 		if (!prior) {
 			throw new RalplanCommandError(2, "refusing to persist ralplan disposition: conflict id did not survive scrub");
 		}
-		const targetId = targetIds.get(prior.targetId) ?? scrubImported(prior.targetId);
-		const mapped = prior.findingIds.map(id => findingIds.get(id) ?? scrubImported(id));
+		const targetId = targetIds.get(prior.targetId) ?? canonicalDispositionId(prior.targetId);
+		const mapped = prior.findingIds.map(id => findingIds.get(id) ?? canonicalDispositionId(id));
 		const [left, right] = mapped[0]! <= mapped[1]! ? [mapped[0]!, mapped[1]!] : [mapped[1]!, mapped[0]!];
 		disposition.conflictId = `conflict:${targetId}:${left}:${right}`;
 		disposition.rationale = scrubImported(disposition.rationale);

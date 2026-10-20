@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import fc from "fast-check";
 import { runRalplanCliCommand } from "../../src/commands/ralplan";
 import { parseReviewConflictDocument } from "../../src/gjc-runtime/ralplan-review-conflicts";
 
@@ -23,6 +24,51 @@ afterAll(() => {
 
 async function tempDir(): Promise<string> {
 	return await fs.mkdtemp(path.join(os.tmpdir(), "ralplan-redact-"));
+}
+
+async function stageReceipt(
+	root: string,
+	runId: string,
+	stage: "architect" | "critic",
+): Promise<{ path: string; sha256: string }> {
+	const result = await runRalplanCliCommand(
+		["--write", "--stage", stage, "--stage_n", "1", "--artifact", `# ${stage}\n`, "--run-id", runId, "--json"],
+		root,
+	);
+	expect(result.status).toBe(0);
+	return JSON.parse(result.stdout ?? "{}") as { path: string; sha256: string };
+}
+
+function repeatedTargetDisposition(
+	targetIds: readonly [string, string],
+	arch: { path: string; sha256: string },
+	crit: { path: string; sha256: string },
+): string {
+	return JSON.stringify({
+		schema: "ralplan.review_conflicts.v1",
+		plannerStageN: 1,
+		findings: [
+			{
+				findingId: "arch-1",
+				targetId: targetIds[0],
+				action: "add",
+				severity: "watch",
+				evidence: "ordinary evidence",
+				sourceRole: "architect",
+				sourceReceipt: { stage: "architect", stageN: 1, path: arch.path, sha256: arch.sha256 },
+			},
+			{
+				findingId: "crit-1",
+				targetId: targetIds[1],
+				action: "add",
+				severity: "watch",
+				evidence: "ordinary evidence",
+				sourceRole: "critic",
+				sourceReceipt: { stage: "critic", stageN: 1, path: crit.path, sha256: crit.sha256 },
+			},
+		],
+		dispositions: [],
+	});
 }
 
 describe("gjc ralplan --write artifact scrub", () => {
@@ -311,36 +357,227 @@ describe("gjc ralplan --write artifact scrub", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+
+	it("refuses distinct disposition target ids that sanitize to one id", async () => {
+		const root = await tempDir();
+		try {
+			const runId = "id-collide";
+			const arch = await stageReceipt(root, runId, "architect");
+			const crit = await stageReceipt(root, runId, "critic");
+			const artifactPath = path.join(root, "disposition.json");
+			await fs.writeFile(
+				artifactPath,
+				repeatedTargetDisposition(
+					["sk-ant-api03-ralplanlefttarget01", "sk-ant-api03-ralplanrighttarget1"],
+					arch,
+					crit,
+				),
+			);
+			const written = await runRalplanCliCommand(
+				[
+					"--write",
+					"--stage",
+					"disposition",
+					"--stage_n",
+					"1",
+					"--artifact",
+					artifactPath,
+					"--run-id",
+					runId,
+					"--json",
+				],
+				root,
+			);
+			expect(written.status).toBe(2);
+			expect(written.stderr ?? "").toContain("distinct target ids collapse");
+			await expect(fs.access(path.join(path.dirname(arch.path), "stage-01-disposition.md"))).rejects.toThrow();
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps repeated findings that share one original disposition target", async () => {
+		const root = await tempDir();
+		try {
+			const runId = "id-repeat";
+			const arch = await stageReceipt(root, runId, "architect");
+			const crit = await stageReceipt(root, runId, "critic");
+			const targetId = "sk-ant-api03-ralplanrepeatedtarget";
+			const artifactPath = path.join(root, "disposition.json");
+			await fs.writeFile(artifactPath, repeatedTargetDisposition([targetId, targetId], arch, crit));
+			const written = await runRalplanCliCommand(
+				[
+					"--write",
+					"--stage",
+					"disposition",
+					"--stage_n",
+					"1",
+					"--artifact",
+					artifactPath,
+					"--run-id",
+					runId,
+					"--json",
+				],
+				root,
+			);
+			expect(written.status).toBe(0);
+			const payload = JSON.parse(written.stdout ?? "{}") as { path: string };
+			const stored = await fs.readFile(payload.path, "utf8");
+			const parsed = parseReviewConflictDocument(stored);
+			expect(parsed.findings).toHaveLength(2);
+			expect(new Set(parsed.findings.map(finding => finding.targetId)).size).toBe(1);
+			expect(parsed.findings.map(finding => finding.findingId).sort()).toEqual(["arch-1", "crit-1"]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses distinct target ids that match only after scrub and trim", async () => {
+		const root = await tempDir();
+		try {
+			const runId = "id-trim";
+			const arch = await stageReceipt(root, runId, "architect");
+			const crit = await stageReceipt(root, runId, "critic");
+			const artifactPath = path.join(root, "disposition.json");
+			await fs.writeFile(
+				artifactPath,
+				repeatedTargetDisposition(
+					["\u200b sk-ant-api03-ralplanlefttarget01", "sk-ant-api03-ralplanrighttarget1"],
+					arch,
+					crit,
+				),
+			);
+			const written = await runRalplanCliCommand(
+				[
+					"--write",
+					"--stage",
+					"disposition",
+					"--stage_n",
+					"1",
+					"--artifact",
+					artifactPath,
+					"--run-id",
+					runId,
+					"--json",
+				],
+				root,
+			);
+			expect(written.status).toBe(2);
+			expect(written.stderr ?? "").toContain("distinct target ids collapse");
+			await expect(fs.access(path.join(path.dirname(arch.path), "stage-01-disposition.md"))).rejects.toThrow();
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps repeated findings that share one spaced credential target", async () => {
+		const root = await tempDir();
+		try {
+			const runId = "id-trim-repeat";
+			const arch = await stageReceipt(root, runId, "architect");
+			const crit = await stageReceipt(root, runId, "critic");
+			const targetId = "\u200b sk-ant-api03-ralplanrepeatedtarget";
+			const artifactPath = path.join(root, "disposition.json");
+			await fs.writeFile(artifactPath, repeatedTargetDisposition([targetId, targetId], arch, crit));
+			const written = await runRalplanCliCommand(
+				[
+					"--write",
+					"--stage",
+					"disposition",
+					"--stage_n",
+					"1",
+					"--artifact",
+					artifactPath,
+					"--run-id",
+					runId,
+					"--json",
+				],
+				root,
+			);
+			expect(written.status).toBe(0);
+			const payload = JSON.parse(written.stdout ?? "{}") as { path: string };
+			const stored = await fs.readFile(payload.path, "utf8");
+			const parsed = parseReviewConflictDocument(stored);
+			expect(parsed.findings).toHaveLength(2);
+			expect(new Set(parsed.findings.map(finding => finding.targetId)).size).toBe(1);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 });
 
 const PROPERTY_SEED = 5472026;
 
-function mulberry32(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (state + 0x6d2b79f5) | 0;
-		let t = Math.imul(state ^ (state >>> 15), 1 | state);
-		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-	};
-}
-
 describe("scrubRalplanPersistedBody property", () => {
 	it("property: scrub idempotence and safe-text agreement, seed 5472026, 64 inputs", async () => {
 		const { scrubRalplanPersistedBody } = await import("../../src/gjc-runtime/ralplan-runtime");
-		const rand = mulberry32(PROPERTY_SEED);
-		for (let index = 0; index < 64; index++) {
-			const note = `note${Math.floor(rand() * 1000)}`;
-			const safe = `# Plan\nKeep src/file${index}.ts ${note}.\n`;
-			expect(scrubRalplanPersistedBody("planner", safe)).toBe(safe);
-			expect(scrubRalplanPersistedBody("planner", safe)).toBe(
-				scrubRalplanPersistedBody("planner", scrubRalplanPersistedBody("planner", safe)),
-			);
-			const planted = `# Plan\n${SECRET} ${note}\n`;
-			const redacted = scrubRalplanPersistedBody("planner", planted);
-			expect(redacted).not.toContain(SECRET);
-			expect(redacted).toContain(note);
-			expect(scrubRalplanPersistedBody("planner", redacted)).toBe(redacted);
-		}
+		const noteArbitrary = fc.integer({ min: 0, max: 9999 }).map(value => `note${value}`);
+		fc.assert(
+			fc.property(fc.integer({ min: 0, max: 9999 }), noteArbitrary, (index, note) => {
+				const safe = `# Plan\nKeep src/file${index}.ts ${note}.\n`;
+				expect(scrubRalplanPersistedBody("planner", safe)).toBe(safe);
+				expect(scrubRalplanPersistedBody("planner", safe)).toBe(
+					scrubRalplanPersistedBody("planner", scrubRalplanPersistedBody("planner", safe)),
+				);
+				const planted = `# Plan\n${SECRET} ${note}\n`;
+				const redacted = scrubRalplanPersistedBody("planner", planted);
+				expect(redacted).not.toContain(SECRET);
+				expect(redacted).toContain(note);
+				expect(scrubRalplanPersistedBody("planner", redacted)).toBe(redacted);
+			}),
+			{ seed: PROPERTY_SEED, numRuns: 64 },
+		);
+	});
+
+	it("property: disposition target collapse after scrub and trim, seed 5472026, 64 inputs", async () => {
+		const { scrubRalplanPersistedBody } = await import("../../src/gjc-runtime/ralplan-runtime");
+		const credential = fc
+			.integer({ min: 0, max: 999_999 })
+			.map(value => `sk-ant-api03-ralplantarget${String(value).padStart(6, "0")}`);
+		const pad = fc.constantFrom("", " ", "\t", "\n", "\u200b", "\u200b ", " \u200b");
+		const body = (left: string, right: string) =>
+			JSON.stringify({
+				schema: "ralplan.review_conflicts.v1",
+				plannerStageN: 1,
+				findings: [
+					{
+						findingId: "arch-1",
+						targetId: left,
+						action: "add",
+						severity: "watch",
+						evidence: "ordinary evidence",
+						sourceRole: "architect",
+						sourceReceipt: { stage: "architect", stageN: 1, path: "architect.md", sha256: "a" },
+					},
+					{
+						findingId: "crit-1",
+						targetId: right,
+						action: "add",
+						severity: "watch",
+						evidence: "ordinary evidence",
+						sourceRole: "critic",
+						sourceReceipt: { stage: "critic", stageN: 1, path: "critic.md", sha256: "b" },
+					},
+				],
+				dispositions: [],
+			});
+		fc.assert(
+			fc.property(credential, credential, pad, pad, (leftSecret, rightSecret, leftPad, rightPad) => {
+				const left = `${leftPad}${leftSecret}${leftPad}`;
+				const right = `${rightPad}${rightSecret}${rightPad}`;
+				if (left === right) {
+					const stored = scrubRalplanPersistedBody("disposition", body(left, right));
+					const parsed = parseReviewConflictDocument(stored);
+					expect(new Set(parsed.findings.map(finding => finding.targetId)).size).toBe(1);
+					expect(stored).not.toContain(leftSecret);
+					expect(scrubRalplanPersistedBody("disposition", stored)).toBe(stored);
+					return;
+				}
+				expect(() => scrubRalplanPersistedBody("disposition", body(left, right))).toThrow(
+					/distinct target ids collapse/,
+				);
+			}),
+			{ seed: PROPERTY_SEED, numRuns: 64 },
+		);
 	});
 });
