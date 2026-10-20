@@ -314,7 +314,7 @@ describe("ssh remote output trust boundary", () => {
 		stubRemote(remote, 0);
 		const session = {
 			allocateOutputArtifact: async () => ({ id: "ssh-full", path: "ssh-full.log" }),
-		} as ToolSession;
+		} as unknown as ToolSession;
 		const write = vi.spyOn(Bun, "write").mockImplementation(async (_path, data) => {
 			stored.push(String(data));
 			return stored[stored.length - 1]?.length ?? 0;
