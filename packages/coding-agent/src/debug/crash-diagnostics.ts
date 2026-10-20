@@ -255,19 +255,27 @@ async function assertRealDiagnosticsDirectory(dir: string): Promise<void> {
 }
 
 async function chmodRealDiagnosticsDirectory(dir: string): Promise<void> {
+	const stat = await fs.lstat(dir);
+	if (stat.isSymbolicLink() || !stat.isDirectory()) {
+		throw new Error("crash diagnostics path is not a private directory");
+	}
+	// A read-only open cannot chmod a directory the owner cannot read (0300 or 0000).
+	// lchmod and O_PATH change that directory without following a symlink and without read permission.
+	if (process.platform === "darwin" && typeof fs.lchmod === "function") {
+		await fs.lchmod(dir, DIRECTORY_MODE);
+		return;
+	}
 	const directoryFlag = fsConstants.O_DIRECTORY ?? 0;
+	const pathFlag = (fsConstants as { O_PATH?: number }).O_PATH ?? 0;
 	if (POSIX_NOFOLLOW !== 0 && directoryFlag !== 0) {
-		const handle = await fs.open(dir, fsConstants.O_RDONLY | directoryFlag | POSIX_NOFOLLOW);
+		const openFlag = pathFlag !== 0 ? pathFlag : fsConstants.O_RDONLY;
+		const handle = await fs.open(dir, openFlag | directoryFlag | POSIX_NOFOLLOW);
 		try {
 			await handle.chmod(DIRECTORY_MODE);
 		} finally {
 			await handle.close();
 		}
 		return;
-	}
-	const stat = await fs.lstat(dir);
-	if (stat.isSymbolicLink() || !stat.isDirectory()) {
-		throw new Error("crash diagnostics path is not a private directory");
 	}
 	await fs.chmod(dir, DIRECTORY_MODE);
 }
