@@ -84,7 +84,7 @@ async function runProbe(logDir: string, home: string): Promise<ProbeResult> {
 }
 
 describe.skipIf(process.platform === "win32")("rotating log owner-only mode", () => {
-	it("still writes a log line the owner can read", async () => {
+	it("still reads a rotating log line the owner wrote", async () => {
 		const home = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-home-"));
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
 		try {
