@@ -99,6 +99,7 @@ export const codexAdapter: Adapter = {
 			slashCommandCandidates: [],
 			agentCandidates: [],
 			instructionCandidates: [],
+			hookCandidates: [],
 			diagnostics: [],
 			manualActions: [],
 		};

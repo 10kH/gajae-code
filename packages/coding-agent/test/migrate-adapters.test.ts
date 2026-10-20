@@ -36,7 +36,7 @@ describe("claude-code adapter", () => {
 		expect(result.diagnostics.every(d => d.status === "skipped_absent_source")).toBe(true);
 	});
 
-	test("reports hooks, model, permissions and env names without reading env values", async () => {
+	test("imports supported hook events and reports only the ones it cannot translate", async () => {
 		await writeFile(
 			".claude/settings.json",
 			JSON.stringify({
@@ -53,13 +53,22 @@ describe("claude-code adapter", () => {
 							],
 						},
 					],
+					Notification: [{ hooks: [{ type: "command", command: "say done" }] }],
 				},
 			}),
 		);
 		const result = await getAdapter("claude-code").collect(adapterOptions());
+		// Supported events become import candidates, with their matcher preserved.
+		expect(result.hookCandidates).toEqual([
+			{ source: "claude-code", event: "PreToolUse", matcher: "Bash", command: "echo pre" },
+			{ source: "claude-code", event: "PostToolUse", command: "echo a" },
+			{ source: "claude-code", event: "PostToolUse", command: "echo b" },
+			{ source: "claude-code", event: "Notification", command: "say done" },
+		]);
 		const byArea = new Map(result.manualActions.map(action => [action.area, action.detail]));
-		expect(byArea.get("settings.json: hooks.PreToolUse")).toContain("1 shell command run on PreToolUse");
-		expect(byArea.get("settings.json: hooks.PostToolUse")).toContain("2 shell commands run on PostToolUse");
+		expect(byArea.has("settings.json: hooks.PreToolUse")).toBe(false);
+		expect(byArea.has("settings.json: hooks.PostToolUse")).toBe(false);
+		expect(byArea.get("settings.json: hooks.Notification")).toContain("no faithful gjc equivalent");
 		expect(byArea.get("settings.json: model")).toContain("claude-sonnet-4-5");
 		expect(byArea.get("settings.json: permissions")).toContain("1 allow, 1 deny, 0 ask");
 		expect(byArea.get("settings.json: permissions")).toContain("Deny rules are the security-relevant ones");
@@ -67,7 +76,6 @@ describe("claude-code adapter", () => {
 		// Values must never appear in the report.
 		const serialized = JSON.stringify(result.manualActions);
 		expect(serialized).not.toContain("sk-secret-value");
-		expect(serialized.includes(JSON.stringify("1"))).toBe(false);
 	});
 
 	test("reports project settings.local.json separately and ignores malformed settings", async () => {

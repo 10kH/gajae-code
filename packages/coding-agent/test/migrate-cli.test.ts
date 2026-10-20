@@ -84,7 +84,10 @@ describe("runMigrate", () => {
 			JSON.stringify({
 				model: "claude-sonnet-4-5",
 				permissions: { deny: ["Read(./.env)"] },
-				hooks: { PreToolUse: [{ hooks: [{ type: "command", command: "npm test" }] }] },
+				hooks: {
+					PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "npm test" }] }],
+					Notification: [{ hooks: [{ type: "command", command: "say done" }] }],
+				},
 			}),
 			"utf-8",
 		);
@@ -100,14 +103,22 @@ describe("runMigrate", () => {
 		// Manual actions are advisory: they never turn a migration into a failure.
 		expect(report.ok).toBe(true);
 		expect(report.manualActions.map(action => action.area).sort()).toEqual([
-			"settings.json: hooks.PreToolUse",
+			"settings.json: hooks.Notification",
 			"settings.json: model",
 			"settings.json: permissions",
 		]);
+		const hookActions = report.actions.filter(action => action.type === "hook");
+		expect(hookActions.some(action => action.name === "Notification" && action.status === "skipped_unmappable")).toBe(
+			true,
+		);
+		const hookAction = hookActions.find(action => action.status === "imported");
+		expect(hookAction).toMatchObject({ name: "migrated-claude-code.ts", status: "imported" });
+		expect(hookAction?.destination).toBe(path.join(report.destinations.hooksDir, "migrated-claude-code.ts"));
+		expect(report.summary.byType.hook.imported).toBe(1);
 		const rendered = renderHuman(report);
 		expect(rendered).toContain("Manual actions:");
-		expect(rendered).toContain("[claude-code] settings.json: hooks.PreToolUse:");
-		expect(rendered).toContain("1 shell command run on PreToolUse");
+		expect(rendered).toContain("[claude-code] migrated-claude-code.ts: imported");
+		expect(rendered).toContain("[claude-code] settings.json: hooks.Notification:");
 		expect(await exists(path.join(cwd, ".gjc", "mcp.json"))).toBe(false);
 		expect(await exists(path.join(cwd, ".gjc", "skills"))).toBe(false);
 		expect(await exists(path.join(cwd, ".gjc", "AGENTS.md"))).toBe(false);

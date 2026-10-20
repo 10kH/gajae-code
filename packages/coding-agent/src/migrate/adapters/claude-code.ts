@@ -3,7 +3,8 @@
  * selected-scope subagents, and the selected scope's `CLAUDE.md`.
  */
 import * as path from "node:path";
-import type { AdapterResult, ManualAction, McpCandidate } from "../types";
+import { isSupportedHookEvent, SUPPORTED_HOOK_EVENTS } from "../hook-module";
+import type { AdapterResult, HookCandidate, ManualAction, McpCandidate } from "../types";
 import {
 	type Adapter,
 	type AdapterOptions,
@@ -28,25 +29,31 @@ function stringArray(value: unknown): string[] {
 	return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
-/** Count the shell commands a `hooks` object would run, per hook event. */
-function countHookCommands(hooks: Record<string, unknown>): Array<{ event: string; commands: number }> {
-	const counted: Array<{ event: string; commands: number }> = [];
+/** Flatten a `hooks` object into `{event, matcher?, command}` candidates. */
+function collectHookCommands(hooks: Record<string, unknown>): HookCandidate[] {
+	const candidates: HookCandidate[] = [];
 	for (const [event, matchers] of Object.entries(hooks)) {
 		if (!Array.isArray(matchers)) continue;
-		let commands = 0;
 		for (const matcher of matchers) {
 			if (!matcher || typeof matcher !== "object") continue;
-			const inner = (matcher as Record<string, unknown>).hooks;
+			const record = matcher as Record<string, unknown>;
+			const matcherValue = typeof record.matcher === "string" ? record.matcher.trim() : "";
+			const inner = record.hooks;
 			if (!Array.isArray(inner)) continue;
 			for (const hook of inner) {
-				if (hook && typeof hook === "object" && typeof (hook as Record<string, unknown>).command === "string") {
-					commands += 1;
-				}
+				if (!hook || typeof hook !== "object") continue;
+				const command = (hook as Record<string, unknown>).command;
+				if (typeof command !== "string" || !command.trim()) continue;
+				candidates.push({
+					source: SOURCE,
+					event,
+					...(matcherValue ? { matcher: matcherValue } : {}),
+					command,
+				});
 			}
 		}
-		if (commands > 0) counted.push({ event, commands });
 	}
-	return counted;
+	return candidates;
 }
 
 /**
@@ -59,13 +66,18 @@ function describeSettings(data: Record<string, unknown>, label: string): ManualA
 	const actions: ManualAction[] = [];
 	const hooks = data.hooks;
 	if (hooks && typeof hooks === "object" && !Array.isArray(hooks)) {
-		for (const { event, commands } of countHookCommands(hooks as Record<string, unknown>)) {
+		const byEvent = new Map<string, number>();
+		for (const candidate of collectHookCommands(hooks as Record<string, unknown>)) {
+			if (isSupportedHookEvent(candidate.event)) continue;
+			byEvent.set(candidate.event, (byEvent.get(candidate.event) ?? 0) + 1);
+		}
+		for (const [event, commands] of [...byEvent.entries()].sort(([a], [b]) => a.localeCompare(b))) {
 			actions.push({
 				source: SOURCE,
 				area: `${label}: hooks.${event}`,
-				detail: `${commands} shell command${commands === 1 ? "" : "s"} run on ${event}; gjc hooks are TypeScript modules, so port ${
+				detail: `${commands} shell command${commands === 1 ? "" : "s"} run on ${event}, which has no faithful gjc equivalent; port ${
 					commands === 1 ? "it" : "them"
-				} to a .gjc/hooks module that subscribes to the equivalent event.`,
+				} by hand to a .gjc/hooks module. Importable events: ${SUPPORTED_HOOK_EVENTS.join(", ")}.`,
 			});
 		}
 	}
@@ -115,6 +127,7 @@ export const claudeCodeAdapter: Adapter = {
 			skillCandidates: [],
 			slashCommandCandidates: [],
 			agentCandidates: [],
+			hookCandidates: [],
 			instructionCandidates: [],
 			diagnostics: [],
 			manualActions: [],
@@ -170,6 +183,10 @@ export const claudeCodeAdapter: Adapter = {
 			if ("diagnostic" in settings) {
 				result.diagnostics.push(settings.diagnostic);
 				continue;
+			}
+			const settingsHooks = settings.data.hooks;
+			if (settingsHooks && typeof settingsHooks === "object" && !Array.isArray(settingsHooks)) {
+				result.hookCandidates.push(...collectHookCommands(settingsHooks as Record<string, unknown>));
 			}
 			result.manualActions.push(...describeSettings(settings.data, path.basename(file)));
 		}
