@@ -14,11 +14,30 @@ import * as fs from "node:fs";
 import type * as winston from "winston";
 import { getEffectiveLogsDir } from "./dirs";
 
-/** Ensure a logs directory exists; return the resolved path. */
+const LOG_DIR_MODE = 0o700;
+const LOG_FILE_MODE = 0o600;
+
+/**
+ * Clear group and world bits on a real file or directory.
+ * Symlinks are left untouched so a mode repair cannot change another path.
+ */
+function tightenOwnerOnly(target: string, mode: number): void {
+	try {
+		const stat = fs.lstatSync(target);
+		if (!stat.isFile() && !stat.isDirectory()) return;
+		if ((stat.mode & 0o077) === 0) return;
+		fs.chmodSync(target, mode);
+	} catch {
+		// A mode repair must not take logging down.
+	}
+}
+
+/** Ensure a logs directory exists at mode 0700; return the resolved path. */
 function ensureDir(dir: string): string {
 	if (!fs.existsSync(dir)) {
-		fs.mkdirSync(dir, { recursive: true });
+		fs.mkdirSync(dir, { recursive: true, mode: LOG_DIR_MODE });
 	}
+	tightenOwnerOnly(dir, LOG_DIR_MODE);
 	return dir;
 }
 
@@ -94,12 +113,28 @@ function makeFileTransport(DailyRotateFile: DailyRotateFileCtor, dir?: string): 
 		maxSize: "10m",
 		maxFiles: 5,
 		zippedArchive: true,
+		// `options` replaces the library default `{ flags: "a" }`. Keep append so
+		// an existing log is not truncated. `mode` applies when the file is created.
+		options: { flags: "a", mode: LOG_FILE_MODE },
 	});
 	// winston-daily-rotate-file never listens on its file-stream-rotator stream,
 	// so a failed open or write of the log file (EACCES, EISDIR, EMFILE, the log
 	// directory removed under a live process) is emitted with no listener and
 	// becomes an uncaught exception from a single `logger.warn()`.
-	(transport.logStream as unknown as NodeJS.EventEmitter).on("error", ignoreSinkError);
+	const stream = transport.logStream as unknown as NodeJS.EventEmitter;
+	let currentLog: string | undefined;
+	const repairLog = (): void => {
+		if (currentLog) tightenOwnerOnly(currentLog, LOG_FILE_MODE);
+	};
+	// `new` names the active file (including one that already existed at 0666).
+	// `open` runs after a newly created file exists, so a late create is covered.
+	stream.on("new", (file: unknown) => {
+		if (typeof file !== "string") return;
+		currentLog = file;
+		repairLog();
+	});
+	stream.on("open", repairLog);
+	stream.on("error", ignoreSinkError);
 	return transport;
 }
 
