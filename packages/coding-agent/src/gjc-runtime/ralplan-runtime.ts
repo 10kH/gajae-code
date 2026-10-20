@@ -2320,64 +2320,66 @@ function buildIndexedReviewArtifacts(indexText: string | undefined): Map<string,
 	return map;
 }
 
-/** Receipt fields stay literal so a validated disposition can still be re-read. */
-const RALPLAN_RECEIPT_PRESERVE_KEYS = new Set([
-	"sha256",
-	"path",
-	"schema",
-	"stage",
-	"stageN",
-	"plannerStageN",
-	"sourceRole",
-	"action",
-	"severity",
-	"choice",
-	"status",
-	"conflictId",
-	"findingId",
-	"targetId",
-	"dispositionedAt",
-]);
-
-function scrubDispositionNode(value: unknown): void {
-	if (Array.isArray(value)) {
-		for (let index = 0; index < value.length; index++) {
-			const item = value[index];
-			if (typeof item === "string") value[index] = sanitizeImportedString(item);
-			else if (item && typeof item === "object") scrubDispositionNode(item);
-		}
-		return;
-	}
-	if (!value || typeof value !== "object") return;
-	const record = value as Record<string, unknown>;
-	for (const key of Object.keys(record)) {
-		const child = record[key];
-		if (typeof child === "string") {
-			if (!RALPLAN_RECEIPT_PRESERVE_KEYS.has(key)) record[key] = sanitizeImportedString(child);
-		} else if (child && typeof child === "object") {
-			scrubDispositionNode(child);
-		}
-	}
+function scrubImported(value: string): string {
+	return sanitizeImportedString(value);
 }
 
 /**
- * Credential scrub for a ralplan stage body. Disposition receipts keep path and
- * sha256; every other string uses the session-import scrubber. The result is
- * what `gjc ralplan --write` hashes and stores.
+ * Scrub a validated disposition, then rebuild conflict ids from the scrubbed
+ * finding and target ids. Only `sourceReceipt.path` and `sourceReceipt.sha256`
+ * stay literal. A result that no longer parses is refused instead of stored.
+ */
+function scrubDispositionDocument(normalized: string): string {
+	const doc = parseReviewConflictDocument(normalized);
+	const findingIds = new Map(doc.findings.map(finding => [finding.findingId, scrubImported(finding.findingId)]));
+	const targetIds = new Map(doc.findings.map(finding => [finding.targetId, scrubImported(finding.targetId)]));
+	const priorConflicts = doc.conflicts.map(conflict => ({
+		conflictId: conflict.conflictId,
+		targetId: conflict.targetId,
+		findingIds: [...conflict.findingIds] as [string, string],
+	}));
+	for (const finding of doc.findings) {
+		finding.findingId = findingIds.get(finding.findingId) ?? finding.findingId;
+		finding.targetId = targetIds.get(finding.targetId) ?? finding.targetId;
+		finding.evidence = scrubImported(finding.evidence);
+		if (finding.proposedOwner !== undefined) finding.proposedOwner = scrubImported(finding.proposedOwner);
+	}
+	for (const disposition of doc.dispositions) {
+		const prior = priorConflicts.find(conflict => conflict.conflictId === disposition.conflictId);
+		if (!prior) {
+			throw new RalplanCommandError(2, "refusing to persist ralplan disposition: conflict id did not survive scrub");
+		}
+		const targetId = targetIds.get(prior.targetId) ?? scrubImported(prior.targetId);
+		const mapped = prior.findingIds.map(id => findingIds.get(id) ?? scrubImported(id));
+		const [left, right] = mapped[0]! <= mapped[1]! ? [mapped[0]!, mapped[1]!] : [mapped[1]!, mapped[0]!];
+		disposition.conflictId = `conflict:${targetId}:${left}:${right}`;
+		disposition.rationale = scrubImported(disposition.rationale);
+		disposition.decisionOwner = scrubImported(disposition.decisionOwner);
+		disposition.affectedSections = disposition.affectedSections.map(section => scrubImported(section));
+		if (disposition.dispositionedAt !== undefined)
+			disposition.dispositionedAt = scrubImported(disposition.dispositionedAt);
+	}
+	const raw = JSON.parse(serializeReviewConflictDocument(doc)) as Record<string, unknown>;
+	delete raw.conflicts;
+	let rewritten: ReturnType<typeof parseReviewConflictDocument>;
+	try {
+		rewritten = parseReviewConflictDocument(`${JSON.stringify(raw, null, 2)}\n`);
+	} catch (error) {
+		throw new RalplanCommandError(
+			2,
+			`refusing to persist ralplan disposition: credential scrub broke the document (${error instanceof Error ? error.message : String(error)})`,
+		);
+	}
+	return serializeReviewConflictDocument(rewritten);
+}
+
+/**
+ * Credential scrub for a ralplan stage body. The result is what
+ * `gjc ralplan --write` hashes and stores.
  */
 export function scrubRalplanPersistedBody(stage: string, content: string): string {
 	const normalized = content.endsWith("\n") ? content : `${content}\n`;
-	if (stage === "disposition") {
-		try {
-			const parsed = JSON.parse(normalized) as unknown;
-			if (parsed && typeof parsed === "object") {
-				scrubDispositionNode(parsed);
-				return `${JSON.stringify(parsed, null, 2)}\n`;
-			}
-		} catch {
-			// Not JSON. Fall through and scrub the raw text.
-		}
-	}
+	if (stage === "disposition") return scrubDispositionDocument(normalized);
 	const scrubbed = sanitizeImportedString(normalized);
 	return scrubbed.endsWith("\n") ? scrubbed : `${scrubbed}\n`;
 }

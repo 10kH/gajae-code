@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { runRalplanCliCommand } from "../../src/commands/ralplan";
+import { parseReviewConflictDocument } from "../../src/gjc-runtime/ralplan-review-conflicts";
 
 const SESSION = "ralplan-redact-session";
 const SECRET = "sk-ant-api03-ralplanartifactsecret";
@@ -198,6 +199,114 @@ describe("gjc ralplan --write artifact scrub", () => {
 			expect(stored).not.toContain(SECRET);
 			expect(stored).toContain(arch.sha256);
 			expect(stored).toContain(crit.sha256);
+			expect(parseReviewConflictDocument(stored).schema).toBe("ralplan.review_conflicts.v1");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("removes credential-shaped disposition identifiers", async () => {
+		const root = await tempDir();
+		try {
+			const architect = await runRalplanCliCommand(
+				[
+					"--write",
+					"--stage",
+					"architect",
+					"--stage_n",
+					"1",
+					"--artifact",
+					"# architect\n",
+					"--run-id",
+					"id-redact",
+					"--json",
+				],
+				root,
+			);
+			const critic = await runRalplanCliCommand(
+				[
+					"--write",
+					"--stage",
+					"critic",
+					"--stage_n",
+					"1",
+					"--artifact",
+					"# critic\n",
+					"--run-id",
+					"id-redact",
+					"--json",
+				],
+				root,
+			);
+			expect(architect.status).toBe(0);
+			expect(critic.status).toBe(0);
+			const arch = JSON.parse(architect.stdout ?? "{}") as { path: string; sha256: string };
+			const crit = JSON.parse(critic.stdout ?? "{}") as { path: string; sha256: string };
+			const targetId = `Bearer ${TOKEN}`;
+			const artifactPath = path.join(root, "disposition.json");
+			await fs.writeFile(
+				artifactPath,
+				JSON.stringify({
+					schema: "ralplan.review_conflicts.v1",
+					plannerStageN: 1,
+					findings: [
+						{
+							findingId: SECRET,
+							targetId,
+							action: "remove",
+							severity: "block",
+							evidence: "ordinary evidence",
+							sourceRole: "architect",
+							sourceReceipt: { stage: "architect", stageN: 1, path: arch.path, sha256: arch.sha256 },
+						},
+						{
+							findingId: "crit-1",
+							targetId,
+							action: "add",
+							severity: "watch",
+							evidence: "ordinary evidence",
+							sourceRole: "critic",
+							sourceReceipt: { stage: "critic", stageN: 1, path: crit.path, sha256: crit.sha256 },
+						},
+					],
+					dispositions: [
+						{
+							conflictId: `conflict:${targetId}:crit-1:${SECRET}`,
+							choice: "accept_architect",
+							rationale: "ordinary rationale",
+							decisionOwner: "ralplan-leader",
+							affectedSections: ["## Contracts"],
+							dispositionedAt: SECRET,
+						},
+					],
+				}),
+			);
+			const written = await runRalplanCliCommand(
+				[
+					"--write",
+					"--stage",
+					"disposition",
+					"--stage_n",
+					"1",
+					"--artifact",
+					artifactPath,
+					"--run-id",
+					"id-redact",
+					"--json",
+				],
+				root,
+			);
+			expect(written.status).toBe(0);
+			const payload = JSON.parse(written.stdout ?? "{}") as { path: string };
+			const stored = await fs.readFile(payload.path, "utf8");
+			expect(stored).not.toContain(SECRET);
+			expect(stored).not.toContain(TOKEN);
+			expect(stored).toContain(arch.sha256);
+			expect(stored).toContain(crit.sha256);
+			const parsed = parseReviewConflictDocument(stored);
+			expect(parsed.findings.map(finding => finding.findingId)).not.toContain(SECRET);
+			expect(parsed.dispositions[0]?.conflictId).not.toContain(SECRET);
+			expect(parsed.dispositions[0]?.dispositionedAt).not.toContain(SECRET);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
@@ -220,7 +329,6 @@ describe("scrubRalplanPersistedBody property", () => {
 	it("property: scrub idempotence and safe-text agreement, seed 5472026, 64 inputs", async () => {
 		const { scrubRalplanPersistedBody } = await import("../../src/gjc-runtime/ralplan-runtime");
 		const rand = mulberry32(PROPERTY_SEED);
-		const digest = "ab".repeat(32);
 		for (let index = 0; index < 64; index++) {
 			const note = `note${Math.floor(rand() * 1000)}`;
 			const safe = `# Plan\nKeep src/file${index}.ts ${note}.\n`;
@@ -233,14 +341,6 @@ describe("scrubRalplanPersistedBody property", () => {
 			expect(redacted).not.toContain(SECRET);
 			expect(redacted).toContain(note);
 			expect(scrubRalplanPersistedBody("planner", redacted)).toBe(redacted);
-			const doc = `${JSON.stringify({ evidence: `see ${SECRET} ${note}`, sha256: digest, path: `src/file${index}.ts` }, null, 2)}\n`;
-			const disposition = scrubRalplanPersistedBody("disposition", doc);
-			const parsed = JSON.parse(disposition) as { evidence: string; sha256: string; path: string };
-			expect(parsed.sha256).toBe(digest);
-			expect(parsed.path).toBe(`src/file${index}.ts`);
-			expect(parsed.evidence).not.toContain(SECRET);
-			expect(parsed.evidence).toContain(note);
-			expect(scrubRalplanPersistedBody("disposition", disposition)).toBe(disposition);
 		}
 	});
 });
