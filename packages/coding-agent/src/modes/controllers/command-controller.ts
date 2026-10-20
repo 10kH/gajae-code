@@ -5,7 +5,7 @@ import { CompactionCancelledError, type CompactionOutcome } from "@gajae-code/ag
 import { getEnvApiKey, type ToolCall, type UsageLimit, type UsageReport } from "@gajae-code/ai/core";
 import type { ProviderDetails } from "@gajae-code/ai/provider-details";
 import { type Keybinding, Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@gajae-code/tui";
-import { formatBytes, formatDuration, Snowflake, setProjectDir } from "@gajae-code/utils";
+import { formatBytes, formatDuration, setProjectDir } from "@gajae-code/utils";
 import { canonicalEnvKey, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { resolveAppendOnlyMode } from "../../append-only-mode";
 import { jobElapsedMs } from "../../async";
@@ -182,6 +182,7 @@ export class CommandController {
 	}
 
 	async handleDebugTranscriptCommand(): Promise<void> {
+		let tempDir: string | undefined;
 		try {
 			const width = Math.max(1, this.ctx.ui.terminal.columns);
 			const renderedLines = this.ctx.chatContainer.render(width).map(line => replaceTabs(Bun.stripANSI(line)));
@@ -190,10 +191,22 @@ export class CommandController {
 				this.ctx.showError("No messages to dump yet.");
 				return;
 			}
-			const tmpPath = path.join(os.tmpdir(), `${Snowflake.next()}-tmp.txt`);
-			await Bun.write(tmpPath, `${rendered}\n`);
+			// Random directory plus an exclusive create: a preexisting symlink under the
+			// shared temp directory is not opened, and the transcript is not left world-readable.
+			tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-debug-transcript-"));
+			if (process.platform !== "win32") await fs.chmod(tempDir, 0o700);
+			const tmpPath = path.join(tempDir, "transcript.txt");
+			const handle = await fs.open(tmpPath, "wx", 0o600);
+			try {
+				await handle.writeFile(`${rendered}\n`);
+			} finally {
+				await handle.close();
+			}
+			if (process.platform !== "win32") await fs.chmod(tmpPath, 0o600);
 			this.ctx.showStatus(`Debug transcript written to:\n${tmpPath}`);
+			tempDir = undefined;
 		} catch (error: unknown) {
+			if (tempDir) await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
 			this.ctx.showError(
 				`Failed to write debug transcript: ${error instanceof Error ? error.message : "Unknown error"}`,
 			);
