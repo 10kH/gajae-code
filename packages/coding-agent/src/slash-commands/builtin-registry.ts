@@ -57,7 +57,7 @@ import {
 	invalidateSessionTitleGeneration,
 	isSessionTitleGenerationCurrent,
 } from "../utils/session-title-generation";
-import { buildConversationTitleInput, generateSessionTitle } from "../utils/title-generator";
+import { buildConversationTitleInput, generateSessionTitle, titleInputObfuscator } from "../utils/title-generator";
 import { handleAsideAcp } from "./helpers/aside";
 import { buildAutoroutingStatusReport } from "./helpers/autorouting-status";
 import { buildContextReportText } from "./helpers/context-report";
@@ -158,7 +158,9 @@ function toSlashCommandRuntime(runtime: TuiSlashCommandRuntime): SlashCommandRun
 async function regenerateSessionTitle(runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
 	try {
 		const generation = beginSessionTitleGeneration(runtime.sessionManager);
-		const input = buildConversationTitleInput(runtime.session.messages);
+		const activeCwd = runtime.sessionManager.getCwd();
+		const obfuscateText = await titleInputObfuscator(runtime.settings, activeCwd);
+		const input = buildConversationTitleInput(runtime.session.messages, obfuscateText);
 		if (!input) {
 			return usage("Nothing to summarize yet — pass a title: /rename <title>", runtime);
 		}
@@ -170,10 +172,11 @@ async function regenerateSessionTitle(runtime: SlashCommandRuntime): Promise<Sla
 			runtime.session.credentialSessionId,
 			runtime.session.model,
 			provider => runtime.session.agent.metadataForProvider(provider),
+			activeCwd,
 		);
 		if (
 			!isSessionTitleGenerationCurrent(runtime.sessionManager, generation) ||
-			buildConversationTitleInput(runtime.session.messages) !== input
+			buildConversationTitleInput(runtime.session.messages, obfuscateText) !== input
 		)
 			return commandConsumed();
 		if (!generated) {

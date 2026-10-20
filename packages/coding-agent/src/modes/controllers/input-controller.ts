@@ -1642,6 +1642,7 @@ export class InputController {
 		// Keep locally intercepted command arguments away from the title model.
 		if (this.ctx.session.isLocallyHandledSlashCommand(text)) return;
 		this.#autoTitleInFlightSessionId = sessionId;
+		const activeCwd = this.ctx.sessionManager.getCwd();
 		generateSessionTitle(
 			text,
 			this.ctx.session.modelRegistry,
@@ -1649,6 +1650,7 @@ export class InputController {
 			this.ctx.session.credentialSessionId,
 			this.ctx.session.model,
 			provider => this.ctx.session.agent.metadataForProvider(provider),
+			activeCwd,
 		)
 			.then(async title => {
 				if (!title || this.ctx.sessionManager.getSessionId() !== sessionId) return;
