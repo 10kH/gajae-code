@@ -272,10 +272,11 @@ describe("searchCodex model selection", () => {
 	it.each([
 		{ name: "Luna-only", ids: ["gpt-6-luna"], expected: "gpt-6-luna" },
 		{ name: "reverse-order Luna/Sol", ids: ["gpt-6-luna", "gpt-6.1-sol"], expected: "gpt-6.1-sol" },
-		{ name: "unknown-only", ids: ["gpt-6-astra"], expected: "gpt-6.1-sol" },
+		{ name: "non-preferred plus Luna", ids: ["gpt-6-astra", "gpt-6-luna"], expected: "gpt-6-luna" },
+		{ name: "non-preferred-only", ids: ["gpt-6-astra"], expected: "gpt-6.1-sol" },
 		{ name: "retired-only", ids: ["gpt-5.5"], expected: "gpt-6.1-sol" },
 		{ name: "empty", ids: [], expected: "gpt-6.1-sol" },
-	])("filters the $name catalog before selecting a default", async ({ ids, expected }) => {
+	])("intersects the $name catalog with the candidate policy, otherwise using Sol", async ({ ids, expected }) => {
 		const catalog = mockCatalog(ids);
 		using _hook = mockCodexFetch(expected);
 

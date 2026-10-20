@@ -22,6 +22,9 @@ import { classifyProviderHttpError, withHardTimeout } from "./utils";
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const CODEX_RESPONSES_PATH = "/codex/responses";
 const FALLBACK_MODEL = "gpt-6.1-sol";
+// Manually maintained candidate policy, not a runtime capability check. Bundled
+// IDs only filter availability; upstream Codex web-search metadata informed the
+// Sol/Luna choices, but does not guarantee this request envelope or entitlement.
 const DEFAULT_MODEL_PREFERENCES = [
 	"gpt-6.1-sol",
 	"gpt-6-luna",
@@ -51,7 +54,7 @@ function getDefaultModelCandidates(): string[] {
 		return candidates;
 	}
 
-	// A catalog entry alone does not establish hosted web_search compatibility.
+	// Keep the reviewed fallback rather than promoting a non-preferred catalog ID.
 	return [FALLBACK_MODEL];
 }
 

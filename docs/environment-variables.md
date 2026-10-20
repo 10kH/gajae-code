@@ -444,6 +444,8 @@ OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth
 
 Codex web search prefers bundled `gpt-6.1-sol`, then `gpt-6-luna`, before older defaults. If no preferred candidate is bundled, it uses `gpt-6.1-sol` rather than an arbitrary catalog model. These models have hosted web-search metadata in the [upstream Codex catalog](https://github.com/openai/codex/blob/091008729d5572712ac08964a9602eb71cf31428/codex-rs/models-manager/models.json); account and workspace availability still apply. Only known unsupported-model HTTP 400 errors advance to the next default. `GJC_OPENAI_CODE_WEB_SEARCH_MODEL` overrides this order (ahead of legacy `PI_CODEX_WEB_SEARCH_MODEL`); explicit overrides are sent once, without model fallback. GPT-5.5 is no longer a default because it [retired from ChatGPT-authenticated Codex](https://learn.chatgpt.com/docs/models#gpt-55-retirement).
 
+This is a manually maintained candidate policy, not runtime capability discovery: the bundled catalog is authoritative only for ID presence, not hosted `web_search` support. Upstream metadata informed the Sol/Luna choices but does not verify acceptance of GJC's exact `/codex/responses` request envelope. Non-preferred catalog models are not automatically promoted, even if they advertise search support upstream.
+
 SearXNG also reads the equivalent `searxng.endpoint`, `searxng.token`, `searxng.basicUsername`, and `searxng.basicPassword` settings from `~/.gjc/agent/config.yml`; environment variables are fallbacks.
 
 ### Anthropic web search auth chain
