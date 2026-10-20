@@ -418,6 +418,39 @@ const KITTY_ESCAPE_FRAME_CHARS = 3 + 1 + 2;
 const KITTY_CHUNK_FLAG_CHARS = ",m=1".length;
 
 /**
+ * RFC 4648 base64, the same guard `encodeITerm2Multipart` already applies.
+ * The alphabet excludes ESC, ST, and BEL, so a payload cannot end an APC or OSC early.
+ * A linear scan, not a repeating-group regex: that regex rejects some multi-megabyte
+ * valid payloads in this runtime.
+ */
+function isBase64Alphabet(code: number): boolean {
+	return (
+		(code >= 65 && code <= 90) ||
+		(code >= 97 && code <= 122) ||
+		(code >= 48 && code <= 57) ||
+		code === 43 ||
+		code === 47
+	);
+}
+
+function isRfc4648Base64(value: string): boolean {
+	const length = value.length;
+	if (length % 4 !== 0) return false;
+	let body = length;
+	if (length > 0 && value.charCodeAt(length - 1) === 61) {
+		body = value.charCodeAt(length - 2) === 61 ? length - 2 : length - 1;
+	}
+	for (let index = 0; index < body; index++) {
+		if (!isBase64Alphabet(value.charCodeAt(index))) return false;
+	}
+	return true;
+}
+
+function assertIterm2Base64(value: string): void {
+	if (!isRfc4648Base64(value)) throw new Error("Invalid RFC 4648 base64");
+}
+
+/**
  * Encode one kitty transmission behind `header` (the control string without a
  * chunk flag), splitting the base64 payload so each escape fits
  * {@link KITTY_MAX_ESCAPE_CHARS} and each non-final chunk keeps the protocol's
@@ -425,6 +458,7 @@ const KITTY_CHUNK_FLAG_CHARS = ",m=1".length;
  * field at all.
  */
 export function encodeKittyTransmission(header: string, base64Data: string): string {
+	assertIterm2Base64(base64Data);
 	const whole = `\x1b_G${header};${base64Data}\x1b\\`;
 	if (whole.length <= KITTY_MAX_ESCAPE_CHARS) return whole;
 	const chunks: string[] = [];
@@ -590,6 +624,7 @@ export function encodeITerm2(
 		inline?: boolean;
 	} = {},
 ): string {
+	assertIterm2Base64(base64Data);
 	const params: string[] = [`inline=${options.inline !== false ? 1 : 0}`];
 
 	if (options.width !== undefined) params.push(`width=${options.width}`);
@@ -812,6 +847,7 @@ export function renderImage(
 	const fit = calculateImageFit(imageDimensions, options, cellDims);
 
 	if (TERMINAL.imageProtocol === ImageProtocol.Kitty) {
+		if (!isRfc4648Base64(base64Data)) return null;
 		const imageId = options.imageId ?? kittyImageId(base64Data);
 		const placementId = options.placementId ?? 1;
 		// Upload data once per image id (out-of-band; the transmit escape is
@@ -840,6 +876,7 @@ export function renderImage(
 		}
 	}
 	if (TERMINAL.imageProtocol === ImageProtocol.Iterm2) {
+		if (!isRfc4648Base64(base64Data)) return null;
 		const sequence = encodeITerm2(base64Data, {
 			width: fit.columns,
 			height: "auto",
@@ -883,12 +920,7 @@ export function parseITerm2CapabilityReply(input: Uint8Array | string): Iterm2Ca
 	return complete ? "missing-f" : undefined;
 }
 
-const ITERM2_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
 const ITERM2_MAX_CAPABILITY_BYTES = 4096;
-
-function assertIterm2Base64(value: string): void {
-	if (value.length % 4 !== 0 || !ITERM2_BASE64.test(value)) throw new Error("Invalid RFC 4648 base64");
-}
 
 export function encodeITerm2Multipart(
 	base64Data: string,
