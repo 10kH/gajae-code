@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -29,6 +29,18 @@ function writeJson(dir: string, value: unknown): string {
 
 function migrate(ymlPath: string): void {
 	new ConfigFile("models", schema, ymlPath);
+}
+
+function pathVisible(target: string): boolean {
+	try {
+		fs.lstatSync(target);
+		return true;
+	} catch (error) {
+		if (error && typeof error === "object" && "code" in error && (error as { code?: string }).code === "ENOENT") {
+			return false;
+		}
+		throw error;
+	}
 }
 
 describe("models.yml json migration", () => {
@@ -96,5 +108,56 @@ describe("models.yml json migration", () => {
 		expect(fs.readFileSync(target, "utf8")).toBe(original);
 		expect(fs.lstatSync(ymlPath).isSymbolicLink()).toBe(true);
 		expect(fs.statSync(target).mode & 0o777).toBe(0o640);
+	});
+
+	it("loads a complete models.yml when a second migration runs during the first write", () => {
+		const dir = tempDir();
+		const payload = { providers: { local: { baseUrl: "http://127.0.0.1:9" } } };
+		writeJson(dir, payload);
+		const ymlPath = path.join(dir, "models.yml");
+		let enteredDuringWrite = false;
+		let destVisibleDuringWrite = false;
+		let secondLoad: unknown = "second-did-not-run";
+		const originalWrite = fs.writeFileSync.bind(fs);
+		const spy = spyOn(fs, "writeFileSync").mockImplementation((...args: Parameters<typeof fs.writeFileSync>) => {
+			const file = args[0];
+			if (!enteredDuringWrite && typeof file === "number") {
+				enteredDuringWrite = true;
+				destVisibleDuringWrite = pathVisible(ymlPath);
+				secondLoad = new ConfigFile("models", schema, ymlPath).load();
+			}
+			return originalWrite(...args);
+		});
+		try {
+			const first = new ConfigFile("models", schema, ymlPath);
+			expect(enteredDuringWrite).toBe(true);
+			expect(destVisibleDuringWrite).toBe(false);
+			expect(secondLoad).toEqual(payload);
+			expect(first.load()).toEqual(payload);
+			expect(YAML.parse(fs.readFileSync(ymlPath, "utf8"))).toEqual(payload);
+			expect(fs.readdirSync(dir).filter(name => name.endsWith(".tmp"))).toEqual([]);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("an interrupted publication does not hide the json source from a later migration", () => {
+		const dir = tempDir();
+		const payload = { providers: { local: { baseUrl: "http://127.0.0.1:9" } } };
+		writeJson(dir, payload);
+		const ymlPath = path.join(dir, "models.yml");
+		const link = spyOn(fs, "linkSync").mockImplementation(() => {
+			const error = new Error("publish interrupted") as Error & { code: string };
+			error.code = "EIO";
+			throw error;
+		});
+		try {
+			expect(new ConfigFile("models", schema, ymlPath).load()).toBeNull();
+			expect(pathVisible(ymlPath)).toBe(false);
+			expect(fs.readdirSync(dir).filter(name => name.endsWith(".tmp"))).toEqual([]);
+		} finally {
+			link.mockRestore();
+		}
+		expect(new ConfigFile("models", schema, ymlPath).load()).toEqual(payload);
 	});
 });

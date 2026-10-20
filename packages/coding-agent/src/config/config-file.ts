@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir, isEnoent, isFsError, logger } from "@gajae-code/utils";
@@ -22,25 +23,57 @@ function ymlPathPresent(ymlPath: string): boolean {
 }
 
 /**
- * Create a new regular file as mode 0600. O_EXCL plus O_NOFOLLOW refuses a
- * symlink that appears after the lstat check, so a dangling link is not
- * followed into a newly created target.
+ * Publish a new regular file as mode 0600. The bytes go to a private inode
+ * opened with O_EXCL and O_NOFOLLOW, then `link` attaches that inode to
+ * `ymlPath`. `link` fails when the name exists, so a final-component symlink
+ * is not followed and an existing file is not replaced. The destination name
+ * stays absent until the write has finished.
  */
 function writeNewOwnerOnlyNoFollow(ymlPath: string, content: string): void {
 	const noFollow = process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0);
-	let fd: number;
+	const tmpPath = path.join(
+		path.dirname(ymlPath),
+		`.${path.basename(ymlPath)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`,
+	);
+	let fd: number | undefined;
 	try {
-		fd = fs.openSync(ymlPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
+		fd = fs.openSync(tmpPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
+		if (process.platform !== "win32") fs.fchmodSync(fd, 0o600);
+		fs.writeFileSync(fd, content);
+		fs.fsyncSync(fd);
+		fs.closeSync(fd);
+		fd = undefined;
 	} catch (error) {
-		// The destination appeared, or the final component is a symlink.
+		if (fd !== undefined) {
+			try {
+				fs.closeSync(fd);
+			} catch {
+				// The original failure is the one that must surface.
+			}
+			try {
+				fs.unlinkSync(tmpPath);
+			} catch {
+				// The destination name was not published.
+			}
+		}
+		throw error;
+	}
+	try {
+		fs.linkSync(tmpPath, ymlPath);
+	} catch (error) {
+		try {
+			fs.unlinkSync(tmpPath);
+		} catch {
+			// The destination name was not replaced.
+		}
+		// The name is already present: a finished peer publish, or a file or symlink we must not replace.
 		if (isFsError(error) && (error.code === "EEXIST" || error.code === "ELOOP")) return;
 		throw error;
 	}
 	try {
-		if (process.platform !== "win32") fs.fchmodSync(fd, 0o600);
-		fs.writeFileSync(fd, content);
-	} finally {
-		fs.closeSync(fd);
+		fs.unlinkSync(tmpPath);
+	} catch {
+		// The destination name already refers to the completed inode.
 	}
 }
 
