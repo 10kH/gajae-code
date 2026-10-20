@@ -4,6 +4,7 @@ import * as fssync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isSettingsInitialized, Settings } from "../config/settings";
+import { sanitizeImportedString } from "../session-import/redact";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { buildRalplanHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
@@ -2319,6 +2320,68 @@ function buildIndexedReviewArtifacts(indexText: string | undefined): Map<string,
 	return map;
 }
 
+/** Receipt fields stay literal so a validated disposition can still be re-read. */
+const RALPLAN_RECEIPT_PRESERVE_KEYS = new Set([
+	"sha256",
+	"path",
+	"schema",
+	"stage",
+	"stageN",
+	"plannerStageN",
+	"sourceRole",
+	"action",
+	"severity",
+	"choice",
+	"status",
+	"conflictId",
+	"findingId",
+	"targetId",
+	"dispositionedAt",
+]);
+
+function scrubDispositionNode(value: unknown): void {
+	if (Array.isArray(value)) {
+		for (let index = 0; index < value.length; index++) {
+			const item = value[index];
+			if (typeof item === "string") value[index] = sanitizeImportedString(item);
+			else if (item && typeof item === "object") scrubDispositionNode(item);
+		}
+		return;
+	}
+	if (!value || typeof value !== "object") return;
+	const record = value as Record<string, unknown>;
+	for (const key of Object.keys(record)) {
+		const child = record[key];
+		if (typeof child === "string") {
+			if (!RALPLAN_RECEIPT_PRESERVE_KEYS.has(key)) record[key] = sanitizeImportedString(child);
+		} else if (child && typeof child === "object") {
+			scrubDispositionNode(child);
+		}
+	}
+}
+
+/**
+ * Credential scrub for a ralplan stage body. Disposition receipts keep path and
+ * sha256; every other string uses the session-import scrubber. The result is
+ * what `gjc ralplan --write` hashes and stores.
+ */
+export function scrubRalplanPersistedBody(stage: string, content: string): string {
+	const normalized = content.endsWith("\n") ? content : `${content}\n`;
+	if (stage === "disposition") {
+		try {
+			const parsed = JSON.parse(normalized) as unknown;
+			if (parsed && typeof parsed === "object") {
+				scrubDispositionNode(parsed);
+				return `${JSON.stringify(parsed, null, 2)}\n`;
+			}
+		} catch {
+			// Not JSON. Fall through and scrub the raw text.
+		}
+	}
+	const scrubbed = sanitizeImportedString(normalized);
+	return scrubbed.endsWith("\n") ? scrubbed : `${scrubbed}\n`;
+}
+
 async function handleArtifactWrite(
 	args: readonly string[],
 	cwd: string,
@@ -2380,7 +2443,9 @@ async function handleArtifactWrite(
 		resolved.stage === "disposition"
 			? normalizeDispositionArtifact(resolved.artifact, resolved.stageN, indexLoad.rawText)
 			: resolved.artifact;
-	const content = normalizedArtifact.endsWith("\n") ? normalizedArtifact : `${normalizedArtifact}\n`;
+	// Scrub before the content hash. The ledger, dedupe, and pending-approval copy
+	// all trust this digest, so it has to name the bytes that actually land on disk.
+	const content = scrubRalplanPersistedBody(resolved.stage, normalizedArtifact);
 	const sha256 = createHash("sha256").update(content).digest("hex");
 
 	// Duplicate-write guard: a second `--write` for the same (stage, stage_n) must not
