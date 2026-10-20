@@ -240,6 +240,20 @@ describe("ssh remote output trust boundary", () => {
 		return lines.join("\n");
 	}
 
+	function truncatedRemoteResult(output: string, exitCode = 0): SSHResult {
+		const outputBytes = Buffer.byteLength(output, "utf-8");
+		const outputLines = output.split("\n").length;
+		return {
+			...sshResult(output, exitCode),
+			truncated: true,
+			totalLines: outputLines + 120,
+			totalBytes: outputBytes + 32_768,
+			outputLines,
+			outputBytes,
+			artifactFailureDiagnostic: "end: injected sink finalization failure",
+		};
+	}
+
 	function modelExcerpt(result: {
 		content: Array<{ type: string; text?: string }>;
 		details?: { meta?: Parameters<typeof stripOutputNotice>[1] };
@@ -392,6 +406,69 @@ describe("ssh remote output trust boundary", () => {
 		const notice = formatTruncationMetaNotice(truncation!);
 		expect(notice).toContain("omitted by the artifact storage cap");
 		expect(notice).toContain("Artifact storage failed: write: storage unavailable");
+	});
+
+	it("ssh execute does not publish a retained window as a full-output artifact", async () => {
+		const retained = overlongRemote("HEADMARKER", "TAILMARKER");
+		const allocateOutputArtifact = vi.fn(async () => ({ id: "ssh-sink", path: "ssh-sink.log" }));
+		const session = { allocateOutputArtifact } as unknown as ToolSession;
+		ensureHostInfoImpl = async () => linuxHostInfo();
+		executeSSHImpl = async () => truncatedRemoteResult(retained, 7);
+		const writes: string[] = [];
+		const write = vi.spyOn(Bun, "write").mockImplementation(async (_path, data) => {
+			writes.push(String(data));
+			return writes[writes.length - 1]?.length ?? 0;
+		});
+		try {
+			const error = await settle(
+				tool(session).execute("ssh-incomplete-error", { host: "box", command: "cat", timeout: 1 }),
+			).then(
+				() => {
+					throw new Error("expected ToolError");
+				},
+				(error: unknown) => error,
+			);
+			expect(error).toBeInstanceOf(ToolError);
+			const message = error instanceof Error ? error.message : String(error);
+			const result = truncatedRemoteResult(retained, 7);
+			expect(allocateOutputArtifact).toHaveBeenCalledTimes(1);
+			expect(writes).toEqual([]);
+			expect(message).not.toContain("Read artifact://ssh-sink for full output");
+			expect(message).toContain(
+				`SSH output is incomplete: retained ${result.outputBytes} of ${result.totalBytes} bytes`,
+			);
+			expect(message).toContain("Artifact storage failed: end: injected sink finalization failure");
+			expect(message).toContain("Command exited with code 7");
+		} finally {
+			write.mockRestore();
+		}
+	});
+
+	it("ssh execute preserves incomplete retained-window totals in truncation metadata", async () => {
+		const retained = overlongRemote("HEADMARKER", "TAILMARKER");
+		const result = truncatedRemoteResult(retained);
+		ensureHostInfoImpl = async () => linuxHostInfo();
+		executeSSHImpl = async () => result;
+		const output = await settle(tool().execute("ssh-incomplete-meta", { host: "box", command: "cat", timeout: 1 }));
+		const truncation = output.details?.meta?.truncation;
+		expect(truncation).toMatchObject({
+			direction: "tail",
+			truncatedBy: "bytes",
+			totalLines: result.totalLines,
+			totalBytes: result.totalBytes,
+			outputLines: result.outputLines,
+			outputBytes: result.outputBytes,
+			artifactFailureDiagnostic: result.artifactFailureDiagnostic,
+		});
+		expect(truncation?.shownRange).toEqual({
+			start: result.totalLines - result.outputLines + 1,
+			end: result.totalLines,
+		});
+		expect(truncation?.artifactId).toBeUndefined();
+		expect(formatTruncationMetaNotice(truncation!)).toContain(
+			"Artifact storage failed: end: injected sink finalization failure",
+		);
+		expect(textOf(output)).not.toContain("Read artifact://");
 	});
 
 	it("ssh execute reports tail fallback counts in remote-output units", async () => {

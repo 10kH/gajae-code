@@ -21,7 +21,7 @@ import {
 } from "../session/streaming-output";
 import type { SSHHostInfo } from "../ssh/connection-manager";
 import { ensureHostInfo, getHostInfoForHost } from "../ssh/connection-manager";
-import { executeSSH } from "../ssh/ssh-executor";
+import { executeSSH, type SSHResult } from "../ssh/ssh-executor";
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import type { ToolSession } from ".";
@@ -216,6 +216,34 @@ async function storeFullRemoteOutput(session: ToolSession, output: string): Prom
 	return allocated.id;
 }
 
+function hasCompleteRemoteOutput(result: SSHResult, output: string): boolean {
+	return (
+		!result.truncated &&
+		result.outputBytes === result.totalBytes &&
+		Buffer.byteLength(output, "utf-8") === result.outputBytes
+	);
+}
+
+function incompleteOutputNotice(result: SSHResult, artifactId: string | undefined): string | undefined {
+	const retainedWindowIncomplete = result.truncated || result.outputBytes < result.totalBytes;
+	if (!retainedWindowIncomplete) return undefined;
+
+	const artifactIncomplete =
+		(result.artifactTruncatedBytes ?? 0) > 0 || result.artifactFailureDiagnostic !== undefined;
+	const completeArtifactAvailable = artifactId !== undefined && !artifactIncomplete;
+	if (completeArtifactAvailable) return undefined;
+
+	const notes = [`SSH output is incomplete: retained ${result.outputBytes} of ${result.totalBytes} bytes`];
+	notes.push("no complete output artifact is available");
+	if ((result.artifactTruncatedBytes ?? 0) > 0) {
+		notes.push(`artifact storage omitted at least ${result.artifactTruncatedBytes} bytes`);
+	}
+	if (result.artifactFailureDiagnostic) {
+		notes.push(`Artifact storage failed: ${result.artifactFailureDiagnostic}`);
+	}
+	return notes.join("; ");
+}
+
 function buildRemoteCommand(command: string, cwd: string | undefined, info: SSHHostInfo): string {
 	if (!cwd) return command;
 
@@ -310,18 +338,24 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 		} else if (!exceedsInlineCap(remote, _ctx?.settings)) {
 			framed = frameFullRemoteOutput(remote);
 		} else {
-			if (!storedArtifactId) storedArtifactId = await storeFullRemoteOutput(this.session, remote);
+			if (!storedArtifactId && hasCompleteRemoteOutput(result, remote)) {
+				storedArtifactId = await storeFullRemoteOutput(this.session, remote);
+			}
 			framed = storedArtifactId ? frameShrunkRemoteOutput(remote, _ctx?.settings) : frameFullRemoteOutput(remote);
 		}
 		// The artifact id stays in truncation metadata. A line after the closing
 		// fence makes the inline backstop drop the opening fence.
 		const modelText = framed?.text;
 		const storedNote =
-			framed?.shrunk && storedArtifactId
+			(framed?.shrunk || result.truncated) && storedArtifactId && !result.artifactFailureDiagnostic
 				? `\n\n${formatArtifactReference(storedArtifactId, result.artifactTruncatedBytes)}`
 				: "";
+		const incompleteNote = incompleteOutputNotice(result, storedArtifactId);
 		if (result.cancelled) {
-			throw new ToolError(modelText ? `${modelText}${storedNote}` : "Command aborted");
+			const message = [modelText || "Command aborted", storedNote.trim() || undefined, incompleteNote]
+				.filter((part): part is string => part !== undefined)
+				.join("\n\n");
+			throw new ToolError(message);
 		}
 
 		const outputText = modelText ?? "(no output)";
@@ -337,7 +371,15 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 		}
 
 		if (result.exitCode !== 0 && result.exitCode !== undefined) {
-			throw new ToolError(`${outputText}${storedNote}\n\nCommand exited with code ${result.exitCode}`);
+			const message = [
+				outputText,
+				storedNote.trim() || undefined,
+				incompleteNote,
+				`Command exited with code ${result.exitCode}`,
+			]
+				.filter((part): part is string => part !== undefined)
+				.join("\n\n");
+			throw new ToolError(message);
 		}
 
 		const built = resultBuilder.done();
