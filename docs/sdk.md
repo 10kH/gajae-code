@@ -483,6 +483,91 @@ does not replay a response or produce `idempotency_conflict`. A retained duplica
 reuse a `clientRef` as a retry mechanism: after eviction the same value can identify
 a new prompt while the old outcome remains unknown.
 
+### GJC-private SDK image staging
+
+Authenticated machine attachments can stage image bytes without enlarging the
+private SDK's **256 KiB frame limit**. These are internal GJC SDK controls, not
+standard ACP methods, MCP tools, or a new public image capability. Attach through
+the Router as usual; do not discover endpoints or credentials yourself.
+
+When installed, `runtime.capabilities` lists `turn.image.begin`, `turn.image.append`,
+`turn.image.finish`, and `turn.image.discard`. A custom host transport must provide
+authoritative live-connection membership and the host's internal read-only definitive
+exact-run settlement observer; otherwise the controls are not installed. This observer
+waits for ledger settlement events independently of socket or host lifetime, not a
+bounded snapshot or polling loop.
+The notifications host also requires its internal run-domain and terminal-owner
+observers and active-handle accessor before advertising staging.
+Model-facing and chat adapters cannot invoke these machine-only controls.
+
+1. `turn.image.begin` takes `{ mimeType, byteLength, sha256, batchId? }` and returns
+   `{ id, nextSequence: 0 }`. Supported formats are static PNG, JPEG, WebP, and GIF;
+   animated PNG, WebP, and GIF images are rejected. The digest is lowercase SHA-256
+   of the original bytes. Each image is at most 20 MiB.
+2. `turn.image.append` takes `{ id, sequence, data }`, with canonical base64 encoding
+   of at most 96 KiB decoded bytes, and acknowledges `nextSequence` and
+   `receivedBytes`. Sequence numbers must be contiguous.
+3. `turn.image.finish` takes `{ id }` and validates size, digest, MIME, dimensions,
+   static-image policy, and decoding without transcoding. `turn.image.discard` takes
+   `{ id }` to abandon an unredeemed upload.
+4. `turn.prompt` can take `stagedImages: [{ id }]` instead of `images`. Redemption is
+   atomic, ordered, one-shot, and scoped to the same authenticated connection and
+   session. Image-only prompts may use `text: ""`; direct and staged images cannot
+   be mixed. Provider input retains the original bytes and MIME without transcoding or
+   byte loss.
+
+There are at most 16 outstanding uploads and 16 images per prompt. Each session has
+separate 64 MiB upload-source and accepted-source admission limits; accepted base64
+storage is charged in addition to source bytes against the shared 256 MiB process
+budget, along with transient decode memory. Each session permits one in-flight
+`finish`; another session can decode concurrently when process capacity permits. Uploads
+expire after 120 seconds without valid progress; optional same-owner `batchId`
+progress renews only live peers. Stock hosts remove unredeemed leases on
+disconnect. Custom transports should forward close notifications for immediate
+reclamation; every access, including async decode completion, also rechecks
+liveness, and missed close notifications cannot extend the expiry deadline. Accepted
+image capacity belongs to the consuming execution, not the socket: disconnect,
+queue residence, an unrelated terminal, or uncertainty alone cannot release it.
+Failed admission or confirmed queue removal releases never-executed capacity.
+Acceptance or cancellation does not prove an unadopted producer has stopped retaining
+images: its capacity remains charged until that submission actually settles.
+Once execution starts, an exact resource-settlement proof is required: even an
+attributed cancelled `agent_end` or transport teardown may leave tools running.
+Each retiring reservation has one event-driven settlement continuation, with no
+polling or observation cutoff. A late exact settlement releases its capacity even
+after transport or host teardown; shutdown does not wait for a still-live producer.
+Unknown runs, quarantine, and observer failures retain capacity and produce a
+process-level diagnostic rather than claiming settlement. Internal budget snapshots
+expose retained process source/accepted and transient charges. The existing ledger makes quarantine
+irreversible, so quarantined executions remain charged for this process's lifetime
+rather than claiming their tombstones prove settlement. An adopted execution
+without an exact resource handle or owning domain also stays charged.
+
+Promotion into an own-run is not itself proof that execution started. If the
+execution producer positively refuses that exact queued invocation before it can
+start, its image reservation retires only after the enqueue producer returns.
+This is a failed prompt, not queue cancellation; normal durable-publication
+rules still apply. Missing lifecycle events, a generic error, or teardown do not
+provide this no-start authority. Started or ambiguous executions still require
+their exact settlement proof.
+
+An ambiguous prompt response must not be replayed: recover the original `clientRef`
+through the correlated `turn.result` contract. Reusing a retained
+`clientRef` returns `client_ref_conflict` before staged-image redemption, not a second
+acknowledgement or execution. Missing or consumed staged IDs return
+`image_upload_unavailable`; a closed session or connection still returns `resource_gone`.
+
+ACP's public contract remains `session/prompt` with `ContentBlock.image`
+(`type: "image"`, base64 `data`, and `mimeType`), negotiated through
+`agentCapabilities.promptCapabilities.image`. See the pinned
+`@agentclientprotocol/sdk` schema and the upstream [content specification](https://agentclientprotocol.com/protocol/content).
+That capability does not advertise `turn.image.*` or `stagedImages`. This SDK
+foundation does **not** change ACP's existing oversized-prompt rejection; a separate
+ACP consumer must bridge standard inline images to staging internally and retain
+the public schema, cancellation, and capability semantics.
+
+### Cancellation outcomes and inactivity limits
+
 `turn.abort` returns a typed disposition. A caller that does not own the target
 receives `resource_gone`; it must not treat that result as cancellation of another
 prompt.

@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { CONFIG_DIR_NAME, getDefaultTabWidth, onDefaultTabWidthChange, setDefaultTabWidth } from "@gajae-code/utils";
 import { YAML } from "bun";
+import { readFile as readCachedFile } from "../src/capability/fs";
 import type { Settings as SettingsCapabilityItem } from "../src/capability/settings";
 import { Settings } from "../src/config/settings";
 import {
@@ -194,7 +195,12 @@ describe("Settings.snapshotForCwd", () => {
 		const itemB = firstB.items.find(item => item.level === "project" && item.path === projectSettingsPath(targetB));
 		expect(itemB?.data.ask).toEqual({ timeout: 120_000 });
 
+		// Project discovery uses contained reads, which deliberately bypass the shared
+		// lexical cache. Prime that cache explicitly to exercise a genuinely stale entry.
+		const cachedSettingsA = await readCachedFile(settingsAPath);
+		expect(cachedSettingsA).toBe(JSON.stringify({ ask: { timeout: 30_000 } }));
 		await writeProjectSettings(targetA, { ask: { timeout: 60_000 } });
+		expect(await readCachedFile(settingsAPath)).toBe(cachedSettingsA);
 		const ordinaryReload = await loadCapability<SettingsCapabilityItem>("settings", {
 			cwd: targetA,
 			includeDisabledProviders: true,
