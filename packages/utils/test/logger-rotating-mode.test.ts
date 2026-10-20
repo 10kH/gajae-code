@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import fc from "fast-check";
 
 const LOGGER_SOURCE = path.resolve(import.meta.dir, "../src/logger.ts");
 
@@ -168,4 +169,95 @@ describe.skipIf(process.platform === "win32")("rotating log owner-only mode", ()
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	}, 20_000);
+
+	it("still writes a rotating log into a directory whose name ends in a backslash", async () => {
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-home-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
+		const sibling = path.join(root, "logs");
+		const named = path.join(root, "logs\\");
+		try {
+			fs.mkdirSync(sibling);
+			fs.chmodSync(sibling, 0o755);
+			fs.writeFileSync(path.join(sibling, "keep.txt"), "sibling-keep\n");
+			const result = await runProbe(named, home);
+			expect(result.written.some(file => file.body.includes("rotating-log-mode-marker"))).toBe(true);
+			expect(fs.readdirSync(root)).toContain("logs\\");
+			expect(fs.lstatSync(sibling).mode & 0o777).toBe(0o755);
+			expect(fs.readFileSync(path.join(sibling, "keep.txt"), "utf8")).toBe("sibling-keep\n");
+			expect(fs.readdirSync(sibling).some(name => name.endsWith(".log"))).toBe(false);
+		} finally {
+			fs.rmSync(home, { recursive: true, force: true });
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	}, 20_000);
+
+	it("creates a backslash-named rotating log directory at 0700", async () => {
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-home-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
+		const named = path.join(root, "logs\\");
+		try {
+			const result = await runProbe(named, home);
+			expect(fs.lstatSync(named).isDirectory()).toBe(true);
+			expect(result.dirMode).toBe(0o700);
+			expect(result.written.length).toBeGreaterThan(0);
+			for (const file of result.written) expect(file.mode).toBe(0o600);
+			expect(fs.existsSync(path.join(root, "logs"))).toBe(false);
+		} finally {
+			fs.rmSync(home, { recursive: true, force: true });
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	}, 20_000);
+});
+
+function isGeneratedSeparator(char: string, platform: "posix" | "win32"): boolean {
+	return char === "/" || (platform === "win32" && char === "\\");
+}
+
+function logPathHolds(
+	lexicalLogPath: (target: string, platform: "posix" | "win32") => string,
+	isFsRoot: (target: string, platform: "posix" | "win32") => boolean,
+	raw: string,
+	platform: "posix" | "win32",
+): boolean {
+	const out = lexicalLogPath(raw, platform);
+	if (!raw.startsWith(out)) return false;
+	for (const char of raw.slice(out.length)) {
+		if (!isGeneratedSeparator(char, platform)) return false;
+	}
+	if (lexicalLogPath(out, platform) !== out) return false;
+	const ends = raw.length > 0 && isGeneratedSeparator(raw[raw.length - 1] ?? "", platform);
+	if (!ends && out !== raw) return false;
+	if (isFsRoot(raw, platform) && !isFsRoot(out, platform)) return false;
+	if (out.length > 0 && !isFsRoot(out, platform) && isGeneratedSeparator(out[out.length - 1] ?? "", platform)) {
+		return false;
+	}
+	if (platform === "posix") {
+		if (raw.split("\\").length !== out.split("\\").length) return false;
+		if (lexicalLogPath(`${raw}\\`, "posix") !== `${raw}\\`) return false;
+	}
+	return true;
+}
+
+it("normalizes log paths without changing a non-separator name", async () => {
+	const mod = await import("../src/logger");
+	const { lexicalLogPath, isFsRoot } = mod;
+	if (typeof lexicalLogPath !== "function" || typeof isFsRoot !== "function") {
+		throw new Error("log path helpers missing");
+	}
+	expect(lexicalLogPath("logs\\", "posix")).toBe("logs\\");
+	expect(lexicalLogPath("logs/", "posix")).toBe("logs");
+	expect(lexicalLogPath("logs\\", "win32")).toBe("logs");
+	expect(lexicalLogPath("C:\\", "win32")).toBe("C:\\");
+	expect(lexicalLogPath("C:/", "win32")).toBe("C:/");
+	expect(lexicalLogPath("C:", "win32")).toBe("C:");
+	expect(isFsRoot("\\", "posix")).toBe(false);
+	expect(isFsRoot("/", "posix")).toBe(true);
+	expect(isFsRoot("C:\\", "win32")).toBe(true);
+	expect(isFsRoot("C:", "win32")).toBe(false);
+	fc.assert(
+		fc.property(fc.string(), fc.constantFrom("posix" as const, "win32" as const), (raw, platform) =>
+			logPathHolds(lexicalLogPath, isFsRoot, raw, platform),
+		),
+		{ seed: 209, numRuns: 128 },
+	);
 });

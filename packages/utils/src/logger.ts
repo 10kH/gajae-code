@@ -17,17 +17,44 @@ import { getEffectiveLogsDir } from "./dirs";
 const LOG_DIR_MODE = 0o700;
 const LOG_FILE_MODE = 0o600;
 
-/** Drop a trailing separator without turning a filesystem root into a relative path. */
-function lexicalLogPath(target: string): string {
-	if (target.length <= 1) return target;
-	let end = target.length;
-	while (end > 1 && (target[end - 1] === "/" || target[end - 1] === "\\")) end -= 1;
-	if (process.platform === "win32" && /^[A-Za-z]:$/.test(target.slice(0, end))) return `${target.slice(0, end)}\\`;
-	return target.slice(0, end);
+type LogPathPlatform = NodeJS.Platform | "posix";
+
+function logPathKind(platform: LogPathPlatform): "posix" | "win32" {
+	return platform === "win32" ? "win32" : "posix";
 }
 
-function isFsRoot(target: string): boolean {
-	return target === "/" || target === "\\" || /^[A-Za-z]:\\$/.test(target);
+function isLogSeparator(char: string, platform: LogPathPlatform): boolean {
+	return char === "/" || (logPathKind(platform) === "win32" && char === "\\");
+}
+
+/** A filesystem root. On POSIX a backslash is a file name, not a root or a separator. */
+export function isFsRoot(target: string, platform: LogPathPlatform = process.platform): boolean {
+	if (logPathKind(platform) === "win32") {
+		return target === "/" || target === "\\" || /^[A-Za-z]:[\\/]$/.test(target);
+	}
+	if (target.length === 0) return false;
+	for (const char of target) {
+		if (char !== "/") return false;
+	}
+	return true;
+}
+
+/**
+ * Drop trailing separators without changing the directory name.
+ * POSIX removes only `/`. Windows also removes `\`.
+ * A root keeps one separator so `C:\` does not become the drive-relative name `C:`.
+ */
+export function lexicalLogPath(target: string, platform: LogPathPlatform = process.platform): string {
+	if (target.length === 0) return target;
+	let end = target.length;
+	while (end > 0 && isLogSeparator(target[end - 1] ?? "", platform)) {
+		const kept = target.slice(0, end);
+		const shorter = target.slice(0, end - 1);
+		if (isFsRoot(kept, platform) && !isFsRoot(shorter, platform)) break;
+		if (end === 1) break;
+		end -= 1;
+	}
+	return target.slice(0, end);
 }
 
 function isFinalSymlink(target: string): boolean {
