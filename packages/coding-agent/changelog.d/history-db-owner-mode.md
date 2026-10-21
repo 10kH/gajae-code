@@ -1,3 +1,3 @@
 ### Fixed
 
-- Session history database files and their WAL sidecars are created mode 0600 and are not opened through a symlink.
+- Session history database files and WAL sidecars are owner-only on POSIX and Windows, are not opened through a symlink, and a failed first open leaves the database in place.

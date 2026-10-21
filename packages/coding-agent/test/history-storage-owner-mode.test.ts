@@ -1,4 +1,6 @@
+import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, it, vi } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -259,4 +261,170 @@ describe("history database owner-only files", () => {
 		expect(await fs.readFile(outside, "utf-8")).toBe("kept");
 		expect((await fs.lstat(`${dbPath}-shm`)).isSymbolicLink()).toBe(true);
 	});
+
+	it("leaves the history database in place when the first open fails", () => {
+		const root = fsSync.mkdtempSync(path.join(os.tmpdir(), "gjc-history-mode-"));
+		tempRoots.push(root);
+		const dbPath = path.join(root, "history.db");
+		const realRun = Database.prototype.run;
+		const run = vi.spyOn(Database.prototype, "run").mockImplementation(function (this: Database, sql, ...args) {
+			if (typeof sql === "string" && sql.includes("CREATE TABLE IF NOT EXISTS history")) {
+				throw new Error("SQLITE_BUSY");
+			}
+			return realRun.call(this, sql, ...args);
+		});
+		HistoryStorage.resetInstance();
+		try {
+			expect(() => HistoryStorage.open(dbPath)).toThrow(/SQLITE_BUSY/);
+			expect(fsSync.existsSync(dbPath)).toBe(true);
+		} finally {
+			run.mockRestore();
+			HistoryStorage.resetInstance();
+		}
+	});
+
+	it("does not delete a history database another process has open when the first open fails", () => {
+		const root = fsSync.mkdtempSync(path.join(os.tmpdir(), "gjc-history-mode-"));
+		tempRoots.push(root);
+		const dbPath = path.join(root, "history.db");
+		const ready = path.join(root, "ready");
+		const script = path.join(root, "hold.ts");
+		fsSync.writeFileSync(
+			script,
+			[
+				'import { Database } from "bun:sqlite";',
+				'import * as fs from "node:fs";',
+				"const db = new Database(process.argv[2]);",
+				'db.run("PRAGMA journal_mode=WAL");',
+				'db.run("CREATE TABLE IF NOT EXISTS marker (note TEXT)");',
+				`db.run("INSERT INTO marker (note) VALUES ('adopted-by-child')");`,
+				'db.run("BEGIN");',
+				'db.prepare("SELECT note FROM marker").get();',
+				'fs.writeFileSync(process.argv[3], "ready");',
+				"setInterval(() => {}, 1_000_000);",
+				"",
+			].join("\n"),
+		);
+		let child: ReturnType<typeof Bun.spawn> | undefined;
+		const realRun = Database.prototype.run;
+		const run = vi.spyOn(Database.prototype, "run").mockImplementation(function (this: Database, sql, ...args) {
+			if (typeof sql === "string" && sql.includes("CREATE TABLE IF NOT EXISTS history")) {
+				child = Bun.spawn([process.execPath, script, dbPath, ready], { stdout: "ignore", stderr: "pipe" });
+				const start = Date.now();
+				while (!fsSync.existsSync(ready)) {
+					if (Date.now() - start > 10000) throw new Error("child not ready");
+				}
+				throw new Error("SQLITE_BUSY");
+			}
+			return realRun.call(this, sql, ...args);
+		});
+		HistoryStorage.resetInstance();
+		try {
+			expect(() => HistoryStorage.open(dbPath)).toThrow(/SQLITE_BUSY/);
+			expect(fsSync.existsSync(dbPath)).toBe(true);
+			const probe = new Database(dbPath, { readonly: true });
+			const row = probe.prepare("SELECT note FROM marker").get() as { note: string };
+			probe.close();
+			expect(row.note).toBe("adopted-by-child");
+			expect(child?.exitCode).toBeNull();
+		} finally {
+			child?.kill();
+			run.mockRestore();
+			HistoryStorage.resetInstance();
+		}
+	});
+
+	it("does not delete a history database another opener created when the first open fails", () => {
+		const root = fsSync.mkdtempSync(path.join(os.tmpdir(), "gjc-history-mode-"));
+		tempRoots.push(root);
+		const dbPath = path.join(root, "history.db");
+		const realLstat = fsSync.lstatSync;
+		const realRun = Database.prototype.run;
+		let armed = false;
+		let forced = 0;
+		const lstat = vi.spyOn(fsSync, "lstatSync").mockImplementation(((
+			target: fsSync.PathLike,
+			options?: fsSync.StatOptions,
+		) => {
+			const name = String(target);
+			if (forced < 3 && (name === dbPath || name === `${dbPath}-wal` || name === `${dbPath}-shm`)) {
+				forced += 1;
+				if (forced === 3) {
+					const planted = new Database(dbPath);
+					planted.run(
+						"CREATE TABLE history (id INTEGER PRIMARY KEY, prompt TEXT); INSERT INTO history (prompt) VALUES ('adopted-prompt')",
+					);
+					planted.close();
+					armed = true;
+				}
+				const error = new Error("ENOENT") as NodeJS.ErrnoException;
+				error.code = "ENOENT";
+				throw error;
+			}
+			return realLstat(target, options as { bigint: true });
+		}) as typeof fsSync.lstatSync);
+		const run = vi.spyOn(Database.prototype, "run").mockImplementation(function (this: Database, sql, ...args) {
+			if (armed && typeof sql === "string" && sql.includes("CREATE TABLE IF NOT EXISTS history")) {
+				throw new Error("SQLITE_BUSY");
+			}
+			return realRun.call(this, sql, ...args);
+		});
+		HistoryStorage.resetInstance();
+		try {
+			expect(() => HistoryStorage.open(dbPath)).toThrow(/SQLITE_BUSY/);
+			expect(fsSync.existsSync(dbPath)).toBe(true);
+			const probe = new Database(dbPath, { readonly: true });
+			const row = probe.prepare("SELECT prompt FROM history").get() as { prompt: string };
+			probe.close();
+			expect(row.prompt).toBe("adopted-prompt");
+		} finally {
+			lstat.mockRestore();
+			run.mockRestore();
+			HistoryStorage.resetInstance();
+		}
+	});
+
+	it.skipIf(process.platform !== "win32")(
+		"still opens a history database when owner-only protection can be established",
+		() => {
+			const native = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
+			const root = fsSync.mkdtempSync(path.join(os.tmpdir(), "gjc-history-mode-"));
+			tempRoots.push(root);
+			const parent = path.join(root, "data");
+			const dbPath = path.join(parent, "history.db");
+			HistoryStorage.resetInstance();
+			try {
+				const storage = HistoryStorage.open(dbPath);
+				expect(storage.getRecent(1)).toEqual([]);
+				expect(native.verifyOwnerOnlyPathSecurity(parent, "directory").ok).toBe(true);
+				for (const suffix of ["", "-wal", "-shm"]) {
+					expect(native.verifyOwnerOnlyPathSecurity(`${dbPath}${suffix}`, "file").ok).toBe(true);
+				}
+			} finally {
+				HistoryStorage.resetInstance();
+			}
+		},
+	);
+
+	it.skipIf(process.platform !== "win32")(
+		"fails closed when history owner-only protection cannot be established",
+		() => {
+			const native = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
+			const root = fsSync.mkdtempSync(path.join(os.tmpdir(), "gjc-history-mode-"));
+			tempRoots.push(root);
+			const dbPath = path.join(root, "history.db");
+			const apply = vi.spyOn(native, "applyOwnerOnlyPathSecurity").mockReturnValue({
+				ok: false,
+				code: "acl_apply_failed",
+			});
+			HistoryStorage.resetInstance();
+			try {
+				expect(() => HistoryStorage.open(dbPath)).toThrow(/owner-only protection/);
+				expect(fsSync.existsSync(dbPath)).toBe(false);
+			} finally {
+				apply.mockRestore();
+				HistoryStorage.resetInstance();
+			}
+		},
+	);
 });

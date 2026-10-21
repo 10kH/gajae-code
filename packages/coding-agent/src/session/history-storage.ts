@@ -26,6 +26,17 @@ function escapeLikePattern(text: string): string {
 }
 
 const HISTORY_SUFFIXES = ["", "-wal", "-shm"] as const;
+let openingHistory: Database | undefined;
+
+function secureHistoryPath(pathname: string, kind: "directory" | "file"): void {
+	if (process.platform !== "win32") return;
+	const native = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
+	const applied = native.applyOwnerOnlyPathSecurity(pathname, kind);
+	const verified = native.verifyOwnerOnlyPathSecurity(pathname, kind);
+	if (applied?.ok !== true || verified?.ok !== true) {
+		throw new Error("history database owner-only protection could not be established");
+	}
+}
 
 function historyErrno(error: unknown): string | undefined {
 	return (error as NodeJS.ErrnoException | undefined)?.code;
@@ -56,15 +67,15 @@ function assertHistoryLeaves(dbPath: string): Set<string> {
 	return present;
 }
 
-function removeNewHistoryLeaves(dbPath: string, before: Set<string>): void {
-	for (const suffix of HISTORY_SUFFIXES) {
-		if (before.has(suffix)) continue;
-		try {
-			fs.unlinkSync(`${dbPath}${suffix}`);
-		} catch {
-			// Already gone, or a raced replacement left a directory.
-		}
+function removeNewHistoryLeaves(): void {
+	// A WAL reader can stay live while BEGIN EXCLUSIVE succeeds, so failure
+	// cleanup must not unlink a database another opener has adopted.
+	try {
+		openingHistory?.close();
+	} catch {
+		// The caller reports the original open failure.
 	}
+	openingHistory = undefined;
 }
 
 function readHistoryDirectory(dir: string): fs.Stats | undefined {
@@ -92,6 +103,7 @@ function tightenHistoryDirectory(dir: string): void {
 		existing = readHistoryDirectory(dir);
 		if (!existing) throw new Error("history database directory is not a real directory");
 	}
+	secureHistoryPath(dir, "directory");
 	if (process.platform === "win32") return;
 	// 0300/0700 are already owner-only. Sticky directories are shared and stay as they are.
 	// chmod(2) needs no read bit, so mode 0333 becomes 0700. A symlink swap is
@@ -138,7 +150,9 @@ function restrictHistoryFiles(dbPath: string, createMissingDb: boolean): void {
 			assertRegularHistoryLeaf(existing);
 			if (!existing) throw new Error("history database path is not a regular file");
 		}
-		if (!existing || process.platform === "win32" || (Number(existing.mode) & 0o077) === 0) continue;
+		if (!existing) continue;
+		secureHistoryPath(target, "file");
+		if (process.platform === "win32" || (Number(existing.mode) & 0o077) === 0) continue;
 		let fd: number | undefined;
 		try {
 			fd = fs.openSync(target, fs.constants.O_RDONLY | noFollow);
@@ -217,6 +231,7 @@ export class HistoryStorage {
 
 	private constructor(dbPath: string) {
 		this.#db = new Database(dbPath);
+		openingHistory = this.#db;
 
 		const hasFts = this.#db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_fts'").get();
 
@@ -277,17 +292,19 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 			this.#db.close();
 			throw error;
 		}
+		openingHistory = undefined;
 	}
 
 	static #openNew(dbPath: string): HistoryStorage {
-		const before = assertHistoryLeaves(dbPath);
+		openingHistory = undefined;
+		assertHistoryLeaves(dbPath);
 		try {
 			tightenHistoryDirectory(path.dirname(dbPath));
 			assertHistoryLeaves(dbPath);
 			restrictHistoryFiles(dbPath, true);
 			return new HistoryStorage(dbPath);
 		} catch (error) {
-			removeNewHistoryLeaves(dbPath, before);
+			removeNewHistoryLeaves();
 			throw error;
 		}
 	}
