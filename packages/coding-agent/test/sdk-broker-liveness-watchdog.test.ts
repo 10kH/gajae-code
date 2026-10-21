@@ -6,6 +6,10 @@ import * as native from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import { Broker, setHeartbeatStallForTest, setLivenessGraceForTest } from "../src/sdk/broker/broker";
 import { publishBrokerDiscovery, readBrokerDiscovery } from "../src/sdk/broker/discovery";
+import {
+	publicationLivenessHardExitEnabled,
+	publicationLivenessMustExit,
+} from "../src/sdk/broker/publication-liveness-deadline";
 
 // A short TTL drives the publication watchdog at `ttl/3`, so a liveness deadline
 // expressed in cadences expires in tens of milliseconds.
@@ -295,6 +299,98 @@ test("a stale watchdog observation cannot mutate a restarted broker generation",
 		retain.mockRestore();
 	}
 });
+
+test("publication liveness hard-exit stays disarmed in the test runner", () => {
+	expect(publicationLivenessHardExitEnabled()).toBe(false);
+	expect(publicationLivenessHardExitEnabled({ GJC_BROKER_LIVENESS_HARD_EXIT: "1", BUN_ENV: "test" })).toBe(true);
+	expect(publicationLivenessHardExitEnabled({ GJC_BROKER_LIVENESS_HARD_EXIT: "0" })).toBe(false);
+});
+
+test("a blocked event loop is the only hard-exit case", () => {
+	const graceMs = 60_000n;
+	const cadenceMs = 5_000n;
+	const publishedMs = 1_000n;
+	// cadence * 4 = 20s, which is inside the 60s publication grace.
+	const loopLimitMs = 20_000n;
+	expect(
+		publicationLivenessMustExit({
+			nowMs: publishedMs + graceMs - 1n,
+			publishedMs,
+			loopMs: publishedMs,
+			graceMs,
+			cadenceMs,
+			active: 1n,
+		}),
+	).toBe(false);
+	expect(
+		publicationLivenessMustExit({
+			nowMs: publishedMs + graceMs,
+			publishedMs,
+			loopMs: publishedMs + graceMs - cadenceMs,
+			graceMs,
+			cadenceMs,
+			active: 1n,
+		}),
+	).toBe(false);
+	expect(
+		publicationLivenessMustExit({
+			nowMs: publishedMs + graceMs,
+			publishedMs,
+			loopMs: publishedMs + graceMs - loopLimitMs,
+			graceMs,
+			cadenceMs,
+			active: 1n,
+		}),
+	).toBe(true);
+	expect(
+		publicationLivenessMustExit({
+			nowMs: publishedMs + graceMs,
+			publishedMs,
+			loopMs: publishedMs + graceMs - loopLimitMs,
+			graceMs,
+			cadenceMs,
+			active: 0n,
+		}),
+	).toBe(false);
+});
+
+test("a heartbeat write that blocks the JS thread still trips publication-liveness-timeout", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-liveness-block-"));
+	roots.push(root);
+	const agentDir = path.join(root, "agent");
+	const home = path.join(root, "home");
+	await fs.mkdir(home);
+	const graceMs = 500;
+	const blockMs = 30_000;
+	const childPath = path.join(import.meta.dir, "sdk-broker-liveness-blocked-write-child.ts");
+	const startedAt = performance.now();
+	const child = Bun.spawn([process.execPath, childPath, agentDir, String(graceMs), String(blockMs)], {
+		cwd: path.join(import.meta.dir, ".."),
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		env: {
+			...process.env,
+			HOME: home,
+			GJC_CODING_AGENT_DIR: agentDir,
+			GJC_BROKER_LIVENESS_HARD_EXIT: "1",
+		},
+	});
+	const finished = await Promise.race([child.exited.then(() => true), Bun.sleep(15_000).then(() => false)]);
+	if (!finished) child.kill("SIGKILL");
+	const stdout = await new Response(child.stdout).text();
+	const stderr = await new Response(child.stderr).text();
+	const elapsedMs = performance.now() - startedAt;
+	expect(finished, `still alive after ${elapsedMs}ms\nstdout:\n${stdout}\nstderr:\n${stderr}`).toBe(true);
+	expect(stdout, stderr).toContain("hooks-installed");
+	expect(stdout, stderr).not.toContain("graceful");
+	expect(stderr, stdout).toContain("sdk broker: publication-liveness-timeout");
+	expect(elapsedMs, stderr).toBeLessThan(blockMs);
+	expect(
+		child.signalCode === "SIGKILL" || child.exitCode === 137,
+		`signal=${String(child.signalCode)} exit=${String(child.exitCode)}\n${stderr}`,
+	).toBe(true);
+}, 30_000);
 
 test("a heartbeat that resumes before the deadline clears the accrued stall", async () => {
 	const broker = await startBroker();
