@@ -325,6 +325,65 @@ describe("ssh remote output trust boundary", () => {
 		expect(result.details?.meta?.truncation?.artifactId).toBeUndefined();
 	});
 
+	it("ssh execute returns completed output and exit status when the post-command artifact allocation rejects", async () => {
+		const remote = overlongRemote("HEADMARKER", "TAILMARKER");
+		const framed = referenceFrame(remote);
+		const run = async (exitCode: number) => {
+			let calls = 0;
+			let ran = false;
+			const allocateOutputArtifact = vi.fn(async () => {
+				calls += 1;
+				if (calls > 1) throw new Error("post-command allocation rejected");
+				return { id: "ssh-stream", path: "ssh-stream.log" };
+			});
+			const session = { allocateOutputArtifact } as unknown as ToolSession;
+			ensureHostInfoImpl = async () => linuxHostInfo();
+			executeSSHImpl = async () => {
+				ran = true;
+				return sshResult(remote, exitCode);
+			};
+			try {
+				const result = await settle(
+					tool(session).execute("ssh-alloc-reject", { host: "box", command: "touch ran", timeout: 1 }),
+				);
+				return {
+					text: textOf(result),
+					error: undefined,
+					calls,
+					ran,
+					artifactId: result.details?.meta?.truncation?.artifactId,
+				};
+			} catch (error) {
+				return {
+					text: error instanceof Error ? error.message : String(error),
+					error,
+					calls,
+					ran,
+					artifactId: undefined,
+				};
+			}
+		};
+
+		const success = await run(0);
+		expect(success.ran).toBe(true);
+		expect(success.calls).toBe(2);
+		expect(success.error).toBeUndefined();
+		expect(success.text).toBe(framed);
+		expect(success.text.startsWith("<untrusted-content>\n")).toBe(true);
+		expect(success.text.endsWith(`\n${CLOSE}`)).toBe(true);
+		expect(success.artifactId).toBeUndefined();
+		expect(success.text).not.toContain("post-command allocation rejected");
+
+		const failed = await run(7);
+		expect(failed.ran).toBe(true);
+		expect(failed.calls).toBe(2);
+		expect(failed.error).toBeInstanceOf(ToolError);
+		expect(failed.text).toContain(framed);
+		expect(failed.text).toContain("Command exited with code 7");
+		expect(failed.text).not.toContain("post-command allocation rejected");
+		expect(failed.text).not.toContain("Read artifact://");
+	});
+
 	it("ssh execute stores the full remote output before a shorter inline frame", async () => {
 		const headMarker = "HEADMARKER";
 		const tailMarker = "TAILMARKER";

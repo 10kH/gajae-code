@@ -206,13 +206,20 @@ function frameShrunkRemoteOutput(output: string, settings: Settings | undefined)
 	};
 }
 
-/** Store the full remote text. Never write an already-shortened excerpt. */
+/** Store the full remote text. Never write an already-shortened excerpt.
+ * The command has already finished, so a rejected reservation must not discard it.
+ */
 async function storeFullRemoteOutput(
 	session: ToolSession,
 	output: string,
 	artifactPublication: SessionArtifactPublication | undefined,
 ): Promise<string | undefined> {
-	const allocated = await session.allocateOutputArtifact?.("ssh");
+	let allocated: { id?: string; path?: string } | undefined;
+	try {
+		allocated = await session.allocateOutputArtifact?.("ssh");
+	} catch {
+		allocated = undefined;
+	}
 	if (allocated?.path && allocated.id) {
 		try {
 			await Bun.write(allocated.path, output);
