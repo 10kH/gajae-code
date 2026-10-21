@@ -10,10 +10,12 @@ import { loadCapability } from "../discovery";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import sshDescriptionBase from "../prompts/tools/ssh.md" with { type: "text" };
+import type { SessionArtifactPublication } from "../session/session-manager";
 import {
 	DEFAULT_MAX_BYTES,
 	streamTailUpdates,
 	TailBuffer,
+	type TerminalArtifactPublisher,
 	type TruncationResult,
 	truncateMiddle,
 	truncateMiddleWindows,
@@ -205,15 +207,43 @@ function frameShrunkRemoteOutput(output: string, settings: Settings | undefined)
 }
 
 /** Store the full remote text. Never write an already-shortened excerpt. */
-async function storeFullRemoteOutput(session: ToolSession, output: string): Promise<string | undefined> {
+async function storeFullRemoteOutput(
+	session: ToolSession,
+	output: string,
+	artifactPublication: SessionArtifactPublication | undefined,
+): Promise<string | undefined> {
 	const allocated = await session.allocateOutputArtifact?.("ssh");
-	if (!allocated?.path || !allocated.id) return undefined;
+	if (allocated?.path && allocated.id) {
+		try {
+			await Bun.write(allocated.path, output);
+			return allocated.id;
+		} catch {
+			// Fall through to the session-owned publisher when a writable path failed.
+		}
+	}
+	if (!artifactPublication) return undefined;
 	try {
-		await Bun.write(allocated.path, output);
+		return await artifactPublication(output, "ssh");
 	} catch {
 		return undefined;
 	}
-	return allocated.id;
+}
+
+function createSshArtifactPublisher(
+	artifactPublication: SessionArtifactPublication | undefined,
+): TerminalArtifactPublisher | undefined {
+	if (!artifactPublication) return undefined;
+	return async (content, info) => {
+		try {
+			const artifactId = await artifactPublication(content, "ssh");
+			if (!artifactId) return { status: "unavailable" };
+			return info.omittedBytes > 0
+				? { status: "published", artifactId, omittedBytes: info.omittedBytes }
+				: { status: "published", artifactId };
+		} catch (error) {
+			return { status: "failed", diagnostic: error instanceof Error ? error.message : String(error) };
+		}
+	};
 }
 
 function hasCompleteRemoteOutput(result: SSHResult, output: string): boolean {
@@ -316,6 +346,8 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 		// Clamp to reasonable range: 1s - 3600s (1 hour)
 		const timeoutSec = clampTimeout("ssh", rawTimeout);
 		const timeoutMs = timeoutSec * 1000;
+		const outputSettings = _ctx?.settings ?? this.session.settings;
+		const artifactPublication = this.session.captureArtifactPublication?.();
 
 		const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES);
 		const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("ssh")) ?? {};
@@ -327,6 +359,7 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 			compatEnabled: hostInfo.compatEnabled,
 			artifactPath,
 			artifactId,
+			artifactPublisher: createSshArtifactPublisher(artifactPublication),
 			onChunk: streamTailUpdates(tailBuffer, onUpdate),
 		});
 
@@ -335,24 +368,33 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 		let framed: RemoteFrame | undefined;
 		if (!remote) {
 			framed = undefined;
-		} else if (!exceedsInlineCap(remote, _ctx?.settings)) {
+		} else if (!exceedsInlineCap(remote, outputSettings)) {
 			framed = frameFullRemoteOutput(remote);
 		} else {
 			if (!storedArtifactId && hasCompleteRemoteOutput(result, remote)) {
-				storedArtifactId = await storeFullRemoteOutput(this.session, remote);
+				storedArtifactId = await storeFullRemoteOutput(this.session, remote, artifactPublication);
 			}
-			framed = storedArtifactId ? frameShrunkRemoteOutput(remote, _ctx?.settings) : frameFullRemoteOutput(remote);
+			framed = storedArtifactId ? frameShrunkRemoteOutput(remote, outputSettings) : frameFullRemoteOutput(remote);
 		}
 		// The artifact id stays in truncation metadata. A line after the closing
 		// fence makes the inline backstop drop the opening fence.
 		const modelText = framed?.text;
 		const storedNote =
-			(framed?.shrunk || result.truncated) && storedArtifactId && !result.artifactFailureDiagnostic
+			(framed?.shrunk || result.truncated) && storedArtifactId
 				? `\n\n${formatArtifactReference(storedArtifactId, result.artifactTruncatedBytes)}`
 				: "";
 		const incompleteNote = incompleteOutputNotice(result, storedArtifactId);
+		const artifactFailureNote =
+			result.artifactFailureDiagnostic && !incompleteNote
+				? `SSH streaming artifact storage failed: ${result.artifactFailureDiagnostic}`
+				: undefined;
 		if (result.cancelled) {
-			const message = [modelText || "Command aborted", storedNote.trim() || undefined, incompleteNote]
+			const message = [
+				modelText || "Command aborted",
+				storedNote.trim() || undefined,
+				incompleteNote,
+				artifactFailureNote,
+			]
 				.filter((part): part is string => part !== undefined)
 				.join("\n\n");
 			throw new ToolError(message);
@@ -375,6 +417,7 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 				outputText,
 				storedNote.trim() || undefined,
 				incompleteNote,
+				artifactFailureNote,
 				`Command exited with code ${result.exitCode}`,
 			]
 				.filter((part): part is string => part !== undefined)

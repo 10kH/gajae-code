@@ -361,6 +361,113 @@ describe("ssh remote output trust boundary", () => {
 		}
 	});
 
+	it("ssh execute publishes raw output for pathless session artifacts before the generic backstop", async () => {
+		const remote = overlongRemote("HEADMARKER", "TAILMARKER");
+		const published: Array<{ content: string; toolType: string }> = [];
+		const publishArtifact = vi.fn(async (content: string, toolType: string) => {
+			published.push({ content, toolType });
+			return "ssh-raw";
+		});
+		const settings = Settings.isolated({ "tools.artifactHeadBytes": 0 });
+		const session = {
+			settings,
+			allocateOutputArtifact: vi.fn(async () => ({ id: "ssh-pathless" })),
+			captureArtifactPublication: () => publishArtifact,
+		} as unknown as ToolSession;
+		ensureHostInfoImpl = async () => linuxHostInfo();
+		executeSSHImpl = async (_host, _command, options) => {
+			expect(options?.artifactPublisher).toBeDefined();
+			return sshResult(remote, 0);
+		};
+
+		const manager = SessionManager.inMemory();
+		const saveArtifact = vi.spyOn(manager, "saveArtifact");
+		const wrapped = wrapToolWithMetaNotice(tool(session));
+		try {
+			const result = await settle(
+				wrapped.execute("ssh-managed-raw", { host: "box", command: "cat", timeout: 1 }, undefined, undefined, {
+					settings,
+					sessionManager: createReadonlySessionManager(manager),
+				} as AgentToolContext),
+			);
+			expect(published).toEqual([{ content: remote, toolType: "ssh" }]);
+			expect(result.details?.meta?.truncation?.artifactId).toBe("ssh-raw");
+			expect(saveArtifact).not.toHaveBeenCalled();
+			expect(textOf(result)).toContain("TAILMARKER");
+			expect(textOf(result)).not.toContain("HEADMARKER");
+		} finally {
+			saveArtifact.mockRestore();
+		}
+	});
+
+	const remote = overlongRemote("HEADMARKER", "TAILMARKER");
+	for (const outcome of [
+		{ name: "nonzero exit", exitCode: 7, cancelled: false },
+		{ name: "cancellation", exitCode: undefined, cancelled: true },
+	]) {
+		it(`ssh error includes a successful fallback artifact after ${outcome.name}`, async () => {
+			let allocations = 0;
+			const allocateOutputArtifact = vi.fn(async () => {
+				allocations++;
+				return allocations === 1
+					? { id: "ssh-original", path: "ssh-original.log" }
+					: { id: "ssh-fallback", path: "ssh-fallback.log" };
+			});
+			const session = {
+				settings: Settings.isolated({ "tools.artifactHeadBytes": 0 }),
+				allocateOutputArtifact,
+			} as unknown as ToolSession;
+			ensureHostInfoImpl = async () => linuxHostInfo();
+			executeSSHImpl = async () => ({
+				...sshResult(remote, outcome.exitCode, outcome.cancelled),
+				artifactFailureDiagnostic: "end: injected sink finalization failure",
+			});
+			const writes: string[] = [];
+			const write = vi.spyOn(Bun, "write").mockImplementation(async (_path, data) => {
+				writes.push(String(data));
+				return writes[writes.length - 1]?.length ?? 0;
+			});
+			try {
+				const error = await settle(
+					tool(session).execute(`ssh-fallback-${outcome.name}`, { host: "box", command: "cat", timeout: 1 }),
+				).then(
+					() => {
+						throw new Error("expected ToolError");
+					},
+					(error: unknown) => error,
+				);
+				expect(error).toBeInstanceOf(ToolError);
+				const message = error instanceof Error ? error.message : String(error);
+				expect(writes).toEqual([remote]);
+				expect(message).toContain("Read artifact://ssh-fallback for full output");
+				expect(message).toContain("SSH streaming artifact storage failed: end: injected sink finalization failure");
+				if (outcome.exitCode !== undefined) expect(message).toContain("Command exited with code 7");
+			} finally {
+				write.mockRestore();
+			}
+		});
+	}
+
+	it("ssh execute uses session output limits when a direct call omits context", async () => {
+		const remote = "x".repeat(16 * 1024);
+		for (const maxInlineResultBytes of [24, 0]) {
+			const publishArtifact = vi.fn(async () => "ssh-raw");
+			const settings = Settings.isolated({ "tools.maxInlineResultBytes": maxInlineResultBytes });
+			const session = {
+				settings,
+				allocateOutputArtifact: vi.fn(async () => ({ id: "ssh-pathless" })),
+				captureArtifactPublication: () => publishArtifact,
+			} as unknown as ToolSession;
+			ensureHostInfoImpl = async () => linuxHostInfo();
+			executeSSHImpl = async () => sshResult(remote, 0);
+			const result = await settle(
+				tool(session).execute("ssh-direct-settings", { host: "box", command: "cat", timeout: 1 }),
+			);
+			expect(textOf(result)).toBe(referenceFrame(remote));
+			expect(publishArtifact).not.toHaveBeenCalled();
+		}
+	});
+
 	it("ssh execute preserves original stream totals when the inline window is shorter", async () => {
 		const remote = overlongRemote("HEADMARKER", "TAILMARKER");
 		ensureHostInfoImpl = async () => linuxHostInfo();
