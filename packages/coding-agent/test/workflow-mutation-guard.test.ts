@@ -2972,6 +2972,8 @@ describe("bash scanner quoting model", () => {
 					`const sink=(p,d)=>process.binding("fs")["writeFileUtf8"](p,d,577,438);const holder={return:1};holder.return / (s=>s["write"]=sink)(process.${stream}) / 1;process.${stream}.write("src/product.ts","PWNED")`,
 					`const sink=(p,d)=>process.binding("fs")["writeFileUtf8"](p,d,577,438);const ${alias}=module["require"]("node:process").${stream};${alias}["write"]=sink;process.${stream}.write("src/product.ts","PWNED")`,
 					`const ${alias}=module["r"+"equire"]("node:process").${stream};${alias}["write"]=writer;process.${stream}.write("src/product.ts","PWNED")`,
+					`const ${alias}=pro\\u0063ess["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
+					`const factory=require("node:module")["createRequire"];const loader=factory(process.cwd()+"/probe.js");const ${alias}=loader("node:process")["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
 					...["globalThis", "global"].flatMap(root =>
 						[`${root}["module"]["require"]`, `${root}["require"]`].map(
 							loader =>
@@ -2982,6 +2984,11 @@ describe("bash scanner quoting model", () => {
 					`\`\${/[}]/,(s=>s["write"]=writer)(process.${stream})}\`;process.${stream}.write("status")`,
 					`let n=1;n++ / (s=>s["write"]=writer)(process.${stream}) / 1;process.${stream}.write("status")`,
 					`const h={return:1};h. return / (s=>s["write"]=writer)(process.${stream}) / 1;process.${stream}.write("status")`,
+					`if(true) if(true) /=/;(s=>s["write"]=writer)(process.${stream});/x/;process.${stream}.write("status")`,
+					...["h.if()", "h. if()", "h./**/if()", "$if()", "h.catch()"].map(
+						callee =>
+							`const h={if:()=>1,catch:()=>1};const $if=()=>1;${callee} / (s=>s["write"]=writer)(process.${stream}) / 1;process.${stream}.write("status")`,
+					),
 					`const r=/"/;const h={return:1};h.return / (s=>s["write"]=writer)(process.${stream}) / 1;process.${stream}.write("status")`,
 					...["\n", "\r", "\u2028", "\u2029"].map(
 						terminator =>
@@ -3045,6 +3052,8 @@ describe("bash scanner quoting model", () => {
 			`function f(){return /x/.test("x")} console.log(f())`,
 			`console.log(Math.max(1, 2) / 2)`,
 			`const getBuiltinModule = id => id; console.log(getBuiltinModule("node:path"))`,
+			`if (true) /x/.test("x"); console.log("inspection")`,
+			`console.log(process.stdout.fd, process.stderr.fd)`,
 		]) {
 			const command = `node -e ${quoteBashSingle(source)}`;
 			expect((await decideBash(cwd, command)).blocked, command).toBe(false);

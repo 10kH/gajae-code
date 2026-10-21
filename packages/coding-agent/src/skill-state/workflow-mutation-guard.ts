@@ -2221,6 +2221,7 @@ function interpreterCodeContainsWriteApi(
 			}
 		}
 		if (INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE.test(script.slice(index))) return true;
+		if (language === "js" && script[index] === "\\") return true;
 		if (language === "py" && PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))) return true;
 		if (
 			language === "js" &&
@@ -2250,7 +2251,7 @@ function interpreterCodeContainsWriteApi(
 				return true;
 			if (
 				/^(?:\.\s*(?:stdout|stderr)\b|\[\s*["'`](?:stdout|stderr)["'`]\s*\])/.test(access) &&
-				!/^\.\s*(?:stdout|stderr)\s*\.\s*(?:write\s*\(|(?:isTTY|columns|rows)(?![\w$\\]))/.test(access)
+				!/^\.\s*(?:stdout|stderr)\s*\.\s*(?:write\s*\(|(?:isTTY|columns|rows|fd)(?![\w$\\]))/.test(access)
 			)
 				return true;
 		}
@@ -2365,7 +2366,8 @@ function javaScriptLoadsOpaqueModule(script: string, index: number): boolean {
 	const module = simpleLiteral(script.slice(cursor, end));
 	if (module === null || (parenthesized && script[skipJavaScriptTrivia(script, end)] !== ")")) return true;
 	return (
-		/^(?:node:)?process$/.test(module) || INTERPRETER_FILESYSTEM_REQUIRE_RE.test(`require(${JSON.stringify(module)})`)
+		/^(?:node:)?(?:process|module)$/.test(module) ||
+		INTERPRETER_FILESYSTEM_REQUIRE_RE.test(`require(${JSON.stringify(module)})`)
 	);
 }
 
@@ -2391,7 +2393,7 @@ function skipJavaScriptRegex(script: string, index: number): number | undefined 
 			}
 		}
 	}
-	const startsExpression =
+	let startsExpression =
 		previous === undefined || /[([{=,:;!?&|*%~^<>]/.test(previous) || (keyword !== null && beforeKeyword !== ".");
 	if (!startsExpression) {
 		if (previous === ")") {
@@ -2408,10 +2410,11 @@ function skipJavaScriptRegex(script: string, index: number): number | undefined 
 				else if (prefix[cursor] === ")") opening = parentheses.pop() ?? -1;
 			}
 			const beforeOpening = prefix.slice(0, opening).trimEnd();
-			if (opening < 0 || beforeOpening.endsWith("*/") || /\b(?:if|while|for|with|switch|catch)$/.test(beforeOpening))
-				return undefined;
+			if (opening < 0 || beforeOpening.endsWith("*/")) return undefined;
+			startsExpression = /(?:^|[;{}])\s*(?:else\s+)?(?:if|while|for|with|switch|catch)$/.test(beforeOpening);
+			if (!startsExpression && /\b(?:if|while|for|with|switch|catch)$/.test(beforeOpening)) return undefined;
 		}
-		return /[\w$\])'"\x60]/.test(previous ?? "") ? index : undefined;
+		if (!startsExpression) return /[\w$\])'"\x60]/.test(previous ?? "") ? index : undefined;
 	}
 	let characterClass = false;
 	for (let cursor = index + 1; cursor < script.length; cursor++) {
