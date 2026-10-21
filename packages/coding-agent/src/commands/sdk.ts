@@ -12,7 +12,8 @@ import {
 } from "@gajae-code/natives";
 import { getAgentDir, logger, postmortem } from "@gajae-code/utils";
 import { CliParseError, Command } from "@gajae-code/utils/cli";
-import { projectEnvSnapshot } from "@gajae-code/utils/env-file";
+import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
+import { type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import type { Args as ParsedArgs } from "../cli/args";
 import { isSafeSdkInternalAgentDir, scanPublicCommand } from "../cli/public-command-entry";
 import { PublicCommandFailure } from "../cli/public-command-errors";
@@ -561,6 +562,65 @@ export function startMemoryBackendAfterReadiness(start: () => Promise<void>): vo
 	});
 }
 
+const SDK_CWD_EQUALITY_TEST_SEAMS = [
+	"GJC_SDK_TEST_HANG_MODEL_PROFILE",
+	"GJC_SDK_TEST_FAIL_AFTER_REGISTRATION",
+	"GJC_SDK_TEST_EXIT_AFTER_READY",
+	"GJC_SDK_TEST_REJECT_AFTER_READY",
+] as const;
+
+type SdkCwdEqualityTestSeam = (typeof SDK_CWD_EQUALITY_TEST_SEAMS)[number];
+
+function isSdkCwdEqualityTestSeam(name: string): name is SdkCwdEqualityTestSeam {
+	return (SDK_CWD_EQUALITY_TEST_SEAMS as readonly string[]).includes(name);
+}
+
+function sdkCwdEqualitySnapshots(cwd: string): ProjectEnvSnapshot[] {
+	// The startup snapshot keeps a declaration Bun loaded before a later chdir.
+	return [projectEnvSnapshot(cwd), startupProjectEnvSnapshot()];
+}
+
+/**
+ * Cwd-equality test seams accept only an operator value. A project dotenv line,
+ * including one Bun expands from `$PWD`, never arms the seam.
+ */
+export function sdkCwdEqualityTestSeamActive(
+	name: string,
+	cwd: string,
+	env: NodeJS.ProcessEnv = process.env,
+	snapshots: readonly ProjectEnvSnapshot[] = sdkCwdEqualitySnapshots(cwd),
+): boolean {
+	if (!isSdkCwdEqualityTestSeam(name) || env[name] !== cwd) return false;
+	// Provenance only. trustedCoordinatorEnv trims, so a second compare to cwd
+	// would drop a trusted path that still matches exactly, including trailing space.
+	return snapshots.every(snapshot => trustedCoordinatorEnv(name, env, snapshot) !== undefined);
+}
+
+/** Copy `env` without project-dotenv values for the four cwd-equality seams. */
+export function omitUntrustedSdkCwdEqualitySeams(
+	env: NodeJS.ProcessEnv,
+	snapshots: readonly ProjectEnvSnapshot[],
+): NodeJS.ProcessEnv {
+	const denied: string[] = [];
+	for (const name of SDK_CWD_EQUALITY_TEST_SEAMS) {
+		const raw = env[name];
+		if (typeof raw !== "string" || raw.length === 0) continue;
+		if (snapshots.some(snapshot => trustedCoordinatorEnv(name, env, snapshot) === undefined)) denied.push(name);
+	}
+	if (denied.length === 0) return env;
+	const next: NodeJS.ProcessEnv = { ...env };
+	for (const name of denied) delete next[name];
+	return next;
+}
+
+function dropUntrustedSdkCwdEqualitySeams(env: NodeJS.ProcessEnv, snapshots: readonly ProjectEnvSnapshot[]): void {
+	const next = omitUntrustedSdkCwdEqualitySeams(env, snapshots);
+	if (next === env) return;
+	for (const name of SDK_CWD_EQUALITY_TEST_SEAMS) {
+		if (next[name] === undefined) delete env[name];
+	}
+}
+
 /** Runs the same persisted AgentSession bootstrap used by the production CLI. */
 export async function runSessionHost(
 	timing: {
@@ -592,6 +652,11 @@ export async function runSessionHost(
 	const agentDir = process.env.GJC_AGENT_DIR;
 	if (!agentDir) throw new Error("GJC_AGENT_DIR is required for sdk session-host-internal.");
 	const cwd = timing.cwd ?? process.cwd();
+	const cwdSeamSnapshots = sdkCwdEqualitySnapshots(cwd);
+	// Drop rejected copies before startup work can spawn a child that inherits them.
+	dropUntrustedSdkCwdEqualitySeams(process.env, cwdSeamSnapshots);
+	const cwdEqualitySeam = (name: SdkCwdEqualityTestSeam): boolean =>
+		sdkCwdEqualityTestSeamActive(name, cwd, process.env, cwdSeamSnapshots);
 	if ((await fs.realpath(request.cwd)) !== (await fs.realpath(cwd)))
 		throw new Error(`Lifecycle worktree mismatch: expected ${request.cwd}, got ${cwd}.`);
 	if (
@@ -1423,7 +1488,7 @@ export async function runSessionHost(
 	try {
 		const startupThinkingLevel = request.modelId ? parseModelString(request.modelId)?.thinkingLevel : undefined;
 		await beforeCutoff(() =>
-			process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE === cwd
+			cwdEqualitySeam("GJC_SDK_TEST_HANG_MODEL_PROFILE")
 				? new Promise<void>(() => {})
 				: applyModelProfiles({
 						session,
@@ -1450,7 +1515,7 @@ export async function runSessionHost(
 		const startup = await beforeCutoff<SdkStartupResult>(() => capability.promise);
 		if (startup.status !== "started") throw startup.failure;
 		throwIfStartupInterrupted();
-		if (process.env.GJC_SDK_TEST_FAIL_AFTER_REGISTRATION === cwd)
+		if (cwdEqualitySeam("GJC_SDK_TEST_FAIL_AFTER_REGISTRATION"))
 			throw new Error("Lifecycle test failure after SDK host registration.");
 
 		await beforeCutoff(() => session.sessionManager.ensureOnDisk());
@@ -1519,11 +1584,11 @@ export async function runSessionHost(
 	// Readiness is published; the session is live. Memory startup issues one LLM
 	// request per queued rollout, so it must run outside the readiness window and
 	// its failure must never take the session down.
-	if (process.env.GJC_SDK_TEST_EXIT_AFTER_READY === cwd) {
+	if (cwdEqualitySeam("GJC_SDK_TEST_EXIT_AFTER_READY")) {
 		process.stderr.write("GJC_SDK_TEST_EXIT_AFTER_READY\n");
 		process.exit(7);
 	}
-	if (process.env.GJC_SDK_TEST_REJECT_AFTER_READY === cwd) {
+	if (cwdEqualitySeam("GJC_SDK_TEST_REJECT_AFTER_READY")) {
 		// Simulates the post-readiness liveness watcher rejecting. With the
 		// post-ready startup receipt removed, this unhandled rejection kills the
 		// host without writing any startup receipt; the broker must classify the
@@ -1768,6 +1833,7 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		const command = resolveSdkInternalSpawnCommand("broker-internal");
 		const brokerEnvironment = { ...command.env };
 		delete brokerEnvironment.GJC_BROKER_TRAMPOLINE_RETAIN_UNTIL_PUBLICATION;
+		dropUntrustedSdkCwdEqualitySeams(brokerEnvironment, sdkCwdEqualitySnapshots(process.cwd()));
 		let child: ChildProcess;
 		try {
 			child = spawn(command.file, [...command.args, "--agent-dir", internal.agentDir], {
