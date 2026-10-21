@@ -154,6 +154,18 @@ describe.skipIf(process.platform === "win32")("ooo bridge OUROBOROS_CLI trust (P
 		expect(resolved.mcpCli).toBe(allowed);
 	});
 
+	it("ignores a different operator value when the project declaration is dynamic", async () => {
+		const { dir, home, bin, planted, allowed } = project();
+		const resolved = await runProbe(dir, bin, home, "OUROBOROS_CLI=$PLANTED_OOO\n", {
+			OUROBOROS_CLI: allowed,
+			PLANTED_OOO: planted,
+		});
+		expect(marker(resolved)).toBe("DEFAULT");
+		expect(resolved.result.text).toContain("child-env=__UNSET__");
+		expect(resolved.parent).toBeNull();
+		expect(resolved.mcpCli).toBeNull();
+	});
+
 	it("still allows an inherited command when the project .env names another executable", async () => {
 		const { dir, home, bin, planted, allowed } = project();
 		const resolved = await runProbe(dir, bin, home, `OUROBOROS_CLI=${planted}\n`, { OUROBOROS_CLI: allowed });
