@@ -12,6 +12,7 @@ import {
 } from "../../config/file-lock";
 import { repo } from "../../utils/git";
 import { endpointIncarnation } from "./endpoint-authority";
+import { brokerLockHostIdentity } from "./lock-host-identity";
 import { processIncarnation } from "./process-incarnation";
 import {
 	assertSupportedSessionIndexEventVersion,
@@ -860,13 +861,26 @@ const SESSION_GENERATION_PROBE_LIMIT = 32;
  * is named in a slow-operation warning when it holds the lock beyond the
  * observation window and (b) the lock budget cannot silently drift per call
  * site.
+ *
+ * Every acquisition also carries this installation's host identity.
+ * `staleLockSnapshot` treats a host-qualified owner as foreign when the acquirer
+ * omits `ownerHostId`, so a same-host process that died holding the lock is never
+ * reclaimed and broker startup burns its whole retry budget. Identity is applied
+ * under the options a caller passed for budget and cancellation, so startup,
+ * heartbeat, and ordinary index transactions share one reclaim rule: a proven-dead
+ * same-host owner can be recovered, and a live or cross-host owner cannot.
  */
-function withSessionIndexLock<T>(
+async function sessionIndexLockOptions(agentDir: string, options: FileLockOptions): Promise<FileLockOptions> {
+	return { ...options, ...(await brokerLockHostIdentity(agentDir)) };
+}
+
+async function withSessionIndexLock<T>(
 	operation: string,
 	agentDir: string,
 	callback: () => Promise<T>,
 	options: FileLockOptions = SESSION_INDEX_LOCK_OPTIONS,
 ): Promise<T> {
+	const lockOptions = await sessionIndexLockOptions(agentDir, options);
 	return withFileLock(
 		logFor(agentDir),
 		async () => {
@@ -886,7 +900,7 @@ function withSessionIndexLock<T>(
 				clearTimeout(note);
 			}
 		},
-		options,
+		lockOptions,
 	);
 }
 function isValidSnapshot(snapshot: unknown): snapshot is { indexSeq: number; events: SessionIndexEvent[] } {
@@ -2452,7 +2466,7 @@ export class SessionIndex {
 				// an idle cycle: the blocked-renewal caller needs the reason and path.
 				const blocked = await describeRetainedLockTransition(
 					path.resolve(logFor(this.#agentDir)),
-					SESSION_INDEX_LOCK_OPTIONS,
+					await sessionIndexLockOptions(this.#agentDir, SESSION_INDEX_LOCK_OPTIONS),
 				);
 				if (blocked) throw blocked;
 				return 0;
