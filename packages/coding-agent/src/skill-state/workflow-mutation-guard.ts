@@ -2245,7 +2245,7 @@ function interpreterCodeContainsWriteApi(
 			// mutable stream through aliases, arguments or computed access.
 			if (!/^(?:\.\s*[A-Za-z_$][\w$]*(?![\w$\\])|\[\s*["'][^"'\\]+["']\s*\])/.test(access)) return true;
 			if (
-				/^\[\s*["'](?:process|Bun|globalThis|global|module|require|binding|_linkedBinding|getBuiltinModule)["']\s*\]/.test(
+				/^\[\s*["'](?:process|Bun|globalThis|global|module|require|eval|Function|binding|_linkedBinding|getBuiltinModule)["']\s*\]/.test(
 					access,
 				)
 			)
@@ -2365,8 +2365,15 @@ function javaScriptExposesConstructor(script: string, index: number): boolean {
 	const quote = script[member];
 	if (quote !== '"' && quote !== "'" && quote !== "`") return false;
 	const end = quote === "`" ? readJavaScriptTemplate(script, member)?.end : skipNoise(script, member, "js");
-	if (end === undefined || script[skipJavaScriptTrivia(script, end)] !== "]") return false;
-	if (script.slice(member + 1, end - 1) !== "constructor") return false;
+	if (end === undefined) return true;
+	const key = script.slice(member + 1, end - 1);
+	if (
+		key !== "constructor" &&
+		!key.includes("\\") &&
+		!(quote === "`" && key.includes("${")) &&
+		script[skipJavaScriptTrivia(script, end)] === "]"
+	)
+		return false;
 	let prefix = "";
 	for (let cursor = 0; cursor < index; cursor++) {
 		const next = skipNoise(script, cursor, "js");
