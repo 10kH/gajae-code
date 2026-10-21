@@ -37,23 +37,35 @@ function sharedView(): BigInt64Array {
 	return view;
 }
 
+/** DOM `WorkerOptions` has no `workerData`; Bun still honors the Node field at runtime. */
+interface PublicationLivenessWorkerOptions extends WorkerOptions {
+	workerData: { buffer: SharedArrayBuffer };
+}
+
+function watchdogWorkerOptions(buffer: SharedArrayBuffer): PublicationLivenessWorkerOptions {
+	return { type: "module", workerData: { buffer } };
+}
+
+function sharedBuffer(): SharedArrayBuffer {
+	const buffer = sharedView().buffer;
+	if (!(buffer instanceof SharedArrayBuffer)) {
+		throw new Error("publication liveness watchdog buffer is not shared");
+	}
+	return buffer;
+}
+
 function ensureWorker(): Promise<void> {
 	if (workerReady) return workerReady;
-	const buffer = sharedView().buffer;
+	const buffer = sharedBuffer();
 	const { promise, resolve, reject } = Promise.withResolvers<void>();
 	workerReady = promise;
 	let worker: Worker;
 	try {
 		// Literal paths must match packages/coding-agent/scripts/compile-args.ts.
+		const options = watchdogWorkerOptions(buffer);
 		worker = isCompiledBinary()
-			? new Worker("./packages/coding-agent/src/sdk/broker/publication-liveness-watchdog-worker.ts", {
-					type: "module",
-					workerData: { buffer },
-				})
-			: new Worker(new URL("./publication-liveness-watchdog-worker.ts", import.meta.url).href, {
-					type: "module",
-					workerData: { buffer },
-				});
+			? new Worker("./packages/coding-agent/src/sdk/broker/publication-liveness-watchdog-worker.ts", options)
+			: new Worker(new URL("./publication-liveness-watchdog-worker.ts", import.meta.url).href, options);
 	} catch (error) {
 		workerReady = undefined;
 		reject(error instanceof Error ? error : new Error(String(error)));
