@@ -5,7 +5,6 @@ import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { pythonBackend } from "@gajae-code/coding-agent/eval";
 import { checkPythonKernelAvailability } from "@gajae-code/coding-agent/eval/py/kernel";
-import { workspacePathContained } from "@gajae-code/coding-agent/eval/py/runtime";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { relativePathEscapesRoot, TempDir } from "@gajae-code/utils";
 import { resetShellConfigCache } from "@gajae-code/utils/shell-config";
@@ -113,7 +112,11 @@ async function withProbeEnv<T>(extra: Record<string, string>, fn: () => Promise<
 
 function under(root: string, candidate: string | undefined): boolean {
 	if (!candidate) return false;
-	return workspacePathContained(root, candidate);
+	const normalize = (value: string): string => {
+		const resolved = path.resolve(value);
+		return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+	};
+	return !relativePathEscapesRoot(path.relative(normalize(root), normalize(candidate)));
 }
 
 function referenceContained(root: string, candidate: string): boolean {
@@ -328,7 +331,8 @@ describe("workspace venv interpreter trust", () => {
 		30_000,
 	);
 
-	it("property: workspace path containment agrees with the root prefix and keeps ..payload inside", () => {
+	it("property: workspace path containment agrees with the root prefix for dot-dot names", async () => {
+		const { workspacePathContained } = await import("@gajae-code/coding-agent/eval/py/runtime");
 		const leaf = fc.constantFrom("..payload", "a\\b", "python", ".venv", "bin");
 		fc.assert(
 			fc.property(
