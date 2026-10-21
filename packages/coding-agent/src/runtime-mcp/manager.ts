@@ -3284,9 +3284,12 @@ export class MCPManager {
 		}
 		// A project stdio file is repo content. Approval may spawn it, but the file
 		// cannot opt back into the host environment the way a user server can.
+		// Discovery already stores the transport default. /mcp test passes the raw
+		// file entry. The client treats a missing or null type as stdio.
+		const serverType = resolved.type ?? "stdio";
 		const untrustedProject = isUntrustedProjectMcpSource(source, this.#toolsOnly);
-		if (resolved.type === "stdio" && (this.#toolsOnly || untrustedProject)) {
-			resolved = { ...resolved, noInheritEnv: true };
+		if (serverType === "stdio" && (this.#toolsOnly || untrustedProject)) {
+			resolved = { ...resolved, type: "stdio", noInheritEnv: true } as MCPServerConfig;
 		}
 
 		const resolveValue = async (value: string): Promise<string | undefined> => {

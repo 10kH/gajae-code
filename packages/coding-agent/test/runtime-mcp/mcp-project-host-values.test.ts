@@ -4,7 +4,7 @@
  * substitutions. User mcp.json and an explicit --mcp-config file keep both.
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -12,6 +12,7 @@ import { getAgentDir, getMCPConfigPath, getProjectDir, setAgentDir, setProjectDi
 import { safeRmSync } from "../../../../scripts/safe-cleanup";
 import { clearConfigValueCache } from "../../src/config/resolve-config-value";
 import { MCPCommandController } from "../../src/modes/controllers/runtime-mcp-command-controller";
+import { getThemeByName, setThemeInstance } from "../../src/modes/theme/theme";
 import { loadAllMCPConfigs } from "../../src/runtime-mcp/config";
 import { MCPManager } from "../../src/runtime-mcp/manager";
 import type { MCPServerConfig } from "../../src/runtime-mcp/types";
@@ -61,6 +62,12 @@ function stdioEnv(config: MCPServerConfig | undefined): Record<string, string> {
 }
 
 describe("project MCP host values", () => {
+	beforeAll(async () => {
+		const loaded = await getThemeByName("red-claw");
+		if (!loaded) throw new Error("red-claw theme missing");
+		setThemeInstance(loaded);
+	});
+
 	let projectDir: string;
 	let tempHome: string;
 	let agentDir: string;
@@ -511,6 +518,166 @@ describe("project MCP host values", () => {
 			expect(report.EXPLICIT_OK).toBe("yes");
 		} finally {
 			await manager.disconnectAll().catch(() => {});
+			restore();
+		}
+	}, 20_000);
+
+	async function runMcpTest(name: string): Promise<void> {
+		const manager = new MCPManager(projectDir, null, {});
+		const controller = new MCPCommandController({
+			showError: vi.fn(),
+			showStatus: vi.fn(),
+			mcpManager: manager,
+			editor: {},
+			chatContainer: { addChild() {} },
+			ui: { requestRender() {} },
+		} as never);
+		try {
+			await controller.handle(`/mcp test ${name}`);
+		} finally {
+			await manager.disconnectAll().catch(() => {});
+		}
+	}
+
+	it("does not pass host credentials when /mcp test runs a project server with no type", async () => {
+		const restore = plantHostCredentials();
+		const scriptPath = await writeChildScript();
+		const nativeReport = path.join(projectDir, "test-native-env.json");
+		const rootReport = path.join(projectDir, "test-root-env.json");
+		const previousProjectDir = getProjectDir();
+		try {
+			setProjectDir(projectDir);
+			await writeJson(getMCPConfigPath("project"), {
+				mcpServers: {
+					nativeImplicit: {
+						command: process.execPath,
+						args: [scriptPath],
+						timeout: 3_000,
+						env: { MOCK_REPORT: nativeReport, EXPLICIT_OK: "yes" },
+					},
+				},
+			});
+			await writeJson(path.join(projectDir, "mcp.json"), {
+				mcpServers: {
+					rootImplicit: {
+						command: process.execPath,
+						args: [scriptPath],
+						noInheritEnv: false,
+						timeout: 3_000,
+						env: { MOCK_REPORT: rootReport, EXPLICIT_OK: "yes" },
+					},
+				},
+			});
+			await runMcpTest("nativeImplicit");
+			await runMcpTest("rootImplicit");
+			expectHostCredentialsWithheld(await readChildReport(nativeReport));
+			expectHostCredentialsWithheld(await readChildReport(rootReport));
+		} finally {
+			setProjectDir(previousProjectDir);
+			restore();
+		}
+	}, 20_000);
+
+	it("does not pass host credentials when /mcp test runs a project server with a null type", async () => {
+		const restore = plantHostCredentials();
+		const scriptPath = await writeChildScript();
+		const nativeReport = path.join(projectDir, "test-native-null-env.json");
+		const rootReport = path.join(projectDir, "test-root-null-env.json");
+		const previousProjectDir = getProjectDir();
+		try {
+			setProjectDir(projectDir);
+			await writeJson(getMCPConfigPath("project"), {
+				mcpServers: {
+					nativeNull: {
+						type: null,
+						command: process.execPath,
+						args: [scriptPath],
+						timeout: 3_000,
+						env: { MOCK_REPORT: nativeReport, EXPLICIT_OK: "yes" },
+					},
+				},
+			});
+			await writeJson(path.join(projectDir, "mcp.json"), {
+				mcpServers: {
+					rootNull: {
+						type: null,
+						command: process.execPath,
+						args: [scriptPath],
+						noInheritEnv: false,
+						timeout: 3_000,
+						env: { MOCK_REPORT: rootReport, EXPLICIT_OK: "yes" },
+					},
+				},
+			});
+			await runMcpTest("nativeNull");
+			await runMcpTest("rootNull");
+			expectHostCredentialsWithheld(await readChildReport(nativeReport));
+			expectHostCredentialsWithheld(await readChildReport(rootReport));
+		} finally {
+			setProjectDir(previousProjectDir);
+			restore();
+		}
+	}, 20_000);
+
+	it("still passes host credentials when /mcp test runs a user server with no type", async () => {
+		const restore = plantHostCredentials();
+		const scriptPath = await writeChildScript();
+		const reportPath = path.join(projectDir, "test-user-env.json");
+		const previousProjectDir = getProjectDir();
+		try {
+			setProjectDir(projectDir);
+			await writeJson(getMCPConfigPath("user"), {
+				mcpServers: {
+					userImplicit: {
+						command: process.execPath,
+						args: [scriptPath],
+						timeout: 3_000,
+						env: { MOCK_REPORT: reportPath, EXPLICIT_OK: "yes" },
+					},
+				},
+			});
+			await runMcpTest("userImplicit");
+			const report = await readChildReport(reportPath);
+			expect(report.OPENAI_API_KEY).toBe("host-openai-key");
+			expect(report.GJC_TRUSTED_SESSION_TOKEN).toBe("host-session-token");
+			expect(report.AWS_SECRET_ACCESS_KEY).toBe("host-aws-secret");
+			expect(report.GJC_CANARY_PUBLIC).toBe(PUBLIC);
+			expect(report.PATH).toBe("set");
+			expect(report.EXPLICIT_OK).toBe("yes");
+		} finally {
+			setProjectDir(previousProjectDir);
+			restore();
+		}
+	}, 20_000);
+
+	it("still passes host credentials when /mcp test runs a user server with a null type", async () => {
+		const restore = plantHostCredentials();
+		const scriptPath = await writeChildScript();
+		const reportPath = path.join(projectDir, "test-user-null-env.json");
+		const previousProjectDir = getProjectDir();
+		try {
+			setProjectDir(projectDir);
+			await writeJson(getMCPConfigPath("user"), {
+				mcpServers: {
+					userNull: {
+						type: null,
+						command: process.execPath,
+						args: [scriptPath],
+						timeout: 3_000,
+						env: { MOCK_REPORT: reportPath, EXPLICIT_OK: "yes" },
+					},
+				},
+			});
+			await runMcpTest("userNull");
+			const report = await readChildReport(reportPath);
+			expect(report.OPENAI_API_KEY).toBe("host-openai-key");
+			expect(report.GJC_TRUSTED_SESSION_TOKEN).toBe("host-session-token");
+			expect(report.AWS_SECRET_ACCESS_KEY).toBe("host-aws-secret");
+			expect(report.GJC_CANARY_PUBLIC).toBe(PUBLIC);
+			expect(report.PATH).toBe("set");
+			expect(report.EXPLICIT_OK).toBe("yes");
+		} finally {
+			setProjectDir(previousProjectDir);
 			restore();
 		}
 	}, 20_000);
