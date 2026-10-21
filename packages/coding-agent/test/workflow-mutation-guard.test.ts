@@ -2972,6 +2972,13 @@ describe("bash scanner quoting model", () => {
 					`const sink=(p,d)=>process.binding("fs")["writeFileUtf8"](p,d,577,438);const holder={return:1};holder.return / (s=>s["write"]=sink)(process.${stream}) / 1;process.${stream}.write("src/product.ts","PWNED")`,
 					`const sink=(p,d)=>process.binding("fs")["writeFileUtf8"](p,d,577,438);const ${alias}=module["require"]("node:process").${stream};${alias}["write"]=sink;process.${stream}.write("src/product.ts","PWNED")`,
 					`const ${alias}=module["r"+"equire"]("node:process").${stream};${alias}["write"]=writer;process.${stream}.write("src/product.ts","PWNED")`,
+					`const myFunction=({}).constructor.constructor;const ${alias}=myFunction("return process")()["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
+					`const myFunction=({})./**/constructor./**/constructor;const ${alias}=myFunction("return process")()["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
+					`const myFunction=({})/**/["constructor"]/**/["constructor"];const ${alias}=myFunction("return process")()["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
+					`const r=/[//]/;const myFunction=({})["constructor"]["constructor"];const ${alias}=myFunction("return process")()["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
+					`const myFunction=({})?.["constructor"]?.["constructor"];const ${alias}=myFunction("return process")()["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
+					`const myFunction=({})[\`constructor\`][/**/"constructor"/**/];const ${alias}=myFunction("return process")()["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
+					`console.log(\`\${({}).constructor.constructor("return 1")()}\`)`,
 					`const ${alias}=pro\\u0063ess["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
 					`const factory=require("node:module")["createRequire"];const loader=factory(process.cwd()+"/probe.js");const ${alias}=loader("node:process")["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
 					...["globalThis", "global"].flatMap(root =>
@@ -3054,9 +3061,42 @@ describe("bash scanner quoting model", () => {
 			`const getBuiltinModule = id => id; console.log(getBuiltinModule("node:path"))`,
 			`if (true) /x/.test("x"); console.log("inspection")`,
 			`console.log(process.stdout.fd, process.stderr.fd)`,
+			`const myFunction = value => value; console.log(myFunction("status"))`,
+			`console.log(({constructor$:1}).constructor$)`,
+			`console.log(["constructor"].join(""))`,
+			`const data=/**/["constructor"];console.log(data.join(""))`,
+			`const r=/[//]/;const data=["constructor"];console.log(r.test("/"),data.join(""))`,
+			`console.log(8 / ["constructor"].length)`,
 		]) {
 			const command = `node -e ${quoteBashSingle(source)}`;
 			expect((await decideBash(cwd, command)).blocked, command).toBe(false);
+		}
+	});
+
+	it("applies the stream trust policy to JavaScript eval cells", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		for (const [code, blocked] of [
+			[`const s=process.stdout;s.write=fs.writeFileSync;s.write("src/product.ts","data")`, true],
+			[`const s=process.stderr;s["write"]=writer;process.stderr.write("status")`, true],
+			[`console.log("status");process.stdout.write("status")`, false],
+			[`console.log(process.stdout.fd);await read("package.json")`, false],
+			[`fs.writeFileSync("src/product.ts","data")`, true],
+			[`const make=({})./**/constructor./**/constructor;make("return process")()`, true],
+			[`const make=({})/**/["constructor"]/**/["constructor"];make("return process")()`, true],
+			[`const r=/[//]/;const make=({})["constructor"]["constructor"];make("return process")()`, true],
+			[`const make=({})?.["constructor"]?.["constructor"];make("return process")()`, true],
+			[`const make=({})[\`constructor\`][/**/"constructor"/**/];make("return process")()`, true],
+			[`console.log(({constructor$:1}).constructor$)`, false],
+			[`console.log(8 / ["constructor"].length)`, false],
+		] as const) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("eval"),
+				args: { cells: [{ language: "js", code }] },
+			});
+			expect(decision.blocked, code).toBe(blocked);
 		}
 	});
 

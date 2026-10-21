@@ -2171,9 +2171,9 @@ function containsOpaqueInterpreterSource(source: string, binary: string): boolea
 function interpreterCodeContainsWriteApi(
 	script: string,
 	language: "py" | "js" | "ruby" | "perl",
-	api: RegExp,
+	api?: RegExp,
 ): boolean {
-	const apiAtStart = new RegExp(`^(?:${api.source})`, "i");
+	const apiAtStart = api ? new RegExp(`^(?:${api.source})`, "i") : undefined;
 	// Reflective mutation of a stream object defeats the stdout/stderr write
 	// exemption: the method that runs may write to a file. Fail closed instead.
 	const streamMutated =
@@ -2198,7 +2198,7 @@ function interpreterCodeContainsWriteApi(
 					language === "py" &&
 					/(?:^|[^\w])(?:[rR]?[fF]|[fF][rR])$/.test(script.slice(Math.max(0, index - 3), index)) &&
 					skipped.includes("{");
-				if (isInterpolated && (api.test(skipped) || PYTHON_DYNAMIC_EXECUTION_TOKEN_RE.test(skipped))) return true;
+				if (isInterpolated && (api?.test(skipped) || PYTHON_DYNAMIC_EXECUTION_TOKEN_RE.test(skipped))) return true;
 				index = next;
 				continue;
 			}
@@ -2214,7 +2214,7 @@ function interpreterCodeContainsWriteApi(
 			const next = skipOtherInterpreterNoise(script, index);
 			if (next !== index) {
 				const skipped = script.slice(index, next);
-				if (language === "ruby" && script[index] !== "'" && skipped.includes("#{") && api.test(skipped))
+				if (language === "ruby" && script[index] !== "'" && skipped.includes("#{") && api?.test(skipped))
 					return true;
 				index = next;
 				continue;
@@ -2222,6 +2222,7 @@ function interpreterCodeContainsWriteApi(
 		}
 		if (INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE.test(script.slice(index))) return true;
 		if (language === "js" && script[index] === "\\") return true;
+		if (language === "js" && javaScriptExposesConstructor(script, index)) return true;
 		if (language === "py" && PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))) return true;
 		if (
 			language === "js" &&
@@ -2262,7 +2263,7 @@ function interpreterCodeContainsWriteApi(
 			index += "open".length;
 			continue;
 		}
-		if (apiAtStart.test(script.slice(index))) {
+		if (apiAtStart?.test(script.slice(index))) {
 			const outputWrite =
 				!streamMutated &&
 				/^\.\s*write\s*\(/.test(script.slice(index)) &&
@@ -2352,6 +2353,36 @@ function skipJavaScriptTrivia(script: string, index: number): number {
 		else break;
 	}
 	return index;
+}
+
+function javaScriptExposesConstructor(script: string, index: number): boolean {
+	if (script[index] === ".") {
+		const member = skipJavaScriptTrivia(script, index + 1);
+		return /^constructor(?![\w$])/.test(script.slice(member));
+	}
+	if (script[index] !== "[") return false;
+	const member = skipJavaScriptTrivia(script, index + 1);
+	const quote = script[member];
+	if (quote !== '"' && quote !== "'" && quote !== "`") return false;
+	const end = quote === "`" ? readJavaScriptTemplate(script, member)?.end : skipNoise(script, member, "js");
+	if (end === undefined || script[skipJavaScriptTrivia(script, end)] !== "]") return false;
+	if (script.slice(member + 1, end - 1) !== "constructor") return false;
+	let prefix = "";
+	for (let cursor = 0; cursor < index; cursor++) {
+		const next = skipNoise(script, cursor, "js");
+		if (next !== cursor) {
+			prefix += script[cursor] === "/" ? " " : '""';
+			cursor = next - 1;
+		} else if (script[cursor] === "/" || script[cursor] === "`") {
+			const end =
+				script[cursor] === "/" ? skipJavaScriptRegex(script, cursor) : readJavaScriptTemplate(script, cursor)?.end;
+			if (end === undefined || end > index) return true;
+			prefix += end === cursor ? "/" : '""';
+			cursor = end === cursor ? cursor : end - 1;
+		} else prefix += script[cursor];
+	}
+	prefix = prefix.trimEnd();
+	return /(?:[\w$)\]}"'`]|\?\.)$/.test(prefix) && !/\b(?:return|yield|throw)$/.test(prefix);
 }
 
 function javaScriptLoadsOpaqueModule(script: string, index: number): boolean {
@@ -3632,8 +3663,13 @@ function extractCodeToolTargets(toolName: string, args: unknown): ExtractedTarge
 			continue;
 		}
 		if (cellRecord.language === "py") scanInterpreterWrites(cellRecord.code, "py", targets);
-		else if (cellRecord.language === "js") scanInterpreterWrites(cellRecord.code, "js", targets);
-		else {
+		else if (cellRecord.language === "js") {
+			scanInterpreterWrites(cellRecord.code, "js", targets);
+			if (interpreterCodeContainsWriteApi(cellRecord.code, "js")) {
+				targets.unknown = true;
+				targets.explicitMutation = true;
+			}
+		} else {
 			targets.unknown = true;
 			targets.explicitMutation = true;
 		}
