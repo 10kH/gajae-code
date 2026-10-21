@@ -209,7 +209,11 @@ import {
 } from "../system-prompt";
 import { AgentOutputManager } from "../task/output-manager";
 import { parseThinkingLevel, resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
-import { isMCPBridgeTool, selectRestorableDiscoveredBuiltinToolNames } from "../tool-discovery/tool-index";
+import {
+	isMCPBridgeTool,
+	isMCPToolName,
+	selectRestorableDiscoveredBuiltinToolNames,
+} from "../tool-discovery/tool-index";
 import {
 	type AutomationToolName,
 	type AutomationTools,
@@ -2864,7 +2868,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			await session.replaceNamedCustomTools(
 				previousCwdCapturing.filter(name => !nextCustomTools.some(tool => tool.name === name)),
 				nextCustomTools,
-				{ mandatoryMCPToolNames: pluginMcpToolNames },
+				{
+					mandatoryMCPToolNames: pluginMcpToolNames,
+					defaultSelectedConventionalMCPToolNames: deferConventionalMcpAutoload ? [] : conventionalMcpToolNames,
+					inactiveNewToolNames: deferConventionalMcpAutoload ? conventionalMcpToolNames : undefined,
+				},
 			);
 			wireOwnedMcpToolSync();
 		};
@@ -2974,11 +2982,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										"This session has already been rescoped; only one agent-invoked move is allowed per session.",
 									);
 								}
-								if (session?.getEffectiveActiveWorkflowSkillState()) {
-									throw new Error(
-										"A workflow skill is active in this session; finish or exit it before rescoping.",
-									);
-								}
 								if (options.mcpManager && !ownsMcpManager) {
 									throw new Error(
 										"Cannot rescope a session with caller-owned MCP authority; recreate the session at the target cwd.",
@@ -2990,9 +2993,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 											"This session has already been rescoped; only one agent-invoked move is allowed per session.",
 										);
 									}
-									if (session?.getEffectiveActiveWorkflowSkillState()) {
+									if (await session?.refreshEffectiveActiveWorkflowSkillState()) {
 										throw new Error(
-											"A workflow skill became active while waiting for the cwd transition; finish or exit it before rescoping.",
+											"A workflow skill is active in this session; finish or exit it before rescoping.",
 										);
 									}
 									const from = sessionManager.getCwd();
@@ -4936,6 +4939,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const requestedToolNameSet = new Set(normalizedRequested);
 		const effectiveDiscoveryMode = resolveEffectiveDiscoveryMode(settings, explicitMcpConfigPath);
 		const mcpDiscoveryEnabled = effectiveDiscoveryMode !== "off";
+		const discoveryDefaultServerNames = new Set(settings.get("mcp.discoveryDefaultServers") ?? []);
+		const deferConventionalMcpAutoload = mcpDiscoveryEnabled && settings.get("mcp.discoveryDeferAutoload");
 		const defaultInactiveToolNames = new Set(
 			registeredTools.filter(tool => tool.definition.defaultInactive).map(tool => tool.definition.name),
 		);
@@ -4954,7 +4959,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let hasExplicitDiscoveredBuiltinToolSelection = false;
 		let explicitlyRequestedDiscoveredBuiltinToolNames: string[] = [];
 		if (mcpDiscoveryEnabled) {
-			const defaultServerNames = new Set(settings.get("mcp.discoveryDefaultServers") ?? []);
 			for (const tool of toolRegistry.values()) {
 				if (!isMCPBridgeTool(tool)) continue;
 				discoverableMCPToolNames.add(tool.name);
@@ -4962,7 +4966,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					explicitlyRequestedMCPToolNames.push(tool.name);
 				}
 				const serverName = (tool as AgentTool & { mcpServerName?: string }).mcpServerName;
-				if (serverName && defaultServerNames.has(serverName)) {
+				if (serverName && discoveryDefaultServerNames.has(serverName)) {
 					discoveryDefaultServerToolNames.push(tool.name);
 				}
 			}
@@ -4975,16 +4979,24 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			...retainPluginMcpMandatoryNames(customTools, pluginMcpToolNames),
 		);
 		const mandatoryMCPToolNameSet = new Set(pluginMcpToolNames);
-		const selectableExplicitMCPToolNames = explicitlyRequestedMCPToolNames.filter(
-			name => !mandatoryMCPToolNameSet.has(name),
-		);
+		const deferredMcpConnectPending = deferredExactMcpConfig !== undefined || deferredConventionalMcp !== undefined;
+		const requestedDeferredMCPToolNames =
+			deferredMcpConnectPending && hasExplicitToolNames
+				? options
+						.toolNames!.map(name => name.toLowerCase())
+						.filter(name => isMCPToolName(name) && !toolRegistry.has(name))
+				: [];
+		const selectableExplicitMCPToolNames = [
+			...new Set([
+				...explicitlyRequestedMCPToolNames.filter(name => !mandatoryMCPToolNameSet.has(name)),
+				...requestedDeferredMCPToolNames.filter(name => !mandatoryMCPToolNameSet.has(name)),
+			]),
+		];
 		let initialToolNames = [...initialRequestedActiveToolNames];
 		if (mcpDiscoveryEnabled) {
 			// A pending deferred MCP connect (exact or conventional) registers its
 			// tools after construction, so persisted selections must be preserved
 			// verbatim instead of being trimmed to names the registry currently has.
-			const deferredMcpConnectPending =
-				deferredExactMcpConfig !== undefined || deferredConventionalMcp !== undefined;
 			const restoredSelectedMCPToolNames = deferredMcpConnectPending
 				? existingSession.selectedMCPToolNames.filter(name => !mandatoryMCPToolNameSet.has(name))
 				: existingSession.selectedMCPToolNames.filter(
@@ -5002,8 +5014,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					...discoveryDefaultServerToolNames,
 					...(explicitMcpConfigPath !== undefined ? exactMcpToolNames : []),
 					// Conventional autoload servers are selected by default so their
-					// tools are exposed in sessions that enable MCP discovery mode.
-					...conventionalMcpToolNames,
+					// tools are exposed in sessions that enable MCP discovery mode,
+					// unless `mcp.discoveryDeferAutoload` keeps them behind tool search.
+					...(deferConventionalMcpAutoload ? [] : conventionalMcpToolNames),
 				]),
 			];
 			hasExplicitMCPToolSelection =
@@ -5517,6 +5530,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			initialSelectedDiscoveredBuiltinToolNames,
 			initialBaselineDiscoveredBuiltinToolNames,
 			defaultSelectedMCPToolNames,
+			defaultSelectedConventionalMCPToolNames: deferConventionalMcpAutoload ? [] : conventionalMcpToolNames,
 			mandatoryMCPToolNames: pluginMcpToolNames,
 			persistInitialMCPToolSelection: !hasExistingSession && hasExplicitMCPToolSelection,
 			persistInitialDiscoveredBuiltinToolSelection: !hasExistingSession && hasExplicitDiscoveredBuiltinToolSelection,
@@ -5842,8 +5856,27 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						try {
 							await session.replaceNamedCustomTools(previousNames, nextTools, {
 								mandatoryMCPToolNames: nextMandatoryMcpToolNames,
+								defaultSelectedConventionalMCPToolNames: deferConventionalMcpAutoload
+									? []
+									: nextConventionalToolNames,
 								activateNewTools: false,
+								persistMCPSelection: false,
 							});
+							const defaultMcpToolNamesToActivate =
+								deferConventionalMcpAutoload && !session.hasCommittedMCPToolSelectionAuthority()
+									? nextTools
+											.filter(
+												tool =>
+													tool.mcpServerName !== undefined &&
+													discoveryDefaultServerNames.has(tool.mcpServerName),
+											)
+											.map(tool => tool.name)
+									: [];
+							if (defaultMcpToolNamesToActivate.length > 0 && !session.hasCommittedMCPToolSelectionAuthority()) {
+								await session.activateDiscoveredTools(defaultMcpToolNamesToActivate, {
+									persistMCPSelection: false,
+								});
+							}
 						} catch (error) {
 							ownedMcpManagerToolNames = [...new Set([...previousNames, ...nextToolNames])];
 							throw error;
@@ -5940,7 +5973,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							await session.replaceNamedCustomTools(previousNames, snapshot, {
 								mandatoryMCPToolNames: mandatoryPluginToolNames,
 								activateNewTools: false,
+								persistMCPSelection: false,
 							});
+							const defaultMcpToolNamesToActivate =
+								deferConventionalMcpAutoload && !session.hasCommittedMCPToolSelectionAuthority()
+									? snapshot
+											.filter(
+												tool =>
+													tool.mcpServerName !== undefined &&
+													discoveryDefaultServerNames.has(tool.mcpServerName),
+											)
+											.map(tool => tool.name)
+									: [];
+							if (defaultMcpToolNamesToActivate.length > 0 && !session.hasCommittedMCPToolSelectionAuthority()) {
+								await session.activateDiscoveredTools(defaultMcpToolNamesToActivate, {
+									persistMCPSelection: false,
+								});
+							}
 						} catch (error) {
 							inheritedMcpManagerToolNames = [...new Set([...previousNames, ...nextNames])];
 							throw error;
@@ -6035,11 +6084,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								throw new ExactMcpToolNameCollisionError(collidingToolNames);
 							}
 							if (!cancelled && !session.isDisposed) {
-								await session.refreshMCPTools(resultTools);
-								if (
-									!session.isDisposed &&
-									(!mcpDiscoveryEnabled || !existingSession.hasPersistedMCPToolSelection)
-								) {
+								await session.refreshMCPTools(resultTools, { persistMCPSelection: false });
+								if (!session.isDisposed && (!mcpDiscoveryEnabled || !session.hasMCPToolSelectionAuthority())) {
 									await session.activateDiscoveredTools(toolNames);
 								}
 							}
@@ -6065,14 +6111,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								// only re-activates a swapped tool that was already active; running it
 								// before this registration would therefore drop a persisted conventional
 								// MCP selection and persist the empty set.
-								await session.refreshMCPTools(resultTools);
+								await session.refreshMCPTools(resultTools, { persistMCPSelection: false });
 								wireOwnedMcpToolSync(resultTools);
 								wireOwnedMcpManagerLifecycle();
-								if (
-									!session.isDisposed &&
-									(!mcpDiscoveryEnabled || !existingSession.hasPersistedMCPToolSelection)
-								) {
-									await session.activateDiscoveredTools(resultTools.map(tool => tool.name));
+								const shouldActivateStartupMcpTools =
+									!mcpDiscoveryEnabled || !session.hasMCPToolSelectionAuthority();
+								if (!session.isDisposed && shouldActivateStartupMcpTools) {
+									await session.activateDiscoveredTools(
+										resultTools
+											.filter(
+												tool =>
+													!deferConventionalMcpAutoload ||
+													(tool.mcpServerName !== undefined &&
+														discoveryDefaultServerNames.has(tool.mcpServerName)),
+											)
+											.map(tool => tool.name),
+										deferConventionalMcpAutoload ? { persistMCPSelection: false } : undefined,
+									);
 								}
 							}
 							loadedToolCount = resultTools.length;
