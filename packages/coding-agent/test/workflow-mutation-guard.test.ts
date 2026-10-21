@@ -2959,6 +2959,14 @@ describe("bash scanner quoting model", () => {
 					`\`\${(s=>s["write"]=process.getBuiltinModule("fs")["writeFileSync"])(process.${stream})}\`;process.${stream}.write("src/product.ts","PWNED")`,
 					`const {${stream}:${alias}}=process;${alias}["write"]=writer;process.${stream}.write("src/product.ts","PWNED")`,
 					`const ${alias}=Bun.${stream};${alias}["write"]=writer;Bun.${stream}.write("src/product.ts","PWNED")`,
+					`const ${alias}=require("node:process").${stream};${alias}["write"]=process.getBuiltinModule("fs")["writeFileSync"];process.${stream}.write("src/product.ts","PWNED")`,
+					`const ${alias}=globalThis["process"].${stream};${alias}["write"]=writer;process.${stream}.write("src/product.ts","PWNED")`,
+					`const ${alias}=process.getBuiltinModule("process").${stream};${alias}["write"]=writer;process.${stream}.write("src/product.ts","PWNED")`,
+					`const ${alias}=require/**/("node:process").${stream};${alias}["write"]=(p=>process.binding("fs")["writeFileUtf8"](p,"PWNED",577,438));process.${stream}.write("src/product.ts","PWNED")`,
+					`const sink=(p,d)=>process.binding("fs")["writeFileUtf8"](p,d,577,438);\`\${/[}]/,(s=>s["write"]=sink)(process.${stream})}\`;process.${stream}.write("src/product.ts","PWNED")`,
+					`const sink=(p,d)=>process.binding("fs")["writeFileUtf8"](p,d,577,438);let n=1;n++ / (s=>s["write"]=sink)(process.${stream}) / 1;process.${stream}.write("src/product.ts","PWNED")`,
+					`const sink=(p,d)=>process.binding("fs")["writeFileUtf8"](p,d,577,438);let n=1;\`\${n-- / (s=>s["write"]=sink)(process.${stream}) / 1}\`;process.${stream}.write("src/product.ts","PWNED")`,
+					`const sink=(p,d)=>process.binding("fs")["writeFileUtf8"](p,d,577,438);const holder={return:1};holder.return / (s=>s["write"]=sink)(process.${stream}) / 1;process.${stream}.write("src/product.ts","PWNED")`,
 				]) {
 					for (const operand of [quoteBashSingle(source), quoteBashDouble(source), quoteBashAnsiC(source)]) {
 						const command = `node -e ${operand}`;
@@ -2992,6 +3000,24 @@ describe("bash scanner quoting model", () => {
 			`const process$=0;console.log(process$)`,
 			`process.stdout.write(\`status \${1}\`)`,
 			`process.stdout.write(\`const s=process.stdout\`)`,
+			`process.stdout.write(\`process complete \${1}\`)`,
+			`console.log(\`cwd=\${process.cwd()}\`)`,
+			`console.log(process.stdout.isTTY)`,
+			`console.log(process.stderr.columns, process.stdout.rows)`,
+			`process.stdout.write(\`status \${\`nested \${1}\`}\`)`,
+			`console.log(\`\${/[{]/.test("{")}\`)`,
+			`console.log(\`\${/[}]/.test("}")}\`)`,
+			`console.log(\`\${8 / 2}\`)`,
+			`console.log(\`\${({value: "}"}).value}\`)`,
+			`console.log(\`require("node:process") \${1}\`)`,
+			`console.log('require("process")')`,
+			`/* require("node:process") */ process.stdout.write("status")`,
+			`console.log(require/**/("node:path").basename("src/product.ts"))`,
+			`const mygetBuiltinModule=1;console.log(mygetBuiltinModule)`,
+			`console.log(\`\${1 /* } */ + 2}\`)`,
+			`process.stdout.write(Array.from([1,2]).join(""))`,
+			`console.log(Buffer.from("status","utf8"))`,
+			`const holder={return:8};console.log(holder.return / 2)`,
 		]) {
 			const command = `node -e ${quoteBashSingle(source)}`;
 			expect((await decideBash(cwd, command)).blocked, command).toBe(false);

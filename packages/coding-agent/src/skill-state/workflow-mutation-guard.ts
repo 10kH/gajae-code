@@ -157,9 +157,8 @@ const PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE =
 	/^(?:exec|eval|execfile|__import__|exec_module|import_module|run_path|run_module|getattr|setattr|__getattr__|__getattribute__)\b/;
 const PYTHON_DYNAMIC_EXECUTION_TOKEN_RE =
 	/\b(?:exec|eval|execfile|__import__|exec_module|import_module|run_path|run_module|getattr|setattr|__getattr__|__getattribute__)\b/;
-/** JavaScript eval and Function construct executable code from runtime strings. */
-const JAVASCRIPT_DYNAMIC_EXECUTION_IDENTIFIER_RE = /^(?:eval|Function)\b/;
-const JAVASCRIPT_DYNAMIC_EXECUTION_TOKEN_RE = /\b(?:eval|Function)\b/;
+/** JavaScript evaluation and reflective builtin loading expose unscanned code. */
+const JAVASCRIPT_DYNAMIC_EXECUTION_IDENTIFIER_RE = /^(?:eval|Function|getBuiltinModule)(?![\w$])/;
 const BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE = new RegExp(
 	`(?:^|[;&|\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?(?:python3?|node|ruby|perl)\\b[^;&|\\n]*(?:<<[-]?\\s*['"]?\\w+['"]?)[\\s\\S]*${BASH_INTERPRETER_WRITE_API}`,
 	"i",
@@ -2181,28 +2180,35 @@ function interpreterCodeContainsWriteApi(
 		INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE.test(script) || INTERPRETER_OUTPUT_STREAM_MUTATION_RE.test(script);
 	let index = 0;
 	while (index < script.length) {
+		if (language === "js" && script[index] === "`") {
+			const template = readJavaScriptTemplate(script, index);
+			if (
+				!template ||
+				template.expressions.some(expression => interpreterCodeContainsWriteApi(expression, "js", api))
+			)
+				return true;
+			index = template.end;
+			continue;
+		}
 		if (language === "py" || language === "js") {
-			const next =
-				language === "js" && script[index] === "`"
-					? skipJavaScriptTemplate(script, index)
-					: skipNoise(script, index, language);
+			const next = skipNoise(script, index, language);
 			if (next !== index) {
 				const skipped = script.slice(index, next);
 				const isInterpolated =
-					(language === "js" && script[index] === "`" && skipped.includes("${")) ||
-					(language === "py" &&
-						/(?:^|[^\w])(?:[rR]?[fF]|[fF][rR])$/.test(script.slice(Math.max(0, index - 3), index)) &&
-						skipped.includes("{"));
-				if (
-					isInterpolated &&
-					(api.test(skipped) ||
-						(language === "py" && PYTHON_DYNAMIC_EXECUTION_TOKEN_RE.test(skipped)) ||
-						(language === "js" &&
-							(JAVASCRIPT_DYNAMIC_EXECUTION_TOKEN_RE.test(skipped) || /\b(?:process|Bun)\b/.test(skipped))))
-				)
-					return true;
+					language === "py" &&
+					/(?:^|[^\w])(?:[rR]?[fF]|[fF][rR])$/.test(script.slice(Math.max(0, index - 3), index)) &&
+					skipped.includes("{");
+				if (isInterpolated && (api.test(skipped) || PYTHON_DYNAMIC_EXECUTION_TOKEN_RE.test(skipped))) return true;
 				index = next;
 				continue;
+			}
+			if (language === "js" && script[index] === "/") {
+				const end = skipJavaScriptRegex(script, index);
+				if (end === undefined) return true;
+				if (end !== index) {
+					index = end;
+					continue;
+				}
 			}
 		} else {
 			const next = skipOtherInterpreterNoise(script, index);
@@ -2216,19 +2222,27 @@ function interpreterCodeContainsWriteApi(
 		}
 		if (INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE.test(script.slice(index))) return true;
 		if (language === "py" && PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))) return true;
-		if (language === "js" && JAVASCRIPT_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))) return true;
 		if (
 			language === "js" &&
 			!/[\w$]/.test(script[index - 1] ?? "") &&
-			/^(?:process|Bun)(?![\w$])/.test(script.slice(index))
+			JAVASCRIPT_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))
+		)
+			return true;
+		if (language === "js" && !/[\w$]/.test(script[index - 1] ?? "") && javaScriptLoadsOpaqueModule(script, index))
+			return true;
+		if (
+			language === "js" &&
+			!/[\w$]/.test(script[index - 1] ?? "") &&
+			/^(?:process|Bun|globalThis|global)(?![\w$])/.test(script.slice(index))
 		) {
-			const access = script.slice(index).replace(/^(?:process|Bun)\s*/, "");
-			// Only direct writes retain stream identity. Aliases, argument passing,
-			// destructuring and computed access can expose a mutable stream object.
+			const access = script.slice(index).replace(/^(?:process|Bun|globalThis|global)\s*/, "");
+			// Only direct writes and scalar terminal properties avoid exposing a
+			// mutable stream through aliases, arguments or computed access.
 			if (!/^(?:\.\s*[A-Za-z_$][\w$]*(?![\w$\\])|\[\s*["'][^"'\\]+["']\s*\])/.test(access)) return true;
+			if (/^\[\s*["'](?:process|Bun|globalThis|global|getBuiltinModule)["']\s*\]/.test(access)) return true;
 			if (
 				/^(?:\.\s*(?:stdout|stderr)\b|\[\s*["'`](?:stdout|stderr)["'`]\s*\])/.test(access) &&
-				!/^\.\s*(?:stdout|stderr)\s*\.\s*write\s*\(/.test(access)
+				!/^\.\s*(?:stdout|stderr)\s*\.\s*(?:write\s*\(|(?:isTTY|columns|rows)(?![\w$\\]))/.test(access)
 			)
 				return true;
 		}
@@ -2322,17 +2336,107 @@ function isReadOnlyPerlOpen(script: string, index: number): boolean {
 	return mode.startsWith("<") && !mode.startsWith("<+");
 }
 
-function skipJavaScriptTemplate(script: string, index: number): number {
+function skipJavaScriptTrivia(script: string, index: number): number {
+	while (index < script.length) {
+		if (/\s/.test(script[index])) index += 1;
+		else if (script.startsWith("//", index) || script.startsWith("/*", index)) index = skipNoise(script, index, "js");
+		else break;
+	}
+	return index;
+}
+
+function javaScriptLoadsOpaqueModule(script: string, index: number): boolean {
+	const loader = /^(require|import|from)(?![\w$])/.exec(script.slice(index));
+	if (!loader) return false;
+	let cursor = skipJavaScriptTrivia(script, index + loader[0].length);
+	const parenthesized = script[cursor] === "(";
+	if (loader[1] === "from" && parenthesized) return false;
+	if (parenthesized) cursor = skipJavaScriptTrivia(script, cursor + 1);
+	if (script[cursor] !== '"' && script[cursor] !== "'") return loader[1] === "require" || parenthesized;
+	const end = skipNoise(script, cursor, "js");
+	const module = simpleLiteral(script.slice(cursor, end));
+	if (module === null || (parenthesized && script[skipJavaScriptTrivia(script, end)] !== ")")) return true;
+	return (
+		/^(?:node:)?process$/.test(module) || INTERPRETER_FILESYSTEM_REQUIRE_RE.test(`require(${JSON.stringify(module)})`)
+	);
+}
+
+/** Ambiguous slash contexts fail closed rather than misreading regexp braces as template boundaries. */
+function skipJavaScriptRegex(script: string, index: number): number | undefined {
+	const prefix = script.slice(0, index).trimEnd();
+	const previous = prefix.at(-1);
+	const keyword =
+		/(?:^|([^\w$]))(?:return|throw|case|yield|await|void|typeof|delete|in|of|instanceof|else|do|break|continue)$/.exec(
+			prefix,
+		);
+	if (keyword && keyword[1] !== ".") return undefined;
+	const startsExpression = previous === undefined || /[([{=,:;!?&|*%~^<>]/.test(previous);
+	if (!startsExpression) return /[\w$\]'"\x60]/.test(previous ?? "") ? index : undefined;
+	let characterClass = false;
+	for (let cursor = index + 1; cursor < script.length; cursor++) {
+		const character = script[cursor];
+		if (character === "\n" || character === "\r") return undefined;
+		if (character === "\\") cursor += 1;
+		else if (character === "[") characterClass = true;
+		else if (character === "]") characterClass = false;
+		else if (character === "/" && !characterClass) {
+			cursor += 1;
+			while (/[a-z]/i.test(script[cursor] ?? "")) cursor += 1;
+			return cursor;
+		}
+	}
+	return undefined;
+}
+
+function readJavaScriptTemplate(
+	script: string,
+	index: number,
+	depth = 0,
+): { end: number; expressions: string[] } | undefined {
+	if (depth >= 8) return undefined;
+	const expressions: string[] = [];
 	let cursor = index + 1;
 	while (cursor < script.length) {
 		if (script[cursor] === "\\") {
 			cursor += 2;
 			continue;
 		}
-		if (script[cursor] === "`") return cursor + 1;
+		if (script[cursor] === "`") return { end: cursor + 1, expressions };
+		if (script.startsWith("${", cursor)) {
+			const start = cursor + 2;
+			cursor = start;
+			let braces = 1;
+			while (cursor < script.length && braces > 0) {
+				if (script[cursor] === "`") {
+					const nested = readJavaScriptTemplate(script, cursor, depth + 1);
+					if (!nested) return undefined;
+					cursor = nested.end;
+					continue;
+				}
+				const next = skipNoise(script, cursor, "js");
+				if (next !== cursor) {
+					cursor = next;
+					continue;
+				}
+				if (script[cursor] === "/") {
+					const end = skipJavaScriptRegex(script, cursor);
+					if (end === undefined) return undefined;
+					if (end !== cursor) {
+						cursor = end;
+						continue;
+					}
+				}
+				if (script[cursor] === "{") braces += 1;
+				else if (script[cursor] === "}") braces -= 1;
+				cursor += 1;
+			}
+			if (braces !== 0) return undefined;
+			expressions.push(script.slice(start, cursor - 1));
+			continue;
+		}
 		cursor += 1;
 	}
-	return script.length;
+	return undefined;
 }
 
 function skipOtherInterpreterNoise(script: string, index: number): number {
