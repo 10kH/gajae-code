@@ -290,45 +290,47 @@ describe("workspace venv interpreter trust", () => {
 	it.skipIf(!SYMLINK_OK)(
 		"does not execute a HOME workspace interpreter whose resolved name is ..payload (skipped without symlink)",
 		async () => {
-			using tempDir = TempDir.createSync("@gjc-py-venv-dotdot-");
-			const repo = tempDir.join("home");
-			const marker = tempDir.join("planted-python-ran");
-			const planted = path.join(repo, "..payload");
-			await fs.promises.mkdir(path.join(repo, ".git"), { recursive: true });
-			await writeScript(planted, marker);
-			const pythonPath = interpreterFile(path.join(repo, ".venv"));
-			await fs.promises.mkdir(path.dirname(pythonPath), { recursive: true });
-			await fs.promises.symlink(planted, pythonPath);
-			await writeCfg(path.join(repo, ".venv"), path.dirname(HOST_PYTHON ?? "."));
-			const repoRoot = path.resolve(import.meta.dir, "../../..");
-			const probe = path.resolve(import.meta.dir, "../fixtures/python-workspace-venv-home-probe.ts");
-			const env: Record<string, string> = {};
-			for (const [key, value] of Object.entries(process.env)) {
-				if (typeof value === "string" && !ENV_KEYS.includes(key as (typeof ENV_KEYS)[number])) env[key] = value;
+			for (const name of [".venv", "venv"] as const) {
+				using tempDir = TempDir.createSync(`@gjc-py-venv-dotdot-${name}-`);
+				const repo = tempDir.join("home");
+				const marker = tempDir.join("planted-python-ran");
+				const planted = path.join(repo, "..payload", "python");
+				await fs.promises.mkdir(path.join(repo, ".git"), { recursive: true });
+				await writeScript(planted, marker);
+				const pythonPath = interpreterFile(path.join(repo, name));
+				await fs.promises.mkdir(path.dirname(pythonPath), { recursive: true });
+				await fs.promises.symlink(planted, pythonPath);
+				await writeCfg(path.join(repo, name), path.dirname(HOST_PYTHON ?? "."));
+				const repoRoot = path.resolve(import.meta.dir, "../../..");
+				const probe = path.resolve(import.meta.dir, "../fixtures/python-workspace-venv-home-probe.ts");
+				const env: Record<string, string> = {};
+				for (const [key, value] of Object.entries(process.env)) {
+					if (typeof value === "string" && !ENV_KEYS.includes(key as (typeof ENV_KEYS)[number])) env[key] = value;
+				}
+				env.HOME = repo;
+				env.USERPROFILE = repo;
+				const child = Bun.spawn([process.execPath, probe, repo], {
+					cwd: repoRoot,
+					env,
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const [stdout, stderr, exitCode] = await Promise.all([
+					new Response(child.stdout).text(),
+					new Response(child.stderr).text(),
+					child.exited,
+				]);
+				expect(exitCode, stderr).toBe(0);
+				const reported = JSON.parse(stdout.trim()) as { pythonPath: string | null };
+				expect(fs.existsSync(marker)).toBe(false);
+				expect(under(repo, fs.realpathSync(pythonPath))).toBe(true);
+				expect(under(path.join(repo, name), reported.pythonPath ?? undefined)).toBe(false);
+				expect(reported.pythonPath === null || path.resolve(reported.pythonPath) !== path.resolve(pythonPath)).toBe(
+					true,
+				);
 			}
-			env.HOME = repo;
-			env.USERPROFILE = repo;
-			const child = Bun.spawn([process.execPath, probe, repo], {
-				cwd: repoRoot,
-				env,
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			const [stdout, stderr, exitCode] = await Promise.all([
-				new Response(child.stdout).text(),
-				new Response(child.stderr).text(),
-				child.exited,
-			]);
-			expect(exitCode, stderr).toBe(0);
-			const reported = JSON.parse(stdout.trim()) as { pythonPath: string | null };
-			expect(fs.existsSync(marker)).toBe(false);
-			expect(under(repo, fs.realpathSync(pythonPath))).toBe(true);
-			expect(under(path.join(repo, ".venv"), reported.pythonPath ?? undefined)).toBe(false);
-			expect(reported.pythonPath === null || path.resolve(reported.pythonPath) !== path.resolve(pythonPath)).toBe(
-				true,
-			);
 		},
-		30_000,
+		60_000,
 	);
 
 	it("property: workspace path containment agrees with the root prefix for dot-dot names", async () => {
@@ -350,6 +352,8 @@ describe("workspace venv interpreter trust", () => {
 					expect(workspacePathContained(root, outside)).toBe(false);
 					expect(workspacePathContained(root, outside)).toBe(referenceContained(root, outside));
 					expect(workspacePathContained(root, root)).toBe(true);
+					expect(workspacePathContained(root, path.resolve(root, ".", name))).toBe(true);
+					expect(workspacePathContained(root, `${root}-sib`)).toBe(false);
 					expect(workspacePathContained(`${root}${path.sep}`, inside)).toBe(workspacePathContained(root, inside));
 					const payload = path.resolve(root, ...segments, "..payload");
 					const payloadRelative = path.relative(path.resolve(root), payload);
