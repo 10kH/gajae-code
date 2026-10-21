@@ -115,9 +115,12 @@ function inodeIsFsRoot(st: fs.Stats): boolean {
 function tightenOwnerOnly(target: string, mode: number, kind: "directory" | "file"): void {
 	const lexical = lexicalLogPath(target);
 	if (skipRootModeRepair(lexical) || isFinalSymlink(lexical)) return;
+	// A trailing "/." is not the directory. lstat and O_NOFOLLOW must use the
+	// same path the symlink check used, or a swapped link is followed.
+	const repairPath = kind === "directory" ? pathForSymlinkCheck(lexical) : lexical;
 	let fd: number | undefined;
 	try {
-		const listed = fs.lstatSync(lexical);
+		const listed = fs.lstatSync(repairPath);
 		if (kind === "directory" ? !listed.isDirectory() : !listed.isFile()) return;
 		if (inodeIsFsRoot(listed) || (listed.mode & 0o077) === 0) return;
 		const noFollow = (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
@@ -125,17 +128,17 @@ function tightenOwnerOnly(target: string, mode: number, kind: "directory" | "fil
 		const writeOnly = fs.constants.O_WRONLY | noFollow;
 		const readOnly = fs.constants.O_RDONLY | noFollow | directoryFlag;
 		try {
-			fd = fs.openSync(lexical, kind === "file" ? writeOnly : readOnly);
+			fd = fs.openSync(repairPath, kind === "file" ? writeOnly : readOnly);
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code !== "EACCES" && code !== "EPERM") throw error;
 			try {
 				if (kind !== "file") throw error;
-				fd = fs.openSync(lexical, fs.constants.O_RDONLY | noFollow);
+				fd = fs.openSync(repairPath, fs.constants.O_RDONLY | noFollow);
 			} catch (again) {
 				const againCode = (again as NodeJS.ErrnoException).code;
 				if (againCode !== "EACCES" && againCode !== "EPERM") throw again;
-				console.error(`rotating log mode repair skipped for an unopenable ${kind}`);
+				reportSkippedRepair(kind);
 				return;
 			}
 		}
@@ -180,6 +183,7 @@ let dailyRotateFileCtor: DailyRotateFileCtor | undefined;
 let winstonLogger: Logger | undefined;
 let loggerInit: Promise<Logger> | undefined;
 let flushingBufferedLogs = false;
+let repairNoteQueued = false;
 const bufferedLogs: LogRecord[] = [];
 /** Cap pre-init buffering so a hung/failed winston import cannot grow heap unboundedly. */
 const MAX_BUFFERED_LOGS = 10_000;
@@ -329,6 +333,35 @@ function flushBufferedLogs(): void {
 	} finally {
 		flushingBufferedLogs = false;
 	}
+}
+
+/**
+ * A skipped mode repair is logged through the transports already configured.
+ * The default is file-only, so this must not write the terminal. Console
+ * output stays opt-in via {@link setTransports}(`{ console: true }`).
+ */
+function reportSkippedRepair(kind: "directory" | "file"): void {
+	if (flushingBufferedLogs) return;
+	if (!transportOptions.console && !transportOptions.file) return;
+	bufferedLogs.push({
+		level: "error",
+		message: `rotating log mode repair skipped for an unopenable ${kind}`,
+	});
+	if (bufferedLogs.length > MAX_BUFFERED_LOGS) {
+		bufferedLogs.splice(0, bufferedLogs.length - MAX_BUFFERED_LOGS);
+	}
+	// Init flushes after the transports exist. A later repair runs from a
+	// stream callback, so deliver it after that callback returns.
+	if (!winstonLogger || repairNoteQueued) return;
+	repairNoteQueued = true;
+	queueMicrotask(() => {
+		repairNoteQueued = false;
+		try {
+			flushBufferedLogs();
+		} catch {
+			// A repair notice must not take logging down.
+		}
+	});
 }
 
 function writeLog(level: LogLevel, message: string, context?: Record<string, unknown>): void {

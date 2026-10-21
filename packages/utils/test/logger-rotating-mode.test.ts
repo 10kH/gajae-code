@@ -85,6 +85,79 @@ async function runProbe(logDir: string, home: string, cwd = path.dirname(logDir)
 	return JSON.parse(line) as ProbeResult;
 }
 
+/** Root ignores mode bits, so an unopenable-mode fixture is not unopenable. */
+function rootBypassesFileMode(): boolean {
+	return typeof process.geteuid === "function" && process.geteuid() === 0;
+}
+
+/** True when this process cannot create a symlink. Those tests must skip, not pass. */
+function symlinkCreationDenied(): boolean {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-symlink-"));
+	const target = path.join(root, "target");
+	const link = path.join(root, "link");
+	try {
+		fs.mkdirSync(target);
+		fs.symlinkSync(target, link);
+		return false;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "EPERM") return true;
+		throw error;
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+}
+
+const symlinkDenied = symlinkCreationDenied();
+
+function captureStream(which: "stdout" | "stderr"): { text(): string; restore(): void } {
+	const lines: string[] = [];
+	const stream = which === "stdout" ? process.stdout : process.stderr;
+	const method = which === "stdout" ? "log" : "error";
+	const consoleSpy = spyOn(console, method).mockImplementation((...args: unknown[]) => {
+		lines.push(args.map(String).join(" "));
+	});
+	const writeSpy = spyOn(stream, "write").mockImplementation((chunk: unknown) => {
+		lines.push(String(chunk));
+		return true;
+	});
+	return {
+		text: () => lines.join("\n"),
+		restore() {
+			consoleSpy.mockRestore();
+			writeSpy.mockRestore();
+		},
+	};
+}
+
+async function settleTransport(): Promise<void> {
+	await new Promise(resolve => setImmediate(resolve));
+	await new Promise(resolve => setImmediate(resolve));
+}
+
+async function waitForText(captured: { text(): string }, needle: string): Promise<boolean> {
+	for (let i = 0; i < 30; i++) {
+		if (captured.text().includes(needle)) return true;
+		await new Promise(resolve => setImmediate(resolve));
+	}
+	return captured.text().includes(needle);
+}
+
+async function readActiveLog(logDir: string, needle: string): Promise<string> {
+	const file = path.join(logDir, `gjc.${localStamp(0)}.log`);
+	let body = "";
+	const deadline = Date.now() + 8000;
+	while (Date.now() < deadline) {
+		try {
+			body = fs.readFileSync(file, "utf8");
+		} catch {
+			body = "";
+		}
+		if (body.includes(needle)) return body;
+		await new Promise(resolve => setTimeout(resolve, 40));
+	}
+	return body;
+}
+
 describe.skipIf(process.platform === "win32")("rotating log owner-only mode", () => {
 	it("still reads a rotating log line the owner wrote", async () => {
 		const home = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-home-"));
@@ -141,59 +214,11 @@ describe.skipIf(process.platform === "win32")("rotating log owner-only mode", ()
 		await expectSymlinkTargetUnchanged(link => link);
 	}, 20_000);
 
-	it("still reads through a trailing-slash symlink log directory and leaves the target mode", async () => {
-		await expectSymlinkTargetUnchanged(link => `${link}/`);
-	}, 20_000);
-
 	it("still reads through dot-suffix symlink log directories and leaves the target mode", async () => {
 		for (const suffix of ["/.", "/./", "/./."]) {
 			await expectSymlinkTargetUnchanged(link => `${link}${suffix}`);
 		}
-		const home = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-home-"));
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
-		const target = path.join(root, "target");
-		const link = path.join(root, "link");
-		try {
-			fs.mkdirSync(target);
-			fs.chmodSync(target, 0o755);
-			fs.symlinkSync(target, link);
-			for (const relative of ["./link/.", "./link/./", "././link/./."]) {
-				await runProbe(relative, home, root);
-				expect(fs.lstatSync(target).mode & 0o777).toBe(0o755);
-				expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
-			}
-		} finally {
-			fs.rmSync(home, { recursive: true, force: true });
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	}, 40_000);
-
-	it("tightens a 0666 log under a dot-suffix symlinked directory", async () => {
-		for (const suffix of ["./link/.", "./link/./", "././link/./.", "/.", "/./", "/./."]) {
-			const home = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-home-"));
-			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
-			const target = path.join(root, "target");
-			const link = path.join(root, "link");
-			const file = path.join(target, `gjc.${localStamp(0)}.log`);
-			try {
-				fs.mkdirSync(target);
-				fs.chmodSync(target, 0o755);
-				fs.writeFileSync(file, "prior-line\n");
-				fs.chmodSync(file, 0o666);
-				fs.symlinkSync(target, link);
-				const relative = suffix.startsWith(".");
-				const result = relative ? await runProbe(suffix, home, root) : await runProbe(`${link}${suffix}`, home);
-				expect(fs.lstatSync(target).mode & 0o777).toBe(0o755);
-				expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
-				expect(fs.lstatSync(file).mode & 0o777).toBe(0o600);
-				expect(result.written.some(entry => entry.body.includes("prior-line"))).toBe(true);
-				expect(result.written.some(entry => entry.body.includes("rotating-log-mode-marker"))).toBe(true);
-			} finally {
-				fs.rmSync(home, { recursive: true, force: true });
-				fs.rmSync(root, { recursive: true, force: true });
-			}
-		}
-	}, 40_000);
+	}, 20_000);
 
 	it("tightens an existing 0755 directory and 0666 log file", async () => {
 		const home = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-home-"));
@@ -404,212 +429,242 @@ describe.skipIf(process.platform === "win32")("rotating log owner-only mode", ()
 		}
 	}, 20_000);
 
-	it("does not chmod the filesystem root when a parent link is retargeted", async () => {
-		if (process.platform === "win32") return;
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
-		const parent = path.join(root, "parent");
-		const child = path.join(parent, "child");
-		const link = path.join(parent, "link");
-		const safe = path.join(root, "safe");
-		const alias = `${link}${path.sep}..`;
-		const rootBefore = fs.statSync("/").mode;
-		const rootStat = fs.statSync("/");
-		const seen: string[] = [];
-		const originalFchmod = fs.fchmodSync;
-		const native = fs.realpathSync.native;
-		let fchmodSpy: { mockRestore(): void } | undefined;
-		let realSpy: { mockRestore(): void } | undefined;
-		const logger = await import("../src/logger");
-		try {
-			fs.mkdirSync(child, { recursive: true });
-			fs.mkdirSync(safe);
+	it.skipIf(symlinkDenied)(
+		"does not chmod the filesystem root when a parent link is retargeted",
+		async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
+			const parent = path.join(root, "parent");
+			const child = path.join(parent, "child");
+			const link = path.join(parent, "link");
+			const safe = path.join(root, "safe");
+			const alias = `${link}${path.sep}..`;
+			const rootBefore = fs.statSync("/").mode;
+			const rootStat = fs.statSync("/");
+			const seen: string[] = [];
+			const originalFchmod = fs.fchmodSync;
+			const native = fs.realpathSync.native;
+			let fchmodSpy: { mockRestore(): void } | undefined;
+			let realSpy: { mockRestore(): void } | undefined;
+			const logger = await import("../src/logger");
 			try {
+				fs.mkdirSync(child, { recursive: true });
+				fs.mkdirSync(safe);
 				fs.symlinkSync(child, link);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "EPERM") return;
-				throw error;
-			}
-			fs.chmodSync(parent, 0o755);
-			logger.setTransports({ file: safe, console: false });
-			logger.info("rotating-log-mode-marker");
-			const ready = Date.now() + 8000;
-			let marked = false;
-			while (Date.now() < ready) {
-				const names = fs.existsSync(safe) ? fs.readdirSync(safe).filter(name => name.endsWith(".log")) : [];
-				marked = names.some(name =>
-					fs.readFileSync(path.join(safe, name), "utf8").includes("rotating-log-mode-marker"),
-				);
-				if (marked) break;
-				await new Promise(resolve => setTimeout(resolve, 40));
-			}
-			expect(marked).toBe(true);
-			let armed = false;
-			fchmodSpy = spyOn(fs, "fchmodSync").mockImplementation((fd, mode) => {
-				const st = fs.fstatSync(fd);
-				if (st.dev === rootStat.dev && st.ino === rootStat.ino) {
-					seen.push("root");
-					return;
+				fs.chmodSync(parent, 0o755);
+				logger.setTransports({ file: safe, console: false });
+				logger.info("rotating-log-mode-marker");
+				const ready = Date.now() + 8000;
+				let marked = false;
+				while (Date.now() < ready) {
+					const names = fs.existsSync(safe) ? fs.readdirSync(safe).filter(name => name.endsWith(".log")) : [];
+					marked = names.some(name =>
+						fs.readFileSync(path.join(safe, name), "utf8").includes("rotating-log-mode-marker"),
+					);
+					if (marked) break;
+					await new Promise(resolve => setTimeout(resolve, 40));
 				}
-				return originalFchmod(fd, mode);
-			});
-			realSpy = spyOn(fs.realpathSync, "native").mockImplementation(((target: fs.PathLike) => {
-				const resolved = native(target);
-				if (!armed && String(target).includes(`${path.sep}link${path.sep}`)) {
-					armed = true;
-					fs.unlinkSync(link);
-					fs.symlinkSync("/", link);
+				expect(marked).toBe(true);
+				let armed = false;
+				fchmodSpy = spyOn(fs, "fchmodSync").mockImplementation((fd, mode) => {
+					const st = fs.fstatSync(fd);
+					if (st.dev === rootStat.dev && st.ino === rootStat.ino) {
+						seen.push("root");
+						return;
+					}
+					return originalFchmod(fd, mode);
+				});
+				realSpy = spyOn(fs.realpathSync, "native").mockImplementation(((target: fs.PathLike) => {
+					const resolved = native(target);
+					if (!armed && String(target).includes(`${path.sep}link${path.sep}`)) {
+						armed = true;
+						fs.unlinkSync(link);
+						fs.symlinkSync("/", link);
+					}
+					return resolved;
+				}) as typeof fs.realpathSync.native);
+				logger.setTransports({ file: alias, console: false });
+				logger.info("root-race-marker");
+				expect(armed).toBe(true);
+				expect(seen).toEqual([]);
+				expect(fs.statSync("/").mode).toBe(rootBefore);
+			} finally {
+				realSpy?.mockRestore();
+				fchmodSpy?.mockRestore();
+				logger.setTransports({ file: false, console: false });
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+		20_000,
+	);
+
+	it.skipIf(symlinkDenied)(
+		"still writes a rotating log through a dot-segment directory",
+		async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
+			const parent = path.join(root, "parent");
+			const child = path.join(parent, "child");
+			const link = path.join(parent, "link");
+			const alias = `${link}${path.sep}..`;
+			const rootBefore = fs.statSync("/").mode;
+			const logger = await import("../src/logger");
+			try {
+				fs.mkdirSync(child, { recursive: true });
+				fs.symlinkSync(child, link);
+				fs.chmodSync(parent, 0o755);
+				logger.setTransports({ file: alias, console: false });
+				logger.info("rotating-log-mode-marker");
+				const deadline = Date.now() + 8000;
+				let marked = false;
+				while (Date.now() < deadline) {
+					const names = fs.readdirSync(parent).filter(name => name.endsWith(".log"));
+					marked = names.some(name =>
+						fs.readFileSync(path.join(parent, name), "utf8").includes("rotating-log-mode-marker"),
+					);
+					if (marked) break;
+					await new Promise(resolve => setTimeout(resolve, 40));
 				}
-				return resolved;
-			}) as typeof fs.realpathSync.native);
-			logger.setTransports({ file: alias, console: false });
-			logger.info("root-race-marker");
-			expect(armed).toBe(true);
-			expect(seen).toEqual([]);
-			expect(fs.statSync("/").mode).toBe(rootBefore);
-		} finally {
-			realSpy?.mockRestore();
-			fchmodSpy?.mockRestore();
-			logger.setTransports({ file: false, console: false });
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	}, 20_000);
+				expect(marked).toBe(true);
+				expect(fs.statSync("/").mode).toBe(rootBefore);
+				expect(fs.statSync(parent).isDirectory()).toBe(true);
+			} finally {
+				logger.setTransports({ file: false, console: false });
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+		20_000,
+	);
 
-	it("still writes a rotating log through a dot-segment directory", async () => {
-		if (process.platform === "win32") return;
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
-		const parent = path.join(root, "parent");
-		const child = path.join(parent, "child");
-		const link = path.join(parent, "link");
-		const alias = `${link}${path.sep}..`;
-		const rootBefore = fs.statSync("/").mode;
-		const logger = await import("../src/logger");
-		try {
-			fs.mkdirSync(child, { recursive: true });
+	it.skipIf(rootBypassesFileMode())(
+		"leaves an unopenable log file at mode 0004 without stderr",
+		async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
+			const logDir = path.join(root, "logs");
+			const file = path.join(logDir, `gjc.${localStamp(0)}.log`);
+			const stderr = captureStream("stderr");
+			const logger = await import("../src/logger");
 			try {
-				fs.symlinkSync(child, link);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "EPERM") return;
-				throw error;
-			}
-			fs.chmodSync(parent, 0o755);
-			logger.setTransports({ file: alias, console: false });
-			logger.info("rotating-log-mode-marker");
-			const deadline = Date.now() + 8000;
-			let marked = false;
-			while (Date.now() < deadline) {
-				const names = fs.readdirSync(parent).filter(name => name.endsWith(".log"));
-				marked = names.some(name =>
-					fs.readFileSync(path.join(parent, name), "utf8").includes("rotating-log-mode-marker"),
-				);
-				if (marked) break;
-				await new Promise(resolve => setTimeout(resolve, 40));
-			}
-			expect(marked).toBe(true);
-			expect(fs.statSync("/").mode).toBe(rootBefore);
-			expect(fs.statSync(parent).isDirectory()).toBe(true);
-		} finally {
-			logger.setTransports({ file: false, console: false });
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	}, 20_000);
-
-	it("tightens a non-root directory reached through a dot segment", async () => {
-		if (process.platform === "win32") return;
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
-		const parent = path.join(root, "parent");
-		const child = path.join(parent, "child");
-		const link = path.join(parent, "link");
-		const alias = `${link}${path.sep}..`;
-		const logger = await import("../src/logger");
-		try {
-			fs.mkdirSync(child, { recursive: true });
-			try {
-				fs.symlinkSync(child, link);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "EPERM") return;
-				throw error;
-			}
-			fs.chmodSync(parent, 0o755);
-			logger.setTransports({ file: alias, console: false });
-			logger.info("rotating-log-mode-marker");
-			const deadline = Date.now() + 8000;
-			let mode = fs.statSync(parent).mode & 0o777;
-			while (Date.now() < deadline && mode !== 0o700) {
-				mode = fs.statSync(parent).mode & 0o777;
-				if (mode === 0o700) break;
-				await new Promise(resolve => setTimeout(resolve, 40));
-			}
-			expect(mode).toBe(0o700);
-		} finally {
-			logger.setTransports({ file: false, console: false });
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	}, 20_000);
-
-	it("reports an unopenable log file at mode 0004 without a path chmod", async () => {
-		if (process.platform === "win32") return;
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
-		const logDir = path.join(root, "logs");
-		const file = path.join(logDir, `gjc.${localStamp(0)}.log`);
-		const notes: string[] = [];
-		const errorSpy = spyOn(console, "error").mockImplementation((...args: unknown[]) => {
-			notes.push(args.map(String).join(" "));
-		});
-		const logger = await import("../src/logger");
-		try {
-			fs.mkdirSync(logDir);
-			fs.chmodSync(logDir, 0o700);
-			fs.writeFileSync(file, "prior-line\n");
-			fs.chmodSync(file, 0o004);
-			logger.setTransports({ file: logDir, console: false });
-			logger.info("rotating-log-mode-marker");
-			const deadline = Date.now() + 4000;
-			while (Date.now() < deadline && !notes.some(line => line.includes("unopenable file"))) {
-				await new Promise(resolve => setTimeout(resolve, 20));
-			}
-			expect(fs.lstatSync(file).mode & 0o777).toBe(0o004);
-			expect(notes.some(line => line.includes("unopenable file"))).toBe(true);
-		} finally {
-			errorSpy.mockRestore();
-			logger.setTransports({ file: false, console: false });
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	}, 20_000);
-
-	it("reports an unopenable directory at mode 0333 without a path chmod", async () => {
-		if (process.platform === "win32") return;
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
-		const logDir = path.join(root, "logs");
-		const notes: string[] = [];
-		const errorSpy = spyOn(console, "error").mockImplementation((...args: unknown[]) => {
-			notes.push(args.map(String).join(" "));
-		});
-		const logger = await import("../src/logger");
-		try {
-			fs.mkdirSync(logDir);
-			fs.chmodSync(logDir, 0o333);
-			logger.setTransports({ file: logDir, console: false });
-			logger.info("rotating-log-mode-marker");
-			const deadline = Date.now() + 4000;
-			while (Date.now() < deadline && !notes.some(line => line.includes("unopenable directory"))) {
-				await new Promise(resolve => setTimeout(resolve, 20));
-			}
-			expect(fs.lstatSync(logDir).mode & 0o777).toBe(0o333);
-			expect(notes.some(line => line.includes("unopenable directory"))).toBe(true);
-		} finally {
-			errorSpy.mockRestore();
-			try {
+				fs.mkdirSync(logDir);
 				fs.chmodSync(logDir, 0o700);
-			} catch {
-				// The directory may already be gone.
+				fs.writeFileSync(file, "prior-line\n");
+				fs.chmodSync(file, 0o004);
+				logger.setTransports({ file: logDir, console: false });
+				logger.info("rotating-log-mode-marker");
+				await settleTransport();
+				expect(fs.lstatSync(file).mode & 0o777).toBe(0o004);
+				expect(stderr.text().includes("unopenable")).toBe(false);
+			} finally {
+				logger.setTransports({ file: false, console: false });
+				await settleTransport();
+				stderr.restore();
+				fs.rmSync(root, { recursive: true, force: true });
 			}
-			logger.setTransports({ file: false, console: false });
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	}, 20_000);
+		},
+		20_000,
+	);
+
+	it.skipIf(rootBypassesFileMode())(
+		"reports an unopenable log file when the console transport is on",
+		async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
+			const logDir = path.join(root, "logs");
+			const file = path.join(logDir, `gjc.${localStamp(0)}.log`);
+			const stdout = captureStream("stdout");
+			const logger = await import("../src/logger");
+			try {
+				fs.mkdirSync(logDir);
+				fs.chmodSync(logDir, 0o700);
+				fs.writeFileSync(file, "prior-line\n");
+				fs.chmodSync(file, 0o004);
+				logger.setTransports({ file: logDir, console: true });
+				logger.info("rotating-log-mode-marker");
+				const seen = await waitForText(stdout, "unopenable file");
+				expect(fs.lstatSync(file).mode & 0o777).toBe(0o004);
+				expect(seen).toBe(true);
+			} finally {
+				logger.setTransports({ file: false, console: false });
+				await settleTransport();
+				stdout.restore();
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+		20_000,
+	);
+
+	it.skipIf(rootBypassesFileMode())(
+		"leaves an unopenable directory at mode 0333 without stderr",
+		async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
+			const logDir = path.join(root, "logs");
+			const stderr = captureStream("stderr");
+			const logger = await import("../src/logger");
+			try {
+				fs.mkdirSync(logDir);
+				fs.chmodSync(logDir, 0o333);
+				logger.setTransports({ file: logDir, console: false });
+				logger.info("rotating-log-mode-marker");
+				const body = await readActiveLog(logDir, "unopenable directory");
+				expect(fs.lstatSync(logDir).mode & 0o777).toBe(0o333);
+				expect(stderr.text().includes("unopenable")).toBe(false);
+				expect(body.includes("unopenable directory")).toBe(true);
+			} finally {
+				logger.setTransports({ file: false, console: false });
+				await settleTransport();
+				stderr.restore();
+				try {
+					fs.chmodSync(logDir, 0o700);
+				} catch {
+					// The directory may already be gone.
+				}
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+		20_000,
+	);
+
+	it.skipIf(symlinkDenied)(
+		"does not chmod a directory swapped to a symlink after the dot-suffix check",
+		async () => {
+			const logger = await import("../src/logger");
+			for (const suffix of ["/.", "/./", "/./."]) {
+				const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
+				const logs = path.join(root, "logs");
+				const victim = path.join(root, "victim");
+				const parked = path.join(root, "parked");
+				const original = fs.lstatSync;
+				let seen = 0;
+				const spy = spyOn(fs, "lstatSync").mockImplementation(((target: fs.PathLike) => {
+					const stat = original(target);
+					if (String(target) === logs) {
+						seen += 1;
+						if (seen === 2) {
+							fs.renameSync(logs, parked);
+							fs.symlinkSync(victim, logs);
+						}
+					}
+					return stat;
+				}) as typeof fs.lstatSync);
+				try {
+					fs.mkdirSync(logs);
+					fs.mkdirSync(victim);
+					fs.chmodSync(logs, 0o755);
+					fs.chmodSync(victim, 0o755);
+					logger.setTransports({ file: `${logs}${suffix}`, console: false });
+					logger.info("dot-suffix-swap-marker");
+					await settleTransport();
+					expect(seen).toBeGreaterThanOrEqual(2);
+					expect(fs.lstatSync(victim).mode & 0o777).toBe(0o755);
+					expect(original(logs).isSymbolicLink()).toBe(true);
+				} finally {
+					spy.mockRestore();
+					logger.setTransports({ file: false, console: false });
+					fs.rmSync(root, { recursive: true, force: true });
+				}
+			}
+		},
+		20_000,
+	);
 
 	it("does not block when a raced fifo is opened for repair", async () => {
-		if (process.platform === "win32") return;
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
 		const logDir = path.join(root, "logs");
 		const file = path.join(logDir, `gjc.${localStamp(0)}.log`);
@@ -664,23 +719,6 @@ describe.skipIf(process.platform === "win32")("rotating log owner-only mode", ()
 		} finally {
 			openSpy?.mockRestore();
 			logger.setTransports({ file: false, console: false });
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	}, 20_000);
-
-	it("creates a backslash-named rotating log directory at 0700", async () => {
-		const home = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-home-"));
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-mode-"));
-		const named = path.join(root, "logs\\");
-		try {
-			const result = await runProbe(named, home);
-			expect(fs.lstatSync(named).isDirectory()).toBe(true);
-			expect(result.dirMode).toBe(0o700);
-			expect(result.written.length).toBeGreaterThan(0);
-			for (const file of result.written) expect(file.mode).toBe(0o600);
-			expect(fs.existsSync(path.join(root, "logs"))).toBe(false);
-		} finally {
-			fs.rmSync(home, { recursive: true, force: true });
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	}, 20_000);
