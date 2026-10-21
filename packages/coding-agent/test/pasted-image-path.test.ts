@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
+import fc from "fast-check";
 import {
 	decodePastedPathCandidate,
 	decodePastedPathCandidates,
@@ -264,16 +265,6 @@ describe("locatePastedImageReferenceAroundCursor", () => {
 	});
 });
 
-function mulberry32(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (state + 0x6d2b79f5) | 0;
-		let mixed = Math.imul(state ^ (state >>> 15), 1 | state);
-		mixed = (mixed + Math.imul(mixed ^ (mixed >>> 7), 61 | mixed)) ^ mixed;
-		return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
-	};
-}
-
 /** Independent linear trim. Equivalent to the old end-anchored newline alternation on short inputs. */
 function referenceTrimTrailingTerminalNewlines(text: string): string {
 	let end = text.length;
@@ -318,58 +309,92 @@ describe("trailing terminal newlines", () => {
 		});
 	});
 
-	it("bounds a single quoted paste that does not end in a newline", () => {
-		const pairs = 24;
-		const quoted = `'${"\r\n".repeat(pairs)}Y'`;
-		const started = performance.now();
-		expect(parsePastedImagePaths(quoted)).toBeUndefined();
-		expect(resolvePastedImagePath(`X${"\r\n".repeat(pairs)}Y`)).toBeUndefined();
-		expect(performance.now() - started).toBeLessThan(200);
-	});
+	it("bounds a single quoted paste that does not end in a newline", async () => {
+		// One failed alternation returns in about a second because the engine caps
+		// backtracking, so a single call fits a multi-second watchdog on both sides.
+		// Repeating the public entry turns that cap into a hang the parent can kill.
+		const pairs = 4096;
+		const repeats = 8;
+		const watchdogMs = 8_000;
+		const moduleHref = new URL("../src/utils/pasted-image-path.ts", import.meta.url).href;
+		const childSource = [
+			`const mod = await import(${JSON.stringify(moduleHref)});`,
+			`const crlf = "\\r\\n".repeat(${pairs});`,
+			`const quoted = "'" + crlf + "Y'";`,
+			`const bare = "X" + crlf + "Y";`,
+			`for (let step = 0; step < ${repeats}; step += 1) {`,
+			"  if (mod.parsePastedImagePaths(quoted) !== undefined) process.exit(2);",
+			"  if (mod.resolvePastedImagePath(bare) !== undefined) process.exit(2);",
+			"}",
+			`process.stdout.write("ok\\n");`,
+		].join("\n");
+		const proc = Bun.spawn({
+			cmd: [process.execPath, "-e", childSource],
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const stdoutPromise = new Response(proc.stdout).text();
+		const stderrPromise = new Response(proc.stderr).text();
+		const outcome: { settledBy: "exit" | "timeout"; exitCode: number } = {
+			settledBy: "exit",
+			exitCode: -1,
+		};
+		await new Promise<void>(resolve => {
+			const timer = setTimeout(() => {
+				outcome.settledBy = "timeout";
+				proc.kill();
+				resolve();
+			}, watchdogMs);
+			void proc.exited.then(code => {
+				clearTimeout(timer);
+				if (outcome.settledBy === "timeout") return;
+				outcome.exitCode = code;
+				resolve();
+			});
+		});
+		if (outcome.settledBy === "timeout") outcome.exitCode = await proc.exited;
+		const stdout = await stdoutPromise;
+		const stderr = await stderrPromise;
+		expect({ settledBy: outcome.settledBy, exitCode: outcome.exitCode, stdout, stderr }).toEqual({
+			settledBy: "exit",
+			exitCode: 0,
+			stdout: "ok\n",
+			stderr: "",
+		});
+	}, 20_000);
 
-	it("property: pasted trailing newlines stay idempotent, seed 433, 64 inputs", () => {
-		const random = mulberry32(433);
-		const alphabet = ["a", "b", " ", "/", ".", "\r", "\n", "\t", "'", '"', "Z"];
-		const inputs: string[] = [];
-		for (let index = 0; index < 32; index += 1) {
-			const length = Math.floor(random() * 9);
-			let text = "";
-			for (let cursor = 0; cursor < length; cursor += 1) {
-				text += alphabet[Math.floor(random() * alphabet.length)] ?? "a";
-			}
-			inputs.push(text);
-		}
-		for (let index = 0; index < 32; index += 1) {
-			const length = Math.floor(random() * 7);
-			let suffix = "";
-			for (let cursor = 0; cursor < length; cursor += 1) {
-				suffix += alphabet[Math.floor(random() * alphabet.length)] ?? "a";
-			}
-			inputs.push(clipboard + suffix);
-		}
-		expect(inputs).toHaveLength(64);
-
-		for (const input of inputs) {
-			const trimmed = referenceTrimTrailingTerminalNewlines(input);
-			if (terminalNewlineCount(input) <= 8) {
-				expect(trimmed).toBe(input.replace(/(?:\r\n|\r|\n)+$/, ""));
-			}
-			const resolved = resolvePastedImagePath(input);
-			expect(resolved).toBe(resolvePastedImagePath(trimmed));
-			expect(resolvePastedImagePath(`${input}\n`)).toBe(resolved);
-			expect(resolvePastedImagePath(`${input}\r`)).toBe(resolved);
-			expect(resolvePastedImagePath(`${input}\r\n`)).toBe(resolved);
-			if (terminalNewlineCount(trimmed) > 0) {
-				expect(resolved).toBeUndefined();
-			}
-			if (trimmed === clipboard) {
-				expect(resolved).toBe(clipboard);
-				expect(parsePastedImagePaths(input)).toEqual({
-					kind: "paths",
-					paths: [clipboard],
-					requiresConfirmation: false,
-				});
-			}
-		}
+	it("property: pasted trailing newlines stay idempotent, fc.property seed 433, numRuns 64", () => {
+		const alphabet = fc.constantFrom("a", "b", " ", "/", ".", "\r", "\n", "\t", "'", '"', "Z");
+		const piece = fc.array(alphabet, { minLength: 0, maxLength: 8 }).map(chars => chars.join(""));
+		const inputArb = fc.oneof(
+			piece,
+			piece.map(suffix => clipboard + suffix),
+		);
+		fc.assert(
+			fc.property(inputArb, input => {
+				const trimmed = referenceTrimTrailingTerminalNewlines(input);
+				if (terminalNewlineCount(input) <= 8) {
+					expect(trimmed).toBe(input.replace(/(?:\r\n|\r|\n)+$/, ""));
+				}
+				const resolved = resolvePastedImagePath(input);
+				expect(resolved).toBe(resolvePastedImagePath(trimmed));
+				expect(resolvePastedImagePath(`${input}\n`)).toBe(resolved);
+				expect(resolvePastedImagePath(`${input}\r`)).toBe(resolved);
+				expect(resolvePastedImagePath(`${input}\r\n`)).toBe(resolved);
+				if (terminalNewlineCount(trimmed) > 0) {
+					expect(resolved).toBeUndefined();
+				}
+				if (trimmed === clipboard) {
+					expect(resolved).toBe(clipboard);
+					expect(parsePastedImagePaths(input)).toEqual({
+						kind: "paths",
+						paths: [clipboard],
+						requiresConfirmation: false,
+					});
+				}
+			}),
+			{ seed: 433, numRuns: 64 },
+		);
 	});
 });
