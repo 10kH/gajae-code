@@ -699,6 +699,56 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		}
 	});
 
+	it("reclaims its own expired root lease instead of waiting on itself forever", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-root-self-lease-"));
+		try {
+			let now = 1;
+			const fake = new FakeSlack();
+			const daemon = new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(fake),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
+				now: () => now,
+				publicationLeaseMs: 10,
+				randomId: () => "stable-root-id",
+				publicationOwnerId: "self",
+			});
+			await daemon.postRoot("session", "root");
+			const [key] = Object.keys((await daemon.store.load()).conversations);
+			const fenceBefore = (await daemon.store.read(key!))?.rootPublicationFence ?? 0;
+			// An uncertain post left our own lease behind with no recovery loop running.
+			await daemon.store.transact(key!, current =>
+				current
+					? {
+							...current,
+							generation: current.generation + 1,
+							state: "posting_root",
+							rootTs: undefined,
+							rootPublicationOwner: "self",
+							rootPublicationLeaseExpiresAt: 10,
+							updatedAt: now,
+						}
+					: current,
+			);
+			fake.knownMessages.clear();
+			now = 11;
+			const outcome = await Promise.race([
+				daemon.postRoot("session", "replacement").then(root => ({ root })),
+				Bun.sleep(5_000).then(() => ({ root: undefined })),
+			]);
+			expect(outcome.root).toMatchObject({ state: "active", clientMsgId: "stable-root-id" });
+			expect(outcome.root?.rootPublicationOwner).toBeUndefined();
+			expect(outcome.root?.rootPublicationFence).toBeGreaterThan(fenceBefore);
+			// The reclaimed post keeps the original client message id, so the provider dedups it.
+			expect(fake.posts.filter(post => post.clientMsgId === "stable-root-id")).toHaveLength(1);
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	it("renews a live root lease across an external-call overrun so a peer cannot take over", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-root-renewal-"));
 		try {
