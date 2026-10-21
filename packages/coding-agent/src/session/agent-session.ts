@@ -442,6 +442,7 @@ import {
 	isCanonicalGjcWorkflowSkill,
 	isWorkflowContinuationInert,
 	readVisibleSkillActiveState,
+	readVisibleSkillActiveStateWithStatus,
 	syncSkillActiveState,
 } from "../skill-state/active-state";
 import {
@@ -4100,6 +4101,7 @@ export class AgentSession {
 	#skillsSettings: SkillsSettings | undefined;
 	#activeSkillState: { skill: string; sessionId?: string } | undefined;
 	#durableWorkflowSkillState: { skill: string; sessionId: string } | undefined;
+	#workflowHydrationRetrySessionId: string | undefined;
 
 	// Model registry for API key resolution
 	#modelRegistry: ModelRegistry;
@@ -13368,6 +13370,10 @@ export class AgentSession {
 	 * Refresh plugin sub-skill tools after workflow/sub-skill activation or phase changes.
 	 */
 	async refreshGjcSubskillTools(): Promise<void> {
+		// Retry failed restoration during turn preflight, not the cancellation-sensitive terminal path.
+		if (this.#workflowHydrationRetrySessionId === this.sessionManager.getSessionId()) {
+			await this.#attachAskToolIfWorkflowActive();
+		}
 		const activeState = await readVisibleSkillActiveState(
 			this.sessionManager.getCwd(),
 			this.sessionManager.getSessionId(),
@@ -14159,6 +14165,7 @@ export class AgentSession {
 	}
 
 	async #attachAskToolIfWorkflowActive(): Promise<void> {
+		if (this.#isDisposed || this.#sessionAdmissionClosing) return;
 		const sessionId = this.sessionManager.getSessionId();
 		const promptGeneration = this.#promptGeneration;
 		const activeSkillState = this.#activeSkillState;
@@ -14170,8 +14177,11 @@ export class AgentSession {
 				: undefined;
 		let activeSkill = inMemoryActiveSkill;
 		if (!activeSkill) {
+			let retryHydration = false;
 			try {
-				const activeState = await readVisibleSkillActiveState(this.sessionManager.getCwd(), sessionId);
+				const result = await readVisibleSkillActiveStateWithStatus(this.sessionManager.getCwd(), sessionId);
+				const activeState = result.state;
+				retryHydration = result.status === "failed" || result.status === "unresolved";
 				const durableEntries =
 					activeState?.active_skills?.filter(
 						entry =>
@@ -14188,13 +14198,14 @@ export class AgentSession {
 				logger.warn("Failed to read durable workflow skill state while restoring identity and ask tool", {
 					error: error instanceof Error ? error.message : String(error),
 				});
-				return;
+				retryHydration = true;
 			}
 			// Fence the async read against session, prompt, and skill-marker changes.
 			// Helper prompt start/end can leave promptGeneration unchanged, so accepting
 			// a read against a replaced marker could resurrect a cleared workflow.
 			if (
 				this.#isDisposed ||
+				this.#sessionAdmissionClosing ||
 				this.sessionManager.getSessionId() !== sessionId ||
 				this.#promptGeneration !== promptGeneration ||
 				this.#activeSkillState !== activeSkillState ||
@@ -14203,7 +14214,12 @@ export class AgentSession {
 					isCanonicalGjcWorkflowSkill(this.#activeSkillState.skill))
 			)
 				return;
+			if (retryHydration && !activeSkill) {
+				this.#workflowHydrationRetrySessionId = sessionId;
+				return;
+			}
 		}
+		this.#workflowHydrationRetrySessionId = undefined;
 		if (activeSkill && isCanonicalGjcWorkflowSkill(activeSkill.trim())) {
 			if (!inMemoryActiveSkill) this.#durableWorkflowSkillState = { skill: activeSkill.trim(), sessionId };
 			this.#attachAskTool();
