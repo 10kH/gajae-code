@@ -100,6 +100,17 @@ function isFinalSymlink(target: string): boolean {
 	}
 }
 
+/** True when this inode is the filesystem root. Unknown identity fails closed. */
+function inodeIsFsRoot(st: fs.Stats): boolean {
+	if (process.platform === "win32") return false;
+	try {
+		const root = fs.statSync("/");
+		return st.dev === root.dev && st.ino === root.ino;
+	} catch {
+		return true;
+	}
+}
+
 /** Clear group/world bits on this inode. A symlink, including a "." suffix, is not opened. */
 function tightenOwnerOnly(target: string, mode: number, kind: "directory" | "file"): void {
 	const lexical = lexicalLogPath(target);
@@ -108,8 +119,8 @@ function tightenOwnerOnly(target: string, mode: number, kind: "directory" | "fil
 	try {
 		const listed = fs.lstatSync(lexical);
 		if (kind === "directory" ? !listed.isDirectory() : !listed.isFile()) return;
-		if ((listed.mode & 0o077) === 0) return;
-		const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+		if (inodeIsFsRoot(listed) || (listed.mode & 0o077) === 0) return;
+		const noFollow = (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
 		const directoryFlag = kind === "directory" ? (fs.constants.O_DIRECTORY ?? 0) : 0;
 		const writeOnly = fs.constants.O_WRONLY | noFollow;
 		const readOnly = fs.constants.O_RDONLY | noFollow | directoryFlag;
@@ -117,11 +128,19 @@ function tightenOwnerOnly(target: string, mode: number, kind: "directory" | "fil
 			fd = fs.openSync(lexical, kind === "file" ? writeOnly : readOnly);
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
-			if (kind !== "file" || (code !== "EACCES" && code !== "EPERM")) throw error;
-			fd = fs.openSync(lexical, fs.constants.O_RDONLY | noFollow);
+			if (code !== "EACCES" && code !== "EPERM") throw error;
+			try {
+				if (kind !== "file") throw error;
+				fd = fs.openSync(lexical, fs.constants.O_RDONLY | noFollow);
+			} catch (again) {
+				const againCode = (again as NodeJS.ErrnoException).code;
+				if (againCode !== "EACCES" && againCode !== "EPERM") throw again;
+				console.error(`rotating log mode repair skipped for an unopenable ${kind}`);
+				return;
+			}
 		}
 		const opened = fs.fstatSync(fd);
-		if (opened.dev !== listed.dev || opened.ino !== listed.ino) return;
+		if (opened.dev !== listed.dev || opened.ino !== listed.ino || inodeIsFsRoot(opened)) return;
 		if (kind === "directory" ? !opened.isDirectory() : !opened.isFile()) return;
 		if ((opened.mode & 0o077) === 0) return;
 		fs.fchmodSync(fd, mode);
