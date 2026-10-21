@@ -141,7 +141,7 @@ describe.skipIf(process.platform === "win32")("ooo bridge OUROBOROS_CLI trust (P
 		const { dir, home, bin } = project();
 		const resolved = await runProbe(dir, bin, home, "OUROBOROS_CLI=\n");
 		expect(marker(resolved)).toBe("DEFAULT");
-		expect(resolved.result.text).toContain("child-env=__UNSET__");
+		expect(resolved.result.text).toContain("args=dispatch --runtime gjc ooo status");
 	});
 
 	it("still allows an operator OUROBOROS_CLI the project does not declare", async () => {
