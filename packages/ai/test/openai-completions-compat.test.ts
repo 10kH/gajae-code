@@ -2155,3 +2155,102 @@ describe("direct DeepSeek chat-template token stripping", () => {
 		expect(text).not.toContain("<｜Assistant｜>");
 	});
 });
+
+// #911
+describe("Mistral typed content parts assemble into visible text", () => {
+	const model: Model<"openai-completions"> = {
+		...getBundledModel("mistral", "mistral-medium-2604"),
+	};
+
+	it("normalizes array-of-parts delta.content into the assembled text without [object Object]", async () => {
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-mistral-1",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [
+					{
+						index: 0,
+						delta: { content: [{ type: "text", text: "Hello" }] },
+					},
+				],
+			},
+			{
+				id: "chatcmpl-mistral-1",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [
+					{
+						index: 0,
+						delta: { content: [{ type: "text", text: ", world" }] },
+					},
+				],
+			},
+			{
+				id: "chatcmpl-mistral-1",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const text = result.content
+			.filter(b => b.type === "text")
+			.map(b => (b as { text: string }).text)
+			.join("");
+
+		expect(text).not.toContain("[object Object]");
+		expect(text).toBe("Hello, world");
+	});
+
+	it("handles mixed string and array-of-parts content shapes within one stream", async () => {
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-mistral-2",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { content: "plain " } }],
+			},
+			{
+				id: "chatcmpl-mistral-2",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [
+					{
+						index: 0,
+						delta: {
+							content: [
+								{ type: "text", text: "and " },
+								{ type: "text", text: "typed" },
+							],
+						},
+					},
+				],
+			},
+			{
+				id: "chatcmpl-mistral-2",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const text = result.content
+			.filter(b => b.type === "text")
+			.map(b => (b as { text: string }).text)
+			.join("");
+
+		expect(text).not.toContain("[object Object]");
+		expect(text).toBe("plain and typed");
+	});
+});
