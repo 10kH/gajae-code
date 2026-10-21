@@ -2,10 +2,11 @@
  * Host-value policy for MCP config that comes from an untrusted project file.
  *
  * User mcp.json and an explicit `--mcp-config` file may still substitute
- * secret-named environment variables and run `!` shell commands. A project
- * file (native `.gjc/mcp.json` or a repo-root `mcp.json`) uses the same
- * sensitive-name rule as project `ssh.json`: do not copy those host values
- * into server env or headers, and do not execute `!`.
+ * secret-named environment variables and run `!` shell commands. Any
+ * project-level source, including providers other than native `.gjc/mcp.json`
+ * and repo-root `mcp.json`, uses the same sensitive-name rule as project
+ * `ssh.json`: do not copy those host values into server env or headers, and
+ * do not execute `!`.
  */
 
 import type { SourceMeta } from "../capability/types";
@@ -25,7 +26,8 @@ export function nativeMcpSource(level: "user" | "project", filePath: string): So
 /** True when this server was loaded from untrusted project MCP config. */
 export function isUntrustedProjectMcpSource(source: SourceMeta | undefined, toolsOnly: boolean): boolean {
 	if (toolsOnly || !source || source.level !== "project") return false;
-	return UNTRUSTED_PROJECT_MCP_PROVIDERS.has(source.provider);
+	if (UNTRUSTED_PROJECT_MCP_PROVIDERS.has(source.provider)) return true;
+	return source.level === "project";
 }
 
 export type ProjectHostValueDecision =
