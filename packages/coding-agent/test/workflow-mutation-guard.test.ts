@@ -2951,6 +2951,9 @@ describe("bash scanner quoting model", () => {
 			for (const stream of ["stdout", "stderr"]) {
 				for (const source of [
 					`const ${alias}=process.${stream};${alias}["write"]=process.getBuiltinModule("fs")["writeFileSync"];process.${stream}.write("src/product.ts","PWNED")`,
+					`// status\rconst ${alias}=process.${stream};${alias}["write"]=process.getBuiltinModule("fs")["writeFileSync"];process.${stream}.write("src/product.ts","PWNED")`,
+					`// status\u2028const ${alias}=process.${stream};${alias}["write"]=writer;process.${stream}.write("src/product.ts","PWNED")`,
+					`// status\u2029const ${alias}=process.${stream};${alias}["write"]=writer;process.${stream}.write("src/product.ts","PWNED")`,
 					`let ${alias};${alias}=process.${stream};Object.assign(${alias},{write:writer});process.${stream}.write("src/product.ts","PWNED")`,
 					`const ${alias}=process["${stream}"];Reflect.set(${alias},"write",writer);process.${stream}.write("src/product.ts","PWNED")`,
 					`const ${alias}=process./**/${stream};${alias}["write"]=writer;process.${stream}.write("src/product.ts","PWNED")`,
@@ -2967,6 +2970,25 @@ describe("bash scanner quoting model", () => {
 					`const sink=(p,d)=>process.binding("fs")["writeFileUtf8"](p,d,577,438);let n=1;n++ / (s=>s["write"]=sink)(process.${stream}) / 1;process.${stream}.write("src/product.ts","PWNED")`,
 					`const sink=(p,d)=>process.binding("fs")["writeFileUtf8"](p,d,577,438);let n=1;\`\${n-- / (s=>s["write"]=sink)(process.${stream}) / 1}\`;process.${stream}.write("src/product.ts","PWNED")`,
 					`const sink=(p,d)=>process.binding("fs")["writeFileUtf8"](p,d,577,438);const holder={return:1};holder.return / (s=>s["write"]=sink)(process.${stream}) / 1;process.${stream}.write("src/product.ts","PWNED")`,
+					`const sink=(p,d)=>process.binding("fs")["writeFileUtf8"](p,d,577,438);const ${alias}=module["require"]("node:process").${stream};${alias}["write"]=sink;process.${stream}.write("src/product.ts","PWNED")`,
+					`const ${alias}=module["r"+"equire"]("node:process").${stream};${alias}["write"]=writer;process.${stream}.write("src/product.ts","PWNED")`,
+					...["globalThis", "global"].flatMap(root =>
+						[`${root}["module"]["require"]`, `${root}["require"]`].map(
+							loader =>
+								`const ${alias}=${loader}("node:process")["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
+						),
+					),
+					`const ${alias}=module["require"]("node:process")["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
+					`\`\${/[}]/,(s=>s["write"]=writer)(process.${stream})}\`;process.${stream}.write("status")`,
+					`let n=1;n++ / (s=>s["write"]=writer)(process.${stream}) / 1;process.${stream}.write("status")`,
+					`const h={return:1};h. return / (s=>s["write"]=writer)(process.${stream}) / 1;process.${stream}.write("status")`,
+					`const r=/"/;const h={return:1};h.return / (s=>s["write"]=writer)(process.${stream}) / 1;process.${stream}.write("status")`,
+					...["\n", "\r", "\u2028", "\u2029"].map(
+						terminator =>
+							`const h={return:1};h.// note${terminator}return / (s=>s["write"]=writer)(process.${stream}) / 1;process.${stream}.write("status")`,
+					),
+					`console.log(\`\${(()=>{if(Boolean(1)) /[}}]/.test("}");const s=process.${stream};s["write"]=writer})()}\`);process.${stream}.write("status")`,
+					`console.log(\`\${process.binding("fs")["writeFileUtf8"]("src/product.ts","PWNED",577,438)}\`)`,
 				]) {
 					for (const operand of [quoteBashSingle(source), quoteBashDouble(source), quoteBashAnsiC(source)]) {
 						const command = `node -e ${operand}`;
@@ -3018,6 +3040,11 @@ describe("bash scanner quoting model", () => {
 			`process.stdout.write(Array.from([1,2]).join(""))`,
 			`console.log(Buffer.from("status","utf8"))`,
 			`const holder={return:8};console.log(holder.return / 2)`,
+			`console.log(module.filename, module.id, module.loaded)`,
+			`console.log('module["require"]("node:process")')`,
+			`function f(){return /x/.test("x")} console.log(f())`,
+			`console.log(Math.max(1, 2) / 2)`,
+			`const getBuiltinModule = id => id; console.log(getBuiltinModule("node:path"))`,
 		]) {
 			const command = `node -e ${quoteBashSingle(source)}`;
 			expect((await decideBash(cwd, command)).blocked, command).toBe(false);

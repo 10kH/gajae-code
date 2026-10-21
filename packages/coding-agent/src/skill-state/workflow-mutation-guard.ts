@@ -157,8 +157,8 @@ const PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE =
 	/^(?:exec|eval|execfile|__import__|exec_module|import_module|run_path|run_module|getattr|setattr|__getattr__|__getattribute__)\b/;
 const PYTHON_DYNAMIC_EXECUTION_TOKEN_RE =
 	/\b(?:exec|eval|execfile|__import__|exec_module|import_module|run_path|run_module|getattr|setattr|__getattr__|__getattribute__)\b/;
-/** JavaScript evaluation and reflective builtin loading expose unscanned code. */
-const JAVASCRIPT_DYNAMIC_EXECUTION_IDENTIFIER_RE = /^(?:eval|Function|getBuiltinModule)(?![\w$])/;
+/** JavaScript evaluation exposes unscanned code. */
+const JAVASCRIPT_DYNAMIC_EXECUTION_IDENTIFIER_RE = /^(?:eval|Function)(?![\w$])/;
 const BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE = new RegExp(
 	`(?:^|[;&|\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?(?:python3?|node|ruby|perl)\\b[^;&|\\n]*(?:<<[-]?\\s*['"]?\\w+['"]?)[\\s\\S]*${BASH_INTERPRETER_WRITE_API}`,
 	"i",
@@ -2233,13 +2233,21 @@ function interpreterCodeContainsWriteApi(
 		if (
 			language === "js" &&
 			!/[\w$]/.test(script[index - 1] ?? "") &&
-			/^(?:process|Bun|globalThis|global)(?![\w$])/.test(script.slice(index))
+			/^(?:process|Bun|globalThis|global|module)(?![\w$])/.test(script.slice(index))
 		) {
-			const access = script.slice(index).replace(/^(?:process|Bun|globalThis|global)\s*/, "");
+			const access = script.slice(index).replace(/^(?:process|Bun|globalThis|global|module)\s*/, "");
+			if (/^module\b/.test(script.slice(index)) && !/^\.\s*(?:filename|id|loaded)(?![\w$\\])/.test(access))
+				return true;
+			if (/^\.\s*(?:binding|_linkedBinding|getBuiltinModule)(?![\w$\\])/.test(access)) return true;
 			// Only direct writes and scalar terminal properties avoid exposing a
 			// mutable stream through aliases, arguments or computed access.
 			if (!/^(?:\.\s*[A-Za-z_$][\w$]*(?![\w$\\])|\[\s*["'][^"'\\]+["']\s*\])/.test(access)) return true;
-			if (/^\[\s*["'](?:process|Bun|globalThis|global|getBuiltinModule)["']\s*\]/.test(access)) return true;
+			if (
+				/^\[\s*["'](?:process|Bun|globalThis|global|module|require|binding|_linkedBinding|getBuiltinModule)["']\s*\]/.test(
+					access,
+				)
+			)
+				return true;
 			if (
 				/^(?:\.\s*(?:stdout|stderr)\b|\[\s*["'`](?:stdout|stderr)["'`]\s*\])/.test(access) &&
 				!/^\.\s*(?:stdout|stderr)\s*\.\s*(?:write\s*\(|(?:isTTY|columns|rows)(?![\w$\\]))/.test(access)
@@ -2369,13 +2377,46 @@ function skipJavaScriptRegex(script: string, index: number): number | undefined 
 		/(?:^|([^\w$]))(?:return|throw|case|yield|await|void|typeof|delete|in|of|instanceof|else|do|break|continue)$/.exec(
 			prefix,
 		);
-	if (keyword && keyword[1] !== ".") return undefined;
-	const startsExpression = previous === undefined || /[([{=,:;!?&|*%~^<>]/.test(previous);
-	if (!startsExpression) return /[\w$\]'"\x60]/.test(previous ?? "") ? index : undefined;
+	let beforeKeyword = "";
+	if (keyword) {
+		const end = keyword.index + (keyword[1]?.length ?? 0);
+		for (let cursor = 0; cursor < end; cursor++) {
+			const next = skipNoise(prefix, cursor, "js");
+			if (next !== cursor) {
+				if (prefix[cursor] !== "/") beforeKeyword = '"';
+				cursor = next - 1;
+			} else {
+				if (prefix[cursor] === "/" || prefix[cursor] === "`") return undefined;
+				if (!/\s/.test(prefix[cursor])) beforeKeyword = prefix[cursor];
+			}
+		}
+	}
+	const startsExpression =
+		previous === undefined || /[([{=,:;!?&|*%~^<>]/.test(previous) || (keyword !== null && beforeKeyword !== ".");
+	if (!startsExpression) {
+		if (previous === ")") {
+			const parentheses: number[] = [];
+			let opening = -1;
+			for (let cursor = 0; cursor < prefix.length; cursor++) {
+				const next = skipNoise(prefix, cursor, "js");
+				if (next !== cursor) {
+					cursor = next - 1;
+					continue;
+				}
+				if (prefix[cursor] === "`" || prefix[cursor] === "/") return undefined;
+				if (prefix[cursor] === "(") parentheses.push(cursor);
+				else if (prefix[cursor] === ")") opening = parentheses.pop() ?? -1;
+			}
+			const beforeOpening = prefix.slice(0, opening).trimEnd();
+			if (opening < 0 || beforeOpening.endsWith("*/") || /\b(?:if|while|for|with|switch|catch)$/.test(beforeOpening))
+				return undefined;
+		}
+		return /[\w$\])'"\x60]/.test(previous ?? "") ? index : undefined;
+	}
 	let characterClass = false;
 	for (let cursor = index + 1; cursor < script.length; cursor++) {
 		const character = script[cursor];
-		if (character === "\n" || character === "\r") return undefined;
+		if (/[\n\r\u2028\u2029]/.test(character)) return undefined;
 		if (character === "\\") cursor += 1;
 		else if (character === "[") characterClass = true;
 		else if (character === "]") characterClass = false;
@@ -3227,8 +3268,8 @@ function skipNoise(code: string, index: number, language: "py" | "js"): number {
 		(language === "py" && character === "#") ||
 		(language === "js" && character === "/" && code[index + 1] === "/")
 	) {
-		const end = code.indexOf("\n", index);
-		return end < 0 ? code.length : end;
+		const end = language === "js" ? code.slice(index).search(/[\n\r\u2028\u2029]/) : code.slice(index).indexOf("\n");
+		return end < 0 ? code.length : index + end;
 	}
 	if (language === "js" && character === "/" && code[index + 1] === "*") {
 		const end = code.indexOf("*/", index + 2);
