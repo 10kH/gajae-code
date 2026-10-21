@@ -388,4 +388,130 @@ describe("project MCP host values", () => {
 			await manager.disconnectAll().catch(() => {});
 		}
 	}, 20_000);
+
+	const HOST_CREDENTIALS = ["OPENAI_API_KEY", "GJC_TRUSTED_SESSION_TOKEN", "AWS_SECRET_ACCESS_KEY"] as const;
+
+	function plantHostCredentials(): () => void {
+		const previous = HOST_CREDENTIALS.map(name => [name, process.env[name]] as const);
+		process.env.OPENAI_API_KEY = "host-openai-key";
+		process.env.GJC_TRUSTED_SESSION_TOKEN = "host-session-token";
+		process.env.AWS_SECRET_ACCESS_KEY = "host-aws-secret";
+		return () => {
+			for (const [name, value] of previous) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+		};
+	}
+
+	async function writeChildScript(): Promise<string> {
+		const scriptPath = path.join(projectDir, "report-host-env.mjs");
+		await fs.writeFile(
+			scriptPath,
+			[
+				"import fs from 'node:fs';",
+				"const report = process.env.MOCK_REPORT;",
+				"const keys = ['OPENAI_API_KEY','GJC_TRUSTED_SESSION_TOKEN','AWS_SECRET_ACCESS_KEY','GJC_CANARY_PUBLIC'];",
+				"const out = { PATH: process.env.PATH ? 'set' : null, EXPLICIT_OK: process.env.EXPLICIT_OK ?? null };",
+				"for (const key of keys) out[key] = process.env[key] ?? null;",
+				"fs.writeFileSync(report, JSON.stringify(out));",
+				"process.exit(0);",
+				"",
+			].join("\n"),
+		);
+		return scriptPath;
+	}
+
+	async function readChildReport(reportPath: string): Promise<Record<string, string | null>> {
+		expect(await waitUntil(async () => exists(reportPath), 2000)).toBe(true);
+		return JSON.parse(await fs.readFile(reportPath, "utf8")) as Record<string, string | null>;
+	}
+
+	function expectHostCredentialsWithheld(report: Record<string, string | null>): void {
+		expect(report.OPENAI_API_KEY).toBeNull();
+		expect(report.GJC_TRUSTED_SESSION_TOKEN).toBeNull();
+		expect(report.AWS_SECRET_ACCESS_KEY).toBeNull();
+		expect(report.GJC_CANARY_PUBLIC).toBeNull();
+		expect(report.PATH).toBe("set");
+		expect(report.EXPLICIT_OK).toBe("yes");
+	}
+
+	it("does not pass host credentials to an approved project stdio child", async () => {
+		const restore = plantHostCredentials();
+		const scriptPath = await writeChildScript();
+		const nativeReport = path.join(projectDir, "native-env.json");
+		const rootReport = path.join(projectDir, "root-env.json");
+		const manager = new MCPManager(projectDir, null, { allowUntrustedProjectStdio: true });
+		try {
+			await writeJson(".gjc/mcp.json", {
+				mcpServers: {
+					nativeStdio: {
+						type: "stdio",
+						command: process.execPath,
+						args: [scriptPath],
+						timeout: 3_000,
+						env: { MOCK_REPORT: nativeReport, EXPLICIT_OK: "yes" },
+					},
+				},
+			});
+			await writeJson("mcp.json", {
+				mcpServers: {
+					rootStdio: {
+						type: "stdio",
+						command: process.execPath,
+						args: [scriptPath],
+						noInheritEnv: false,
+						timeout: 3_000,
+						env: { MOCK_REPORT: rootReport, EXPLICIT_OK: "yes" },
+					},
+				},
+			});
+			await manager.discoverAndConnect({
+				filterExa: false,
+				autoloadOnly: true,
+				enableProjectConfig: true,
+			});
+			expectHostCredentialsWithheld(await readChildReport(nativeReport));
+			expectHostCredentialsWithheld(await readChildReport(rootReport));
+		} finally {
+			await manager.disconnectAll().catch(() => {});
+			restore();
+		}
+	}, 20_000);
+
+	it("still passes host credentials to a user-scoped stdio child", async () => {
+		const restore = plantHostCredentials();
+		const scriptPath = await writeChildScript();
+		const reportPath = path.join(projectDir, "user-env.json");
+		const manager = new MCPManager(projectDir, null, {});
+		try {
+			await writeJson(path.join(agentDir, "mcp.json"), {
+				mcpServers: {
+					userStdio: {
+						type: "stdio",
+						command: process.execPath,
+						args: [scriptPath],
+						timeout: 3_000,
+						env: { MOCK_REPORT: reportPath, EXPLICIT_OK: "yes" },
+					},
+				},
+			});
+			await manager.discoverAndConnect({
+				filterExa: false,
+				nativeOnly: true,
+				autoloadOnly: true,
+				enableProjectConfig: true,
+			});
+			const report = await readChildReport(reportPath);
+			expect(report.OPENAI_API_KEY).toBe("host-openai-key");
+			expect(report.GJC_TRUSTED_SESSION_TOKEN).toBe("host-session-token");
+			expect(report.AWS_SECRET_ACCESS_KEY).toBe("host-aws-secret");
+			expect(report.GJC_CANARY_PUBLIC).toBe(PUBLIC);
+			expect(report.PATH).toBe("set");
+			expect(report.EXPLICIT_OK).toBe("yes");
+		} finally {
+			await manager.disconnectAll().catch(() => {});
+			restore();
+		}
+	}, 20_000);
 });

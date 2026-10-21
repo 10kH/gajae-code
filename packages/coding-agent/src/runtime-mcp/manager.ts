@@ -3282,11 +3282,13 @@ export class MCPManager {
 				},
 			};
 		}
-		if (this.#toolsOnly && resolved.type === "stdio") {
+		// A project stdio file is repo content. Approval may spawn it, but the file
+		// cannot opt back into the host environment the way a user server can.
+		const untrustedProject = isUntrustedProjectMcpSource(source, this.#toolsOnly);
+		if (resolved.type === "stdio" && (this.#toolsOnly || untrustedProject)) {
 			resolved = { ...resolved, noInheritEnv: true };
 		}
 
-		const untrustedProject = isUntrustedProjectMcpSource(source, this.#toolsOnly);
 		const resolveValue = async (value: string): Promise<string | undefined> => {
 			const decision = decideUntrustedProjectConfigValue(value, untrustedProject);
 			if (decision.action === "drop") return undefined;
