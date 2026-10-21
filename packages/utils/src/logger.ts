@@ -11,6 +11,7 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import type * as winston from "winston";
 import { getEffectiveLogsDir } from "./dirs";
 
@@ -57,22 +58,52 @@ export function lexicalLogPath(target: string, platform: LogPathPlatform = proce
 	return target.slice(0, end);
 }
 
-function isFinalSymlink(target: string): boolean {
+function pathFor(platform: LogPathPlatform): { normalize(target: string): string } {
+	return logPathKind(platform) === "win32" ? path.win32 : path.posix;
+}
+
+/** True when "." / ".." collapse to a filesystem root. Does not follow symlinks. */
+export function resolvesAsFsRoot(target: string, platform: LogPathPlatform = process.platform): boolean {
+	const lexical = lexicalLogPath(target, platform);
+	if (isFsRoot(lexical, platform)) return true;
+	const collapsed = lexicalLogPath(pathFor(platform).normalize(lexical), platform);
+	return isFsRoot(collapsed, platform);
+}
+
+/** Skip mode repair for every spelling of a filesystem root. The transport path stays unchanged. */
+function skipRootModeRepair(target: string): boolean {
+	const lexical = lexicalLogPath(target);
+	if (resolvesAsFsRoot(lexical) || resolvesAsFsRoot(path.resolve(lexical))) return true;
 	try {
-		return fs.lstatSync(lexicalLogPath(target)).isSymbolicLink();
+		return resolvesAsFsRoot(fs.realpathSync.native(lexical));
 	} catch {
 		return false;
 	}
 }
 
-/**
- * Clear group and world bits on the inode opened from this path.
- * A symlink, including one spelled with a trailing separator, is not opened.
- * `O_NOFOLLOW` plus `fchmod` keeps the repair on that inode if the path is replaced.
- */
+/** Drop a trailing "/." so "./link/." is judged as "./link". ".." is not collapsed. */
+function pathForSymlinkCheck(target: string): string {
+	let current = lexicalLogPath(target);
+	const win = process.platform === "win32";
+	for (;;) {
+		const dot = current.endsWith("/.") || (win && current.endsWith("\\."));
+		if (!dot) return current;
+		current = lexicalLogPath(current.slice(0, -2));
+	}
+}
+
+function isFinalSymlink(target: string): boolean {
+	try {
+		return fs.lstatSync(pathForSymlinkCheck(target)).isSymbolicLink();
+	} catch {
+		return false;
+	}
+}
+
+/** Clear group/world bits on this inode. A symlink, including a "." suffix, is not opened. */
 function tightenOwnerOnly(target: string, mode: number, kind: "directory" | "file"): void {
 	const lexical = lexicalLogPath(target);
-	if (isFsRoot(lexical) || isFinalSymlink(lexical)) return;
+	if (skipRootModeRepair(lexical) || isFinalSymlink(lexical)) return;
 	let fd: number | undefined;
 	try {
 		const listed = fs.lstatSync(lexical);
@@ -80,8 +111,17 @@ function tightenOwnerOnly(target: string, mode: number, kind: "directory" | "fil
 		if ((listed.mode & 0o077) === 0) return;
 		const noFollow = fs.constants.O_NOFOLLOW ?? 0;
 		const directoryFlag = kind === "directory" ? (fs.constants.O_DIRECTORY ?? 0) : 0;
-		fd = fs.openSync(lexical, fs.constants.O_RDONLY | noFollow | directoryFlag);
+		const writeOnly = fs.constants.O_WRONLY | noFollow;
+		const readOnly = fs.constants.O_RDONLY | noFollow | directoryFlag;
+		try {
+			fd = fs.openSync(lexical, kind === "file" ? writeOnly : readOnly);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (kind !== "file" || (code !== "EACCES" && code !== "EPERM")) throw error;
+			fd = fs.openSync(lexical, fs.constants.O_RDONLY | noFollow);
+		}
 		const opened = fs.fstatSync(fd);
+		if (opened.dev !== listed.dev || opened.ino !== listed.ino) return;
 		if (kind === "directory" ? !opened.isDirectory() : !opened.isFile()) return;
 		if ((opened.mode & 0o077) === 0) return;
 		fs.fchmodSync(fd, mode);
@@ -101,7 +141,7 @@ function tightenOwnerOnly(target: string, mode: number, kind: "directory" | "fil
 /** Ensure a logs directory exists at mode 0700; return the path the transport should use. */
 function ensureDir(dir: string): string {
 	const lexical = lexicalLogPath(dir);
-	if (isFsRoot(lexical) || isFinalSymlink(lexical)) return lexical;
+	if (skipRootModeRepair(lexical) || isFinalSymlink(lexical)) return lexical;
 	if (!fs.existsSync(lexical)) {
 		fs.mkdirSync(lexical, { recursive: true, mode: LOG_DIR_MODE });
 	}
@@ -175,7 +215,6 @@ function makeLogFormat(winston: WinstonModule): winston.Logform.Format {
  */
 function makeFileTransport(DailyRotateFile: DailyRotateFileCtor, dir?: string): Transport {
 	const dirname = ensureDir(dir ?? getEffectiveLogsDir());
-	const skipFileMode = isFinalSymlink(dirname);
 	const transport = new DailyRotateFile({
 		dirname,
 		filename: "gjc.%DATE%.log",
@@ -194,7 +233,7 @@ function makeFileTransport(DailyRotateFile: DailyRotateFileCtor, dir?: string): 
 	const stream = transport.logStream as unknown as NodeJS.EventEmitter;
 	let currentLog: string | undefined;
 	const repairLog = (): void => {
-		if (skipFileMode || !currentLog) return;
+		if (!currentLog) return;
 		tightenOwnerOnly(currentLog, LOG_FILE_MODE, "file");
 	};
 	// `new` names the active file (including one that already existed at 0666).
