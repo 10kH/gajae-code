@@ -309,11 +309,16 @@ function resolveLiveCredentialEnvValue(name: string): string | undefined {
  * control socket directory and the session-root registry. The harness reads both
  * from the process environment after this module loads, so a project `.env` must
  * not point either at a path the repository controls.
+ * `PI_COMPILED` is the build script's `--define` marker for a standalone binary.
+ * It is not a project setting: foreground `gjc sdk broker run` loads dotenv
+ * in-process, and a repository-controlled true value must not be treated as
+ * evidence that this process is that binary.
  */
 const PROJECT_DENIED_ENV_NAMES = [
 	"NODE_TLS_REJECT_UNAUTHORIZED",
 	"GJC_HARNESS_SOCKET_DIR",
 	"GJC_HARNESS_ROOT_REGISTRY_DIR",
+	"PI_COMPILED",
 ] as const;
 
 // Bun may have loaded cwd/.env before JS runs. Drop a value the project declares
@@ -443,17 +448,26 @@ export function isBunTestRuntime(): boolean {
 }
 
 /**
+ * True when `moduleUrl` is a Bun standalone-binary module.
+ * Bun rewrites `import.meta.url` for every module bundled into the executable
+ * to an embedded virtual-filesystem path (`$bunfs`, `~BUN`, or `%7EBUN`).
+ * This does not read the environment. `PI_COMPILED` is not evidence: a project
+ * `.env` can declare it, and the launching shell can export it.
+ */
+export function isEmbeddedCompiledModule(moduleUrl: string = import.meta.url): boolean {
+	return moduleUrl.includes("$bunfs") || moduleUrl.includes("~BUN") || moduleUrl.includes("%7EBUN");
+}
+
+/**
  * True when this code is running inside a `bun build --compile` standalone
- * binary. Detects via the embedded virtual-filesystem path markers
- * (`$bunfs`, `~BUN`, or its URL-encoded form `%7EBUN`) in `import.meta.url`,
- * which Bun rewrites for every module bundled into the executable. The
- * `PI_COMPILED` env var (set by the build script's `--define`) is checked
- * first for cheap fast-path detection.
+ * binary. Prefers `PI_COMPILED` when the launching process already has it,
+ * then {@link isEmbeddedCompiledModule}. Project dotenv cannot install
+ * `PI_COMPILED`; callers that load a repository file must use
+ * {@link isEmbeddedCompiledModule} so a shell export cannot redirect them.
  */
 export function isCompiledBinary(): boolean {
 	if (Bun.env.PI_COMPILED) return true;
-	const url = import.meta.url;
-	return url.includes("$bunfs") || url.includes("~BUN") || url.includes("%7EBUN");
+	return isEmbeddedCompiledModule();
 }
 
 const TRUTHY: Dict<boolean> = { "1": true, Y: true, TRUE: true, YES: true, ON: true };
