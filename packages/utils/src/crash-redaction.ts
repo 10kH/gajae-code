@@ -376,8 +376,6 @@ function redactCredentialValue(
 	unclosedBacktickQuoted: string | undefined,
 ): string {
 	if (parseCredentialYamlBlockScalarHeader(_match) !== undefined) return _match;
-	// A value that is already a redaction placeholder carries no secret; re-masking it
-	// would only erase which credential shape an earlier pass identified.
 	const value =
 		escapedDoubleQuoted ??
 		doubleQuoted ??
@@ -390,7 +388,24 @@ function redactCredentialValue(
 		unclosedSingleQuoted ??
 		unclosedBacktickQuoted ??
 		_match.slice(prefix.length);
-	if (REDACTION_PLACEHOLDER_PATTERN.test(value.trim())) return _match;
+	const open =
+		escapedDoubleOpen ??
+		doubleOpen ??
+		escapedSingleOpen ??
+		singleOpen ??
+		backtickOpen ??
+		unclosedEscapedDoubleOpen ??
+		unclosedDoubleOpen ??
+		unclosedEscapedSingleOpen ??
+		unclosedSingleOpen ??
+		unclosedBacktickOpen ??
+		"";
+	const close = escapedDoubleClose ?? doubleClose ?? escapedSingleClose ?? singleClose ?? backtickClose ?? "";
+	const suffix = _match.slice(prefix.length + open.length + value.length + close.length);
+	// Only quoted-value boundary punctuation may follow a complete placeholder, never a credential suffix.
+	if (REDACTION_PLACEHOLDER_PATTERN.test(value.trim()) && /^(?:[):.]|\/?>)*$/.test(suffix)) {
+		return _match;
+	}
 	if (escapedDoubleQuoted !== undefined && escapedDoubleOpen !== undefined && escapedDoubleClose !== undefined) {
 		return `${prefix}${escapedDoubleOpen}«redacted»${escapedDoubleClose}`;
 	}

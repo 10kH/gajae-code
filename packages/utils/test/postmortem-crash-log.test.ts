@@ -510,6 +510,55 @@ describe("recordFatalCrash", () => {
 		expect(redactCrashSecrets("token=[REDACTED_TOKEN] next=1")).toBe("token=[REDACTED_TOKEN] next=1");
 	});
 
+	it("only exempts complete placeholders, not quoted fragments with adjacent suffixes", () => {
+		for (const label of ["token", "password", "serviceAccessToken"]) {
+			for (const placeholder of ["[REDACTED_TOKEN]", "«redacted-npm-token»"]) {
+				for (const delimiter of ['"', "'", "`", '\\"', "\\'", '\\\\"', "\\\\'"]) {
+					for (const boundary of ["", " next=1", "\nnext=1", ", next=1", "; next=1", "}"]) {
+						const standalone = `${label}=${delimiter}${placeholder}${delimiter}${boundary}`;
+						expect(redactCrashSecrets(standalone)).toBe(standalone);
+						const input = `${label}=${delimiter}${placeholder}${delimiter}tail-secret-123${boundary}`;
+						const expected = `${label}=${delimiter}«redacted»${delimiter}${boundary}`;
+						expect(redactCrashSecrets(input)).toBe(expected);
+						expect(redactCrashSecrets(expected)).toBe(expected);
+					}
+				}
+				const standalone = `${label}=${placeholder} next=1`;
+				expect(redactCrashSecrets(standalone)).toBe(standalone);
+				const expected = `${label}=«redacted» next=1`;
+				expect(redactCrashSecrets(`${label}=${placeholder}tail-secret-123 next=1`)).toBe(expected);
+				expect(redactCrashSecrets(expected)).toBe(expected);
+			}
+		}
+	});
+
+	it("keeps quoted-placeholder boundary punctuation without exempting adjacent credentials", () => {
+		for (const label of ["token", "serviceAccessToken"]) {
+			for (const placeholder of ["[REDACTED_TOKEN]", "«redacted-npm-token»"]) {
+				for (const delimiter of ['"', "'", "`", '\\"', "\\'"]) {
+					for (const boundary of [")", ".", ":", ">", "/>", ")."]) {
+						const standalone = `${label}=${delimiter}${placeholder}${delimiter}${boundary}`;
+						expect(redactCrashSecrets(standalone)).toBe(standalone);
+						expect(redactCrashSecrets(`${standalone}tail-secret-123`)).toBe(
+							`${label}=${delimiter}«redacted»${delimiter}`,
+						);
+					}
+				}
+			}
+		}
+	});
+
+	it("scrubs placeholder-adjacent suffixes from fatal and handled crash records", async () => {
+		for (const write of [recordFatalCrash, recordHandledError]) {
+			const target = tempCrashLog();
+			const message = 'token="[REDACTED_TOKEN]"tail-secret-123 note=keep';
+			expect(write("synthetic-audit", new Error(message), { path: target })).toBe(target);
+			const contents = await Bun.file(target).text();
+			expect(contents).not.toContain("tail-secret-123");
+			expect(contents).toContain('token="«redacted»" note=keep');
+		}
+	});
+
 	it("still masks a value that only begins with a redaction placeholder", () => {
 		for (const input of [
 			"token=[REDACTED_TOKEN]tail-secret-123",
