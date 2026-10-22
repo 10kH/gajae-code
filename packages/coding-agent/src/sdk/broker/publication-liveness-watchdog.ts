@@ -1,5 +1,5 @@
 import { logger } from "@gajae-code/utils";
-import { isCompiledBinary } from "@gajae-code/utils/env";
+import { isEmbeddedCompiledModule } from "@gajae-code/utils/env";
 import {
 	PUBLICATION_LIVENESS_ACTIVE,
 	PUBLICATION_LIVENESS_CLAIMING,
@@ -62,8 +62,10 @@ function ensureWorker(): Promise<void> {
 	let worker: Worker;
 	try {
 		// Literal paths must match packages/coding-agent/scripts/compile-args.ts.
+		// The relative literal is only for a module Bun embedded in the binary.
+		// Source mode always uses this file's URL, never the project cwd.
 		const options = watchdogWorkerOptions(buffer);
-		worker = isCompiledBinary()
+		worker = isEmbeddedCompiledModule()
 			? new Worker("./packages/coding-agent/src/sdk/broker/publication-liveness-watchdog-worker.ts", options)
 			: new Worker(new URL("./publication-liveness-watchdog-worker.ts", import.meta.url).href, options);
 	} catch (error) {

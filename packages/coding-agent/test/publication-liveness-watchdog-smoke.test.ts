@@ -35,6 +35,7 @@ test("publication liveness smoke keeps the compiled literal on the CLI smoke pat
 	for (const source of [smokeSource, watchdogSource, compileArgsSource]) {
 		expect(source).toContain(`"${compiledLiteral}"`);
 	}
-	expect(smokeSource).toContain("isCompiledBinary()");
+	expect(smokeSource).toContain("isEmbeddedCompiledModule()");
+	expect(watchdogSource).toContain("isEmbeddedCompiledModule()");
 	expect(cliSource).toContain("await smokeTestPublicationLivenessWatchdog()");
 });

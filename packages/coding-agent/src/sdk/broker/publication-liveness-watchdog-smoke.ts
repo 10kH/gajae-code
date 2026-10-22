@@ -1,4 +1,4 @@
-import { isCompiledBinary } from "@gajae-code/utils/env";
+import { isEmbeddedCompiledModule } from "@gajae-code/utils/env";
 import { PUBLICATION_LIVENESS_SLOT_COUNT, PUBLICATION_LIVENESS_SLOT_STRIDE } from "./publication-liveness-deadline";
 
 /** DOM `WorkerOptions` has no `workerData`; Bun still honors the Node field at runtime. */
@@ -12,7 +12,7 @@ export interface PublicationLivenessWatchdogSmokeOptions {
 	timeoutMs?: number;
 	/**
 	 * Force the compiled-binary worker literal. `gjc --smoke-test` leaves this
-	 * unset and follows `isCompiledBinary()`.
+	 * unset and follows the embedded module URL, not `PI_COMPILED`.
 	 */
 	compiled?: boolean;
 }
@@ -26,7 +26,7 @@ export async function smokeTestPublicationLivenessWatchdog(
 	options: PublicationLivenessWatchdogSmokeOptions = {},
 ): Promise<void> {
 	const timeoutMs = options.timeoutMs ?? SMOKE_TIMEOUT_MS;
-	const compiled = options.compiled ?? isCompiledBinary();
+	const compiled = options.compiled ?? isEmbeddedCompiledModule();
 	const buffer = new SharedArrayBuffer(
 		PUBLICATION_LIVENESS_SLOT_COUNT * PUBLICATION_LIVENESS_SLOT_STRIDE * BigInt64Array.BYTES_PER_ELEMENT,
 	);
