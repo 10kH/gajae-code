@@ -267,17 +267,17 @@ describe("AgentSession startup continuation lifecycle", () => {
 
 	it("emits one cancelled agent_end when startup continuation is aborted", async () => {
 		const pending = new AssistantMessageEventStream();
-		const streamStarted = Promise.withResolvers<void>();
-		await createManagedSession(() => {
-			streamStarted.resolve();
-			return pending;
-		});
+		await createManagedSession(() => pending);
 		const events: AgentSessionEvent[] = [];
 		session!.subscribe(event => events.push(event));
 		const continuation = session!.continuePersistedHistory();
-		// Wait for the stream to actually start being consumed, not just for activeRunId to be set.
-		// This ensures the run is accepted before we abort.
-		await streamStarted.promise;
+		// Abort only once the agent loop is blocked in `next()` on the provider stream,
+		// so this covers the pending-read abort race rather than the pre-consumption check.
+		const deadline = Date.now() + 1_000;
+		while (!(pending.hasActiveConsumer && session!.isStreaming)) {
+			if (Date.now() >= deadline) throw new Error("Timed out waiting for provider stream consumption");
+			await Bun.sleep(1);
+		}
 
 		await session!.abort();
 		await continuation;
