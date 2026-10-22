@@ -93,6 +93,14 @@ discovery pid is the supervised process itself.
 - It exits 1 when it stops abnormally while serving: its discovery root was
   lost or replaced, or its heartbeat could not be renewed. A requested
   `broker.shutdown` is a clean stop (exit 0). Use `Restart=on-failure`.
+- It is SIGKILLed (signal status 137, not exit 1) when a discovery
+  publication write blocks the process so the event loop cannot reach that
+  same liveness deadline (`publication-liveness-timeout`, `max(60s, heartbeat
+  TTL × 4)`). `Restart=on-failure` still restarts it; do not add 137 to
+  `SuccessExitStatus`. stderr includes `sdk broker: publication-liveness-timeout`
+  only when that write can finish without waiting. A full stderr pipe does
+  not postpone the SIGKILL. While the event loop is still running, the
+  exit-1 path above is the one that runs.
 - Pair it with attach-only clients (`GJC_SDK_BROKER_AUTOSTART=0`) so nothing
   else starts a competing broker. Set the variable on the broker unit as well
   if its session hosts should stay attach-only.
