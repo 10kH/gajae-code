@@ -324,15 +324,17 @@ function isSubcommand(first: string | undefined): boolean {
 }
 
 /**
- * Smoke-test entry. Spawns the stats sync worker and the browser tab worker, then verifies their protocol.
+ * Smoke-test entry. Spawns the stats sync worker, the browser tab worker, and
+ * the publication-liveness watchdog worker, then verifies their protocol.
  *
  * Purpose: catch silent compiled-worker load regressions (issues #1011,
- * #1027, and #2598). Neither `--version` nor `stats --summary` spawns both
+ * #1027, and #2598). Neither `--version` nor `stats --summary` spawns these
  * worker entries on a fresh install. This probe proves each bundled worker
  * module resolves and evaluates; the tab-worker probe also completes its
- * bootstrap/closed protocol without launching a browser. Wired into
- * `scripts/install-tests/run-ci.sh` so binary / source-link / tarball installs
- * exercise it on every CI run.
+ * bootstrap/closed protocol without launching a browser. The publication
+ * watchdog probe waits for its ready message and does not arm a deadline.
+ * Wired into `scripts/install-tests/run-ci.sh` so binary / source-link /
+ * tarball installs exercise it on every CI run.
  */
 async function runSmokeTest(): Promise<void> {
 	const { smokeTestSyncWorker } = await import("@gajae-code/stats");
@@ -341,8 +343,10 @@ async function runSmokeTest(): Promise<void> {
 	await runNativeSmokeTest();
 	const { smokeTestTabWorker } = await import("./tools/browser/tab-worker-smoke");
 	const { smokeTestIsolatedShell } = await import("./exec/isolated-shell");
+	const { smokeTestPublicationLivenessWatchdog } = await import("./sdk/broker/publication-liveness-watchdog-smoke");
 	await smokeTestTabWorker();
 	await smokeTestIsolatedShell();
+	await smokeTestPublicationLivenessWatchdog();
 	process.stdout.write("smoke-test: ok\n");
 }
 
