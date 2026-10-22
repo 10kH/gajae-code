@@ -14,6 +14,7 @@ import {
 import * as memoryStorage from "@gajae-code/coding-agent/memories/storage";
 import { localBackend } from "@gajae-code/coding-agent/memory-backend";
 import { getAgentDbPath, Snowflake } from "@gajae-code/utils";
+import fc from "fast-check";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 interface SessionFixture {
@@ -122,17 +123,6 @@ function legacyRolloutStem(threadId: string, rolloutSlug: string | null): string
 		.slice(0, 20);
 	if (!normalized) return threadId;
 	return `${threadId}-${normalized}`;
-}
-
-function mulberry32(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (state + 0x6d2b79f5) >>> 0;
-		let t = state;
-		t = Math.imul(t ^ (t >>> 15), t | 1);
-		t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-	};
 }
 
 async function writeRollout(fx: SessionFixture, threadId: string): Promise<void> {
@@ -780,8 +770,6 @@ describe("memories runtime", () => {
 		}
 		const summariesDir = path.join(path.sep, "rollout-summaries-root");
 		const root = path.resolve(summariesDir);
-		const rand = mulberry32(468);
-		const safeAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-";
 		const fixed: Array<[string, string | null]> = [
 			["../../../../outside/evil", null],
 			["../outside/evil", "Hello"],
@@ -792,20 +780,9 @@ describe("memories runtime", () => {
 			["..\\outside\\evil", "slug"],
 			["thread/../../outside", null],
 		];
-		const generated: Array<[string, string | null]> = [];
-		while (generated.length < 64) {
-			const length = 1 + Math.floor(rand() * 16);
-			let threadId = "";
-			for (let i = 0; i < length; i += 1) {
-				threadId += safeAlphabet[Math.floor(rand() * safeAlphabet.length)];
-			}
-			const slug = rand() < 0.5 ? null : `S${Math.floor(rand() * 1000)} x`;
-			generated.push([threadId, slug]);
-		}
-		expect(fixed.length).toBe(8);
-		expect(generated.length).toBe(64);
-		for (const [threadId, rolloutSlug] of [...fixed, ...generated]) {
+		const assertContained = (threadId: string, rolloutSlug: string | null): void => {
 			const target = destination(summariesDir, threadId, rolloutSlug);
+			const again = destination(summariesDir, threadId, rolloutSlug);
 			const stem = legacyRolloutStem(threadId, rolloutSlug);
 			const filename = `${stem}.md`;
 			const safe =
@@ -815,17 +792,30 @@ describe("memories runtime", () => {
 				filename !== "." &&
 				filename !== ".." &&
 				path.basename(filename) === filename;
+			expect(target).toBe(again);
 			if (!safe) {
 				expect(target).toBeUndefined();
-				continue;
+				return;
 			}
 			const expected = path.resolve(root, filename);
 			expect(target).toBe(expected);
-			expect(destination(summariesDir, threadId, rolloutSlug)).toBe(expected);
 			expect(path.basename(expected)).toBe(filename);
 			const relative = path.relative(root, expected);
 			expect(relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)).toBe(false);
-		}
+			expect(relative).toBe(filename);
+		};
+		expect(fixed.length).toBe(8);
+		for (const [threadId, rolloutSlug] of fixed) assertContained(threadId, rolloutSlug);
+		fc.assert(
+			fc.property(
+				fc.string({ maxLength: 32 }),
+				fc.option(fc.string({ maxLength: 24 }), { nil: null }),
+				(threadId, rolloutSlug) => {
+					assertContained(threadId, rolloutSlug);
+				},
+			),
+			{ seed: 468, numRuns: 64 },
+		);
 	});
 
 	test("phase2 empty-input cleanup removes consolidated files and skills dir", async () => {
