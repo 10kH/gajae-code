@@ -29241,6 +29241,11 @@ export class AgentSession {
 					this.#checkpointState = undefined;
 					this.#pendingRewindReport = undefined;
 					this.#releasePredecessorResolveDispatch();
+					// Deferred bash and python rows belong to the predecessor file.
+					// Leaving them queued lets the next prompt append that command
+					// text to the successor transcript.
+					this.#pendingBashMessages.length = 0;
+					this.#pendingPythonMessages.length = 0;
 					let ownerShutdownSettled = true;
 					if (ownerShutdownManager && ownerShutdownLease && ownerId) {
 						try {
