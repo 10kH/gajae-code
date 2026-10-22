@@ -392,6 +392,50 @@ test("a heartbeat write that blocks the JS thread still trips publication-livene
 	).toBe(true);
 }, 30_000);
 
+test.skipIf(process.platform === "win32")(
+	"publication-liveness SIGKILL still fires when stderr cannot accept a write",
+	async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-liveness-stderr-"));
+		roots.push(root);
+		const agentDir = path.join(root, "agent");
+		const home = path.join(root, "home");
+		await fs.mkdir(home);
+		const graceMs = 500;
+		const blockMs = 30_000;
+		const childPath = path.join(import.meta.dir, "sdk-broker-liveness-blocked-write-child.ts");
+		const startedAt = performance.now();
+		const child = Bun.spawn(
+			[process.execPath, childPath, agentDir, String(graceMs), String(blockMs), "block-stderr"],
+			{
+				cwd: path.join(import.meta.dir, ".."),
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+				env: {
+					...process.env,
+					HOME: home,
+					GJC_CODING_AGENT_DIR: agentDir,
+					GJC_BROKER_LIVENESS_HARD_EXIT: "1",
+				},
+			},
+		);
+		const finished = await Promise.race([child.exited.then(() => true), Bun.sleep(15_000).then(() => false)]);
+		if (!finished) child.kill("SIGKILL");
+		const stdout = await new Response(child.stdout).text();
+		const elapsedMs = performance.now() - startedAt;
+		expect(finished, `still alive after ${elapsedMs}ms\nstdout:\n${stdout}`).toBe(true);
+		expect(stdout).toContain("hooks-installed");
+		expect(stdout).toContain("stderr-blocked");
+		expect(stdout).not.toContain("graceful");
+		expect(elapsedMs).toBeLessThan(blockMs);
+		expect(
+			child.signalCode === "SIGKILL" || child.exitCode === 137,
+			`signal=${String(child.signalCode)} exit=${String(child.exitCode)}`,
+		).toBe(true);
+	},
+	30_000,
+);
+
 test("a heartbeat that resumes before the deadline clears the accrued stall", async () => {
 	const broker = await startBroker();
 	setLivenessGraceForTest(broker, WATCHDOG_CADENCE_MS * 12);
