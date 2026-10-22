@@ -1129,11 +1129,13 @@ class ArtifactStagingSink implements ArtifactByteSink {
 	#ended = false;
 	readonly #stagingPath: string;
 	readonly #destination: string;
+	readonly #inPlace: boolean;
 
-	constructor(fd: number, stagingPath: string, destination: string) {
+	constructor(fd: number, stagingPath: string, destination: string, inPlace = false) {
 		this.#fd = fd;
 		this.#stagingPath = stagingPath;
 		this.#destination = destination;
+		this.#inPlace = inPlace;
 	}
 
 	write(chunk: string | Uint8Array): number {
@@ -1177,6 +1179,16 @@ class ArtifactStagingSink implements ArtifactByteSink {
 		}
 		if (closeError) throw closeError;
 		if (!staged) return;
+		if (this.#inPlace) {
+			const named = fs.lstatSync(this.#destination, { bigint: true });
+			if (named.isSymbolicLink() || !named.isFile() || named.dev !== staged.dev || named.ino !== staged.ino) {
+				throw new Error("artifact destination changed");
+			}
+			if (process.platform !== "win32" && (Number(named.mode) & 0o777) !== ARTIFACT_PUBLISH_MODE) {
+				throw new Error("artifact mode");
+			}
+			return;
+		}
 		try {
 			publishArtifactStaging(this.#stagingPath, this.#destination, staged);
 		} catch (error) {
@@ -1186,10 +1198,49 @@ class ArtifactStagingSink implements ArtifactByteSink {
 	}
 }
 
+function openExistingArtifactNoCreate(destination: string, createError: NodeJS.ErrnoException): ArtifactStagingSink {
+	let existing: fs.BigIntStats;
+	try {
+		existing = fs.lstatSync(destination, { bigint: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") throw createError;
+		throw error;
+	}
+	// A missing write bit on the parent blocks create and rename. An existing regular file can still be opened.
+	if (existing.isSymbolicLink() || !existing.isFile()) {
+		throw new Error("artifact destination is not a regular file");
+	}
+	const flags = fs.constants.O_WRONLY | artifactNoFollowFlag();
+	const fd = fs.openSync(destination, flags);
+	try {
+		const opened = fs.fstatSync(fd, { bigint: true });
+		if (!opened.isFile() || opened.dev !== existing.dev || opened.ino !== existing.ino) {
+			throw new Error("artifact destination changed");
+		}
+		fs.ftruncateSync(fd, 0);
+		if (process.platform !== "win32") fs.fchmodSync(fd, ARTIFACT_PUBLISH_MODE);
+		return new ArtifactStagingSink(fd, destination, destination, true);
+	} catch (error) {
+		try {
+			fs.closeSync(fd);
+		} catch {
+			// The original open error is the one callers record.
+		}
+		throw error;
+	}
+}
+
 function openArtifactStaging(destination: string): ArtifactStagingSink {
 	const stagingPath = path.join(path.dirname(destination), `.${randomUUID()}.staging`);
 	const flags = fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | artifactNoFollowFlag();
-	const fd = fs.openSync(stagingPath, flags, ARTIFACT_PUBLISH_MODE);
+	let fd: number;
+	try {
+		fd = fs.openSync(stagingPath, flags, ARTIFACT_PUBLISH_MODE);
+	} catch (error) {
+		const denied = error as NodeJS.ErrnoException;
+		if (denied.code === "EACCES" || denied.code === "EPERM") return openExistingArtifactNoCreate(destination, denied);
+		throw error;
+	}
 	try {
 		if (process.platform !== "win32") fs.fchmodSync(fd, ARTIFACT_PUBLISH_MODE);
 		return new ArtifactStagingSink(fd, stagingPath, destination);

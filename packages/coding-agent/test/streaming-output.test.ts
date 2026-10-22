@@ -601,6 +601,35 @@ describe("OutputSink", () => {
 		expect((await fs.lstat(artifactPath)).mode & 0o777).toBe(0o600);
 	});
 
+	test.skipIf(process.platform === "win32")(
+		"still allows writing an existing mode 0600 artifact when the parent directory is mode 0500",
+		async () => {
+			const dir = await createTempDir();
+			const parent = path.join(dir, "parent-ro");
+			await fs.mkdir(parent, { mode: 0o700 });
+			const artifactPath = path.join(parent, "exist.log");
+			await fs.writeFile(artifactPath, "OLD", { mode: 0o600 });
+			await fs.chmod(artifactPath, 0o600);
+			await fs.chmod(parent, 0o500);
+			try {
+				const sink = new OutputSink({ artifactPath, artifactId: "parent-ro", spillThreshold: 4 });
+				sink.push("NEWCONTENT");
+				const dumped = await sink.dump();
+
+				expect(dumped.artifactId).toBe("parent-ro");
+				expect(dumped.artifactFailureDiagnostic).toBeUndefined();
+				expect(await fs.readFile(artifactPath, "utf8")).toBe("NEWCONTENT");
+				const published = await fs.lstat(artifactPath);
+				expect(published.isSymbolicLink()).toBe(false);
+				expect(published.isFile()).toBe(true);
+				expect(published.mode & 0o777).toBe(0o600);
+				expect(await fs.readdir(parent)).toEqual(["exist.log"]);
+			} finally {
+				await fs.chmod(parent, 0o700);
+			}
+		},
+	);
+
 	test("still allows a long regular artifact basename", async () => {
 		const dir = await createTempDir();
 		const payload = "NEW-CONTENT";
