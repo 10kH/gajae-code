@@ -68,6 +68,7 @@ import { truncateTail } from "../session/streaming-output";
 // Ensure mandatory subagent result extraction is available even when a session is mocked.
 import "../tools/yield";
 import type { ContextFileEntry } from "../tools";
+import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
 import { jtdToJsonSchema, normalizeSchema } from "../tools/jtd-to-json-schema";
 import type { ReportFindingDetails } from "../tools/review";
 import { ToolAbortError } from "../tools/tool-errors";
@@ -223,6 +224,81 @@ export function trimForkContextSeedForModel(seed: ForkContextSeed, model: Model 
 	};
 }
 
+/**
+ * Not an approved command word. Paired with the read-only profile, a quoted
+ * form of this word is rejected too. An empty overlap must stay distinct from
+ * an unrestricted child, which has no profile and no prefixes.
+ */
+const CHILD_BASH_EMPTY_OVERLAP_PREFIX = ";";
+
+function normalizedBashPrefixes(prefixes: readonly string[] | undefined): string[] {
+	const unique: string[] = [];
+	for (const prefix of prefixes ?? []) {
+		const trimmed = prefix.trim();
+		if (trimmed.length === 0 || unique.includes(trimmed)) continue;
+		unique.push(trimmed);
+	}
+	return unique;
+}
+
+function bashPrefixWords(prefix: string): string[] {
+	return prefix
+		.trim()
+		.split(/\s+/u)
+		.filter(word => word.length > 0);
+}
+
+/** True when every command matched by `specific` is also matched by `broader`. */
+function bashPrefixCovers(broader: string, specific: string): boolean {
+	const left = bashPrefixWords(broader);
+	const right = bashPrefixWords(specific);
+	if (left.length === 0 || left.length > right.length) return false;
+	return left.every((word, index) => word === right[index]);
+}
+
+/**
+ * Bash posture for a task child. An unrestricted parent keeps the child agent's
+ * allowlist. A restricted parent is copied, and a child allowlist can only narrow it.
+ * An empty overlap is read-only with a prefix the bash gate cannot approve.
+ */
+export function resolveChildBashRestriction(input: {
+	parentProfile?: BashRestrictionProfile;
+	parentPrefixes?: readonly string[];
+	childPrefixes?: readonly string[];
+}): { bashRestrictionProfile?: BashRestrictionProfile; bashAllowedPrefixes?: string[] } {
+	const parentPrefixes = normalizedBashPrefixes(input.parentPrefixes);
+	const childPrefixes = normalizedBashPrefixes(input.childPrefixes);
+	if (input.parentProfile === undefined && parentPrefixes.length === 0) {
+		return childPrefixes.length > 0 ? { bashAllowedPrefixes: childPrefixes } : {};
+	}
+	let bashAllowedPrefixes: string[] | undefined;
+	if (parentPrefixes.length === 0) {
+		bashAllowedPrefixes = childPrefixes.length > 0 ? childPrefixes : undefined;
+	} else if (childPrefixes.length === 0) {
+		bashAllowedPrefixes = parentPrefixes;
+	} else {
+		const merged: string[] = [];
+		for (const parentPrefix of parentPrefixes) {
+			for (const childPrefix of childPrefixes) {
+				if (bashPrefixCovers(childPrefix, parentPrefix)) merged.push(parentPrefix);
+				else if (bashPrefixCovers(parentPrefix, childPrefix)) merged.push(childPrefix);
+			}
+		}
+		const unique = normalizedBashPrefixes(merged);
+		if (unique.length === 0) {
+			return {
+				bashRestrictionProfile: "read-only",
+				bashAllowedPrefixes: [CHILD_BASH_EMPTY_OVERLAP_PREFIX],
+			};
+		}
+		bashAllowedPrefixes = unique;
+	}
+	return {
+		...(input.parentProfile ? { bashRestrictionProfile: input.parentProfile } : {}),
+		...(bashAllowedPrefixes ? { bashAllowedPrefixes } : {}),
+	};
+}
+
 /** Options for subagent execution */
 export interface ExecutorOptions {
 	cwd: string;
@@ -313,6 +389,12 @@ export interface ExecutorOptions {
 	 * `enforcePlanModeWrite` still refuses product-file writes.
 	 */
 	planModeState?: PlanModeState;
+	/**
+	 * Parent bash posture. Applied before the child prompt so a read-only or
+	 * workflow allowlist cannot be cleared by spawn. A child allowlist may only narrow it.
+	 */
+	bashRestrictionProfile?: BashRestrictionProfile;
+	parentBashAllowedPrefixes?: string[];
 	/**
 	 * Parent client bridge. Only `requestPermission` is copied onto the child.
 	 * Terminal, filesystem, and deferAgentInitiatedTurns stay on the parent.
@@ -2060,6 +2142,11 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			}
 
 			if (options.preflightProbe || options.preflightDurable) preflightOperation = "tool_bootstrap";
+			const childBash = resolveChildBashRestriction({
+				parentProfile: options.bashRestrictionProfile,
+				parentPrefixes: options.parentBashAllowedPrefixes,
+				childPrefixes: agent.bashAllowedPrefixes,
+			});
 			const { session } = await awaitAbortable(
 				canonicalSdk.createAgentSession({
 					cwd: worktree ?? cwd,
@@ -2132,7 +2219,8 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					agentId: id,
 					agentDisplayName: agent.name,
 					agentRosterLabel: options.description,
-					bashAllowedPrefixes: agent.bashAllowedPrefixes,
+					bashAllowedPrefixes: childBash.bashAllowedPrefixes,
+					bashRestrictionProfile: childBash.bashRestrictionProfile,
 					enableLsp: lspEnabled,
 					skipPythonPreflight,
 					enableMCP,
