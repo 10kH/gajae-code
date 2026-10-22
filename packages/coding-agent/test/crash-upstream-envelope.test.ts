@@ -138,7 +138,7 @@ describe("buildCrashEnvelope", () => {
 		expect(result.body).toContain("«redacted»");
 	});
 
-	it("keeps a short secret assignment and a slash token under 40 characters", () => {
+	it("keeps short session cookies and a slash token under 40 characters", () => {
 		const slashToken = ["wJalrXUtnFEMI", "K7MDEN", "bPxRfiCYEXAMPLE"].join("/");
 		const alphanumeric = `${"wJalrXUtnFEMI7K7MDENGbPxRfiCYEXAMPLEKEY"}X`;
 		expect(slashToken.length).toBeLessThan(40);
@@ -146,7 +146,6 @@ describe("buildCrashEnvelope", () => {
 		expect(alphanumeric).not.toMatch(/[/+]/);
 		const message = [
 			"failed to open config (ENOENT)",
-			"AWS_SECRET_ACCESS_KEY=short",
 			"sessionid%3Dabc",
 			"sessionid=abc",
 			slashToken,
@@ -155,12 +154,19 @@ describe("buildCrashEnvelope", () => {
 		const result = buildCrashEnvelope(envelopeInput({ messageClass: message }));
 		expect(result.ok).toBe(true);
 		if (!result.ok) return;
-		expect(result.body).toContain("AWS_SECRET_ACCESS_KEY=short");
 		expect(result.body).toContain("sessionid%3Dabc");
 		expect(result.body).toContain("sessionid=abc");
 		expect(result.body).toContain(slashToken);
 		expect(result.body).toContain(alphanumeric);
 		expect(result.body).toContain("failed to open config");
+	});
+
+	it("masks a labeled AWS secret at any length", () => {
+		const result = buildCrashEnvelope(envelopeInput({ messageClass: "failed AWS_SECRET_ACCESS_KEY=short" }));
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.body).not.toContain("AWS_SECRET_ACCESS_KEY=short");
+		expect(result.body).toContain("AWS_SECRET_ACCESS_KEY=«redacted»");
 	});
 
 	it("refuses an envelope that exceeds the 48 KiB body limit", () => {

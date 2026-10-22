@@ -10286,7 +10286,9 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				toolName: "bash",
 				args: {},
 			});
-			const boundaryDeadline = Date.now() + 2_000;
+			// This checks ordering, not prompt latency; allow the scheduler to reach
+			// the boundary when many CI shards are contending for the event loop.
+			const boundaryDeadline = Date.now() + 10_000;
 			while (!boundaryWaitStarted && Date.now() < boundaryDeadline) await Bun.sleep(10);
 			expect(boundaryWaitStarted).toBe(true);
 			expect(abortCalls).toHaveLength(0);
@@ -10300,7 +10302,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			await Bun.sleep(30);
 			expect(abortCalls).toHaveLength(0);
-			const abortDeadline = Date.now() + 2_000;
+			const abortDeadline = Date.now() + 10_000;
 			while (abortCalls.length === 0 && Date.now() < abortDeadline) await Bun.sleep(10);
 			expect(abortCalls).toEqual([{ handle: "deadline-tool-run", scope: "owned", expectedEpoch: epoch }]);
 			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
@@ -10667,7 +10669,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect(accepted.ok).toBe(true);
 			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
 			const claimWaitStartedAt = Date.now();
-			const claimDeadline = claimWaitStartedAt + 2_000;
+			const claimDeadline = claimWaitStartedAt + 10_000;
 			while (!claimWasEntered && Date.now() < claimDeadline) await Bun.sleep(5);
 			try {
 				expect(claimWasEntered).toBe(true);
@@ -10689,7 +10691,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			}
 			await claimEntered.promise;
 			startPromise = harness.emit("agent_start");
-			const captureDeadline = Date.now() + 2_000;
+			const captureDeadline = Date.now() + 10_000;
 			while (handleReads === 0 && Date.now() < captureDeadline) await Bun.sleep(5);
 			expect(handleReads).toBeGreaterThan(0);
 			releaseClaim.resolve();
@@ -10708,7 +10710,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			await harness?.stop();
 			await rm(cwd, { recursive: true, force: true });
 		}
-	});
+	}, 15_000);
 
 	test("agent_start during an expiry claim keeps the queued correlation owned", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-start-race-"));
