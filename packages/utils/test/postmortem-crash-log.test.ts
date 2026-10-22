@@ -532,6 +532,22 @@ describe("recordFatalCrash", () => {
 		}
 	});
 
+	it("keeps quoted-placeholder boundary punctuation without exempting adjacent credentials", () => {
+		for (const label of ["token", "serviceAccessToken"]) {
+			for (const placeholder of ["[REDACTED_TOKEN]", "«redacted-npm-token»"]) {
+				for (const delimiter of ['"', "'", "`", '\\"', "\\'"]) {
+					for (const boundary of [")", ".", ":", ">", "/>", ")."]) {
+						const standalone = `${label}=${delimiter}${placeholder}${delimiter}${boundary}`;
+						expect(redactCrashSecrets(standalone)).toBe(standalone);
+						expect(redactCrashSecrets(`${standalone}tail-secret-123`)).toBe(
+							`${label}=${delimiter}«redacted»${delimiter}`,
+						);
+					}
+				}
+			}
+		}
+	});
+
 	it("scrubs placeholder-adjacent suffixes from fatal and handled crash records", async () => {
 		for (const write of [recordFatalCrash, recordHandledError]) {
 			const target = tempCrashLog();

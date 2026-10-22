@@ -401,11 +401,9 @@ function redactCredentialValue(
 		unclosedBacktickOpen ??
 		"";
 	const close = escapedDoubleClose ?? doubleClose ?? escapedSingleClose ?? singleClose ?? backtickClose ?? "";
-	// A quoted placeholder is only the complete value when no adjacent suffix was matched.
-	if (
-		_match.length === prefix.length + open.length + value.length + close.length &&
-		REDACTION_PLACEHOLDER_PATTERN.test(value.trim())
-	) {
+	const suffix = _match.slice(prefix.length + open.length + value.length + close.length);
+	// Only quoted-value boundary punctuation may follow a complete placeholder, never a credential suffix.
+	if (REDACTION_PLACEHOLDER_PATTERN.test(value.trim()) && /^(?:[):.]|\/?>)*$/.test(suffix)) {
 		return _match;
 	}
 	if (escapedDoubleQuoted !== undefined && escapedDoubleOpen !== undefined && escapedDoubleClose !== undefined) {
