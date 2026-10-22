@@ -1810,7 +1810,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "interaction",
 			label: "Prompt Suggestions",
 			description:
-				"Predict your likely next prompt after each turn (one extra default-role model call) and show it as ghost text; Tab accepts",
+				"Predict your likely next message after each completed turn (one extra call to the session model with the full conversation) and show it as ghost text; Tab accepts, Esc dismisses",
 		},
 	},
 

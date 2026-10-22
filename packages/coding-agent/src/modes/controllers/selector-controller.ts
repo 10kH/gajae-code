@@ -3377,6 +3377,7 @@ export class SelectorController {
 					}
 
 					try {
+						this.ctx.promptSuggestion?.clear();
 						const result = await this.ctx.session.navigateTree(entryId, {
 							summarize: wantsSummary,
 							customInstructions,
@@ -3512,6 +3513,7 @@ export class SelectorController {
 			return true;
 		}
 
+		this.ctx.promptSuggestion?.clear();
 		const detached = await this.ctx.session.newSession();
 		if (this.ctx.isStopped?.()) return false;
 		if (!detached) {
@@ -3544,6 +3546,7 @@ export class SelectorController {
 	#resumeInFlight = false;
 
 	async handleResumeSession(sessionPath: string): Promise<void> {
+		this.ctx.promptSuggestion?.clear();
 		if (this.#resumeInFlight) {
 			this.ctx.showStatus("Resume already in progress");
 			return;
