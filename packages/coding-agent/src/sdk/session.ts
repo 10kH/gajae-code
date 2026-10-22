@@ -2290,6 +2290,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					: existingSession.models.default
 						? [existingSession.models.default]
 						: [];
+		if (
+			startupRegistryMutationAuthorized &&
+			!hasExplicitModel &&
+			hasExistingSession &&
+			defaultModelEntries.length > 0
+		) {
+			// Resume skips startup discovery, so refresh a missing saved provider
+			// before resolution when this session owns authority to mutate the registry.
+			await refreshMissingQualifiedModelProviders(defaultModelEntries, modelRegistry, credentialSessionId);
+		}
 		const persistedProfileName =
 			persistedDefaultChain?.origin === "profile-activation" ? persistedDefaultChain.identity : undefined;
 		const resolvedPersistedProfileName = persistedProfileName
