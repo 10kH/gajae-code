@@ -150,7 +150,7 @@ function createMockSession(): AgentSession {
 
 async function childBashSurface(options: Parameters<typeof executorModule.runSubprocess>[0]) {
 	let captured: CreateAgentSessionOptions | undefined;
-	vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async (sessionOptions: CreateAgentSessionOptions) => {
+	vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async (sessionOptions?: CreateAgentSessionOptions) => {
 		captured = sessionOptions;
 		const result: CreateAgentSessionResult = {
 			session: createMockSession(),
