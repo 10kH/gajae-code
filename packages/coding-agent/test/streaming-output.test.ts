@@ -630,6 +630,33 @@ describe("OutputSink", () => {
 		},
 	);
 
+	test.skipIf(process.platform === "win32")(
+		"does not follow a symlink when the parent directory is mode 0500",
+		async () => {
+			const dir = await createTempDir();
+			const parent = path.join(dir, "parent-ro-link");
+			await fs.mkdir(parent, { mode: 0o700 });
+			const victim = path.join(parent, "victim");
+			await fs.writeFile(victim, "VICTIM-ORIGINAL", { mode: 0o600 });
+			const artifactPath = path.join(parent, "artifact.log");
+			await fs.symlink(victim, artifactPath);
+			await fs.chmod(parent, 0o500);
+			try {
+				const sink = new OutputSink({ artifactPath, artifactId: "symlink-ro", spillThreshold: 4 });
+				sink.push("SECRET-BYTES");
+				const dumped = await sink.dump();
+
+				expect(dumped.artifactId).toBeUndefined();
+				expect(dumped.artifactFailureDiagnostic).toContain("not a regular file");
+				expect(await fs.readFile(victim, "utf8")).toBe("VICTIM-ORIGINAL");
+				expect((await fs.lstat(victim)).mode & 0o777).toBe(0o600);
+				expect((await fs.lstat(artifactPath)).isSymbolicLink()).toBe(true);
+			} finally {
+				await fs.chmod(parent, 0o700);
+			}
+		},
+	);
+
 	test("still allows a long regular artifact basename", async () => {
 		const dir = await createTempDir();
 		const payload = "NEW-CONTENT";
