@@ -2,6 +2,41 @@
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-22
+
+### Added
+
+- Added the Amazon Bedrock Claude Haiku 5.5 selectors (`anthropic.claude-haiku-5-5` and the `au.`, `eu.`, `global.`, `jp.` and `us.` inference profiles) to the bundled catalog, taken from a fresh `generate-models` run.
+- Bedrock Haiku 5.5 resolves to adaptive thinking with the documented `low`..`max` effort range and `medium` default, sends an explicit `thinking: { type: "disabled" }` when thinking is Off (with a forced tool choice the selected effort is kept, capped at `high` while thinking is disabled), and bills prompts above 100K tokens at a long-context tier, with 1-hour cache writes (long retention) at twice the tier input rate.
+
+- Added Claude Haiku 5.5 (`anthropic/claude-haiku-5-5`) to the bundled catalog, taken from a fresh `generate-models` run. Bedrock selectors are not part of this change.
+- Claude Haiku 5.5 resolves to adaptive thinking with the documented `low`..`max` effort range and `medium` default on the Anthropic Messages API. Direct requests omit unsupported sampling controls, send an explicit `thinking: { type: "disabled" }` when thinking is Off, and with a forced tool choice keep the selected effort (capped at `high` while thinking is disabled), request summarized thinking output, and use the documented >100K-token pricing tier, billing 1-hour cache writes at their own rate from the response TTL split. Haiku 4.5 and older keep their existing behavior.
+
+### Changed
+
+- First-party Anthropic requests (`api.anthropic.com` over HTTPS) now send gzip-compressed bodies with `Content-Encoding: gzip`, which shrinks large, repetitive prompts substantially. Third-party endpoints, non-standard ports, and stream bodies are sent unchanged, and a stale `Content-Length` is dropped so the transport recomputes it.
+
+### Fixed
+
+- Antigravity model discovery now identifies with the Gemini CLI user agent so Gemini 4 Argon can be returned without relying on project metadata. Both `google-antigravity` and `google-gemini-cli` still forward project IDs from stored OAuth credentials or structured Google keys when available, and the generated-model refresh path forwards the stored project ID too. Discovery diagnostics redact endpoint credentials, and custom loggers keep their method receiver.
+- Google discovery cache identity now includes the session-selected project and the effective user agent for both Google providers, so catalogs are not reused across projects, CLI identities, or custom Antigravity user-agent overrides. Project-specific dynamic rows are also removed or withheld when the selected project changes.
+
+- Automatic Anthropic prompt caching now also marks the last system block, so a new session reads the shared tools + system prefix instead of re-writing it.
+
+- Anthropic automatic prompt caching no longer adds a root cache marker when caller markers already occupy all four breakpoints, which made the request fail validation.
+
+- `disableReasoning` is now honored on the Bedrock path, so budget-mode Bedrock models keep the caller's requested output cap when reasoning is disabled.
+
+- GLM ZCode OAuth endpoints and the client id (`ZCODE_OAUTH_*`) now resolve from the launching shell and user-owned env files, so a project `.env` cannot redirect the authorize, broker, or login calls. A dynamic project declaration also blocks a different shell value for that name.
+
+- A usage limit that is scoped to one model (an explicit `scope.modelId`, or a model-family tier such as Claude's `opus`/`sonnet`) no longer takes the whole credential out of rotation. The block is recorded for that model only, ranking ignores limits scoped to other models, and callers that do not know the requested model keep the previous conservative behaviour. Plan and quota tiers (`Codex`/`Copilot` plans, Gemini quota tiers) still apply to every model.
+
+- OpenAI Codex token refresh error messages now display readable error details instead of `[object Object]` when the OpenAI token endpoint returns structured error objects with `code`, `type`, and `message` fields. Both string errors (with optional `error_description`) and object errors are now handled correctly.
+
+- `getProxyForUrl` ignores `PI_PROXY`, `PI_PROXY_<PROVIDER>`, `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` (and their lowercase aliases) when the project dotenv declares that value. The startup snapshot remains in force when `--worktree` changes cwd before the proxy module's first use. A different shell value is still used only when that declaration is a comparable static value. A dynamic or incomparable declaration (expansion, quoted inner whitespace, or an escape the snapshot will not compare) drops the shell value as well.
+
+- Orphan tool results restored as a user stale-tool-result note escape `&`, `<`, and `>` in the tool text, and attribute metacharacters in the tool name and id, so a closing tag in the tool output cannot end the note early.
+
 ## [0.18.12] - 2026-10-16
 
 ### Added
