@@ -266,11 +266,43 @@ describe("task child bash restriction", () => {
 			bashRestrictionProfile: forwarded.bashRestrictionProfile,
 			parentBashAllowedPrefixes: forwarded.parentBashAllowedPrefixes,
 		});
-		expect(surface.bashAllowedPrefixes).toEqual(["gjc __no_inherited_bash_overlap__"]);
 		const tool = bashTool(surface, cwd);
-		await expect(tool.execute("attack-cat", { command: "cat secret.txt" })).rejects.toThrow(
-			/restricted role-agent bash/,
-		);
+		await expectRestrictedRefusal(tool, "attack-cat", "cat secret.txt");
+		await expectRestrictedRefusal(tool, "attack-sentinel", "gjc __no_inherited_bash_overlap__");
+		await expectRestrictedRefusal(tool, "attack-sentinel-write", "gjc __no_inherited_bash_overlap__ --write");
+		await expectRestrictedRefusal(tool, "attack-sentinel-arg", "gjc __no_inherited_bash_overlap__ extra");
+		await expectRestrictedRefusal(tool, "attack-quoted", "';'");
+	});
+
+	it("refuses a child allowlist disjoint from a parent allowlist with no profile", async () => {
+		const definition = agent(["cat"]);
+		const forwarded = await spawnOptions(createSession({ bashAllowedPrefixes: ["pwd"] }), definition);
+		expect(forwarded.bashRestrictionProfile).toBeUndefined();
+		expect(forwarded.parentBashAllowedPrefixes).toEqual(["pwd"]);
+		vi.restoreAllMocks();
+
+		const surface = await childBashSurface({
+			cwd: process.cwd(),
+			agent: definition,
+			task: "Inspect.",
+			index: 0,
+			id: "InheritRo",
+			settings: Settings.isolated(),
+			modelRegistry: {
+				refresh: async () => {},
+				getAvailable: () => [],
+				getApiKey: async () => kNoAuth,
+			} as unknown as ModelRegistry,
+			enableLsp: false,
+			bashRestrictionProfile: forwarded.bashRestrictionProfile,
+			parentBashAllowedPrefixes: forwarded.parentBashAllowedPrefixes,
+		});
+		const tool = bashTool(surface, process.cwd());
+		await expectRestrictedRefusal(tool, "attack-cat", "cat secret.txt");
+		await expectRestrictedRefusal(tool, "attack-sentinel", "gjc __no_inherited_bash_overlap__");
+		await expectRestrictedRefusal(tool, "attack-sentinel-write", "gjc __no_inherited_bash_overlap__ --write");
+		await expectRestrictedRefusal(tool, "attack-sentinel-arg", "gjc __no_inherited_bash_overlap__ extra");
+		await expectRestrictedRefusal(tool, "attack-quoted", "';'");
 	});
 
 	it("unrestricted parent still keeps the child bash allowlist", async () => {
@@ -362,8 +394,7 @@ describe("task child bash restriction", () => {
 	it("property: child bash prefixes stay inside both allowlists", async () => {
 		const loaded = await import("../../src/task/executor");
 		const resolve = loaded.resolveChildBashRestriction;
-		const deny = loaded.CHILD_BASH_DENY_PREFIX;
-		if (typeof resolve !== "function" || typeof deny !== "string") {
+		if (typeof resolve !== "function") {
 			throw new Error("child bash restriction resolver is missing");
 		}
 		const word = fc.stringMatching(/^[a-z][a-z0-9]{0,6}$/);
@@ -373,45 +404,70 @@ describe("task child bash restriction", () => {
 		);
 		const list = fc.array(prefix, { maxLength: 4 });
 		const profile = fc.constantFrom(undefined, "workflow" as const, "read-only" as const);
+		const command = fc.oneof(
+			fc.constantFrom(
+				"id",
+				"pwd",
+				"ls",
+				"cat secret.txt",
+				"git status",
+				"gjc __no_inherited_bash_overlap__",
+				"gjc __no_inherited_bash_overlap__ --write",
+				"gjc __no_inherited_bash_overlap__ extra",
+				";",
+				"';'",
+				"$(id)",
+				"true",
+			),
+			fc.tuple(word, word).map(([left, right]) => `${left} ${right}`),
+		);
 		await fc.assert(
-			fc.property(profile, list, list, (parentProfile, parentPrefixes, childPrefixes) => {
+			fc.property(profile, list, list, command, (parentProfile, parentPrefixes, childPrefixes, sampled) => {
 				const result = resolve({ parentProfile, parentPrefixes, childPrefixes });
 				const parent = [...new Set(parentPrefixes.map(item => item.trim()).filter(item => item.length > 0))];
 				const child = [...new Set(childPrefixes.map(item => item.trim()).filter(item => item.length > 0))];
 				if (parentProfile === undefined && parent.length === 0) {
 					expect(result.bashRestrictionProfile).toBeUndefined();
 					expect(result.bashAllowedPrefixes ?? []).toEqual(child);
-					return;
 				}
-				expect(result.bashRestrictionProfile).toBe(parentProfile);
-				const produced = result.bashAllowedPrefixes ?? [];
-				if (parent.length === 0) {
-					expect(produced).toEqual(child);
-					return;
+				const commands = new Set([
+					sampled,
+					...parent,
+					...child,
+					"id",
+					"pwd",
+					"cat secret.txt",
+					"gjc __no_inherited_bash_overlap__",
+					"gjc __no_inherited_bash_overlap__ --write",
+					"gjc __no_inherited_bash_overlap__ extra",
+					";",
+					"';'",
+				]);
+				for (const one of commands) {
+					const childAllowed = gateAllowed(one, result.bashAllowedPrefixes, result.bashRestrictionProfile);
+					if (!childAllowed) continue;
+					const parentAllowed =
+						parentProfile === undefined && parent.length === 0 ? true : gateAllowed(one, parent, parentProfile);
+					const childDefinitionAllowed = child.length === 0 ? true : gateAllowed(one, child, parentProfile);
+					expect(parentAllowed).toBe(true);
+					expect(childDefinitionAllowed).toBe(true);
 				}
-				if (child.length === 0) {
-					expect(produced).toEqual(parent);
-					return;
-				}
-				const overlap: string[] = [];
-				for (const parentPrefix of parent) {
-					for (const childPrefix of child) {
-						if (covers(childPrefix, parentPrefix)) overlap.push(parentPrefix);
-						else if (covers(parentPrefix, childPrefix)) overlap.push(childPrefix);
-					}
-				}
-				const expected = [...new Set(overlap)];
-				if (expected.length === 0) expect(produced).toEqual([deny]);
-				else expect(produced).toEqual(expected);
 			}),
 			{ seed: 20261023, numRuns: 64 },
 		);
 	});
 });
 
-function covers(broader: string, specific: string): boolean {
-	const left = broader.trim().split(/\s+/u).filter(Boolean);
-	const right = specific.trim().split(/\s+/u).filter(Boolean);
-	if (left.length === 0 || left.length > right.length) return false;
-	return left.every((part, index) => part === right[index]);
+function gateAllowed(
+	command: string,
+	prefixes: readonly string[] | undefined,
+	profile: "workflow" | "read-only" | undefined,
+): boolean {
+	return checkBashAllowedPrefixes(command, prefixes, profile ? { profile } : {}).allowed;
+}
+
+async function expectRestrictedRefusal(tool: BashTool, id: string, command: string): Promise<void> {
+	await expect(tool.execute(id, { command })).rejects.toThrow(
+		/read-only bash|restricted role-agent bash|shell control operator/,
+	);
 }

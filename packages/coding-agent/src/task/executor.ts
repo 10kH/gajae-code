@@ -224,8 +224,12 @@ export function trimForkContextSeedForModel(seed: ForkContextSeed, model: Model 
 	};
 }
 
-/** Fail-closed prefix when a parent allowlist and a child allowlist share no command. */
-export const CHILD_BASH_DENY_PREFIX = "gjc __no_inherited_bash_overlap__";
+/**
+ * Not an approved command word. Paired with the read-only profile, a quoted
+ * form of this word is rejected too. An empty overlap must stay distinct from
+ * an unrestricted child, which has no profile and no prefixes.
+ */
+const CHILD_BASH_EMPTY_OVERLAP_PREFIX = ";";
 
 function normalizedBashPrefixes(prefixes: readonly string[] | undefined): string[] {
 	const unique: string[] = [];
@@ -255,6 +259,7 @@ function bashPrefixCovers(broader: string, specific: string): boolean {
 /**
  * Bash posture for a task child. An unrestricted parent keeps the child agent's
  * allowlist. A restricted parent is copied, and a child allowlist can only narrow it.
+ * An empty overlap is read-only with a prefix the bash gate cannot approve.
  */
 export function resolveChildBashRestriction(input: {
 	parentProfile?: BashRestrictionProfile;
@@ -280,7 +285,13 @@ export function resolveChildBashRestriction(input: {
 			}
 		}
 		const unique = normalizedBashPrefixes(merged);
-		bashAllowedPrefixes = unique.length > 0 ? unique : [CHILD_BASH_DENY_PREFIX];
+		if (unique.length === 0) {
+			return {
+				bashRestrictionProfile: "read-only",
+				bashAllowedPrefixes: [CHILD_BASH_EMPTY_OVERLAP_PREFIX],
+			};
+		}
+		bashAllowedPrefixes = unique;
 	}
 	return {
 		...(input.parentProfile ? { bashRestrictionProfile: input.parentProfile } : {}),
