@@ -1,3 +1,3 @@
-### Bug Fixes
+### Fixed
 
-- Fix flaky "stale deadline callback" test in sdk-bus-prompt-deadline.test.ts by preventing concurrent deadline re-arming during agent_end processing. When noteTerminalTransition is called after the deadline clears the lease, it now checks if the deadline is currently expiring before re-arming, eliminating a race condition that caused terminal frames to be lost or deferred.
+- Fixed the flaky "a stale deadline callback cannot terminalize after its submission was cleared" test: its `setTimeout` capture matched the bus deadline by delay window alone, so the SDK broker discovery timer the bus arms concurrently during startup (~35s, inside the 30–60s lease window) was intermittently captured as a second deadline. The capture now attributes timers to the `armPromptDeadline` arming site.
