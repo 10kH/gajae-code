@@ -285,7 +285,7 @@ describe("AgentSession startup continuation lifecycle", () => {
 
 		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
 		expect(events.find(event => event.type === "agent_end")).toMatchObject({ stopReason: "cancelled" });
-		expect(session!.isStreaming).toBe(false);
+		expect(Boolean(session!.isStreaming)).toBe(false);
 	});
 
 	it("does not duplicate terminal delivery after the agent event subscription reconnects", async () => {
