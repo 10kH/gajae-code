@@ -1069,9 +1069,12 @@ export class TailBuffer {
 // =============================================================================
 
 const ARTIFACT_PUBLISH_MODE = 0o600;
+const ARTIFACT_WRITE_HIGH_WATER = 64 * 1024;
 
 type ArtifactByteSink = {
 	write(chunk: string | Uint8Array): number;
+	settled(): Promise<void> | undefined;
+	writeFailed(): boolean;
 	end(): Promise<void>;
 };
 
@@ -1127,6 +1130,9 @@ function publishArtifactStaging(stagingPath: string, destination: string, staged
 class ArtifactStagingSink implements ArtifactByteSink {
 	#fd: number | undefined;
 	#ended = false;
+	#queued = 0;
+	#tail: Promise<void> = Promise.resolve();
+	#writeError: unknown;
 	readonly #stagingPath: string;
 	readonly #destination: string;
 	readonly #inPlace: boolean;
@@ -1140,20 +1146,56 @@ class ArtifactStagingSink implements ArtifactByteSink {
 
 	write(chunk: string | Uint8Array): number {
 		const fd = this.#fd;
-		if (fd === undefined) throw new Error("artifact sink closed");
+		if (fd === undefined || this.#ended) throw new Error("artifact sink closed");
+		if (this.#writeError) throw this.#writeError;
 		const buffer = typeof chunk === "string" ? Buffer.from(chunk) : Buffer.from(chunk);
+		this.#queued += buffer.length;
+		this.#tail = this.#tail.then(() => this.#flush(fd, buffer));
+		return buffer.length;
+	}
+
+	settled(): Promise<void> | undefined {
+		return this.#queued > ARTIFACT_WRITE_HIGH_WATER ? this.#tail : undefined;
+	}
+
+	writeFailed(): boolean {
+		return this.#writeError !== undefined;
+	}
+
+	async #flush(fd: number, buffer: Buffer): Promise<void> {
 		let offset = 0;
-		while (offset < buffer.length) {
-			const wrote = fs.writeSync(fd, buffer, offset, buffer.length - offset);
-			if (wrote <= 0) throw new Error("artifact write failed");
-			offset += wrote;
+		try {
+			while (!this.#writeError && offset < buffer.length) {
+				const wrote = await new Promise<number>((resolve, reject) => {
+					fs.write(fd, buffer, offset, buffer.length - offset, (error, bytes) =>
+						error ? reject(error) : resolve(bytes),
+					);
+				});
+				if (wrote <= 0) throw new Error("artifact write failed");
+				offset += wrote;
+			}
+		} catch (error) {
+			this.#writeError ??= error;
+		} finally {
+			this.#queued -= buffer.length;
 		}
-		return offset;
 	}
 
 	async end(): Promise<void> {
 		if (this.#ended) return;
 		this.#ended = true;
+		await this.#tail;
+		if (this.#writeError) {
+			const failed = this.#fd;
+			this.#fd = undefined;
+			if (failed !== undefined)
+				try {
+					fs.closeSync(failed);
+				} catch {
+					/* keep the write error */
+				}
+			throw this.#writeError;
+		}
 		const fd = this.#fd;
 		this.#fd = undefined;
 		let staged: { dev: bigint; ino: bigint } | undefined;
@@ -1217,8 +1259,11 @@ function openExistingArtifactNoCreate(destination: string, createError: NodeJS.E
 		if (!opened.isFile() || opened.dev !== existing.dev || opened.ino !== existing.ino) {
 			throw new Error("artifact destination changed");
 		}
+		if (process.platform !== "win32") {
+			fs.fchmodSync(fd, ARTIFACT_PUBLISH_MODE);
+			if ((Number(fs.fstatSync(fd).mode) & 0o777) !== ARTIFACT_PUBLISH_MODE) throw new Error("artifact mode");
+		}
 		fs.ftruncateSync(fd, 0);
-		if (process.platform !== "win32") fs.fchmodSync(fd, ARTIFACT_PUBLISH_MODE);
 		return new ArtifactStagingSink(fd, destination, destination, true);
 	} catch (error) {
 		try {
@@ -1391,15 +1436,13 @@ export class OutputSink {
 	 */
 	// F21: with coalescing enabled, accumulate raw chunks and process them in batches; the default
 	// (disabled) path calls #ingest directly and is byte-identical to the historical per-chunk path.
-	push(chunk: string): void {
-		if (!this.#coalesceSanitize) {
-			this.#ingest(chunk);
-			return;
+	push(chunk: string): void | Promise<void> {
+		if (!this.#coalesceSanitize) this.#ingest(chunk);
+		else {
+			this.#coalesceBuf += chunk;
+			if (this.#coalesceBuf.length >= COALESCE_FLUSH_CHARS) this.#flushCoalesced();
 		}
-		this.#coalesceBuf += chunk;
-		if (this.#coalesceBuf.length >= COALESCE_FLUSH_CHARS) {
-			this.#flushCoalesced();
-		}
+		return this.#file?.sink.settled();
 	}
 
 	/** Process any buffered coalesced chunks as a single batch (F21). */
@@ -1888,9 +1931,7 @@ export class OutputSink {
 			this.push(dec.decode());
 		};
 		return new WritableStream({
-			write: chunk => {
-				this.push(typeof chunk === "string" ? chunk : dec.decode(chunk, { stream: true }));
-			},
+			write: chunk => this.push(typeof chunk === "string" ? chunk : dec.decode(chunk, { stream: true })),
 			close: finalize,
 			abort: finalize,
 		});
@@ -1958,7 +1999,7 @@ export class OutputSink {
 						artifactId = this.#file.artifactId;
 						this.#finalized = true;
 					} catch (error) {
-						this.#recordArtifactFailure("end", error);
+						this.#recordArtifactFailure(this.#file.sink.writeFailed() ? "write" : "end", error);
 						this.#artifactFinalizationFailed = true;
 						this.#file = undefined;
 						this.#fileReady = false;

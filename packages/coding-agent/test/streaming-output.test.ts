@@ -486,7 +486,7 @@ describe("OutputSink", () => {
 		const dir = await createTempDir();
 		const artifactPath = path.join(dir, "partial-write.log");
 		const originalFile = Bun.file;
-		const originalWriteSync = nodeFs.writeSync;
+		const originalWrite = nodeFs.write;
 		let writes = 0;
 		let failed = false;
 		let insideBunWriter = false;
@@ -498,14 +498,14 @@ describe("OutputSink", () => {
 				throw new Error("simulated write failure");
 			}
 		};
-		const writeSyncSpy = spyOn(nodeFs, "writeSync").mockImplementation(((...args: unknown[]) => {
+		const writeSpy = spyOn(nodeFs, "write").mockImplementation(((...args: unknown[]) => {
 			if (!insideBunWriter) {
 				const buffer = args[1];
 				const text = typeof buffer === "string" ? buffer : Buffer.from(buffer as Uint8Array).toString("utf8");
 				noteWrite(text);
 			}
-			return Reflect.apply(originalWriteSync, nodeFs, args) as number;
-		}) as typeof nodeFs.writeSync);
+			return Reflect.apply(originalWrite, nodeFs, args);
+		}) as typeof nodeFs.write);
 		try {
 			Bun.file = ((filePath: string | URL, ...args: unknown[]) => {
 				const file = originalFile(filePath, ...(args as []));
@@ -547,8 +547,66 @@ describe("OutputSink", () => {
 			expect(summary.output).not.toContain("artifact://partial-write");
 			expect(summary.artifactFailureDiagnostic).toBe("write: simulated write failure");
 		} finally {
-			writeSyncSpy.mockRestore();
+			writeSpy.mockRestore();
 			Bun.file = originalFile;
+		}
+	});
+
+	test("path-backed push does not write before it returns", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "async.log");
+		let writes = 0;
+		const originalWrite = nodeFs.write;
+		const writeSpy = spyOn(nodeFs, "write").mockImplementation(((...args: unknown[]) => {
+			writes++;
+			return Reflect.apply(originalWrite, nodeFs, args);
+		}) as typeof nodeFs.write);
+		try {
+			const sink = new OutputSink({ artifactPath, artifactId: "async-push", spillThreshold: 4 });
+			sink.push("hello-async");
+			expect(writes).toBe(0);
+			const dumped = await sink.dump();
+			expect(writes).toBeGreaterThan(0);
+			expect(dumped.artifactId).toBe("async-push");
+			expect(dumped.artifactFailureDiagnostic).toBeUndefined();
+			expect(await fs.readFile(artifactPath, "utf8")).toBe("hello-async");
+		} finally {
+			writeSpy.mockRestore();
+		}
+	});
+
+	test("path-backed push waits once queued bytes pass the high water mark", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "pressure.log");
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const originalWrite = nodeFs.write;
+		const writeSpy = spyOn(nodeFs, "write").mockImplementation(((...args: unknown[]) => {
+			started.resolve();
+			void release.promise.then(() => {
+				Reflect.apply(originalWrite, nodeFs, args);
+			});
+		}) as typeof nodeFs.write);
+		try {
+			const sink = new OutputSink({ artifactPath, artifactId: "pressure", spillThreshold: 4 });
+			const chunk = "x".repeat(64 * 1024 + 1);
+			const pending = sink.push(chunk);
+			expect(pending).toBeInstanceOf(Promise);
+			await started.promise;
+			const winner = await Promise.race([
+				Promise.resolve(pending).then(() => "settled"),
+				Promise.resolve().then(() => "open"),
+			]);
+			expect(winner).toBe("open");
+			release.resolve();
+			await pending;
+			const dumped = await sink.dump();
+			expect(dumped.artifactId).toBe("pressure");
+			expect(dumped.artifactFailureDiagnostic).toBeUndefined();
+			expect(await fs.readFile(artifactPath, "utf8")).toBe(chunk);
+		} finally {
+			release.resolve();
+			writeSpy.mockRestore();
 		}
 	});
 
@@ -625,6 +683,43 @@ describe("OutputSink", () => {
 				expect(published.mode & 0o777).toBe(0o600);
 				expect(await fs.readdir(parent)).toEqual(["exist.log"]);
 			} finally {
+				await fs.chmod(parent, 0o700);
+			}
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"does not truncate an existing artifact when applying mode 0600 fails",
+		async () => {
+			const dir = await createTempDir();
+			const parent = path.join(dir, "parent-chmod");
+			await fs.mkdir(parent, { mode: 0o700 });
+			const artifactPath = path.join(parent, "exist.log");
+			await fs.writeFile(artifactPath, "KEEP-OLD", { mode: 0o644 });
+			await fs.chmod(artifactPath, 0o644);
+			await fs.chmod(parent, 0o500);
+			let truncated = false;
+			const chmodError = Object.assign(new Error("EPERM"), { code: "EPERM" });
+			const originalTruncate = nodeFs.ftruncateSync;
+			const chmodSpy = spyOn(nodeFs, "fchmodSync").mockImplementation(() => {
+				throw chmodError;
+			});
+			const truncateSpy = spyOn(nodeFs, "ftruncateSync").mockImplementation((...args: unknown[]) => {
+				truncated = true;
+				return Reflect.apply(originalTruncate, nodeFs, args) as ReturnType<typeof nodeFs.ftruncateSync>;
+			});
+			try {
+				const sink = new OutputSink({ artifactPath, artifactId: "chmod-eperm", spillThreshold: 4 });
+				sink.push("NEWCONTENT");
+				const dumped = await sink.dump();
+				expect(dumped.artifactId).toBeUndefined();
+				expect(dumped.artifactFailureDiagnostic).toContain("EPERM");
+				expect(truncated).toBe(false);
+				expect(await fs.readFile(artifactPath, "utf8")).toBe("KEEP-OLD");
+				expect((await fs.lstat(artifactPath)).mode & 0o777).toBe(0o644);
+			} finally {
+				chmodSpy.mockRestore();
+				truncateSpy.mockRestore();
 				await fs.chmod(parent, 0o700);
 			}
 		},
