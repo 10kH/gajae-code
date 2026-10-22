@@ -35,6 +35,8 @@ export interface PublicationLivenessSample {
  * Hard-kill switch. Production leaves it unset and arms the watchdog. The test
  * runner sets `BUN_ENV=test` / `NODE_ENV=test`, where a false kill would take
  * down the runner, so the watchdog stays disarmed unless a child opts in.
+ * That opt-out is the only startup path that may succeed without a worker.
+ * When this is enabled, failing to arm the worker rejects broker startup.
  */
 export function publicationLivenessHardExitEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
 	const flag = env.GJC_BROKER_LIVENESS_HARD_EXIT;

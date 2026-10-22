@@ -89,7 +89,10 @@ discovery pid is the supervised process itself.
   failure.
 - It exits 1 without serving when another live broker already owns the agent
   directory (even one this version cannot reuse), or when startup fails. It
-  never retires the other owner.
+  never retires the other owner. Startup also fails when the off-thread
+  publication-liveness watchdog cannot be armed. That attempt removes its
+  discovery file and lock instead of leaving a live pid published without
+  the watchdog.
 - It exits 1 when it stops abnormally while serving: its discovery root was
   lost or replaced, or its heartbeat could not be renewed. A requested
   `broker.shutdown` is a clean stop (exit 0). Use `Restart=on-failure`.

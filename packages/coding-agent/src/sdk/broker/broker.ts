@@ -123,6 +123,7 @@ import {
 	disarmPublicationLivenessWatchdog,
 	notePublicationLivenessLoop,
 	notePublicationLivenessProven,
+	publicationLivenessWatchdogLost,
 	syncPublicationLivenessGrace,
 } from "./publication-liveness-watchdog";
 import { sdkInternalRuntimeImage } from "./runtime";
@@ -1447,7 +1448,9 @@ const BROKER_AMBIGUITY_GRACE_MS = 120_000;
 // from the last *successful* publication and is the only bound that survives a
 // stalled tick. The interval that evaluates it shares the JS thread with the
 // tick's fsync/rename, so a syscall that never returns also suppresses the
-// check. An off-thread watchdog enforces the same deadline in that case.
+// check. An off-thread watchdog enforces the same deadline in that case. Startup
+// rejects when that watchdog cannot be armed, so the broker is not left published
+// without it. The test runner and `GJC_BROKER_LIVENESS_HARD_EXIT=0` opt out.
 const BROKER_LIVENESS_GRACE_MS = 60_000;
 // The floor must still be a multiple of the peer-visible TTL: with a longer TTL
 // configured, a fixed floor would terminate a broker whose published heartbeat is
@@ -1680,6 +1683,8 @@ export class Broker {
 	#stopping = false;
 	#transport: BrokerTransport | null = null;
 	#heartbeatTimer: NodeJS.Timeout | null = null;
+	/** This generation armed the watchdog. A later worker loss must end the broker. */
+	#publicationWatchdogArmed = false;
 	#startupAbortSignal: AbortSignal | undefined;
 	#startupCheckpointDeadline: number | undefined;
 	#onStartupReady: (() => void) | undefined;
@@ -4119,6 +4124,7 @@ export class Broker {
 			this.#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
 		}
 		this.#stopping = false;
+		this.#publicationWatchdogArmed = false;
 		this.#publicationState = "healthy-owned";
 		this.#fenceReason = null;
 		this.#lossAt = null;
@@ -4305,12 +4311,22 @@ export class Broker {
 				Math.min(BROKER_PUBLICATION_CADENCE_MS, Math.floor(this.settings.heartbeatTtlMs / 3)),
 			);
 			this.#heartbeatTimer = setInterval(() => {
+				if (this.#publicationWatchdogArmed && publicationLivenessWatchdogLost()) {
+					void this.#complete("lost-root", "publication-liveness-timeout");
+					return;
+				}
 				notePublicationLivenessLoop(this, this.#livenessGraceMs());
 				void this.#watchPublication();
 				void this.#reapSpawnOrphans();
 				void this.#reapSelfIfAbandoned();
 			}, cadenceMs);
-			await armPublicationLivenessWatchdog(this, this.#livenessGraceMs(), cadenceMs);
+			// The timer above cannot run while a discovery write blocks this thread.
+			// Hard-exit startup must not return until the off-thread watchdog is armed.
+			this.#publicationWatchdogArmed = await armPublicationLivenessWatchdog(
+				this,
+				this.#livenessGraceMs(),
+				cadenceMs,
+			);
 			if (this.#startupPostPublicationDelayMs > 0) await Bun.sleep(this.#startupPostPublicationDelayMs);
 			// This process is now the independently verified successor: its own
 			// discovery just published under its own retained authority. Release the
@@ -4332,11 +4348,25 @@ export class Broker {
 			return this.discovery;
 		} catch (error) {
 			disarmPublicationLivenessWatchdog(this);
-			if (this.#startupAbortSignal?.aborted && this.discovery) {
+			this.#publicationWatchdogArmed = false;
+			if (this.#heartbeatTimer) {
+				clearInterval(this.#heartbeatTimer);
+				this.#heartbeatTimer = null;
+				// A tick already queued must not publish or complete over this cleanup.
+				this.#stopping = true;
+				this.#publicationState = "stopping";
+			}
+			// `close()` drops the retained handle and leaves the file. After publication,
+			// a rejected start has to remove that file too: the lock release below would
+			// otherwise leave a live pid in discovery with no watchdog. Cancellation
+			// before the publication is retained uses the same rollback.
+			const published = this.#publishedAt !== null;
+			this.#publishedAt = null;
+			if (this.discovery && (this.#startupAbortSignal?.aborted || published)) {
 				try {
 					await rollbackBrokerDiscoveryIfCurrent(this.settings.agentDir, this.discovery);
 				} catch (rollbackError) {
-					logger.error("sdk broker: cancelled startup publication rollback failed", {
+					logger.error("sdk broker: startup publication rollback failed", {
 						reason: "startup-publication-rollback-failed",
 						pid: process.pid,
 						error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
@@ -4674,6 +4704,7 @@ export class Broker {
 		// Disarm before any later syscall. A graceful exit that then blocks must
 		// not be SIGKILLed by the watchdog it has already superseded.
 		disarmPublicationLivenessWatchdog(this);
+		this.#publicationWatchdogArmed = false;
 		this.#terminalExit = { mode, reason };
 		const now = process.hrtime.bigint();
 		const fenceStartedAt = this.#lossAt ?? this.#ambiguousAt;

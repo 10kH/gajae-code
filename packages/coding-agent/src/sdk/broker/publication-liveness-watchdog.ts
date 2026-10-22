@@ -1,4 +1,3 @@
-import { logger } from "@gajae-code/utils";
 import { isEmbeddedCompiledModule } from "@gajae-code/utils/env";
 import {
 	PUBLICATION_LIVENESS_ACTIVE,
@@ -17,6 +16,50 @@ const slots = new WeakMap<object, number>();
 let shared: SharedArrayBuffer | undefined;
 let view: BigInt64Array | undefined;
 let workerReady: Promise<void> | undefined;
+let liveWorker: Worker | undefined;
+let workerIsLive = false;
+let workerGeneration = 0;
+let failedWorkerGeneration = 0;
+let workerStartFailureForTest: Error | undefined;
+let slotExhaustedForTest = false;
+
+/** Test-only. The next hard-exit arm rejects before it spawns a worker. */
+export function setPublicationLivenessWorkerStartFailureForTest(error: Error | undefined): void {
+	workerStartFailureForTest = error;
+}
+
+/** Test-only. The next hard-exit arm rejects as if every watchdog slot were taken. */
+export function setPublicationLivenessSlotExhaustedForTest(exhausted: boolean): void {
+	slotExhaustedForTest = exhausted;
+}
+
+function watchdogUnavailable(error: unknown): Error {
+	const message = error instanceof Error ? error.message : String(error);
+	return new Error(`sdk broker: publication liveness watchdog unavailable: ${message}`, {
+		cause: error,
+	});
+}
+
+function noteLiveWatchdogLost(): void {
+	if (!workerIsLive) return;
+	workerIsLive = false;
+	liveWorker = undefined;
+	workerReady = undefined;
+	failedWorkerGeneration = workerGeneration;
+}
+
+/**
+ * The live worker has gone away. Armed brokers must leave through the liveness
+ * path; a replacement `arm` may start a new worker and clear this.
+ */
+export function publicationLivenessWatchdogLost(): boolean {
+	return publicationLivenessHardExitEnabled() && workerGeneration > 0 && failedWorkerGeneration === workerGeneration;
+}
+
+/** Test-only. Stops the live watchdog worker so its close/exit path records the loss. */
+export function terminatePublicationLivenessWatchdogForTest(): void {
+	liveWorker?.terminate();
+}
 
 function nowMs(): bigint {
 	return BigInt(Math.floor(performance.now()));
@@ -80,22 +123,45 @@ function ensureWorker(): Promise<void> {
 		settled = true;
 		clearTimeout(timer);
 		if (error) {
+			// A timed-out worker must not stay alive. The next arm would spawn
+			// another one against the same slots, and this one could still SIGKILL.
+			workerIsLive = false;
 			workerReady = undefined;
+			worker.terminate();
 			reject(error);
 			return;
 		}
+		workerGeneration += 1;
+		workerIsLive = true;
+		liveWorker = worker;
 		resolve();
 	};
 	const timer = setTimeout(() => finish(new Error("publication liveness watchdog did not start")), 5_000);
 	timer.unref?.();
+	const failBeforeReady = (message: string): void => {
+		finish(new Error(message));
+	};
 	worker.addEventListener("message", event => {
 		const data = (event as MessageEvent<{ type?: string }>).data;
 		if (data?.type === "ready") finish();
 	});
 	worker.addEventListener("error", event => {
 		const message = "message" in event && typeof event.message === "string" ? event.message : "worker error";
-		finish(new Error(`publication liveness watchdog failed: ${message}`));
+		if (!settled) {
+			failBeforeReady(`publication liveness watchdog failed: ${message}`);
+			return;
+		}
+		noteLiveWatchdogLost();
 	});
+	const onGone: EventListener = () => {
+		if (!settled) {
+			failBeforeReady("publication liveness watchdog closed before ready");
+			return;
+		}
+		noteLiveWatchdogLost();
+	};
+	worker.addEventListener("close", onGone);
+	worker.addEventListener("exit", onGone);
 	return promise;
 }
 
@@ -129,32 +195,36 @@ function slotOf(owner: object): number | undefined {
 }
 
 /**
- * Arm one broker's off-thread liveness deadline. No-op under the test runner
- * unless `GJC_BROKER_LIVENESS_HARD_EXIT=1`.
+ * Arm one broker's off-thread liveness deadline.
+ * Returns false when hard-exit protection is disabled (the test runner, or
+ * `GJC_BROKER_LIVENESS_HARD_EXIT=0`); that path never spawns a worker.
+ * When protection is enabled, a full slot table or a worker that does not
+ * become ready rejects. Callers must not report startup success in that case.
  */
-export async function armPublicationLivenessWatchdog(owner: object, graceMs: number, cadenceMs: number): Promise<void> {
-	if (!publicationLivenessHardExitEnabled()) return;
+export async function armPublicationLivenessWatchdog(
+	owner: object,
+	graceMs: number,
+	cadenceMs: number,
+): Promise<boolean> {
+	if (!publicationLivenessHardExitEnabled()) return false;
 	const table = sharedView();
 	let slot = slots.get(owner);
 	if (slot === undefined) {
-		slot = claimSlot(table);
-		if (slot === undefined) {
-			logger.warn("sdk broker: publication liveness watchdog slot table is full");
-			return;
-		}
+		slot = slotExhaustedForTest ? undefined : claimSlot(table);
+		if (slot === undefined) throw new Error("sdk broker: publication liveness watchdog slot table is full");
 		slots.set(owner, slot);
 	}
 	const now = nowMs();
 	publishSlot(table, slot, now, now, asMs(graceMs), asMs(cadenceMs));
 	try {
+		if (workerStartFailureForTest) throw workerStartFailureForTest;
 		await ensureWorker();
 	} catch (error) {
 		Atomics.store(table, slot * PUBLICATION_LIVENESS_SLOT_STRIDE + PUBLICATION_LIVENESS_INDEX_ACTIVE, 0n);
 		slots.delete(owner);
-		logger.warn(
-			`sdk broker: publication liveness watchdog unavailable: ${error instanceof Error ? error.message : String(error)}`,
-		);
+		throw watchdogUnavailable(error);
 	}
+	return true;
 }
 
 /** Record that the JS publication interval ran, and refresh the grace it enforces. */

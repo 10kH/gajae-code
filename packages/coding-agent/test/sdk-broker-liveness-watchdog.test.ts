@@ -10,6 +10,10 @@ import {
 	publicationLivenessHardExitEnabled,
 	publicationLivenessMustExit,
 } from "../src/sdk/broker/publication-liveness-deadline";
+import {
+	setPublicationLivenessSlotExhaustedForTest,
+	setPublicationLivenessWorkerStartFailureForTest,
+} from "../src/sdk/broker/publication-liveness-watchdog";
 
 // A short TTL drives the publication watchdog at `ttl/3`, so a liveness deadline
 // expressed in cadences expires in tens of milliseconds.
@@ -40,6 +44,8 @@ function completedWithin(broker: Broker, ms: number): Promise<boolean> {
 }
 
 afterEach(async () => {
+	setPublicationLivenessWorkerStartFailureForTest(undefined);
+	setPublicationLivenessSlotExhaustedForTest(false);
 	for (const broker of brokers) {
 		setHeartbeatStallForTest(broker, false);
 		setLivenessGraceForTest(broker, undefined);
@@ -297,6 +303,101 @@ test("a stale watchdog observation cannot mutate a restarted broker generation",
 		expect(await broker.handleRequest("session.list", {})).toMatchObject({ ok: true });
 	} finally {
 		retain.mockRestore();
+	}
+});
+
+interface WatchdogInitChildReport {
+	result: string;
+	message?: string;
+	reason?: string | null;
+	mode?: string | null;
+	memory?: boolean;
+	file?: boolean;
+	lock?: boolean;
+}
+
+async function runWatchdogInitChild(mode: "fail" | "slots" | "lost"): Promise<WatchdogInitChildReport> {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-liveness-init-"));
+	roots.push(root);
+	const agentDir = path.join(root, "agent");
+	const home = path.join(root, "home");
+	await fs.mkdir(home);
+	const childPath = path.join(import.meta.dir, "sdk-broker-liveness-watchdog-init-child.ts");
+	const child = Bun.spawn([process.execPath, childPath, agentDir, mode], {
+		cwd: path.join(import.meta.dir, ".."),
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		env: {
+			...process.env,
+			HOME: home,
+			GJC_CODING_AGENT_DIR: agentDir,
+			GJC_BROKER_LIVENESS_HARD_EXIT: "1",
+		},
+	});
+	const finished = await Promise.race([child.exited.then(() => true), Bun.sleep(10_000).then(() => false)]);
+	if (!finished) child.kill("SIGKILL");
+	const stdout = await new Response(child.stdout).text();
+	const stderr = await new Response(child.stderr).text();
+	expect(finished, `still alive\nstdout:\n${stdout}\nstderr:\n${stderr}`).toBe(true);
+	expect(child.exitCode, `${stderr}\n${stdout}`).toBe(0);
+	const line = stdout
+		.trim()
+		.split("\n")
+		.findLast(row => row.startsWith("{"));
+	expect(line, stdout).toBeTruthy();
+	return JSON.parse(line ?? "{}") as WatchdogInitChildReport;
+}
+
+test("broker startup fails and releases lock and discovery when the liveness watchdog cannot start", async () => {
+	const report = await runWatchdogInitChild("fail");
+	expect(report.result).toBe("failed");
+	expect(report.message).toContain("publication liveness watchdog unavailable");
+	expect(report.message).toContain("worker failed to start");
+	expect(report.memory).toBe(false);
+	expect(report.file).toBe(false);
+	expect(report.lock).toBe(false);
+}, 15_000);
+
+test("broker startup fails and releases lock and discovery when the liveness watchdog slot table is full", async () => {
+	const report = await runWatchdogInitChild("slots");
+	expect(report.result).toBe("failed");
+	expect(report.message).toContain("publication liveness watchdog slot table is full");
+	expect(report.memory).toBe(false);
+	expect(report.file).toBe(false);
+	expect(report.lock).toBe(false);
+}, 15_000);
+
+test("a watchdog worker that exits after startup ends the broker", async () => {
+	const report = await runWatchdogInitChild("lost");
+	expect(report).toMatchObject({
+		result: "exited",
+		reason: "publication-liveness-timeout",
+		mode: "lost-root",
+		memory: false,
+		file: true,
+		lock: true,
+	});
+}, 15_000);
+
+test("hard-exit opt-out still starts when watchdog initialization cannot succeed", async () => {
+	const previous = process.env.GJC_BROKER_LIVENESS_HARD_EXIT;
+	process.env.GJC_BROKER_LIVENESS_HARD_EXIT = "0";
+	setPublicationLivenessWorkerStartFailureForTest(new Error("worker failed to start"));
+	setPublicationLivenessSlotExhaustedForTest(true);
+	try {
+		const broker = await startBroker();
+		expect(broker.discovery).not.toBeNull();
+		expect((await readBrokerDiscovery(broker.settings.agentDir, HEARTBEAT_TTL_MS))?.ownerId).toBe(
+			broker.discovery?.ownerId,
+		);
+		const lockPath = path.join(broker.settings.agentDir, "sdk", "broker.lock");
+		expect(await fs.stat(lockPath)).toBeTruthy();
+	} finally {
+		setPublicationLivenessWorkerStartFailureForTest(undefined);
+		setPublicationLivenessSlotExhaustedForTest(false);
+		if (previous === undefined) delete process.env.GJC_BROKER_LIVENESS_HARD_EXIT;
+		else process.env.GJC_BROKER_LIVENESS_HARD_EXIT = previous;
 	}
 });
 

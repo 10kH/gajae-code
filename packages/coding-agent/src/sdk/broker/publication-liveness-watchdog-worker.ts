@@ -104,6 +104,10 @@ setInterval(() => {
 		const confirmed = readSlot(slot, BigInt(Math.floor(performance.now())));
 		if (!publicationLivenessMustExit(confirmed)) continue;
 		writeDiagnosticWithoutBlocking();
+		// Disarm is synchronous at the start of shutdown. Re-check after the
+		// diagnostic write so that teardown wins over a kill already in progress.
+		const stillDue = readSlot(slot, BigInt(Math.floor(performance.now())));
+		if (!publicationLivenessMustExit(stillDue)) continue;
 		process.kill(process.pid, "SIGKILL");
 		return;
 	}
