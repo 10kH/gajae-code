@@ -983,6 +983,34 @@ export function boundConversationTextForSummary(
 	return fitsBudget(bareMarker) ? bareMarker : "";
 }
 
+const SUMMARY_FENCE_OPEN = "<untrusted-content>\n";
+const SUMMARY_FENCE_CLOSE = "\n</untrusted-content>";
+
+/**
+ * Closers that would end the summary fence or the surrounding conversation
+ * block. Whitespace before ">" still closes the tag, so those spellings go too.
+ */
+function escapeSummaryFenceClosers(text: string): string {
+	return text
+		.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>")
+		.replace(/<\/untrusted-content[ \t\n\r\f]+>/gi, "&lt;/untrusted-content>")
+		.replace(/<\/conversation>/gi, "&lt;/conversation>")
+		.replace(/<\/conversation[ \t\n\r\f]+>/gi, "&lt;/conversation>");
+}
+
+/**
+ * Frame a conversation excerpt after {@link boundConversationTextForSummary}.
+ * A head cut or a tail cut can drop an opener that was added earlier; the fence
+ * belongs on the text that is about to enter the summary prompt.
+ */
+export function frameSummaryConversationAfterClip(excerpt: string): string {
+	return `${SUMMARY_FENCE_OPEN}${escapeSummaryFenceClosers(excerpt)}${SUMMARY_FENCE_CLOSE}`;
+}
+
+function clippedSummaryConversation(serialized: string, model: Model, outputMaxTokens: number): string {
+	return frameSummaryConversationAfterClip(boundConversationTextForSummary(serialized, model, outputMaxTokens));
+}
+
 /** Convert a stored summary the same way as conversation text, for the outbound prompt only. */
 function outboundSummaryText(text: string, convert: ConvertToLlm): string {
 	const [message] = convert([
@@ -1024,7 +1052,7 @@ export async function generateSummary(
 	// Serialize conversation to text so model doesn't try to continue it
 	// Convert to LLM messages first (handles custom app messages when caller provides a transformer).
 	const llmMessages = (options?.convertToLlm ?? convertToLlm)(currentMessages);
-	const conversationText = boundConversationTextForSummary(serializeConversation(llmMessages), model, maxTokens);
+	const conversationText = clippedSummaryConversation(serializeConversation(llmMessages), model, maxTokens);
 
 	// Build the prompt with conversation wrapped in tags.
 	// The stored summary stays unchanged; only this outbound copy is converted.
@@ -1629,7 +1657,7 @@ async function generateTurnPrefixSummary(
 	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
 
 	const llmMessages = (options?.convertToLlm ?? convertToLlm)(messages);
-	const conversationText = boundConversationTextForSummary(serializeConversation(llmMessages), model, maxTokens);
+	const conversationText = clippedSummaryConversation(serializeConversation(llmMessages), model, maxTokens);
 	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
 	const summarizationMessages = [
 		{
