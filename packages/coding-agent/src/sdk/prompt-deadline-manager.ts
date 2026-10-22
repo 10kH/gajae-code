@@ -831,10 +831,16 @@ export class PromptDeadlineManager {
 		const key = leaseKey(correlation);
 		if (!this.#leases.has(key)) {
 			// A real agent_end may arrive after a synthetic deadline already cleared
-			// its lease. Re-arm a bounded replay owner before the durable upgrade so a
-			// failed terminal_ok write is retried rather than leaving the synthetic
-			// deadline result permanently visible.
-			this.onAccepted(correlation);
+			// its lease. Do NOT re-arm a lease if the deadline is currently expiring:
+			// the deadline is fenced from concurrent agent_end by the identity check in
+			// #expire, so re-arming would create a new deadline that races with the
+			// expiry path and causes the agent_end emission to be deferred/lost.
+			// If the deadline is NOT expiring, re-arm a bounded replay owner before the
+			// durable upgrade so a failed terminal_ok write is retried rather than
+			// leaving the synthetic deadline result permanently visible.
+			if (!this.#expiring.has(key)) {
+				this.onAccepted(correlation);
+			}
 		}
 		this.#pendingTerminalTransitions.add(key);
 		if (deferUntilDeadlineSettlement) this.#deadlineDeferredTerminalTransitions.add(key);
