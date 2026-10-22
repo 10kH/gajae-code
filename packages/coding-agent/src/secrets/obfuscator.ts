@@ -382,19 +382,14 @@ export function deobfuscateSessionContext(
 
 type OutboundBlock = TextContent | ImageContent | ThinkingContent | RedactedThinkingContent | ToolCall;
 
-/** Obfuscate outbound message fields before they reach the provider. */
+/** Obfuscate outbound string content and thinking prose before they reach the provider. */
 export function obfuscateMessages(obfuscator: SecretObfuscator, messages: Message[]): Message[] {
 	return messages.map(msg => obfuscateOutboundMessage(obfuscator, msg));
 }
 
 function obfuscateOutboundMessage(obfuscator: SecretObfuscator, msg: Message): Message {
 	const content = obfuscateMessageContent(obfuscator, msg);
-	if (msg.role !== "assistant" || typeof msg.errorMessage !== "string") {
-		return content === msg.content ? msg : ({ ...msg, content } as typeof msg);
-	}
-	const errorMessage = obfuscator.obfuscate(msg.errorMessage);
-	if (content === msg.content && errorMessage === msg.errorMessage) return msg;
-	return { ...msg, content, errorMessage } as typeof msg;
+	return content === msg.content ? msg : ({ ...msg, content } as typeof msg);
 }
 
 function obfuscateMessageContent(obfuscator: SecretObfuscator, msg: Message): Message["content"] {
@@ -424,14 +419,6 @@ function obfuscateOutboundBlock(obfuscator: SecretObfuscator, block: OutboundBlo
 		}
 		case "thinking":
 			return obfuscateThinkingBlock(obfuscator, block);
-		case "image": {
-			const data = obfuscator.obfuscate(block.data);
-			return data === block.data ? block : { ...block, data };
-		}
-		case "toolCall": {
-			const args = deepWalkStrings(block.arguments, text => obfuscator.obfuscate(text));
-			return args === block.arguments ? block : { ...block, arguments: args };
-		}
 		default:
 			return block;
 	}

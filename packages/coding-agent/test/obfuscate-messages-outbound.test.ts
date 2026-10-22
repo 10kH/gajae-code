@@ -1,12 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type {
-	AssistantMessage,
-	ImageContent,
-	Message,
-	TextContent,
-	ThinkingContent,
-	ToolCall,
-} from "@gajae-code/ai/core";
+import type { AssistantMessage, Message, TextContent, ThinkingContent, ToolCall } from "@gajae-code/ai/core";
 import fc from "fast-check";
 import { obfuscateMessages, SecretObfuscator } from "../src/secrets/obfuscator";
 
@@ -87,7 +80,7 @@ describe("obfuscateMessages outbound fields", () => {
 		expect(secrets.deobfuscate(block?.text ?? "")).toBe(text);
 	});
 
-	it("masks tool-call arguments, image data, and assistant error text", () => {
+	it("keeps tool-call arguments, image data, and assistant error text unchanged", () => {
 		const secrets = obfuscator();
 		const input: Message[] = [
 			assistant([
@@ -114,24 +107,7 @@ describe("obfuscateMessages outbound fields", () => {
 			}),
 		];
 		const out = obfuscateMessages(secrets, input);
-		const call = (out[0]?.content as ToolCall[])[0];
-		expect(call?.arguments.cmd).toBe(secrets.obfuscate(`echo ${SECRET}`));
-		expect(call?.arguments.nested.note).toBe(secrets.obfuscate(SECRET));
-		expect(call?.arguments.n).toBe(3);
-		expect(call?.id).toBe("call-1");
-		expect(call?.name).toBe("bash");
-		expect(call?.thoughtSignature).toBe("opaque-thought");
-		const image = (out[1]?.content as ImageContent[])[0];
-		expect(image?.data).toBe(secrets.obfuscate(`img-${SECRET}`));
-		expect(image?.mimeType).toBe("image/png");
-		const shot = (out[2]?.content as ImageContent[])[0];
-		expect(shot?.data).not.toContain(SECRET);
-		expect(shot?.mimeType).toBe("image/webp");
-		const failed = out[3] as AssistantMessage;
-		expect(failed.errorMessage).toBe(secrets.obfuscate(`status ${SECRET}`));
-		expect(failed.errorCode).toBe("upstream_timeout");
-		expect((failed.content[0] as TextContent).text).toBe("failed");
-		expect(JSON.stringify(out)).not.toContain(SECRET);
+		for (let index = 0; index < input.length; index++) expect(out[index]).toBe(input[index]);
 	});
 
 	it("omits signed thinking prose that contains a configured secret", () => {
@@ -271,32 +247,11 @@ describe("obfuscateMessages outbound fields", () => {
 						expect(thinkingOut.content[0]).toBe((input[2] as AssistantMessage).content[0]);
 					}
 
-					const call = (out[3]?.content as ToolCall[])[0];
-					expect(call?.id).toBe("call-1");
-					expect(call?.name).toBe("bash");
-					expect(call?.thoughtSignature).toBe("opaque-thought");
-					expect(call?.arguments.n).toBe(3);
-					if (!argsHas) expect(out[3]).toBe(input[3]);
-					else {
-						expect(call?.arguments.cmd).toBe(secrets.obfuscate(cmd));
-						expect(call?.arguments.nested.note).not.toContain(SECRET);
-					}
+					expect(out[3]).toBe(input[3]);
+					expect(out[4]).toBe(input[4]);
+					expect(out[5]).toBe(input[5]);
 
-					const image = (out[4]?.content as ImageContent[])[0];
-					expect(image?.mimeType).toBe("image/png");
-					if (!imageHas) expect(out[4]).toBe(input[4]);
-					else expect(image?.data).toBe(secrets.obfuscate(imageData));
-
-					const failed = out[5] as AssistantMessage;
-					expect(failed.errorCode).toBe("upstream_timeout");
-					expect((failed.content[0] as TextContent).text).toBe("status");
-					if (!errorHas) expect(out[5]).toBe(input[5]);
-					else {
-						expect(failed.errorMessage).toBe(secrets.obfuscate(errorMessage));
-						expect(failed.errorMessage).not.toContain(SECRET);
-					}
-
-					if (!stringHas && !textHas && !thinkingHas && !argsHas && !imageHas && !errorHas) {
+					if (!stringHas && !textHas && !thinkingHas) {
 						for (let index = 0; index < input.length; index++) expect(out[index]).toBe(input[index]);
 					}
 				},
