@@ -394,7 +394,7 @@ function obfuscateOutboundMessage(obfuscator: SecretObfuscator, msg: Message): M
 	}
 	const errorMessage = obfuscator.obfuscate(msg.errorMessage);
 	if (content === msg.content && errorMessage === msg.errorMessage) return msg;
-	return { ...msg, content, errorMessage };
+	return { ...msg, content, errorMessage } as typeof msg;
 }
 
 function obfuscateMessageContent(obfuscator: SecretObfuscator, msg: Message): Message["content"] {
@@ -413,7 +413,7 @@ function obfuscateMessageContent(obfuscator: SecretObfuscator, msg: Message): Me
 		if (updated !== block) changed = true;
 		next.push(updated);
 	}
-	return changed ? next : msg.content;
+	return (changed ? next : msg.content) as Message["content"];
 }
 
 function obfuscateOutboundBlock(obfuscator: SecretObfuscator, block: OutboundBlock): OutboundBlock | undefined {
