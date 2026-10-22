@@ -12,6 +12,14 @@ const CREDENTIAL_KEY_LABELS = `api${CREDENTIAL_KEY_SEPARATOR}key|apikey|account$
 const CREDENTIAL_KEY_PREFIX = `(?:[A-Za-z0-9][A-Za-z0-9_.-]*[_.-])?`;
 const CREDENTIAL_KEY_PATTERN = `${CREDENTIAL_KEY_PREFIX}(?:${CREDENTIAL_KEY_LABELS})`;
 const CREDENTIAL_KEY_SUFFIX = new RegExp(`^${CREDENTIAL_KEY_PATTERN}$`, "i");
+/**
+ * A complete value that an earlier redaction pass (this module or a caller's) already
+ * replaced. The closing `]` is optional because unquoted values stop before `]`; the
+ * container rule only leaves a bracketed placeholder in place when a field boundary
+ * follows it, so the unbracketed form never hides a trailing secret.
+ */
+const REDACTION_PLACEHOLDER_PATTERN = /^(?:«redacted(?:-[a-z]+(?:-[a-z]+)*)?»|\[REDACTED_[A-Z]+(?:_[A-Z]+)*\]?)$/;
+const REDACTION_PLACEHOLDER_BOUNDARY_PATTERN = /^(?:$|[\s,;})"'`\\])/;
 const CREDENTIAL_CAMEL_COMPOUND_SUFFIXES =
 	"AccessToken|RefreshToken|IdToken|SessionToken|ClientSecret|EncryptionKey|SigningKey";
 const CREDENTIAL_CAMEL_SIMPLE_SUFFIXES =
@@ -368,6 +376,21 @@ function redactCredentialValue(
 	unclosedBacktickQuoted: string | undefined,
 ): string {
 	if (parseCredentialYamlBlockScalarHeader(_match) !== undefined) return _match;
+	// A value that is already a redaction placeholder carries no secret; re-masking it
+	// would only erase which credential shape an earlier pass identified.
+	const value =
+		escapedDoubleQuoted ??
+		doubleQuoted ??
+		escapedSingleQuoted ??
+		singleQuoted ??
+		backtickQuoted ??
+		unclosedEscapedDoubleQuoted ??
+		unclosedDoubleQuoted ??
+		unclosedEscapedSingleQuoted ??
+		unclosedSingleQuoted ??
+		unclosedBacktickQuoted ??
+		_match.slice(prefix.length);
+	if (REDACTION_PLACEHOLDER_PATTERN.test(value.trim())) return _match;
 	if (escapedDoubleQuoted !== undefined && escapedDoubleOpen !== undefined && escapedDoubleClose !== undefined) {
 		return `${prefix}${escapedDoubleOpen}«redacted»${escapedDoubleClose}`;
 	}
@@ -418,6 +441,17 @@ function redactCredentialContainersWithPattern(text: string, assignment: RegExp)
 		const containerStart = assignment.lastIndex;
 		if (containerStart < copiedUntil) continue;
 		const containerEnd = findCredentialContainerEnd(text, containerStart);
+		// `[REDACTED_TOKEN]` from an earlier pass is bracketed but is a placeholder, not a
+		// container — only when a field boundary follows, so nothing can trail it unscrubbed.
+		const container = text.slice(containerStart, containerEnd);
+		if (
+			container.endsWith("]") &&
+			REDACTION_PLACEHOLDER_PATTERN.test(container) &&
+			REDACTION_PLACEHOLDER_BOUNDARY_PATTERN.test(text.slice(containerEnd))
+		) {
+			assignment.lastIndex = containerEnd;
+			continue;
+		}
 		output += `${text.slice(copiedUntil, containerStart)}«redacted»`;
 		copiedUntil = containerEnd;
 		assignment.lastIndex = containerEnd;

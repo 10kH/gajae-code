@@ -503,6 +503,27 @@ describe("recordFatalCrash", () => {
 		);
 	});
 
+	it("keeps a standalone redaction placeholder under a sensitive label", () => {
+		expect(redactCrashSecrets("+NPM_TOKEN=«redacted-npm-token»\n+x")).toBe("+NPM_TOKEN=«redacted-npm-token»\n+x");
+		expect(redactCrashSecrets("+token=[REDACTED_TOKEN]\n+x")).toBe("+token=[REDACTED_TOKEN]\n+x");
+		expect(redactCrashSecrets("pw='[REDACTED_SECRET]' a=b")).toBe("pw='[REDACTED_SECRET]' a=b");
+		expect(redactCrashSecrets("token=[REDACTED_TOKEN] next=1")).toBe("token=[REDACTED_TOKEN] next=1");
+	});
+
+	it("still masks a value that only begins with a redaction placeholder", () => {
+		for (const input of [
+			"token=[REDACTED_TOKEN]tail-secret-123",
+			"password=«redacted»xyz-secret",
+			"token=[REDACTED_TOKENx]",
+		]) {
+			const output = redactCrashSecrets(input);
+			expect(output).not.toContain("tail-secret-123");
+			expect(output).not.toContain("xyz-secret");
+			expect(output).not.toContain("TOKENx");
+			expect(output).toMatch(/=«redacted»$/);
+		}
+	});
+
 	it("redacts short values under sensitive labels", async () => {
 		const target = tempCrashLog();
 		const labeled = [
