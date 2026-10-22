@@ -6,7 +6,7 @@ import type { InteractiveModeContext } from "./types";
  * Owns the ghost-text next-prompt prediction lifecycle for interactive mode.
  *
  * After each agent turn ends (and only when `promptSuggestions` is enabled
- * and the composer is empty), a smol-model prediction of the user's next
+ * and the composer is empty), a model prediction of the user's next
  * prompt is generated in the background. The result renders as dim ghost
  * text in the empty composer via the autocomplete provider's inline hint;
  * Tab accepts it, typing dismisses it, and a new turn clears it.

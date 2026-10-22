@@ -1,6 +1,6 @@
 /**
- * Predict the user's likely next prompt after an agent turn using a smol,
- * fast model. Native GJC port of the ghost-text prompt-suggestion behavior
+ * Predict the user's likely next prompt after an agent turn with the `default`
+ * model role. Native GJC port of the ghost-text prompt-suggestion behavior
  * from Claude Code: the prediction renders as dim ghost text in the empty
  * composer and Tab accepts it.
  */

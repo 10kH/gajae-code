@@ -1576,7 +1576,7 @@
 		},
 		"promptSuggestions": {
 			"type": "boolean",
-			"description": "Predict your likely next prompt after each turn (smol-model call) and show it as ghost text; Tab accepts",
+			"description": "Predict your likely next prompt after each turn (one extra default-role model call) and show it as ghost text; Tab accepts",
 			"default": false
 		},
 		"telemetry": {

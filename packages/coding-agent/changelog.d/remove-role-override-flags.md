@@ -1,0 +1,3 @@
+### Removed
+
+- Removed the `--smol` and `--slow` CLI flags and the `GJC_SMOL_MODEL`/`GJC_SLOW_MODEL` (and legacy `PI_SMOL_MODEL`/`PI_SLOW_MODEL`) environment variables. Since model roles were reduced to `default` (#449), no built-in feature resolves the `smol` or `slow` roles; passing the flags now fails with `Unknown option`. A custom `cycleOrder` entry named `smol`/`slow` still resolves from persisted `modelRoles`, just without a CLI/env override. The `resolveModelRoleOverrides` export is removed from the package root. `--plan`/`GJC_PLAN_MODEL` are kept because plan mode still switches to the `plan` role.
