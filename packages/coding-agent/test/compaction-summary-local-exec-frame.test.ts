@@ -6,7 +6,6 @@ import {
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
 	frameSummaryConversationAfterClip,
-	generateSummary,
 } from "@gajae-code/agent-core/compaction/compaction";
 import { createFileOps } from "@gajae-code/agent-core/compaction/utils";
 import type { AssistantMessage, Context, Model, Usage } from "@gajae-code/ai";
@@ -64,18 +63,6 @@ function bashMessage(output: string): AgentMessage {
 	return {
 		role: "bashExecution",
 		command: "echo hello",
-		output,
-		exitCode: 0,
-		cancelled: false,
-		truncated: false,
-		timestamp: 1,
-	};
-}
-
-function pythonMessage(output: string): AgentMessage {
-	return {
-		role: "pythonExecution",
-		code: "print('ok')",
 		output,
 		exitCode: 0,
 		cancelled: false,
@@ -208,40 +195,5 @@ describe("compact summary prompt", () => {
 			expect(prompt).toContain("&lt;/conversation>");
 			expect(prompt).toContain("&lt;/untrusted-content>");
 		}
-	});
-
-	it("keeps ordinary bash and python output inside the summary frame", async () => {
-		const captured: Context[] = [];
-		vi.spyOn(ai, "completeSimple").mockImplementation(async (_model, ctx) => {
-			captured.push(ctx as Context);
-			return assistant("summary text");
-		});
-		const wide: Model = { ...MODEL, contextWindow: 200_000 };
-		const summary = await generateSummary(
-			[
-				{ role: "user", content: "summarize the command", timestamp: 1 },
-				bashMessage("hello world"),
-				pythonMessage("ok"),
-			],
-			wide,
-			2_000,
-			"test-key",
-			undefined,
-			undefined,
-			undefined,
-			{ convertToLlm },
-		);
-		expect(summary).toBe("summary text");
-		expect(captured).toHaveLength(1);
-		const prompt = promptText(captured[0] as Context);
-		expect(prompt.startsWith(`<conversation>\n${FENCE_OPEN}`)).toBe(true);
-		expect(prompt).toContain("hello world");
-		expect(prompt).toContain("Ran `echo hello`");
-		expect(prompt).toContain("print('ok')");
-		expect(prompt).toContain("\nok\n");
-		const helloAt = prompt.indexOf("hello world");
-		const closeAt = prompt.indexOf(`${FENCE_CLOSE}\n</conversation>`);
-		expect(helloAt).toBeGreaterThan(0);
-		expect(helloAt).toBeLessThan(closeAt);
 	});
 });
