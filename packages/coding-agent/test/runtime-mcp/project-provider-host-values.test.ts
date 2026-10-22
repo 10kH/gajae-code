@@ -4,7 +4,7 @@
  * and must not copy sensitive host names into that child's env.
  */
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -23,26 +23,14 @@ import type { MCPServerConfig } from "../../src/runtime-mcp/types";
 const SECRET_NAME = "GJC_CANARY_SECRET";
 const SECRET = "canary-secret-value";
 const BANG_TEXT = "outside-provider-bang";
+const HOST_KEY = "OPENAI_API_KEY";
+const HOST_VALUE = "host-openai-key";
 
 function source(provider: string, level: SourceMeta["level"]): SourceMeta {
 	return { provider, providerName: provider, path: `${provider}.json`, level };
 }
 
-function bangCommand(text: string): string {
-	const script = `process.stdout.write(${JSON.stringify(text)})`;
-	return `!${process.execPath} -e ${JSON.stringify(script)}`;
-}
-
-async function waitForFile(filePath: string, timeoutMs: number): Promise<boolean> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		try {
-			await fs.access(filePath);
-			return true;
-		} catch {
-			await new Promise(resolve => setTimeout(resolve, 20));
-		}
-	}
+async function exists(filePath: string): Promise<boolean> {
 	try {
 		await fs.access(filePath);
 		return true;
@@ -51,12 +39,32 @@ async function waitForFile(filePath: string, timeoutMs: number): Promise<boolean
 	}
 }
 
+async function waitUntil(check: () => Promise<boolean>, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (await check()) return true;
+		await Bun.sleep(20);
+	}
+	return check();
+}
+
 describe("project MCP providers outside the historical set", () => {
 	const tempDirs: string[] = [];
+	let restoreEnv: Array<() => void> = [];
+
+	beforeEach(() => {
+		restoreEnv = [SECRET_NAME, HOST_KEY].map(name => {
+			const previous = process.env[name];
+			return () => {
+				if (previous === undefined) delete process.env[name];
+				else process.env[name] = previous;
+			};
+		});
+	});
 
 	afterEach(() => {
+		for (const restore of restoreEnv) restore();
 		clearConfigValueCache();
-		delete process.env[SECRET_NAME];
 		for (const dir of tempDirs.splice(0)) safeRmSync(dir, { recursive: true, force: true });
 		MCPManager.resetForTests();
 	});
@@ -74,6 +82,8 @@ describe("project MCP providers outside the historical set", () => {
 	): Promise<Record<string, string | null>> {
 		const reportPath = path.join(dir, `${provider}-report.json`);
 		const scriptPath = path.join(dir, `${provider}-report.mjs`);
+		const bangScript = path.join(dir, `${provider}-bang.mjs`);
+		await fs.writeFile(bangScript, `process.stdout.write(${JSON.stringify(BANG_TEXT)});\n`);
 		await fs.writeFile(
 			scriptPath,
 			[
@@ -82,6 +92,7 @@ describe("project MCP providers outside the historical set", () => {
 				"  BANG: process.env.BANG ?? null,",
 				"  PUBLIC: process.env.PUBLIC ?? null,",
 				"  LEAK: process.env.LEAK ?? null,",
+				"  HOST: process.env.OPENAI_API_KEY ?? null,",
 				"}));",
 				"process.exit(0);",
 				"",
@@ -91,20 +102,20 @@ describe("project MCP providers outside the historical set", () => {
 			type: "stdio",
 			command: process.execPath,
 			args: [scriptPath],
-			noInheritEnv: true,
 			timeout: 3000,
 			env: {
 				REPORT: reportPath,
-				BANG: bangCommand(BANG_TEXT),
+				BANG: `!"${process.execPath}" "${bangScript}"`,
 				PUBLIC: "plain-ok",
 				LEAK: SECRET_NAME,
 			},
 		};
 		process.env[SECRET_NAME] = SECRET;
+		process.env[HOST_KEY] = HOST_VALUE;
 		const manager = new MCPManager(dir, null, {});
 		try {
 			await manager.connectServers({ server: config }, { server: source(provider, level) });
-			expect(await waitForFile(reportPath, 4000)).toBe(true);
+			expect(await waitUntil(async () => exists(reportPath), 4000)).toBe(true);
 			return JSON.parse(await fs.readFile(reportPath, "utf8")) as Record<string, string | null>;
 		} finally {
 			await manager.disconnectAll().catch(() => {});
@@ -120,17 +131,20 @@ describe("project MCP providers outside the historical set", () => {
 			expect(report.PUBLIC).toBe("plain-ok");
 			expect(report.LEAK).toBe(SECRET_NAME);
 			expect(report.LEAK).not.toBe(SECRET);
+			expect(report.HOST).toBeNull();
 			expect(JSON.stringify(report)).not.toContain(SECRET);
 			expect(JSON.stringify(report)).not.toContain(BANG_TEXT);
+			expect(JSON.stringify(report)).not.toContain(HOST_VALUE);
 		}
 	}, 20_000);
 
-	it("still runs ! and expands a sensitive name for a user-level provider outside that set", async () => {
+	it("still runs ! and keeps host credentials for a user-level provider outside that set", async () => {
 		const dir = await tempDir();
 		const report = await childReport(dir, "user", "claude-plugins");
 		expect(report.BANG).toBe(BANG_TEXT);
 		expect(report.PUBLIC).toBe("plain-ok");
 		expect(report.LEAK).toBe(SECRET);
+		expect(report.HOST).toBe(HOST_VALUE);
 	}, 20_000);
 
 	it("drops unapproved project stdio from a provider outside the historical set", () => {
@@ -175,7 +189,7 @@ describe("project MCP providers outside the historical set", () => {
 		expect(toolsOnly.tools?.type).toBe("stdio");
 	});
 
-	it("property project provider trust seed 432202610", () => {
+	it("property project provider trust seed 20261022", () => {
 		const provider = fc.oneof(
 			fc.constantFrom("native", "mcp-json", "claude-plugins", "gjc-plugins"),
 			fc.string({ maxLength: 24 }),
@@ -209,7 +223,7 @@ describe("project MCP providers outside the historical set", () => {
 					expect(decision).toEqual({ action: "resolve" });
 				},
 			),
-			{ seed: 432202610, numRuns: 80 },
+			{ seed: 20261022, numRuns: 80 },
 		);
 	});
 });

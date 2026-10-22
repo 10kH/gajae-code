@@ -12,8 +12,6 @@
 import type { SourceMeta } from "../capability/types";
 import { isSensitiveEnvName } from "../discovery/helpers";
 
-const UNTRUSTED_PROJECT_MCP_PROVIDERS = new Set(["native", "mcp-json"]);
-
 export function nativeMcpSource(level: "user" | "project", filePath: string): SourceMeta {
 	return {
 		provider: "native",
@@ -23,11 +21,15 @@ export function nativeMcpSource(level: "user" | "project", filePath: string): So
 	};
 }
 
-/** True when this server was loaded from untrusted project MCP config. */
+/**
+ * True when this server was loaded from untrusted project MCP config.
+ * Every project-level provider is untrusted, including providers other than
+ * native `.gjc/mcp.json` and repo-root `mcp.json`. User scope and a tools-only
+ * load stay on the previous path.
+ */
 export function isUntrustedProjectMcpSource(source: SourceMeta | undefined, toolsOnly: boolean): boolean {
 	if (toolsOnly || !source || source.level !== "project") return false;
-	if (UNTRUSTED_PROJECT_MCP_PROVIDERS.has(source.provider)) return true;
-	return source.level === "project";
+	return true;
 }
 
 export type ProjectHostValueDecision =
