@@ -86,6 +86,7 @@ import { disposeKernelSessionsByOwner } from "../eval/py/executor";
 import type { MasterModeContext } from "../master-mode/context";
 import { describeFoldReceipt } from "../session/fold-coordinator";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
+import { wrapUntrustedContent } from "../tools/fetch";
 import { SearchTool } from "../tools/search";
 import "../discovery";
 import { resolveConfigValue } from "../config/resolve-config-value";
@@ -1240,7 +1241,10 @@ function buildMCPPromptCommands(manager: MCPManager): LoadedCustomCommand[] {
 								}
 							}
 						}
-						return parts.join("\n\n");
+						const body = parts.join("\n\n");
+						// A blank body must stay blank so the prompt entry still rejects it.
+						if (body.trim().length === 0) return body;
+						return wrapUntrustedContent(body);
 					},
 				},
 			});
