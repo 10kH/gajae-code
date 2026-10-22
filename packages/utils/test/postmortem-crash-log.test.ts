@@ -503,6 +503,13 @@ describe("recordFatalCrash", () => {
 		);
 	});
 
+	it("redacts suffixes after single-quoted password placeholders", () => {
+		for (const placeholder of ["«redacted»", "[REDACTED_TOKEN]"]) {
+			expect(redactCrashSecrets(`pw='${placeholder}'tail-secret-123`)).toBe("pw='«redacted»'");
+		}
+		expect(redactCrashSecrets("pw='[REDACTED_TOKEN]' note=keep")).toBe("pw='[REDACTED_TOKEN]' note=keep");
+	});
+
 	it("keeps a standalone redaction placeholder under a sensitive label", () => {
 		expect(redactCrashSecrets("+NPM_TOKEN=«redacted-npm-token»\n+x")).toBe("+NPM_TOKEN=«redacted-npm-token»\n+x");
 		expect(redactCrashSecrets("+token=[REDACTED_TOKEN]\n+x")).toBe("+token=[REDACTED_TOKEN]\n+x");
@@ -836,10 +843,14 @@ describe("recordFatalCrash", () => {
 	});
 
 	it("redacts abbreviated password credential fields", () => {
-		for (const key of ["pwd", "dbPwd", "user_pwd"]) expect(isCredentialKey(key)).toBe(true);
-		expect(redactCrashSecrets("pwd=opaque-pwd dbPwd=opaque-db-pwd user_pwd=opaque-user-pwd")).toBe(
-			"pwd=«redacted» dbPwd=«redacted» user_pwd=«redacted»",
-		);
+		for (const key of ["pw", "pwd", "dbPw", "dbPwd", "user_pw", "user_pwd"]) {
+			expect(isCredentialKey(key)).toBe(true);
+		}
+		expect(
+			redactCrashSecrets(
+				"pw=opaque-pw pwd=opaque-pwd dbPw=opaque-db-pw dbPwd=opaque-db-pwd user_pw=opaque-user-pw user_pwd=opaque-user-pwd",
+			),
+		).toBe("pw=«redacted» pwd=«redacted» dbPw=«redacted» dbPwd=«redacted» user_pw=«redacted» user_pwd=«redacted»");
 		expect(redactCrashSecrets('{"dbPwd":"opaque-db-pwd"}')).toBe('{"dbPwd":"«redacted»"}');
 	});
 
