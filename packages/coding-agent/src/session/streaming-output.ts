@@ -1131,6 +1131,9 @@ class ArtifactStagingSink implements ArtifactByteSink {
 	#fd: number | undefined;
 	#ended = false;
 	#queued = 0;
+	#busy = false;
+	#pending: Buffer | undefined;
+	#pendingLen = 0;
 	#tail: Promise<void> = Promise.resolve();
 	#writeError: unknown;
 	readonly #stagingPath: string;
@@ -1148,10 +1151,13 @@ class ArtifactStagingSink implements ArtifactByteSink {
 		const fd = this.#fd;
 		if (fd === undefined || this.#ended) throw new Error("artifact sink closed");
 		if (this.#writeError) throw this.#writeError;
-		const buffer = typeof chunk === "string" ? Buffer.from(chunk) : Buffer.from(chunk);
-		this.#queued += buffer.length;
-		this.#tail = this.#tail.then(() => this.#flush(fd, buffer));
-		return buffer.length;
+		const incoming = typeof chunk === "string" ? Buffer.from(chunk) : Buffer.from(chunk);
+		if (incoming.length === 0) return 0;
+		// Callers that ignore settled() still run. One fs.write stays in flight; the rest share one buffer.
+		this.#queued += incoming.length;
+		this.#appendPending(incoming);
+		this.#schedule(fd);
+		return incoming.length;
 	}
 
 	settled(): Promise<void> | undefined {
@@ -1160,6 +1166,46 @@ class ArtifactStagingSink implements ArtifactByteSink {
 
 	writeFailed(): boolean {
 		return this.#writeError !== undefined;
+	}
+
+	#appendPending(incoming: Buffer): void {
+		if (this.#pending === undefined || this.#pendingLen === 0) {
+			this.#pending = incoming;
+			this.#pendingLen = incoming.length;
+			return;
+		}
+		const need = this.#pendingLen + incoming.length;
+		if (need > this.#pending.length) {
+			const grown = Buffer.allocUnsafe(Math.max(need, this.#pending.length * 2));
+			this.#pending.copy(grown, 0, 0, this.#pendingLen);
+			this.#pending = grown;
+		}
+		incoming.copy(this.#pending, this.#pendingLen);
+		this.#pendingLen = need;
+	}
+
+	#schedule(fd: number): void {
+		if (this.#busy) return;
+		this.#busy = true;
+		this.#tail = this.#tail
+			.then(() => this.#drain(fd))
+			.finally(() => {
+				this.#busy = false;
+				const next = this.#fd;
+				if (next !== undefined && this.#pendingLen > 0 && !this.#writeError) this.#schedule(next);
+			});
+	}
+
+	async #drain(fd: number): Promise<void> {
+		while (this.#pending && this.#pendingLen > 0 && !this.#writeError) {
+			const pending = this.#pending;
+			const length = this.#pendingLen;
+			const buffer = length === pending.length ? pending : pending.subarray(0, length);
+			this.#pending = undefined;
+			this.#pendingLen = 0;
+			await this.#flush(fd, buffer);
+			this.#queued -= length;
+		}
 	}
 
 	async #flush(fd: number, buffer: Buffer): Promise<void> {
@@ -1176,15 +1222,18 @@ class ArtifactStagingSink implements ArtifactByteSink {
 			}
 		} catch (error) {
 			this.#writeError ??= error;
-		} finally {
-			this.#queued -= buffer.length;
 		}
 	}
 
 	async end(): Promise<void> {
 		if (this.#ended) return;
 		this.#ended = true;
-		await this.#tail;
+		while (this.#busy || (this.#pendingLen > 0 && !this.#writeError)) {
+			if (!this.#busy && this.#fd !== undefined) this.#schedule(this.#fd);
+			const tail = this.#tail;
+			await tail;
+			if (tail === this.#tail && !this.#busy && (this.#pendingLen === 0 || this.#writeError)) break;
+		}
 		if (this.#writeError) {
 			const failed = this.#fd;
 			this.#fd = undefined;
@@ -1852,9 +1901,7 @@ export class OutputSink {
 
 		try {
 			const pending = this.#pendingFileWrites;
-			if (pending) {
-				for (const chunk of pending) sink.write(chunk);
-			}
+			if (pending && pending.length > 0) sink.write(pending.join(""));
 		} catch (error) {
 			this.#failArtifact("write", error, sink);
 			return false;

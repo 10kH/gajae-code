@@ -493,7 +493,7 @@ describe("OutputSink", () => {
 		const noteWrite = (text: string) => {
 			if (!text.includes("abcde") && !text.includes("fghij") && !text.includes("klmno")) return;
 			writes++;
-			if (!failed && writes === 2) {
+			if (!failed && text.includes("klmno")) {
 				failed = true;
 				throw new Error("simulated write failure");
 			}
@@ -542,7 +542,7 @@ describe("OutputSink", () => {
 			for (let offset = 0; offset < input.length; offset += 5) sink.push(input.slice(offset, offset + 5));
 			const summary = await sink.dump();
 
-			expect(writes).toBe(2);
+			expect(writes).toBe(1);
 			expect(summary.artifactId).toBeUndefined();
 			expect(summary.output).not.toContain("artifact://partial-write");
 			expect(summary.artifactFailureDiagnostic).toBe("write: simulated write failure");
@@ -604,6 +604,41 @@ describe("OutputSink", () => {
 			expect(dumped.artifactId).toBe("pressure");
 			expect(dumped.artifactFailureDiagnostic).toBeUndefined();
 			expect(await fs.readFile(artifactPath, "utf8")).toBe(chunk);
+		} finally {
+			release.resolve();
+			writeSpy.mockRestore();
+		}
+	});
+
+	test("synchronous one-byte pushes share one queued artifact write", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "coalesce.log");
+		const originalWrite = nodeFs.write;
+		const release = Promise.withResolvers<void>();
+		let started = 0;
+		let firstLength = 0;
+		const writeSpy = spyOn(nodeFs, "write").mockImplementation(((...args: unknown[]) => {
+			if (started === 0 && typeof args[3] === "number") firstLength = args[3];
+			started++;
+			void release.promise.then(() => {
+				Reflect.apply(originalWrite, nodeFs, args);
+			});
+		}) as typeof nodeFs.write);
+		try {
+			const sink = new OutputSink({ artifactPath, artifactId: "coalesce-sync", spillThreshold: 4 });
+			const count = 8_192;
+			for (let i = 0; i < count; i++) sink.push("a");
+			expect(started).toBe(0);
+			for (let i = 0; i < 5 && started === 0; i++) await Promise.resolve();
+			expect(started).toBe(1);
+			expect(firstLength).toBe(count);
+			for (let i = 0; i < 100; i++) sink.push("b");
+			expect(started).toBe(1);
+			release.resolve();
+			const dumped = await sink.dump();
+			expect(dumped.artifactId).toBe("coalesce-sync");
+			expect(dumped.artifactFailureDiagnostic).toBeUndefined();
+			expect(await fs.readFile(artifactPath, "utf8")).toBe(`${"a".repeat(count)}${"b".repeat(100)}`);
 		} finally {
 			release.resolve();
 			writeSpy.mockRestore();
