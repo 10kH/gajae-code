@@ -39,19 +39,20 @@ function runtimeHome(port: number): string {
 
 function listen(): { port: number; hits: string[] } {
 	const hits: string[] = [];
-	const server = Bun.serve({
+	const server: ReturnType<typeof Bun.serve> = Bun.serve({
 		hostname: "127.0.0.1",
 		port: 0,
-		fetch(req) {
+		fetch(req: Request): Response {
 			const pathname = new URL(req.url).pathname;
 			hits.push(pathname);
-			if (pathname === "/healthz") return Response.json({ ok: true, version: "opencodex", port: server.port });
+			const bound = server.port ?? 0;
+			if (pathname === "/healthz") return Response.json({ ok: true, version: "opencodex", port: bound });
 			if (pathname === "/v1/models") return Response.json({ data: [{ id: "local-model" }] });
 			return new Response("no", { status: 404 });
 		},
 	});
 	servers.push(server);
-	return { port: server.port, hits };
+	return { port: server.port ?? 0, hits };
 }
 
 afterEach(() => {
