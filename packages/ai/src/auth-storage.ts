@@ -1249,6 +1249,19 @@ function safeUsageReport(report: UsageReport): SafeUsageReport {
 	return safe;
 }
 
+function isUsageReportValue(value: unknown): value is UsageReport {
+	if (typeof value !== "object" || value === null) return false;
+	const report = value as Partial<UsageReport>;
+	return typeof report.provider === "string" && typeof report.fetchedAt === "number" && Array.isArray(report.limits);
+}
+
+/** Persist the same projection `safeUsageReport` already returns to readers. */
+function persistedUsageCacheValue<T>(value: T): T {
+	if (Array.isArray(value)) return value.map(item => persistedUsageCacheValue(item)) as T;
+	if (isUsageReportValue(value)) return safeUsageReport(value) as T;
+	return value;
+}
+
 function scrubHealthReason(reason: unknown, secrets: readonly string[] = []): string {
 	let value = (reason instanceof Error ? reason.message : String(reason)).replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
 	for (const secret of secrets) {
@@ -1481,7 +1494,8 @@ class AuthStorageUsageCache implements UsageCache {
 	}
 
 	set<T>(key: string, entry: UsageCacheEntry<T>): void {
-		const payload = JSON.stringify({ value: entry.value, expiresAt: entry.expiresAt });
+		const value = persistedUsageCacheValue(entry.value);
+		const payload = JSON.stringify({ value, expiresAt: entry.expiresAt });
 		const durableExpiresAt =
 			entry.value === null ? entry.expiresAt : Math.max(entry.expiresAt, Date.now() + USAGE_LAST_GOOD_RETENTION_MS);
 		this.store.setCache(`${USAGE_CACHE_PREFIX}${key}`, payload, Math.floor(durableExpiresAt / 1000));
