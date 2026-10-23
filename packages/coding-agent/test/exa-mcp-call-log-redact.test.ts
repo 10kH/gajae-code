@@ -7,19 +7,25 @@ const TOKEN = "sk-synthetictoolargsecret";
 const SHORT_SECRET = "short-password";
 const ORDINARY_QUERY = "rust ownership model";
 
-function jsonRpcError(message: string): Response {
-	return new Response(
-		JSON.stringify({
-			jsonrpc: "2.0",
-			id: "1",
-			error: { code: -32000, message },
-		}),
-		{ status: 200, headers: { "Content-Type": "application/json" } },
-	);
+function jsonRpcError(message: string, data?: unknown): Response {
+	const error: Record<string, unknown> = { code: -32000, message };
+	if (data !== undefined) error.data = data;
+	return new Response(JSON.stringify({ jsonrpc: "2.0", id: "1", error }), {
+		status: 200,
+		headers: { "Content-Type": "application/json" },
+	});
 }
 
-function stubFailure(message: string) {
-	const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonRpcError(message));
+function nested(depth: number, leaf: unknown): unknown {
+	let value = leaf;
+	for (let i = 0; i < depth; i++) value = [value];
+	return value;
+}
+
+function stubFailure(message: string, data?: unknown) {
+	const fetchSpy = vi
+		.spyOn(globalThis, "fetch")
+		.mockImplementation(() => Promise.resolve(jsonRpcError(message, data)));
 	const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
 	return { fetchSpy, errorSpy };
 }
@@ -103,6 +109,24 @@ describe("MCP tools/call error logs", () => {
 		expect(body).toContain(ORDINARY_QUERY);
 		expect(errorSpy.mock.calls[0]?.[0]).toBe("Websets MCP tools/call error");
 		expect(loggedContext(errorSpy).args).toEqual({ query: ORDINARY_QUERY, limit: 2 });
+	});
+
+	it("keeps the server message when a tools/call error payload is deeply nested", async () => {
+		const message = "expected server message";
+		for (const depth of [64, 25_000]) {
+			vi.restoreAllMocks();
+			const data = nested(depth, { note: "leaf" });
+			const args = { payload: nested(depth, { note: "leaf" }) };
+			const { errorSpy } = stubFailure(message, data);
+			await expect(callExaTool("web_search", args, null)).rejects.toThrow(`MCP error: ${message}`);
+			expect(errorSpy.mock.calls).toHaveLength(1);
+			expect(errorSpy.mock.calls[0]?.[0]).toBe("MCP tools/call error");
+			await expect(callWebsetsTool("exa-account-marker", "websets_search", args)).rejects.toThrow(
+				`MCP error: ${message}`,
+			);
+			expect(errorSpy.mock.calls).toHaveLength(2);
+			expect(errorSpy.mock.calls[1]?.[0]).toBe("Websets MCP tools/call error");
+		}
 	});
 
 	it("keeps ordinary tools/call argument text across generated inputs", async () => {
