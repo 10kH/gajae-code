@@ -42,6 +42,7 @@ function note(line) {
   if (!process.env.MCP_STATUS) return;
   try { fs.appendFileSync(process.env.MCP_STATUS, line + "\\n"); } catch {}
 }
+note("started");
 rl.on("line", line => {
   let msg;
   try { msg = JSON.parse(line); } catch { return; }
@@ -189,6 +190,7 @@ describe("MCP resource update notifications", () => {
 						type: "stdio",
 						command: process.execPath,
 						args: ["-e", SERVER_SCRIPT],
+						timeout: 1_250,
 						env: { MCP_STATUS: statusPath, MCP_TRIGGER_DIR: triggerDir },
 					},
 				},
@@ -226,7 +228,7 @@ describe("MCP resource update notifications", () => {
 		});
 		session = created.session;
 		mcpManager = created.mcpManager;
-		if (!mcpManager) throw new Error("Expected a session MCP manager");
+		if (!mcpManager) throw new Error(`Expected a session MCP manager (${await statusText()})`);
 		await waitFor(`resources were not listed (${await statusText()})`, () => {
 			const resources = mcpManager?.getConnection("docs")?.resources ?? [];
 			return resources.length === 3;
