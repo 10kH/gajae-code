@@ -426,6 +426,12 @@ export class LifecycleLedger {
 	 * `terminal_uncertain` is a durable terminal record too: an operation that concluded
 	 * uncertainly persists that conclusion, and refusing to read it back would report a
 	 * synced row as unpersisted and replace its true reason with a generic one.
+	 *
+	 * Shape damage is scoped to the identity that asks. A decodable row naming a
+	 * different identity cannot verify this request, and startup already quarantines
+	 * it; letting one unrelated oversized receipt reject the whole file made every
+	 * later lifecycle result unverifiable on that agent directory (#7134). Rows for
+	 * this identity, undecodable rows, and unsupported state versions stay strict.
 	 */
 	async readTerminal(identity: string, requestHash: string): Promise<TerminalReadBack> {
 		const sourceRead = await this.#readBoundedSourceReadOnly();
@@ -450,6 +456,12 @@ export class LifecycleLedger {
 			try {
 				const value = parseLifecycleJson(line);
 				assertSupportedStateVersion(this.#file, value);
+				// A decodable row that names another identity cannot verify this request.
+				// Skip it before full validation so one unrelated malformed row (for
+				// example an artifact snapshot over the JSON bounds) does not withhold
+				// proof for every identity. A row naming this identity stays strict.
+				const rowIdentity = (value as { identity?: unknown }).identity;
+				if (typeof rowIdentity === "string" && rowIdentity !== identity) continue;
 				if (!isLifecycleLedgerEntry(value)) return { kind: "rejected", reason: "shape" };
 				entry = value;
 			} catch {
