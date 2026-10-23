@@ -75,27 +75,21 @@ function healthPort(endpoint: string): number {
 
 const OPENCODEX_HOME_ENV = "OPENCODEX_HOME";
 
-let rejectedOpenCodexHome: string | undefined;
-/** Trusted directory, or empty when the live value is rejected with no trusted directory. */
+/** Trusted directory, or empty when the live value is rejected with no trusted directory. Captured once. */
 let pinnedOpenCodexHome = "";
 let spawnFilterInstalled = false;
 
 function envForOpenCodexChild(env: Record<string, string | undefined> | undefined): Record<string, string> {
 	const source = env ?? process.env;
 	const out: Record<string, string> = {};
-	let sawHome = false;
 	for (const key of Object.keys(source)) {
 		const value = source[key];
 		if (typeof value !== "string") continue;
-		if (key === OPENCODEX_HOME_ENV) {
-			sawHome = true;
-			out[key] = value.trim() === rejectedOpenCodexHome ? pinnedOpenCodexHome : value;
-			continue;
-		}
+		if (key === OPENCODEX_HOME_ENV) continue;
 		out[key] = value;
 	}
-	// An omitted name lets the child reload a project `.env` from its cwd.
-	if (!sawHome) out[OPENCODEX_HOME_ENV] = pinnedOpenCodexHome;
+	// Always set the pinned value. A missing name, or an older rejected value, would let the child cwd reload `.env`.
+	out[OPENCODEX_HOME_ENV] = pinnedOpenCodexHome;
 	return out;
 }
 
@@ -127,16 +121,17 @@ function installOpenCodexSpawnFilter(): void {
  * and user-owned env files and skips a project `.env`. A rejected live value is
  * removed from `process.env`. Later `Bun.spawn` and `Bun.spawnSync` calls set
  * that name to the trusted directory, or to an empty string when none is
- * trusted, including when the caller omits it or passes a copy made earlier.
- * The name is already set, so the child cwd `.env` does not restore the
- * rejected value. `node:child_process` omits a key deleted from `process.env`.
+ * trusted. The pin is captured at the first rejection and a later discovery
+ * does not replace it. Every later child env gets that pin, including an
+ * omitted name or a copy that still holds an older rejected value, so the
+ * child cwd `.env` cannot restore it. `node:child_process` omits a key
+ * deleted from `process.env`.
  */
 function trustedOpenCodexHome(): string | undefined {
 	const trusted = $credentialEnv(OPENCODEX_HOME_ENV)?.trim();
 	const live = process.env[OPENCODEX_HOME_ENV]?.trim();
 	if (live && live !== trusted) {
-		rejectedOpenCodexHome = live;
-		pinnedOpenCodexHome = trusted || "";
+		if (!spawnFilterInstalled) pinnedOpenCodexHome = trusted || "";
 		delete process.env[OPENCODEX_HOME_ENV];
 		installOpenCodexSpawnFilter();
 	}

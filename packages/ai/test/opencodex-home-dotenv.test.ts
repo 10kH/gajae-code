@@ -24,6 +24,10 @@ interface Probe {
 	projectPassedHome: string;
 	projectCopiedHome: string;
 	projectArrayHome: string;
+	secondSyncHome: string;
+	secondArrayHome: string;
+	secondAsyncHome: string;
+	secondAsyncArrayHome: string;
 }
 
 const tempDirs: string[] = [];
@@ -168,5 +172,26 @@ describe("OpenCodex home provenance", () => {
 		expect(probe.grandchildHome).toBe("");
 		expect(probe.nodeHome).toBe("");
 		expectProjectHome(probe, "");
+	});
+
+	test("ignores two successive rejected OpenCodex homes in a later Bun child", async () => {
+		const planted = `${String.fromCharCode(36)}{OPENCODEX_HOME_PLANTED}`;
+		const first = "/rejected-one";
+		const second = "/rejected-two";
+		const probe = await discover(projectDir(`${HOME}=${planted}\n`), {
+			[HOME]: first,
+			OPENCODEX_HOME_SECOND: second,
+		});
+		expect(probe.parentHome).toBeNull();
+		for (const home of [
+			probe.secondSyncHome,
+			probe.secondArrayHome,
+			probe.secondAsyncHome,
+			probe.secondAsyncArrayHome,
+		]) {
+			expect(home).toBe("");
+			expect(home).not.toBe(first);
+			expect(home).not.toBe(second);
+		}
 	});
 });

@@ -36,6 +36,10 @@ let projectAsyncHome = "";
 let projectPassedHome = "";
 let projectCopiedHome = "";
 let projectArrayHome = "";
+let secondSyncHome = "";
+let secondArrayHome = "";
+let secondAsyncHome = "";
+let secondAsyncArrayHome = "";
 try {
 	// A directory with no dotenv, so the child reports only the env object it was given.
 	explicitHome = syncHome({ cwd: empty, env: process.env });
@@ -63,6 +67,37 @@ try {
 	});
 	projectAsyncHome = await new Response(asyncChild.stdout).text();
 	if ((await asyncChild.exited) !== 0) throw new Error(await new Response(asyncChild.stderr).text());
+	const second = process.env.OPENCODEX_HOME_SECOND;
+	if (second !== undefined) {
+		process.env.OPENCODEX_HOME = second;
+		await fetchOpenCodexModels();
+		secondSyncHome = syncHome({ cwd: project, env: copied });
+		const arrayChild = Bun.spawnSync([process.execPath, "-e", script], {
+			cwd: project,
+			env: copied,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (arrayChild.exitCode !== 0) throw new Error(decode(arrayChild.stderr));
+		secondArrayHome = decode(arrayChild.stdout);
+		const asyncObject = Bun.spawn({
+			cmd: [process.execPath, "-e", script],
+			cwd: project,
+			env: copied,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		secondAsyncHome = await new Response(asyncObject.stdout).text();
+		if ((await asyncObject.exited) !== 0) throw new Error(await new Response(asyncObject.stderr).text());
+		const asyncArray = Bun.spawn([process.execPath, "-e", script], {
+			cwd: project,
+			env: copied,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		secondAsyncArrayHome = await new Response(asyncArray.stdout).text();
+		if ((await asyncArray.exited) !== 0) throw new Error(await new Response(asyncArray.stderr).text());
+	}
 } finally {
 	fs.rmSync(empty, { recursive: true, force: true });
 }
@@ -80,5 +115,9 @@ console.log(
 		projectPassedHome,
 		projectCopiedHome,
 		projectArrayHome,
+		secondSyncHome,
+		secondArrayHome,
+		secondAsyncHome,
+		secondAsyncArrayHome,
 	}),
 );
