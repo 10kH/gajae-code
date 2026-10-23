@@ -443,9 +443,12 @@ function buildMcpNotificationBatchMessage(entries: McpNotificationEntry[]): Agen
 		lines.push(`- server="${resource.serverName}" uri=${resource.uri}`);
 	}
 	lines.push('Use read(path="mcp://<uri>") to inspect if relevant.');
+	// Frame after the lines are joined. This builder does not truncate; the
+	// fence is the last step before the text becomes the user turn.
+	const text = wrapUntrustedContent(lines.join("\n"));
 	return {
 		role: "user",
-		content: [{ type: "text", text: lines.join("\n") }],
+		content: [{ type: "text", text }],
 		attribution: "agent",
 		timestamp: Date.now(),
 	};
