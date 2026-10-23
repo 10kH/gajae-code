@@ -25,7 +25,7 @@ function nested(depth: number, leaf: unknown): unknown {
 function stubFailure(message: string, data?: unknown) {
 	const fetchSpy = vi
 		.spyOn(globalThis, "fetch")
-		.mockImplementation((() => Promise.resolve(jsonRpcError(message, data))) as typeof fetch);
+		.mockImplementation((() => Promise.resolve(jsonRpcError(message, data))) as unknown as typeof fetch);
 	const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
 	return { fetchSpy, errorSpy };
 }
