@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { loadInstallationHostId, loadLegacyInstallationHostId } from "../src/config/machine-identity";
 
 const GUID = "12345678-1234-1234-1234-123456789abc";
-const SECRET = "abababababababababababababababababababababababababababababababab";
+const SECRET = Buffer.alloc(32, 0xab).toString("hex");
 
 function stubSpawnSync() {
 	return spyOn(Bun, "spawnSync").mockImplementation((() => ({
