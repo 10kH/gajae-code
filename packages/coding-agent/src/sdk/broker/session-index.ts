@@ -849,6 +849,7 @@ const SESSION_INDEX_REPLAY_FRESHNESS_MS = 2_000;
  * heartbeat for long enough that live hosts project as dead.
  */
 const SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS = 4;
+const SESSION_HEARTBEAT_STALE_WARNING_INTERVAL_MS = 60_000;
 /** One elapsed budget for queueing, probing and every reacquisition in a pass. */
 export const SESSION_HEARTBEAT_CHECKPOINT_BUDGET_MS = 15_000;
 const STALE_OBSERVATION: unique symbol = Symbol("stale-heartbeat-observation");
@@ -1208,6 +1209,7 @@ export class SessionIndex {
 	#observationDeps: SessionIndexObservationDeps;
 	#events: SessionIndexEvent[] = [];
 	#warnings: string[] = [];
+	#lastHeartbeatStaleWarningAt = Number.NEGATIVE_INFINITY;
 	#logOffset = 0;
 	#corruptSuffix = false;
 	/**
@@ -2448,9 +2450,22 @@ export class SessionIndex {
 			for (let attempt = 0; ; attempt++) {
 				if (signal.aborted || performance.now() >= deadline) return 0;
 				const result = await this.#checkpointLiveHeartbeatsOnce(now, signal, deadline);
-				if (result !== STALE_OBSERVATION || attempt + 1 >= SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS)
-					return result === STALE_OBSERVATION ? 0 : result;
-				now = Date.now();
+				if (result === STALE_OBSERVATION) {
+					if (attempt + 1 >= SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS) {
+						const warningAt = performance.now();
+						if (warningAt - this.#lastHeartbeatStaleWarningAt >= SESSION_HEARTBEAT_STALE_WARNING_INTERVAL_MS) {
+							this.#lastHeartbeatStaleWarningAt = warningAt;
+							logger.warn("sdk broker: skipped session heartbeat checkpoint after repeated stale observations", {
+								indexPath: path.resolve(logFor(this.#agentDir)),
+								attempts: attempt + 1,
+							});
+						}
+						return 0;
+					}
+					now = Date.now();
+					continue;
+				}
+				return result;
 			}
 		};
 		try {

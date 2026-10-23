@@ -23244,14 +23244,19 @@ export class AgentSession {
 			// A skipped compaction (most often: nothing before the keep window to
 			// summarize, e.g. one oversized early message) leaves the context
 			// unchanged. Crossing the threshold is not an overflow: while the
-			// unchanged context still fits the model window with its reserve, send
-			// it, as the agent_end threshold path does. Failing here would end every
-			// later turn of the session with the same error. A prune committed above
-			// has already rewritten durable history, so the run must restart on it
-			// rather than send its pre-prune snapshot.
+			// unchanged context still fits the model window with the configured
+			// reserve, send it, as the agent_end threshold path does. Failing here
+			// would end every later turn of the session with the same error. The
+			// window-scaled reserve is not used: below the 300k ceiling it is exactly
+			// the margin that placed the default threshold, so no context could
+			// cross the threshold and still pass. A prune committed above has already
+			// rewritten durable history, so the run must restart on it rather than
+			// send its pre-prune snapshot.
 			if (
 				compactionStatus.kind === "skipped" &&
-				contextTokens + effectiveReserveTokens(contextWindow, compactionSettings) <= contextWindow
+				contextTokens +
+					Math.max(compactionSettings.reserveTokens, autoCompactionOutputReserveTokens) <=
+					contextWindow
 			) {
 				return pruneResult?.committed ? result("pruned", true) : result("not-needed");
 			}
