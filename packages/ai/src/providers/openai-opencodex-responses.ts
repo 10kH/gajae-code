@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { $credentialEnv } from "@gajae-code/utils";
 
 import type { Model } from "../types";
 
@@ -72,8 +73,22 @@ function healthPort(endpoint: string): number {
 	return Number(new URL(endpoint).port);
 }
 
+const OPENCODEX_HOME_ENV = "OPENCODEX_HOME";
+
+/**
+ * Directory for `runtime-port.json`. `$credentialEnv` keeps the launching shell
+ * and user-owned env files and skips a project `.env`. A live value that
+ * resolution rejects is removed so a later child does not inherit it.
+ */
+function trustedOpenCodexHome(): string | undefined {
+	const trusted = $credentialEnv(OPENCODEX_HOME_ENV)?.trim();
+	const live = process.env[OPENCODEX_HOME_ENV]?.trim();
+	if (live && live !== trusted) delete process.env[OPENCODEX_HOME_ENV];
+	return trusted || undefined;
+}
+
 async function readRuntimeEndpoint(): Promise<string | undefined> {
-	const home = process.env.OPENCODEX_HOME?.trim() || path.join(os.homedir(), ".opencodex");
+	const home = trustedOpenCodexHome() || path.join(os.homedir(), ".opencodex");
 	try {
 		const raw = JSON.parse(await fs.readFile(path.join(home, "runtime-port.json"), "utf8")) as RuntimePortFile;
 		const hostname =
