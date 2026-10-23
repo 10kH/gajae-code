@@ -238,6 +238,7 @@ import {
 	type PreparedModelProfileActivation,
 	prepareModelProfileActivation,
 	publishPreparedModelProfileActivation,
+	recordPublishedModelProfileActivationUsage,
 	resolveMissingSessionModelRecovery,
 	rollbackPreparedModelProfileActivation,
 } from "../config/model-profile-activation";
@@ -2983,6 +2984,10 @@ export class AgentSession {
 	#selectionFenceGeneration = 0;
 	#defaultModelSelectionMutationRevision = 0;
 	#userModelSelectionRevision = 0;
+	/** Mutation-order sequence for model choices that may enter the model MRU. */
+	#modelSelectionUsageSequence = 0;
+	/** Sequence of the newest choice this session recorded in the model MRU. */
+	#recordedModelSelectionUsageSequence = 0;
 	#userCanonicalVariantSelectionRevision = 0;
 	#userCanonicalVariantSelection: string | undefined;
 	#thinkingLevelMutationRevision = 0;
@@ -19330,6 +19335,12 @@ export class AgentSession {
 			thinkingLevel?: ThinkingLevel;
 			cause?: ModelChangeCause;
 			onMutationStarted?: () => void;
+			/**
+			 * `false` when the caller owns a larger transaction that can still fail and
+			 * roll back: it records the usage itself via {@link recordModelSelectionUsage}
+			 * once that transaction succeeds.
+			 */
+			recordUsage?: boolean;
 		},
 	): Promise<void> {
 		const previousEditMode = this.#resolveActiveEditMode();
@@ -19359,7 +19370,7 @@ export class AgentSession {
 			this.#defaultFallbackExhaustedLastTurn = false;
 			this.#escapedNonAsciiExhaustedModelKeys.clear();
 		}
-		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+		if (options?.recordUsage !== false) this.recordModelSelectionUsage(model, this.beginModelSelectionUsage());
 
 		// Persist configured intent rather than a transient controller index. A pick
 		// inside an existing chain keeps its deterministic suffix; a different
@@ -19947,6 +19958,10 @@ export class AgentSession {
 					}
 					const preparedActivation = prepared;
 					if (preparedActivation) {
+						// Both finalizers succeeded: record the published profile DEFAULT now,
+						// before the awaited lease, so a user selection made while the lease
+						// waits on another publisher stays the most recent usage.
+						recordPublishedModelProfileActivationUsage(preparedActivation);
 						await this.#modelRegistry.withConsumerLease(async () => {
 							await finishPreparedModelProfileActivation(preparedActivation);
 						});
@@ -20694,8 +20709,15 @@ export class AgentSession {
 				`${model.provider}/${model.id}`,
 				options?.persistAsSessionDefault ? "default" : "temporary",
 			);
-			if (options?.cause !== "startup-override") {
-				this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+			// A run-scoped CLI override and a rollback to a captured model are not usage
+			// choices. A profile activation records its DEFAULT only once the whole
+			// activation succeeds, so a failed or superseded switch leaves no trace.
+			if (
+				options?.cause !== "startup-override" &&
+				options?.cause !== "rollback" &&
+				options?.cause !== "profile-activation"
+			) {
+				this.recordModelSelectionUsage(model, this.beginModelSelectionUsage());
 			}
 			if (options?.persistAsSessionDefault) {
 				this.#seedSessionCanonicalVariant(model);
@@ -20773,7 +20795,6 @@ export class AgentSession {
 		this.#setModelAuthoritatively(prepared.model, "profile-activation");
 		this.#syncAppendOnlyContext(prepared.model);
 		this.sessionManager.appendModelChange(`${prepared.model.provider}/${prepared.model.id}`, "temporary");
-		this.settings.getStorage()?.recordModelUsage(`${prepared.model.provider}/${prepared.model.id}`);
 		this.#applyThinkingLevel(prepared.committedThinkingLevel, false, false, onThinkingLevelApplied);
 	}
 
@@ -20792,7 +20813,39 @@ export class AgentSession {
 		return this.#syncEditToolModeAfterModelChange(prepared.previousEditMode);
 	}
 
-	/** Restore the exact live-model state captured before a failed selector transaction. */
+	/**
+	 * Claim the MRU order slot for a model choice. Call when the choice mutates the
+	 * live model and pass the result to {@link recordModelSelectionUsage} once the
+	 * owning transaction succeeds.
+	 */
+	beginModelSelectionUsage(): number {
+		return ++this.#modelSelectionUsageSequence;
+	}
+
+	/**
+	 * Record a completed model choice in the agent.db usage order (MRU), which
+	 * resolves glob/ambiguous role selectors for later sessions. Callers record
+	 * only after the owning selection transaction succeeded.
+	 * Records follow mutation order, not completion order: once a newer choice
+	 * (higher `sequence` from {@link beginModelSelectionUsage}) was recorded, an
+	 * older choice that finishes later is not recorded over it. A newer choice that
+	 * fails and rolls back records nothing, so the older successful choice still
+	 * records. An automatic fallback switch claims no slot and is not a usage
+	 * choice, so it does not suppress the user's completed choice.
+	 * The order covers this session's participating writers only: raw
+	 * `recordModelUsage` callers and other sessions sharing agent.db are not
+	 * sequenced, and the high-water mark tracks attempted (best-effort) writes.
+	 */
+	recordModelSelectionUsage(model: Model, sequence: number): void {
+		if (sequence <= this.#recordedModelSelectionUsageSequence) return;
+		this.#recordedModelSelectionUsageSequence = sequence;
+		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+	}
+
+	/**
+	 * Restore the exact live-model state captured before a failed selector transaction.
+	 * Compensation is not a usage choice, so the restored model is not recorded.
+	 */
 	async restoreModelSelectionForRollback(
 		model: Model | undefined,
 		thinkingLevel: ThinkingLevel | undefined,
@@ -20803,7 +20856,6 @@ export class AgentSession {
 			// the old credential may have disappeared after the forward mutation.
 			this.#setModelAuthoritatively(model, "rollback");
 			this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, "temporary");
-			this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 		} else {
 			this.#clearActiveRetryFallback();
 			this.#setModelWithProviderSessionReset(undefined);
@@ -20911,7 +20963,7 @@ export class AgentSession {
 		}
 		this.#applyPreparedDefaultModelSelectionPrompt(systemPrompt);
 		try {
-			this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+			this.recordModelSelectionUsage(model, this.beginModelSelectionUsage());
 		} catch {
 			logger.warn("Failed to record model usage after default model selection", {
 				code: "default_model_selection_model_usage_record_failed",
