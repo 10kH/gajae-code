@@ -77,8 +77,8 @@ const OPENCODEX_HOME_ENV = "OPENCODEX_HOME";
 
 /**
  * Directory for `runtime-port.json`. `$credentialEnv` keeps the launching shell
- * and user-owned env files and skips a project `.env`. A live value that
- * resolution rejects is removed so a later child does not inherit it.
+ * and user-owned env files and skips a project `.env`. A rejected live value is
+ * removed from `process.env`, which `node:child_process` and `env: process.env` omit.
  */
 function trustedOpenCodexHome(): string | undefined {
 	const trusted = $credentialEnv(OPENCODEX_HOME_ENV)?.trim();
