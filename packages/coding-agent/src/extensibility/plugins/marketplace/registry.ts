@@ -8,8 +8,10 @@
  * Read/write functions accept explicit file paths so callers control the
  * location. Path helpers compute the default paths from the dir singleton.
  *
- * Both use atomic write (tmp + rename). On Windows, rename over existing file
- * can fail with EPERM — fallback: unlink target then rename.
+ * Both use atomic write (exclusive tmp + rename). A symlink, hard link, or
+ * other non-directory at the temp path is removed, not followed. On Windows,
+ * rename over an existing file can fail with EPERM — fallback: unlink target
+ * then rename.
  */
 
 import * as fs from "node:fs/promises";
@@ -46,11 +48,51 @@ export function getPluginsCacheDir(): string {
 
 // ── Atomic write ─────────────────────────────────────────────────────
 
+/**
+ * Open `<file>.tmp` with O_CREAT|O_EXCL. A directory stays put so the open
+ * fails with EISDIR. Any other existing entry is unlinked first: unlink does
+ * not follow a symlink, and a hard link loses only this name. Exclusive create
+ * then refuses a link planted in that gap instead of writing through it.
+ */
+async function openExclusiveRegistryTemp(tmpPath: string): Promise<import("node:fs/promises").FileHandle> {
+	let existing: import("node:fs").Stats | undefined;
+	try {
+		existing = await fs.lstat(tmpPath);
+	} catch (err) {
+		if (!isEnoent(err)) throw err;
+	}
+	if (existing && !existing.isDirectory()) {
+		await fs.unlink(tmpPath);
+	}
+	const handle = await fs.open(tmpPath, "wx", 0o600);
+	try {
+		const opened = await handle.stat();
+		if (!opened.isFile() || opened.nlink > 1) {
+			throw Object.assign(new Error(`registry temp at ${tmpPath} is not a new ordinary file`), {
+				code: "unsafe_registry_link",
+			});
+		}
+		return handle;
+	} catch (err) {
+		await handle.close();
+		await fs.unlink(tmpPath).catch(() => {});
+		throw err;
+	}
+}
+
 async function atomicWriteJson(filePath: string, data: unknown): Promise<void> {
 	const content = `${JSON.stringify(data, null, 2)}\n`;
 	const tmpPath = `${filePath}.tmp`;
-
-	await Bun.write(tmpPath, content);
+	const handle = await openExclusiveRegistryTemp(tmpPath);
+	try {
+		await handle.writeFile(content);
+		await handle.sync();
+	} catch (err) {
+		await fs.unlink(tmpPath).catch(() => {});
+		throw err;
+	} finally {
+		await handle.close();
+	}
 
 	try {
 		await fs.rename(tmpPath, filePath);
