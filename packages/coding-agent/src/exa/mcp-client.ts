@@ -1,5 +1,5 @@
 import type { TSchema } from "@gajae-code/ai/core";
-import { $credentialEnv, logger } from "@gajae-code/utils";
+import { $credentialEnv, isCredentialKey, logger, redactCrashSecrets } from "@gajae-code/utils";
 import type { CustomTool, CustomToolResult } from "../extensibility/custom-tools/types";
 import { callMCP } from "../runtime-mcp/json-rpc";
 import type {
@@ -23,6 +23,23 @@ import type {
  */
 export function findApiKey(): string | null {
 	return $credentialEnv("EXA_API_KEY") ?? null;
+}
+
+/**
+ * Copy a tools/call failure payload for the rotating log.
+ * Credential field names are replaced whole. Other strings go through the crash
+ * redactor so a token shape is masked before it is written. The object sent to
+ * the server is not modified.
+ */
+function redactMcpCallLogValue(value: unknown): unknown {
+	if (typeof value === "string") return redactCrashSecrets(value);
+	if (Array.isArray(value)) return value.map(redactMcpCallLogValue);
+	if (typeof value !== "object" || value === null) return value;
+	const redacted: Record<string, unknown> = {};
+	for (const [key, entry] of Object.entries(value)) {
+		redacted[key] = isCredentialKey(key) ? "«redacted»" : redactMcpCallLogValue(entry);
+	}
+	return redacted;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -125,7 +142,11 @@ export async function callExaTool(
 	})) as MCPCallResponse;
 
 	if (response.error) {
-		logger.error("MCP tools/call error", { toolName, args, error: response.error });
+		logger.error("MCP tools/call error", {
+			toolName,
+			args: redactMcpCallLogValue(args),
+			error: redactMcpCallLogValue(response.error),
+		});
 		throw new Error(`MCP error: ${response.error.message}`);
 	}
 
@@ -145,7 +166,11 @@ export async function callWebsetsTool(
 	})) as MCPCallResponse;
 
 	if (response.error) {
-		logger.error("Websets MCP tools/call error", { toolName, args, error: response.error });
+		logger.error("Websets MCP tools/call error", {
+			toolName,
+			args: redactMcpCallLogValue(args),
+			error: redactMcpCallLogValue(response.error),
+		});
 		throw new Error(`MCP error: ${response.error.message}`);
 	}
 
