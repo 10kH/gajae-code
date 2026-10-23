@@ -357,10 +357,10 @@ export function setFileOffset(sessionFile: string, offset: number, lastModified:
 }
 
 /**
- * Credential shapes are removed at the insert boundary. The session file stays as recorded.
- * The full error string is scrubbed before it is bound; nothing is sliced first.
+ * Credential shapes are removed before the row is bound. The session file stays as recorded.
+ * The full error string is scrubbed first; nothing is sliced before that call.
  */
-function persistedErrorMessage(errorMessage: string | null): string | null {
+function scrubbedErrorMessage(errorMessage: string | null): string | null {
 	if (errorMessage === null) return null;
 	return redactCrashSecrets(errorMessage);
 }
@@ -403,7 +403,7 @@ export function insertMessageStats(stats: ParsedMessageStats[]): number {
 				s.duration,
 				s.ttft,
 				s.stopReason,
-				persistedErrorMessage(s.errorMessage),
+				scrubbedErrorMessage(s.errorMessage),
 				s.usage.input,
 				s.usage.output,
 				s.usage.cacheRead,
