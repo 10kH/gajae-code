@@ -1277,7 +1277,16 @@ async function classifyFileLockRemovalTransition(
 	// A sibling record survives rename and scrub without mutating the captured tree.
 	const recordedOwner = await readRemovalTransitionOwnerRecord(transitionPath);
 	if (recordedOwner) {
-		if (lockRecordIsForeignHost(recordedOwner.owner, ownerHostId, previousOwnerHostIds)) return "active";
+		if (
+			await retainedRemovalRecordIsForeignHost(
+				transitionPath,
+				recordedOwner.owner,
+				orphanAgeMs,
+				ownerHostId,
+				previousOwnerHostIds,
+			)
+		)
+			return "active";
 		if (
 			canonicalLockDeviceId(transition.dev).toString() !== recordedOwner.rootDev ||
 			canonicalLockFileId(transition.ino).toString() !== recordedOwner.rootIno
@@ -2655,6 +2664,66 @@ function lockRecordIsForeignHost(
 ): boolean {
 	if (ownerHostId === undefined) return info.owner_host_id !== undefined;
 	return info.owner_host_id !== ownerHostId && !previousOwnerHostIds.includes(info.owner_host_id ?? "");
+}
+
+/**
+ * Host attribution for a `.removing.owner` record whose transition directory is
+ * still on disk.
+ *
+ * Host-qualified records, and every record judged by an acquirer that carries no
+ * host identity, follow `lockRecordIsForeignHost`. A hostless record judged by a
+ * host-qualified acquirer has no provenance: it was written by a remover that
+ * stamped no host id, either a build that predates host-id stamping on this
+ * machine or a hostless caller sharing the volume. While that remover could still
+ * be mid-removal it stays foreign, so a live remover on another host is never
+ * probed. Once the record and every entry of the captured tree have been
+ * quiescent for the orphan adoption age, the record carries strictly more
+ * evidence than an ownerless transition, which is adopted at the same age, so its
+ * pid is judged locally instead of wedging the lock forever. Any tree that cannot
+ * be captured, and any timestamp that is not finite or lies in the future, keeps
+ * the record foreign.
+ */
+async function retainedRemovalRecordIsForeignHost(
+	transitionPath: string,
+	owner: LockInfo,
+	orphanAgeMs: number,
+	ownerHostId: string | undefined,
+	previousOwnerHostIds: readonly string[],
+): Promise<boolean> {
+	if (owner.owner_host_id !== undefined || ownerHostId === undefined)
+		return lockRecordIsForeignHost(owner, ownerHostId, previousOwnerHostIds);
+	let recordMtimeNs: bigint;
+	try {
+		recordMtimeNs = (await fs.lstat(removalRecordPath(transitionPath), { bigint: true })).mtimeNs;
+	} catch (error) {
+		if (isEnoent(error) || isTransientReleaseError(error)) return true;
+		throw error;
+	}
+	if (!(await isNativeExactRemovalUsable())) return true;
+	let captured: NativeDirectoryTreeResult;
+	try {
+		captured = nativeFileLockBindings().snapshotDirectoryTree(transitionPath);
+	} catch (error) {
+		if (isTransientReleaseError(error)) return true;
+		throw error;
+	}
+	if (!captured.ok || !captured.snapshot || captured.snapshot.entries.length === 0) return true;
+	const now = Date.now();
+	const quiescent = (mtimeNs: bigint): boolean => {
+		const ageMs = now - Number(mtimeNs / 1_000_000n);
+		return Number.isFinite(ageMs) && ageMs >= orphanAgeMs;
+	};
+	if (!quiescent(recordMtimeNs)) return true;
+	for (const entry of captured.snapshot.entries) {
+		let mtimeNs: bigint;
+		try {
+			mtimeNs = BigInt(entry.mtimeNs);
+		} catch {
+			return true;
+		}
+		if (!quiescent(mtimeNs)) return true;
+	}
+	return false;
 }
 
 async function staleLockSnapshot(
