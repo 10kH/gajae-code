@@ -490,7 +490,11 @@ import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { extractFileMentions, generateFileMentionMessages } from "../utils/file-mentions";
 import { invalidateSessionTitleGeneration } from "../utils/session-title-generation";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
-import { buildWorkflowIntentDiff, WORKFLOW_INTENT_DIFF_CUSTOM_TYPE } from "../workflow/workflow-intent-diff";
+import {
+	buildWorkflowIntentDiff,
+	WORKFLOW_INTENT_DIFF_CUSTOM_TYPE,
+	type WorkflowIntentDiff,
+} from "../workflow/workflow-intent-diff";
 import { buildWorkspaceTree, type WorkspaceTree } from "../workspace-tree";
 import type { AuthStorage } from "./auth-storage";
 import {
@@ -14941,9 +14945,6 @@ export class AgentSession {
 					return;
 				}
 				this.#throwIfPromptPreflightCancelled(admissionGeneration, admissionSignal);
-				if (workflowIntentDiff) {
-					this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
-				}
 
 				// Skip eager todo prelude when the user has already queued a directive
 				const hasPendingUserDirective = this.#toolChoiceQueue.inspect().includes("user-force");
@@ -14985,6 +14986,7 @@ export class AgentSession {
 						prependMessages: eagerTodoPrelude ? [eagerTodoPrelude.message] : undefined,
 						admissionLease: admission,
 						resetRetryReplaySafety: true,
+						workflowIntentDiff: workflowIntentDiff ?? undefined,
 					});
 				} finally {
 					// Clean up residual eager-todo directive if the prompt never consumed it
@@ -15249,6 +15251,7 @@ export class AgentSession {
 			onRunAccepted?: (handle: AttemptRunHandle) => void;
 			onFinalPreflight?: (context: { hasPendingNextTurnMessages: boolean }) => Promise<boolean>;
 			resetRetryReplaySafety?: boolean;
+			workflowIntentDiff?: WorkflowIntentDiff;
 		},
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
@@ -15665,6 +15668,14 @@ export class AgentSession {
 					if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 					else options?.onPreflightAccepted?.();
 					this.#assertExternalSessionIngress({ allowCancelAndSubmit: true });
+				},
+				onAccepted: () => {
+					if (options?.workflowIntentDiff) {
+						this.sessionManager.appendCustomEntry(
+							WORKFLOW_INTENT_DIFF_CUSTOM_TYPE,
+							options.workflowIntentDiff,
+						);
+					}
 				},
 			});
 			const activeTerminalScope = this.#activeAttemptScope;
@@ -27671,6 +27682,7 @@ export class AgentSession {
 			signal?: AbortSignal;
 			resourceRunId?: string;
 			onPreflightAccepted?: () => void | Promise<void>;
+			onAccepted?: () => void;
 		},
 	): Promise<void> {
 		const deadline = Date.now() + 30_000;
@@ -27695,6 +27707,10 @@ export class AgentSession {
 						await seam?.onPreflightAccepted?.();
 						if (seam?.signal?.aborted) throw promptPreflightCancelledError();
 						preflightAccepted = true;
+						// Runs once, after every acceptance check and before execution, so a
+						// retry cannot append twice and a cancellation cannot leave a trace
+						// for work that never started (#7138).
+						seam?.onAccepted?.();
 					}
 					await this.agent.prompt(messages, options);
 					this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
