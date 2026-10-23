@@ -19,6 +19,11 @@ interface Probe {
 	inheritedHome: string;
 	copiedHome: string;
 	nodeHome: string;
+	projectSyncHome: string;
+	projectAsyncHome: string;
+	projectPassedHome: string;
+	projectCopiedHome: string;
+	projectArrayHome: string;
 }
 
 const tempDirs: string[] = [];
@@ -61,6 +66,14 @@ afterEach(() => {
 	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
+function expectProjectHome(probe: Probe, home: string) {
+	expect(probe.projectSyncHome).toBe(home);
+	expect(probe.projectAsyncHome).toBe(home);
+	expect(probe.projectPassedHome).toBe(home);
+	expect(probe.projectCopiedHome).toBe(home);
+	expect(probe.projectArrayHome).toBe(home);
+}
+
 function spawnEnv(overrides: Record<string, string> = {}): Record<string, string> {
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(process.env)) {
@@ -95,6 +108,7 @@ describe("OpenCodex home provenance", () => {
 		expect(probe.inheritedHome).toBe("");
 		expect(probe.copiedHome).toBe("");
 		expect(probe.nodeHome).toBe("");
+		expectProjectHome(probe, "");
 	});
 
 	test("still uses an inherited OpenCodex home when the project dotenv names another directory", async () => {
@@ -110,6 +124,7 @@ describe("OpenCodex home provenance", () => {
 		expect(probe.inheritedHome).toBe(trusted);
 		expect(probe.copiedHome).toBe(trusted);
 		expect(probe.nodeHome).toBe(trusted);
+		expectProjectHome(probe, trusted);
 	});
 
 	test("still uses an inherited OpenCodex home when the project has no dotenv entry", async () => {
@@ -123,6 +138,7 @@ describe("OpenCodex home provenance", () => {
 		expect(probe.inheritedHome).toBe(trusted);
 		expect(probe.copiedHome).toBe(trusted);
 		expect(probe.nodeHome).toBe(trusted);
+		expectProjectHome(probe, trusted);
 	});
 
 	test("ignores an OpenCodex home that repeats the project dotenv", async () => {
@@ -136,6 +152,7 @@ describe("OpenCodex home provenance", () => {
 		expect(probe.copiedHome).toBe("");
 		expect(probe.grandchildHome).toBe("");
 		expect(probe.nodeHome).toBe("");
+		expectProjectHome(probe, "");
 	});
 
 	test("ignores a shell OpenCodex home when the project dotenv expands a variable", async () => {
@@ -150,5 +167,6 @@ describe("OpenCodex home provenance", () => {
 		expect(probe.copiedHome).toBe("");
 		expect(probe.grandchildHome).toBe("");
 		expect(probe.nodeHome).toBe("");
+		expectProjectHome(probe, "");
 	});
 });

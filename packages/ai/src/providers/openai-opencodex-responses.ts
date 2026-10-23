@@ -76,21 +76,30 @@ function healthPort(endpoint: string): number {
 const OPENCODEX_HOME_ENV = "OPENCODEX_HOME";
 
 let rejectedOpenCodexHome: string | undefined;
+/** Trusted directory, or empty when the live value is rejected with no trusted directory. */
+let pinnedOpenCodexHome = "";
 let spawnFilterInstalled = false;
 
-function envWithoutRejectedOpenCodexHome(env: Record<string, string | undefined> | undefined): Record<string, string> {
+function envForOpenCodexChild(env: Record<string, string | undefined> | undefined): Record<string, string> {
 	const source = env ?? process.env;
 	const out: Record<string, string> = {};
+	let sawHome = false;
 	for (const key of Object.keys(source)) {
 		const value = source[key];
 		if (typeof value !== "string") continue;
-		if (key === OPENCODEX_HOME_ENV && value.trim() === rejectedOpenCodexHome) continue;
+		if (key === OPENCODEX_HOME_ENV) {
+			sawHome = true;
+			out[key] = value.trim() === rejectedOpenCodexHome ? pinnedOpenCodexHome : value;
+			continue;
+		}
 		out[key] = value;
 	}
+	// An omitted name lets the child reload a project `.env` from its cwd.
+	if (!sawHome) out[OPENCODEX_HOME_ENV] = pinnedOpenCodexHome;
 	return out;
 }
 
-/** After a project value is rejected, later Bun spawns in this process omit that name. */
+/** After a project value is rejected, later Bun spawns pin that name so cwd `.env` cannot restore it. */
 function installOpenCodexSpawnFilter(): void {
 	if (spawnFilterInstalled) return;
 	spawnFilterInstalled = true;
@@ -105,9 +114,9 @@ function installOpenCodexSpawnFilter(): void {
 		first: unknown,
 		second?: { env?: Record<string, string | undefined> },
 	) => {
-		if (Array.isArray(first)) return run(first, { ...second, env: envWithoutRejectedOpenCodexHome(second?.env) });
+		if (Array.isArray(first)) return run(first, { ...second, env: envForOpenCodexChild(second?.env) });
 		const options = (first ?? {}) as { env?: Record<string, string | undefined> };
-		return run({ ...options, env: envWithoutRejectedOpenCodexHome(options.env) });
+		return run({ ...options, env: envForOpenCodexChild(options.env) });
 	};
 	bun.spawn = (first, second) => call(spawn, first, second);
 	bun.spawnSync = (first, second) => call(spawnSync, first, second);
@@ -116,15 +125,18 @@ function installOpenCodexSpawnFilter(): void {
 /**
  * Directory for `runtime-port.json`. `$credentialEnv` keeps the launching shell
  * and user-owned env files and skips a project `.env`. A rejected live value is
- * removed from `process.env`. Later `Bun.spawn` and `Bun.spawnSync` calls omit
- * that name, including when the caller passes an env object copied earlier.
- * `node:child_process` omits a key deleted from `process.env`.
+ * removed from `process.env`. Later `Bun.spawn` and `Bun.spawnSync` calls set
+ * that name to the trusted directory, or to an empty string when none is
+ * trusted, including when the caller omits it or passes a copy made earlier.
+ * The name is already set, so the child cwd `.env` does not restore the
+ * rejected value. `node:child_process` omits a key deleted from `process.env`.
  */
 function trustedOpenCodexHome(): string | undefined {
 	const trusted = $credentialEnv(OPENCODEX_HOME_ENV)?.trim();
 	const live = process.env[OPENCODEX_HOME_ENV]?.trim();
 	if (live && live !== trusted) {
 		rejectedOpenCodexHome = live;
+		pinnedOpenCodexHome = trusted || "";
 		delete process.env[OPENCODEX_HOME_ENV];
 		installOpenCodexSpawnFilter();
 	}

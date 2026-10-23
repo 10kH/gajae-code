@@ -13,38 +13,56 @@ const models = await fetchOpenCodexModels();
 const first = models?.[0];
 const script = "process.stdout.write(process.env.OPENCODEX_HOME ?? '')";
 const empty = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-opencodex-child-"));
+const project = process.cwd();
+const decode = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
+
+function syncHome(options: { cwd: string; env?: Record<string, string | undefined> }): string {
+	const result = Bun.spawnSync({
+		cmd: [process.execPath, "-e", script],
+		stdout: "pipe",
+		stderr: "pipe",
+		...options,
+	});
+	if (result.exitCode !== 0) throw new Error(decode(result.stderr));
+	return decode(result.stdout);
+}
+
 let explicitHome = "";
 let inheritedHome = "";
 let nodeHome = "";
 let copiedHome = "";
+let projectSyncHome = "";
+let projectAsyncHome = "";
+let projectPassedHome = "";
+let projectCopiedHome = "";
+let projectArrayHome = "";
 try {
 	// A directory with no dotenv, so the child reports only the env object it was given.
-	const explicit = Bun.spawnSync({
-		cmd: [process.execPath, "-e", script],
-		env: process.env,
-		cwd: empty,
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	const inherited = Bun.spawnSync({
-		cmd: [process.execPath, "-e", script],
-		cwd: empty,
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	const copiedChild = Bun.spawnSync({
-		cmd: [process.execPath, "-e", script],
-		env: copied,
-		cwd: empty,
-		stdout: "pipe",
-		stderr: "pipe",
-	});
+	explicitHome = syncHome({ cwd: empty, env: process.env });
+	inheritedHome = syncHome({ cwd: empty });
+	copiedHome = syncHome({ cwd: empty, env: copied });
 	const nodeChild = spawnSync(process.execPath, ["-e", script], { cwd: empty, encoding: "utf8" });
-	const decode = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
-	explicitHome = decode(explicit.stdout);
-	inheritedHome = decode(inherited.stdout);
-	copiedHome = decode(copiedChild.stdout);
+	if (nodeChild.status !== 0) throw new Error(nodeChild.stderr ?? "");
 	nodeHome = nodeChild.stdout ?? "";
+	// The project directory still has the `.env`. Bun reloads it when the name is absent.
+	projectSyncHome = syncHome({ cwd: project });
+	projectPassedHome = syncHome({ cwd: project, env: process.env });
+	projectCopiedHome = syncHome({ cwd: project, env: copied });
+	const arrayChild = Bun.spawnSync([process.execPath, "-e", script], {
+		cwd: project,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (arrayChild.exitCode !== 0) throw new Error(decode(arrayChild.stderr));
+	projectArrayHome = decode(arrayChild.stdout);
+	const asyncChild = Bun.spawn({
+		cmd: [process.execPath, "-e", script],
+		cwd: project,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	projectAsyncHome = await new Response(asyncChild.stdout).text();
+	if ((await asyncChild.exited) !== 0) throw new Error(await new Response(asyncChild.stderr).text());
 } finally {
 	fs.rmSync(empty, { recursive: true, force: true });
 }
@@ -57,5 +75,10 @@ console.log(
 		inheritedHome,
 		copiedHome,
 		nodeHome,
+		projectSyncHome,
+		projectAsyncHome,
+		projectPassedHome,
+		projectCopiedHome,
+		projectArrayHome,
 	}),
 );
