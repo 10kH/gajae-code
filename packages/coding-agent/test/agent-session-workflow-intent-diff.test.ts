@@ -343,6 +343,22 @@ describe("AgentSession workflow intent-diff tracking", () => {
 		}
 	});
 
+	it("does not persist the trace when the accept commit cancels before execution", async () => {
+		const controller = new AbortController();
+
+		await expect(
+			session.prompt("fix the direct null check", {
+				preflightSignal: controller.signal,
+				onPreflightAcceptCommit: async () => {
+					// The durable-accept fence is the last asynchronous step before
+					// execution; an abort here must still leave no workflow trace.
+					controller.abort();
+				},
+			}),
+		).rejects.toMatchObject({ name: "PromptPreflightCancelledError" });
+		expect(workflowIntentEntries()).toEqual([]);
+	});
+
 	it("does not record workflow intent diffs for synthetic prompts", async () => {
 		await session.prompt("internal continuation", { synthetic: true });
 

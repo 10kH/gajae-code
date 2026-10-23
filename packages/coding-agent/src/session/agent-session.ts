@@ -15602,12 +15602,6 @@ export class AgentSession {
 				if (options?.onPreflightAccepted || options?.onPreflightAcceptCommit) throw promptPreflightCancelledError();
 				return;
 			}
-			// Persist the workflow trace only after the last preflight gate: a
-			// prompt cancelled during admission must not leave a trace for work
-			// that never started (#7138).
-			if (options?.workflowIntentDiff) {
-				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, options.workflowIntentDiff);
-			}
 
 			const agentPromptOptions = {
 				...(options?.toolChoice ? { toolChoice: options.toolChoice } : undefined),
@@ -15669,6 +15663,14 @@ export class AgentSession {
 					if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 					else options?.onPreflightAccepted?.();
 					this.#assertExternalSessionIngress({ allowCancelAndSubmit: true });
+				},
+				onAccepted: () => {
+					if (options?.workflowIntentDiff) {
+						this.sessionManager.appendCustomEntry(
+							WORKFLOW_INTENT_DIFF_CUSTOM_TYPE,
+							options.workflowIntentDiff,
+						);
+					}
 				},
 			});
 			const activeTerminalScope = this.#activeAttemptScope;
@@ -27623,6 +27625,7 @@ export class AgentSession {
 			signal?: AbortSignal;
 			resourceRunId?: string;
 			onPreflightAccepted?: () => void | Promise<void>;
+			onAccepted?: () => void;
 		},
 	): Promise<void> {
 		const deadline = Date.now() + 30_000;
@@ -27647,6 +27650,10 @@ export class AgentSession {
 						await seam?.onPreflightAccepted?.();
 						if (seam?.signal?.aborted) throw promptPreflightCancelledError();
 						preflightAccepted = true;
+						// Runs once, after every acceptance check and before execution, so a
+						// retry cannot append twice and a cancellation cannot leave a trace
+						// for work that never started (#7138).
+						seam?.onAccepted?.();
 					}
 					await this.agent.prompt(messages, options);
 					this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
