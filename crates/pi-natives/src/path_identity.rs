@@ -43,6 +43,122 @@ fn is_trusted_windows_owner_sid(
 		|| owner_matches_sid(WINDOWS_BUILTIN_ADMINISTRATORS_SID.0.as_slice())
 }
 
+#[cfg(any(windows, test))]
+const WINDOWS_LOCAL_SYSTEM_SID: WindowsSid = WindowsSid([
+	0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+]);
+
+/// Access bits that let a principal change an executable's bytes, metadata, or
+/// security. `SYNCHRONIZE`, `READ_CONTROL`, and the read/execute bits are
+/// deliberately absent: deriving this mask from `FILE_ALL_ACCESS` (which
+/// carries `SYNCHRONIZE`) made every ordinary `(RX)` ACE look write-capable
+/// (#6096). Generic bits are listed explicitly because an ACE may store them
+/// unmapped.
+#[cfg(any(windows, test))]
+const EXECUTABLE_WRITE_CAPABLE_MASK: u32 = 0x0000_0002 // FILE_WRITE_DATA
+	| 0x0000_0004 // FILE_APPEND_DATA
+	| 0x0000_0010 // FILE_WRITE_EA
+	| 0x0000_0040 // FILE_DELETE_CHILD
+	| 0x0000_0100 // FILE_WRITE_ATTRIBUTES
+	| 0x0001_0000 // DELETE
+	| 0x0004_0000 // WRITE_DAC
+	| 0x0008_0000 // WRITE_OWNER
+	| 0x0200_0000 // MAXIMUM_ALLOWED
+	| 0x1000_0000 // GENERIC_ALL
+	| 0x4000_0000; // GENERIC_WRITE
+
+/// Whether an ACCESS_ALLOWED ACE for `ace_sid` is acceptable on an executable
+/// the updater will publish or retire. Read/execute grants are acceptable for
+/// any principal. Write-capable grants are acceptable only for principals that
+/// already hold full authority over the user's profile: the current user, the
+/// built-in Administrators group, and LocalSystem — exactly what a default
+/// `%LOCALAPPDATA%` DACL inherits. Any other write grant (Users, Authenticated
+/// Users, Everyone, a sandbox capability SID, …) is a shared-write exposure.
+#[cfg(any(windows, test))]
+fn executable_ace_is_safe(
+	mask: u32,
+	mut ace_matches_sid: impl FnMut(&[u8]) -> bool,
+	current_user_sid: &[u8],
+) -> bool {
+	mask & EXECUTABLE_WRITE_CAPABLE_MASK == 0
+		|| is_trusted_windows_owner_sid(&mut ace_matches_sid, current_user_sid)
+		|| ace_matches_sid(WINDOWS_LOCAL_SYSTEM_SID.0.as_slice())
+}
+
+#[cfg(test)]
+mod windows_executable_ace_tests {
+	use super::{
+		WINDOWS_BUILTIN_ADMINISTRATORS_SID, WINDOWS_LOCAL_SYSTEM_SID, executable_ace_is_safe,
+	};
+
+	const CURRENT_USER_SID: [u8; 12] =
+		[0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00, 0x00];
+	// S-1-5-32-545 BUILTIN\Users and S-1-1-0 Everyone.
+	const USERS_SID: [u8; 16] = [
+		0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x21, 0x02, 0x00,
+		0x00,
+	];
+	const EVERYONE_SID: [u8; 12] =
+		[0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
+
+	const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+	// What icacls prints as (RX): FILE_GENERIC_READ | FILE_GENERIC_EXECUTE.
+	const READ_EXECUTE: u32 = 0x0012_00a9;
+	const MODIFY: u32 = 0x0013_01bf;
+	const GENERIC_READ_EXECUTE: u32 = 0x8000_0000 | 0x2000_0000;
+	const GENERIC_WRITE: u32 = 0x4000_0000;
+	const GENERIC_ALL: u32 = 0x1000_0000;
+
+	fn safe_for(mask: u32, ace_sid: &[u8]) -> bool {
+		executable_ace_is_safe(mask, |trusted| trusted == ace_sid, &CURRENT_USER_SID)
+	}
+
+	#[test]
+	fn read_execute_grants_are_safe_for_any_principal() {
+		// #6096: SYNCHRONIZE inside (RX) must not make a read-only ACE write-capable.
+		for sid in [USERS_SID.as_slice(), EVERYONE_SID.as_slice()] {
+			assert!(safe_for(READ_EXECUTE, sid));
+			assert!(safe_for(GENERIC_READ_EXECUTE, sid));
+			assert!(safe_for(0x0010_0000, sid), "SYNCHRONIZE alone is not a write grant");
+			assert!(safe_for(0x0002_0000, sid), "READ_CONTROL alone is not a write grant");
+		}
+	}
+
+	#[test]
+	fn default_profile_full_control_principals_are_trusted() {
+		// A default %LOCALAPPDATA% DACL inherits SYSTEM:(F) and Administrators:(F).
+		for sid in [
+			CURRENT_USER_SID.as_slice(),
+			WINDOWS_BUILTIN_ADMINISTRATORS_SID.0.as_slice(),
+			WINDOWS_LOCAL_SYSTEM_SID.0.as_slice(),
+		] {
+			assert!(safe_for(FILE_ALL_ACCESS, sid));
+			assert!(safe_for(GENERIC_ALL, sid));
+		}
+	}
+
+	#[test]
+	fn write_grants_to_other_principals_stay_refused() {
+		for mask in [
+			FILE_ALL_ACCESS,
+			MODIFY,
+			GENERIC_WRITE,
+			GENERIC_ALL,
+			0x0000_0002, // FILE_WRITE_DATA
+			0x0000_0004, // FILE_APPEND_DATA
+			0x0000_0010, // FILE_WRITE_EA
+			0x0000_0100, // FILE_WRITE_ATTRIBUTES
+			0x0001_0000, // DELETE
+			0x0004_0000, // WRITE_DAC
+			0x0008_0000, // WRITE_OWNER
+			READ_EXECUTE | 0x0000_0002,
+		] {
+			assert!(!safe_for(mask, &USERS_SID), "0x{mask:08X} for Users must be refused");
+			assert!(!safe_for(mask, &EVERYONE_SID), "0x{mask:08X} for Everyone must be refused");
+		}
+	}
+}
+
 #[cfg(test)]
 mod windows_owner_sid_tests {
 	use super::{WINDOWS_BUILTIN_ADMINISTRATORS_SID, is_trusted_windows_owner_sid};
@@ -12312,21 +12428,6 @@ mod platform {
 	/// a principal other than the verified owner. Read/execute-only ACEs for
 	/// other principals are accepted.
 	fn verify_executable_ownership_no_shared_write(handle: HANDLE) -> Result<(), &'static str> {
-		const FILE_WRITE_DATA: u32 = 0x0000_0002;
-		const FILE_APPEND_DATA: u32 = 0x0000_0004;
-		const FILE_WRITE_EA: u32 = 0x0000_0010;
-		const DELETE: u32 = 0x0001_0000;
-		const GENERIC_WRITE: u32 = 0x4000_0000;
-		const WRITE_CAPABLE_MASK: u32 = FILE_WRITE_DATA
-			| FILE_APPEND_DATA
-			| FILE_WRITE_EA
-			| FILE_WRITE_ATTRIBUTES
-			| WRITE_DAC
-			| WRITE_OWNER
-			| DELETE
-			| GENERIC_WRITE
-			| GENERIC_ALL
-			| FILE_ALL_ACCESS;
 		let sid = match current_user_sid() {
 			Ok(sid) => sid,
 			Err(()) => return Err("acl_unavailable"),
@@ -12360,9 +12461,18 @@ mod platform {
 			if owner.is_null() {
 				return Err("acl_unavailable");
 			}
-			// SAFETY: GetSecurityInfo returned owner within the live security
-			// descriptor; sid is a validated current-user SID.
-			if unsafe { EqualSid(owner, sid.as_ptr().cast_mut().cast()) } == 0 {
+			// An elevated token's default owner is BUILTIN\Administrators, so an
+			// elevated install and every candidate it downloads are Administrators-owned
+			// (#6916); accept the same trusted owners as managed roots (#6420).
+			let owner_trusted = super::is_trusted_windows_owner_sid(
+				|trusted_sid| {
+					// SAFETY: `owner` is inside the live descriptor; `trusted_sid` is the
+					// validated current-user SID or the fixed Administrators SID.
+					unsafe { EqualSid(owner, trusted_sid.as_ptr().cast_mut().cast()) != 0 }
+				},
+				&sid,
+			);
+			if !owner_trusted {
 				return Err("owner_mismatch");
 			}
 			if dacl.is_null() {
@@ -12418,9 +12528,6 @@ mod platform {
 				// live ACE.
 				let mask =
 					unsafe { std::ptr::read_unaligned(ace.cast::<u8>().add(mask_offset).cast::<u32>()) };
-				if mask & WRITE_CAPABLE_MASK == 0 {
-					continue;
-				}
 				// SAFETY: structural validation proved the SID range lies inside the
 				// live ACE.
 				let ace_sid = unsafe {
@@ -12429,12 +12536,21 @@ mod platform {
 				if valid_sid(ace_sid).is_none() {
 					return Err("acl_malformed");
 				}
-				// SAFETY: both pointers identify complete validated SIDs that remain live
-				// through comparison.
-				let grants_owner = unsafe {
-					EqualSid(ace_sid.as_ptr().cast_mut().cast(), sid.as_ptr().cast_mut().cast())
-				} != 0;
-				if !grants_owner {
+				let safe = super::executable_ace_is_safe(
+					mask,
+					|trusted_sid| {
+						// SAFETY: both pointers identify complete validated SIDs that remain
+						// live through comparison.
+						unsafe {
+							EqualSid(
+								ace_sid.as_ptr().cast_mut().cast(),
+								trusted_sid.as_ptr().cast_mut().cast(),
+							) != 0
+						}
+					},
+					&sid,
+				);
+				if !safe {
 					return Err("acl_present");
 				}
 			}
