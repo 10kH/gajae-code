@@ -75,15 +75,59 @@ function healthPort(endpoint: string): number {
 
 const OPENCODEX_HOME_ENV = "OPENCODEX_HOME";
 
+let rejectedOpenCodexHome: string | undefined;
+let spawnFilterInstalled = false;
+
+function envWithoutRejectedOpenCodexHome(env: Record<string, string | undefined> | undefined): Record<string, string> {
+	const source = env ?? process.env;
+	const out: Record<string, string> = {};
+	for (const key of Object.keys(source)) {
+		const value = source[key];
+		if (typeof value !== "string") continue;
+		if (key === OPENCODEX_HOME_ENV && value.trim() === rejectedOpenCodexHome) continue;
+		out[key] = value;
+	}
+	return out;
+}
+
+/** After a project value is rejected, later Bun spawns in this process omit that name. */
+function installOpenCodexSpawnFilter(): void {
+	if (spawnFilterInstalled) return;
+	spawnFilterInstalled = true;
+	const bun = Bun as unknown as {
+		spawn: (first: unknown, second?: { env?: Record<string, string | undefined> }) => unknown;
+		spawnSync: (first: unknown, second?: { env?: Record<string, string | undefined> }) => unknown;
+	};
+	const spawn = bun.spawn.bind(Bun);
+	const spawnSync = bun.spawnSync.bind(Bun);
+	const call = (
+		run: (first: unknown, second?: { env?: Record<string, string | undefined> }) => unknown,
+		first: unknown,
+		second?: { env?: Record<string, string | undefined> },
+	) => {
+		if (Array.isArray(first)) return run(first, { ...second, env: envWithoutRejectedOpenCodexHome(second?.env) });
+		const options = (first ?? {}) as { env?: Record<string, string | undefined> };
+		return run({ ...options, env: envWithoutRejectedOpenCodexHome(options.env) });
+	};
+	bun.spawn = (first, second) => call(spawn, first, second);
+	bun.spawnSync = (first, second) => call(spawnSync, first, second);
+}
+
 /**
  * Directory for `runtime-port.json`. `$credentialEnv` keeps the launching shell
  * and user-owned env files and skips a project `.env`. A rejected live value is
- * removed from `process.env`, which `node:child_process` and `env: process.env` omit.
+ * removed from `process.env`. Later `Bun.spawn` and `Bun.spawnSync` calls omit
+ * that name, including when the caller passes an env object copied earlier.
+ * `node:child_process` omits a key deleted from `process.env`.
  */
 function trustedOpenCodexHome(): string | undefined {
 	const trusted = $credentialEnv(OPENCODEX_HOME_ENV)?.trim();
 	const live = process.env[OPENCODEX_HOME_ENV]?.trim();
-	if (live && live !== trusted) delete process.env[OPENCODEX_HOME_ENV];
+	if (live && live !== trusted) {
+		rejectedOpenCodexHome = live;
+		delete process.env[OPENCODEX_HOME_ENV];
+		installOpenCodexSpawnFilter();
+	}
 	return trusted || undefined;
 }
 

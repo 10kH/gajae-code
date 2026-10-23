@@ -17,6 +17,7 @@ interface Probe {
 	parentHome: string | null;
 	grandchildHome: string;
 	inheritedHome: string;
+	copiedHome: string;
 	nodeHome: string;
 }
 
@@ -91,6 +92,8 @@ describe("OpenCodex home provenance", () => {
 		expect(probe.baseUrl ?? "").not.toContain(`:${port}`);
 		expect(probe.parentHome).toBeNull();
 		expect(probe.grandchildHome).toBe("");
+		expect(probe.inheritedHome).toBe("");
+		expect(probe.copiedHome).toBe("");
 		expect(probe.nodeHome).toBe("");
 	});
 
@@ -105,6 +108,7 @@ describe("OpenCodex home provenance", () => {
 		expect(probe.parentHome).toBe(trusted);
 		expect(probe.grandchildHome).toBe(trusted);
 		expect(probe.inheritedHome).toBe(trusted);
+		expect(probe.copiedHome).toBe(trusted);
 		expect(probe.nodeHome).toBe(trusted);
 	});
 
@@ -117,6 +121,7 @@ describe("OpenCodex home provenance", () => {
 		expect(probe.parentHome).toBe(trusted);
 		expect(probe.grandchildHome).toBe(trusted);
 		expect(probe.inheritedHome).toBe(trusted);
+		expect(probe.copiedHome).toBe(trusted);
 		expect(probe.nodeHome).toBe(trusted);
 	});
 
@@ -127,6 +132,8 @@ describe("OpenCodex home provenance", () => {
 		expect(hits).toEqual([]);
 		expect(probe.baseUrl ?? "").not.toContain(`:${port}`);
 		expect(probe.parentHome).toBeNull();
+		expect(probe.inheritedHome).toBe("");
+		expect(probe.copiedHome).toBe("");
 		expect(probe.grandchildHome).toBe("");
 		expect(probe.nodeHome).toBe("");
 	});
@@ -139,6 +146,8 @@ describe("OpenCodex home provenance", () => {
 		expect(hits).toEqual([]);
 		expect(probe.baseUrl ?? "").not.toContain(`:${port}`);
 		expect(probe.parentHome).toBeNull();
+		expect(probe.inheritedHome).toBe("");
+		expect(probe.copiedHome).toBe("");
 		expect(probe.grandchildHome).toBe("");
 		expect(probe.nodeHome).toBe("");
 	});
