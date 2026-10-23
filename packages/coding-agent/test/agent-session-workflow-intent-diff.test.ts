@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent, AgentBusyError } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
@@ -312,6 +312,34 @@ describe("AgentSession workflow intent-diff tracking", () => {
 			expect(workflowIntentEntries()).toEqual([]);
 		} finally {
 			session.agent.state.isStreaming = false;
+		}
+	});
+
+	it("keeps preflight-cancelled prompts out of workflow intent tracking", async () => {
+		const controller = new AbortController();
+		let releaseRefresh!: () => void;
+		const refreshGate = new Promise<void>(resolve => {
+			releaseRefresh = resolve;
+		});
+		const refresh = vi.spyOn(session, "refreshGjcSubskillTools").mockImplementation(async () => {
+			await refreshGate;
+		});
+		try {
+			const pending = session.prompt("fix the direct null check", { preflightSignal: controller.signal });
+			// Wait until admission reaches the sub-skill refresh that runs after the
+			// intent router has built its diff, then cancel before the final gate.
+			const deadline = Date.now() + 2_000;
+			while (refresh.mock.calls.length === 0) {
+				if (Date.now() > deadline) throw new Error("prompt did not reach admission");
+				await Bun.sleep(5);
+			}
+			controller.abort();
+			releaseRefresh();
+
+			await expect(pending).rejects.toMatchObject({ name: "PromptPreflightCancelledError" });
+			expect(workflowIntentEntries()).toEqual([]);
+		} finally {
+			refresh.mockRestore();
 		}
 	});
 

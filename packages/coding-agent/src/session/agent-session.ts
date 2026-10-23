@@ -489,7 +489,11 @@ import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { extractFileMentions, generateFileMentionMessages } from "../utils/file-mentions";
 import { invalidateSessionTitleGeneration } from "../utils/session-title-generation";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
-import { buildWorkflowIntentDiff, WORKFLOW_INTENT_DIFF_CUSTOM_TYPE } from "../workflow/workflow-intent-diff";
+import {
+	buildWorkflowIntentDiff,
+	WORKFLOW_INTENT_DIFF_CUSTOM_TYPE,
+	type WorkflowIntentDiff,
+} from "../workflow/workflow-intent-diff";
 import { buildWorkspaceTree, type WorkspaceTree } from "../workspace-tree";
 import type { AuthStorage } from "./auth-storage";
 import {
@@ -14936,9 +14940,6 @@ export class AgentSession {
 					return;
 				}
 				this.#throwIfPromptPreflightCancelled(admissionGeneration, admissionSignal);
-				if (workflowIntentDiff) {
-					this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
-				}
 
 				// Skip eager todo prelude when the user has already queued a directive
 				const hasPendingUserDirective = this.#toolChoiceQueue.inspect().includes("user-force");
@@ -14980,6 +14981,7 @@ export class AgentSession {
 						prependMessages: eagerTodoPrelude ? [eagerTodoPrelude.message] : undefined,
 						admissionLease: admission,
 						resetRetryReplaySafety: true,
+						workflowIntentDiff: workflowIntentDiff ?? undefined,
 					});
 				} finally {
 					// Clean up residual eager-todo directive if the prompt never consumed it
@@ -15244,6 +15246,7 @@ export class AgentSession {
 			onRunAccepted?: (handle: AttemptRunHandle) => void;
 			onFinalPreflight?: (context: { hasPendingNextTurnMessages: boolean }) => Promise<boolean>;
 			resetRetryReplaySafety?: boolean;
+			workflowIntentDiff?: WorkflowIntentDiff;
 		},
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
@@ -15598,6 +15601,12 @@ export class AgentSession {
 				// (aborted after setup) resolve gracefully as before f24f46ff5.
 				if (options?.onPreflightAccepted || options?.onPreflightAcceptCommit) throw promptPreflightCancelledError();
 				return;
+			}
+			// Persist the workflow trace only after the last preflight gate: a
+			// prompt cancelled during admission must not leave a trace for work
+			// that never started (#7138).
+			if (options?.workflowIntentDiff) {
+				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, options.workflowIntentDiff);
 			}
 
 			const agentPromptOptions = {
