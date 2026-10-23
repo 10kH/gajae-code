@@ -46,7 +46,7 @@ describe("MCP tools/call error logs", () => {
 		expect(body).toContain(TOKEN);
 		expect(body).toContain(SHORT_SECRET);
 		expect(args.query).toBe(TOKEN);
-		expect(errorSpy).toHaveBeenCalledOnce();
+		expect(errorSpy.mock.calls).toHaveLength(1);
 		expect(errorSpy.mock.calls[0]?.[0]).toBe("MCP tools/call error");
 		const metadata = loggedContext(errorSpy);
 		expect(JSON.stringify(metadata)).not.toContain(TOKEN);
