@@ -50,9 +50,9 @@ export function getPluginsCacheDir(): string {
 
 /**
  * Open `<file>.tmp` with O_CREAT|O_EXCL. A directory stays put so the open
- * fails with EISDIR. Any other existing entry is unlinked first: unlink does
- * not follow a symlink, and a hard link loses only this name. Exclusive create
- * then refuses a link planted in that gap instead of writing through it.
+ * fails because that name already exists. Any other existing entry is unlinked
+ * first: unlink does not follow a symlink, and a hard link loses only that
+ * name. Exclusive create then refuses a link planted in that gap.
  */
 async function openExclusiveRegistryTemp(tmpPath: string): Promise<import("node:fs/promises").FileHandle> {
 	let existing: import("node:fs").Stats | undefined;
@@ -83,6 +83,8 @@ async function openExclusiveRegistryTemp(tmpPath: string): Promise<import("node:
 async function atomicWriteJson(filePath: string, data: unknown): Promise<void> {
 	const content = `${JSON.stringify(data, null, 2)}\n`;
 	const tmpPath = `${filePath}.tmp`;
+	// Bun.write created missing parents. Exclusive open does not, so keep that.
+	await fs.mkdir(path.dirname(filePath), { recursive: true });
 	const handle = await openExclusiveRegistryTemp(tmpPath);
 	try {
 		await handle.writeFile(content);

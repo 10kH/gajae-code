@@ -89,6 +89,20 @@ test.skipIf(process.platform === "win32")("keeps the target of a symlinked regis
 	expect(fs.readFileSync(file, "utf8")).toContain('"version": 2');
 });
 
+test("still allows an installed registry write when parent directories are missing", async () => {
+	const file = path.join(dir, "nested", "plugins", "installed_plugins.json");
+	await writeInstalledPluginsRegistry(file, installed());
+	expect(fs.readFileSync(file, "utf8")).toContain('"version": 2');
+	expect(fs.existsSync(`${file}.tmp`)).toBe(false);
+});
+
+test("still allows a marketplaces registry write when parent directories are missing", async () => {
+	const file = path.join(dir, "nested", "market", "marketplaces.json");
+	await writeMarketplacesRegistry(file, markets());
+	expect(fs.readFileSync(file, "utf8")).toContain('"version": 1');
+	expect(fs.existsSync(`${file}.tmp`)).toBe(false);
+});
+
 test("still allows a marketplaces registry write", async () => {
 	const file = path.join(dir, "marketplaces.json");
 	await writeMarketplacesRegistry(file, markets());
