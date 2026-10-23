@@ -1168,10 +1168,45 @@ function removeLegacySourceNodeModulesLink(sourceRoot: string, worktreePath: str
 	fs.unlinkSync(target);
 }
 
+function isSemverNumericIdentifier(part: string): boolean {
+	return /^(?:0|[1-9][0-9]*)$/.test(part);
+}
+
+function isSemverBuildMetadata(build: string): boolean {
+	return build.length > 0 && /^[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*$/.test(build);
+}
+
+function isSemverPrerelease(pre: string): boolean {
+	if (pre.length === 0) return false;
+	return pre.split(".").every(id => /^(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)$/.test(id));
+}
+
+/**
+ * Corepack `packageManager` versions are an exact semver with an optional leading `v`.
+ * `bun x name@version` otherwise treats `npm:`, `file:`, and URLs as a package alias.
+ */
+function isExactPackageManagerVersion(version: string): boolean {
+	let rest = version;
+	if (rest.startsWith("v")) rest = rest.slice(1);
+	const plus = rest.indexOf("+");
+	const release = plus < 0 ? rest : rest.slice(0, plus);
+	const build = plus < 0 ? null : rest.slice(plus + 1);
+	if (build !== null && !isSemverBuildMetadata(build)) return false;
+	const dash = release.indexOf("-");
+	const core = dash < 0 ? release : release.slice(0, dash);
+	const pre = dash < 0 ? null : release.slice(dash + 1);
+	if (pre !== null && !isSemverPrerelease(pre)) return false;
+	const parts = core.split(".");
+	return parts.length === 3 && parts.every(isSemverNumericIdentifier);
+}
+
 function workspaceInstallCommand(manager: ResolvedWorkspacePackageManager): string[] {
 	const args = manager.name === "npm" ? ["ci"] : ["install", "--frozen-lockfile"];
 	if (manager.name === "bun" || Bun.which(manager.name) !== null) return [manager.name, ...args];
 	if (manager.version === null) throw new Error(`worktree_dependency_manager_unavailable:${manager.name}`);
+	if (!isExactPackageManagerVersion(manager.version)) {
+		throw new Error(`worktree_dependency_manager_version_invalid:${manager.name}`);
+	}
 	return ["bun", "x", `${manager.name}@${manager.version}`, ...args];
 }
 
