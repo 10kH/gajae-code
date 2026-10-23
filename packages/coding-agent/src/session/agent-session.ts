@@ -1778,6 +1778,11 @@ export type EphemeralTurnArgs =
 			 * turn claim and commit its own roster candidate; `null` opts out.
 			 */
 			ircRosterClaim?: IrcRosterClaim | null;
+			/**
+			 * Marks app-generated utility work (for example prompt suggestions) so
+			 * agent-level providers can refuse it instead of billing an upstream agent.
+			 */
+			maintenanceCall?: boolean;
 	  });
 
 interface EphemeralTurnResult {
@@ -28581,6 +28586,7 @@ export class AgentSession {
 					serviceTier: this.serviceTier,
 					signal: args.signal,
 					toolChoice: "none",
+					maintenanceCall: args.maintenanceCall,
 				},
 				model.provider,
 				sideScope,
