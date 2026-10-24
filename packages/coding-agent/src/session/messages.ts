@@ -452,7 +452,7 @@ export function wrapUntrustedContent(content: string): string {
  */
 export function neutralizeReservedPromptTag(value: string): string {
 	return value.replace(
-		/<\/?\s*(?:system-interrupt|system-reminder|untrusted-content|rules)\b/gi,
+		/<\/?\s*(?:system-interrupt|system-reminder|untrusted-content|rules)(?=[\s>/]|$)/gi,
 		tag => `&lt;${tag.slice(1)}`,
 	);
 }
