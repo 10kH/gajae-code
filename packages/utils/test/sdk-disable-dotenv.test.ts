@@ -10,7 +10,9 @@ import * as path from "node:path";
  * A repository dotenv file must not install it. Bun autoloads cwd dotenv,
  * and the env module copies the project files itself when autoload is off,
  * so both paths are exercised. A shell export stays unless it is the same
- * string the project declares.
+ * string the project declares, or the project declaration is dynamic.
+ * A dynamic declaration drops a different shell value too, because the
+ * source is ambiguous. A static project value that disagrees is kept.
  */
 
 const PROBE = path.join(import.meta.dir, "fixtures", "sdk-disable-env-probe.ts");
@@ -83,6 +85,12 @@ describe.each([
 
 	it("keeps an operator opt-out in the spawned child environment", async () => {
 		expect(await resolveIn(tempDir(), { autoload, inherited: "1" })).toBe("1");
+	});
+
+	it("drops a shell opt-out when the project declaration is dynamic", async () => {
+		expect(
+			await resolveIn(tempDir({ ".env": `ATTACK=0\n${KEY}=$ATTACK\n` }), { autoload, inherited: "1" }),
+		).toBeNull();
 	});
 
 	it("keeps an operator opt-out when the project declares a different value", async () => {

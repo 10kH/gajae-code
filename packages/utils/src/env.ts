@@ -317,7 +317,8 @@ function resolveLiveCredentialEnvValue(name: string): string | undefined {
  * and the harness owner read it from the process environment after this module
  * loads, and they copy a value that is still set into the child environment.
  * A repository `.env` must not install it. A shell export is kept unless it is
- * the same string the project declares.
+ * the same string the project declares, or the project declaration is dynamic.
+ * A dynamic declaration is ambiguous, so a different shell value is dropped too.
  */
 const PROJECT_DENIED_ENV_NAMES = [
 	"NODE_TLS_REJECT_UNAUTHORIZED",
