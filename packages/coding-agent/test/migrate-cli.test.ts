@@ -25,6 +25,7 @@ function symlinkSupported(): boolean {
 }
 
 const SYMLINKS = symlinkSupported();
+const MKFIFO = process.platform === "win32" ? null : Bun.which("mkfifo");
 
 let home: string;
 let cwd: string;
@@ -471,22 +472,56 @@ describe("runMigrate", () => {
 		}
 	});
 
-	test.skipIf(process.platform === "win32")("a fifo migrate source is not read", async () => {
-		const fifo = path.join(cwd, "pipe-source");
-		const made = Bun.spawnSync(["mkfifo", fifo]);
+	test.skipIf(process.platform === "win32" || MKFIFO === null)("a fifo migrate source is not read", async () => {
+		const fifo = path.join(cwd, "CLAUDE.md");
+		const made = Bun.spawnSync([MKFIFO as string, fifo]);
 		expect(made.exitCode).toBe(0);
+		const entry = path.join(import.meta.dir, "../src/cli/migrate-cli.ts");
+		const script = `
+			import { runMigrate } from ${JSON.stringify(entry)};
+			import * as fs from "node:fs/promises";
+			import * as path from "node:path";
+			const project = process.env.MIGRATE_CWD ?? "";
+			const homeDir = process.env.MIGRATE_HOME ?? "";
+			const report = await runMigrate({
+				from: ["claude-code"],
+				project: true,
+				force: false,
+				dryRun: false,
+				json: true,
+				homeDir,
+				cwd: project,
+			});
+			let agents = "";
+			try {
+				agents = await fs.readFile(path.join(project, ".gjc", "AGENTS.md"), "utf-8");
+			} catch {}
+			if (report.ok !== false) process.exit(2);
+			if (agents.length > 0) process.exit(3);
+			const refused = report.actions.some(action => action.type === "source" && action.status === "failed_io");
+			process.exit(refused ? 0 : 4);
+		`;
+		const child = Bun.spawn([process.execPath, "-e", script], {
+			cwd: path.join(import.meta.dir, "../../.."),
+			env: { ...process.env, MIGRATE_CWD: cwd, MIGRATE_HOME: home },
+			stdout: "ignore",
+			stderr: "pipe",
+		});
 		let timer: ReturnType<typeof setTimeout> | undefined;
-		const result = await Promise.race([
-			readSourceText(fifo, "claude-code", "instruction", cwd).finally(() => {
-				if (timer) clearTimeout(timer);
-			}),
-			new Promise<string>(resolve => {
-				timer = setTimeout(() => resolve("blocked"), 1500);
+		const finished = await Promise.race([
+			child.exited.then(() => "exited" as const),
+			new Promise<"timeout">(resolve => {
+				timer = setTimeout(() => resolve("timeout"), 5000);
 			}),
 		]);
 		if (timer) clearTimeout(timer);
-		expect(result).not.toBe("blocked");
-		expect(result).toMatchObject({ diagnostic: { status: "failed_io" } });
+		if (finished === "timeout") {
+			child.kill(9);
+			await child.exited;
+		}
+		const stderr = child.stderr ? await new Response(child.stderr).text() : "";
+		expect(finished, stderr).toBe("exited");
+		expect(child.exitCode, stderr).toBe(0);
 	});
 
 	test("property: migrate source containment stays inside the root, fc.property seed 17011, numRuns 64", async () => {
