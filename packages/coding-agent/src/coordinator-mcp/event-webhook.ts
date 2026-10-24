@@ -111,7 +111,7 @@ const WEBHOOK_BACKOFF_CAP_MS = 15_000;
 const WEBHOOK_ERROR_CAP = 240;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
 
-function isLoopbackHttpWebhook(rawUrl: string): boolean {
+export function isLoopbackHttpWebhook(rawUrl: string): boolean {
 	let parsed: URL;
 	try {
 		parsed = new URL(rawUrl);

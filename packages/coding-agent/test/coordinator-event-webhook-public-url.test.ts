@@ -28,6 +28,17 @@ function outbox(dir: string, eventId: string): string {
 	return path.join(dir, "webhook-outbox", `${createHash("sha256").update(eventId).digest("hex")}.json`);
 }
 
+function expectedLoopbackHttpWebhook(rawUrl: string): boolean {
+	let parsed: URL;
+	try {
+		parsed = new URL(rawUrl);
+	} catch {
+		return false;
+	}
+	const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+	return parsed.protocol === "http:" && (hostname === "127.0.0.1" || hostname === "::1" || hostname === "localhost");
+}
+
 function mockFetchOk() {
 	return spyOn(globalThis, "fetch").mockImplementation(
 		(async () => new Response("ok", { status: 200 })) as unknown as typeof fetch,
@@ -308,6 +319,41 @@ describe("event webhook public destinations", () => {
 				fetchSpy.mockRestore();
 			}
 		});
+	});
+
+	it("classifies http loopback separately from other webhook urls", async () => {
+		const mod = await import("../src/coordinator-mcp/event-webhook");
+		const classify = mod.isLoopbackHttpWebhook;
+		expect(typeof classify).toBe("function");
+		fc.assert(
+			fc.property(
+				fc.constantFrom("http", "https", "HTTP", "ftp"),
+				fc.constantFrom(
+					"127.0.0.1",
+					"LOCALHOST",
+					"localhost",
+					"[::1]",
+					"[0:0:0:0:0:0:0:1]",
+					"1.1.1.1",
+					"10.0.0.1",
+					"example.test",
+				),
+				fc.constantFrom("", ":80", ":443", ":9"),
+				fc.constantFrom("/", "/hook"),
+				fc.constantFrom("plain", "spaced"),
+				(scheme, host, port, path, shape) => {
+					const raw =
+						shape === "spaced" ? ` ${scheme}://${host}${port}${path}` : `${scheme}://${host}${port}${path}`;
+					expect(classify("http://127.0.0.1/hook")).toBe(true);
+					expect(classify("HTTP://LOCALHOST:80/hook")).toBe(true);
+					expect(classify("http://[::1]:9/")).toBe(true);
+					expect(classify("https://127.0.0.1/hook")).toBe(false);
+					expect(classify("https://[::1]/")).toBe(false);
+					expect(classify(raw)).toBe(expectedLoopbackHttpWebhook(raw));
+				},
+			),
+			{ seed: 4352027, numRuns: 64 },
+		);
 	});
 
 	it("matches the public address check for https literals", async () => {
