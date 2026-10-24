@@ -103,6 +103,39 @@ describe("agent settings pending-retirement marker", () => {
 		},
 	);
 
+	test.skipIf(process.platform === "win32" || !symlinkAllowed)(
+		"a symlinked pending-retirement marker does not retire an edited settings.json",
+		async () => {
+			const home = await tempDir();
+			const cwd = await tempDir();
+			const outside = await tempDir();
+			const { agentDir, settingsPath } = await setupAgent(home);
+			const edited = JSON.stringify({ "gjc.ralplan.maxIterations": 9 });
+			await fs.writeFile(settingsPath, edited, { mode: 0o600 });
+			await fs.writeFile(
+				path.join(agentDir, "config.yml"),
+				"configSchemaVersion: 2\ngjc:\n  ralplan:\n    maxIterations: 7\n",
+			);
+			const victim = path.join(outside, "victim-marker");
+			const staleHash = nodeCrypto
+				.createHash("sha256")
+				.update(JSON.stringify({ "gjc.ralplan.maxIterations": 7 }))
+				.digest("hex");
+			await fs.writeFile(victim, staleHash, { mode: 0o600 });
+			await fs.symlink(victim, path.join(agentDir, "settings.json.pending-retirement"));
+
+			await loadAgentSettings(cwd, home);
+
+			expect(await fs.readFile(victim, "utf8")).toBe(staleHash);
+			expect(await fs.readFile(settingsPath, "utf8")).toBe(edited);
+			expect(await fs.stat(`${settingsPath}.bak`).catch(() => null)).toBeNull();
+			const config = await fs.readFile(path.join(agentDir, "config.yml"), "utf8");
+			expect(config).toContain("maxIterations: 7");
+			expect(config).not.toContain("maxIterations: 9");
+			expect((await fs.lstat(path.join(agentDir, "settings.json.pending-retirement"))).isSymbolicLink()).toBe(true);
+		},
+	);
+
 	test.skipIf(process.platform === "win32")(
 		"an existing mode 0666 pending-retirement marker is rewritten to mode 0600",
 		async () => {

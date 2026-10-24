@@ -2674,12 +2674,15 @@ export class Settings implements NotificationSettingsReader {
 			await this.#storage?.clearSettings();
 			logger.debug("Settings: migrated to config.yml", { path: this.#configPath });
 		}
-		// The combined migration committed (database validated and the merged
-		// values published): retire the settings.json source now. Any earlier
-		// failure path (malformed database row, unreadable marker, drain
-		// failure) returns above with the source still in place for the next
-		// load.
-		if (settingsJsonRetirementPending || (await this.#pathExists(`${settingsJsonPath}.pending-retirement`))) {
+		// Retire settings.json only when this load could publish the current
+		// bytes. A rejected pending-marker write leaves the marker flag false
+		// and skips publication; path presence in an older config.yml is not
+		// those bytes. Keep the source active for the next load. A persisted
+		// marker is the gate that lets publication run before retirement.
+		if (
+			(!settingsJsonRetirementPending || settingsJsonMarkerPersisted) &&
+			(settingsJsonRetirementPending || (await this.#pathExists(`${settingsJsonPath}.pending-retirement`)))
+		) {
 			// Revalidate the source BEFORE retiring it: an edit or replacement
 			// after the bytes were read but while this method awaited database
 			// retries, the config transaction, or the drain must NOT be moved to
