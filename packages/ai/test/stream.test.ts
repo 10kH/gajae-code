@@ -1294,7 +1294,6 @@ describe("Generate E2E Tests", () => {
 				{ retry: 3 },
 			);
 
-			// FIXME: the prior thinking probe reported HTTP 422; verify with the official SDK.
 			// Historical sketch, not validated current API syntax or capability evidence:
 			// const llm = getModel("mistral", "magistral-medium-latest");
 			// await handleThinking(llm, { reasoningEffort: "medium" });
