@@ -12,21 +12,23 @@ const PROBE = path.join(import.meta.dir, "../fixtures/settings-workflow-migratio
 const temporaryDirectories: string[] = [];
 
 function symlinkCreationAllowed(): boolean {
-	if (process.platform === "win32") return false;
 	const directory = fsSync.mkdtempSync(path.join(os.tmpdir(), "gjc-symlink-probe-"));
 	try {
 		fsSync.symlinkSync("target", path.join(directory, "link"));
 		return true;
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
-		if (code === "EPERM" || code === "EACCES") return false;
+		const denied = code === "EPERM" || code === "EACCES";
+		if (denied) {
+			return false;
+		}
 		throw error;
 	} finally {
 		fsSync.rmSync(directory, { recursive: true, force: true });
 	}
 }
 
-const symlinkAllowed = symlinkCreationAllowed();
+const symlinkAllowed = process.platform === "win32" ? false : symlinkCreationAllowed();
 
 async function tempDir(): Promise<string> {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-retirement-"));
