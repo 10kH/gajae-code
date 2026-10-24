@@ -313,12 +313,18 @@ function resolveLiveCredentialEnvValue(name: string): string | undefined {
  * It is not a project setting: foreground `gjc sdk broker run` loads dotenv
  * in-process, and a repository-controlled true value must not be treated as
  * evidence that this process is that binary.
+ * `GJC_SDK_DISABLE=1` is the operator opt-out for SDK hosting. Session startup
+ * and the harness owner read it from the process environment after this module
+ * loads, and they copy a value that is still set into the child environment.
+ * A repository `.env` must not install it. A shell export is kept unless it is
+ * the same string the project declares.
  */
 const PROJECT_DENIED_ENV_NAMES = [
 	"NODE_TLS_REJECT_UNAUTHORIZED",
 	"GJC_HARNESS_SOCKET_DIR",
 	"GJC_HARNESS_ROOT_REGISTRY_DIR",
 	"PI_COMPILED",
+	"GJC_SDK_DISABLE",
 ] as const;
 
 // Bun may have loaded cwd/.env before JS runs. Drop a value the project declares
