@@ -13,6 +13,7 @@ import * as path from "node:path";
  * string the project declares, or the project declaration is dynamic.
  * A dynamic declaration drops a different shell value too, because the
  * source is ambiguous. A static project value that disagrees is kept.
+ * An escaped dollar is a literal, so it does not drop a different shell value.
  */
 
 const PROBE = path.join(import.meta.dir, "fixtures", "sdk-disable-env-probe.ts");
@@ -95,6 +96,10 @@ describe.each([
 
 	it("keeps an operator opt-out when the project declares a different value", async () => {
 		expect(await resolveIn(tempDir({ ".env": `${KEY}=0\n` }), { autoload, inherited: "1" })).toBe("1");
+	});
+
+	it("keeps an operator opt-out when the project value is an escaped dollar", async () => {
+		expect(await resolveIn(tempDir({ ".env": `${KEY}=\\$UNSET\n` }), { autoload, inherited: "1" })).toBe("1");
 	});
 
 	it("keeps a shell value with surrounding whitespace", async () => {
