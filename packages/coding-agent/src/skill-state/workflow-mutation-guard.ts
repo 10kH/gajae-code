@@ -1941,7 +1941,12 @@ function pythonSystemCommand(script: string, start: number): string | undefined 
 	return undefined;
 }
 
-function collectPythonSystemWrites(script: string, targets: ExtractedTargets, depth: number): void {
+function collectPythonSystemWrites(
+	script: string,
+	targets: ExtractedTargets,
+	depth: number,
+	perlStartupConfigured: boolean,
+): void {
 	const calls = pythonSystemCallArguments(script);
 	if (calls.unclassifiable) {
 		targets.explicitMutation = true;
@@ -1954,7 +1959,7 @@ function collectPythonSystemWrites(script: string, targets: ExtractedTargets, de
 			targets.unknown = true;
 			continue;
 		}
-		const nested = extractBashTargets({ command: payload }, depth + 1);
+		const nested = extractBashTargets({ command: payload }, depth + 1, perlStartupConfigured);
 		for (const nestedPath of nested.paths) addPath(targets, nestedPath);
 		if (nested.unknown) {
 			targets.explicitMutation = true;
@@ -2060,7 +2065,12 @@ function cleanInterpreterCodeWord(word: string): string | undefined {
 	return decoded;
 }
 
-function collectInterpreterOneLinerWrites(command: string, targets: ExtractedTargets, depth: number): void {
+function collectInterpreterOneLinerWrites(
+	command: string,
+	targets: ExtractedTargets,
+	depth: number,
+	perlStartupConfigured: boolean,
+): void {
 	const api = new RegExp(BASH_INTERPRETER_WRITE_API, "i");
 	const names = new RegExp(
 		`(?:^|[;&|\\n])\\s*(?:(?:if|then|else|elif|do|in|while|until)\\s+)*(?:!\\s+)?(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(?:busybox\\s+)?(python(?:\\d+(?:\\.\\d+)*)?|pypy(?:\\d+(?:\\.\\d+)*)?|node(?:js)?|bun|deno|ruby|jruby|perl|php(?:\\d+(?:\\.\\d+)*)?|lua(?:\\d+(?:\\.\\d+)*)?|bash|ash|sh|zsh|dash|ksh|fish)\\b`,
@@ -2072,9 +2082,29 @@ function collectInterpreterOneLinerWrites(command: string, targets: ExtractedTar
 		const words = shellWords(tail);
 		const parts = words.map(cleanShellWord);
 		const binary = (match[1] ?? "").toLowerCase();
+		if (binary === "perl") {
+			if (perlStartupConfigured) {
+				targets.explicitMutation = true;
+				targets.unknown = true;
+				return;
+			}
+			// shellWords does not decode unquoted escapes in interpreter options.
+			for (const escapeMatch of tail.matchAll(/\\/g)) {
+				if (!shellSyntaxPosition(tail, escapeMatch.index)) continue;
+				targets.explicitMutation = true;
+				targets.unknown = true;
+				return;
+			}
+		}
 		const options = interpreterCodeOptions(binary);
 		for (let index = 0; index < parts.length; index++) {
 			const part = parts[index] ?? "";
+			// Module/debugger switches, including bundled -wM, run unscanned code.
+			if (binary === "perl" && /^-[^eEImMd]*[mMd]/.test(part)) {
+				targets.explicitMutation = true;
+				targets.unknown = true;
+				return;
+			}
 			let rawScript: string | undefined;
 			const option = options.find(
 				candidate =>
@@ -2116,7 +2146,7 @@ function collectInterpreterOneLinerWrites(command: string, targets: ExtractedTar
 					targets.unknown = true;
 					return;
 				}
-				const nested = extractBashTargets({ command: script }, depth + 1);
+				const nested = extractBashTargets({ command: script }, depth + 1, perlStartupConfigured);
 				for (const nestedPath of nested.paths) addPath(targets, nestedPath);
 				if (nested.unknown) targets.unknown = true;
 				if (nested.explicitMutation) targets.explicitMutation = true;
@@ -2137,7 +2167,7 @@ function collectInterpreterOneLinerWrites(command: string, targets: ExtractedTar
 					targets.explicitMutation = true;
 					targets.unknown = true;
 				}
-				collectPythonSystemWrites(script, targets, depth);
+				collectPythonSystemWrites(script, targets, depth, perlStartupConfigured);
 				continue;
 			}
 			if (interpreterCodeContainsWriteApi(script, language, api)) {
@@ -2207,6 +2237,7 @@ function interpreterCodeContainsWriteApi(
 			const next = skipOtherInterpreterNoise(script, index);
 			if (next !== index) {
 				const skipped = script.slice(index, next);
+				if (language === "perl" && script[index] === '"' && /(?:^|[^\\])(?:\\\\)*[$@]/.test(skipped)) return true;
 				if (language === "ruby" && script[index] !== "'" && skipped.includes("#{") && api.test(skipped))
 					return true;
 				index = next;
@@ -2216,11 +2247,19 @@ function interpreterCodeContainsWriteApi(
 		if (INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE.test(script.slice(index))) return true;
 		if (language === "py" && PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))) return true;
 		if (language === "js" && JAVASCRIPT_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))) return true;
-		if (language === "perl" && /^open\b/.test(script.slice(index))) {
+		// Perl imports can shadow even a bare open with an unscanned routine.
+		if (
+			language === "perl" &&
+			/^(?:use|no)\b/.test(script.slice(index)) &&
+			!/[\p{ID_Continue}:'$@%&]$/u.test(script.slice(0, index))
+		)
+			return true;
+		const perlOpen = language === "perl" ? /^(?:CORE::)?open\b/.exec(script.slice(index)) : null;
+		if (perlOpen) {
 			// Both `open(...)` and the list form `open H, MODE, EXPR` matter; only an
 			// explicit read mode is safe, and an unparsed open fails closed.
 			if (!isReadOnlyPerlOpen(script, index)) return true;
-			index += "open".length;
+			index += perlOpen[0].length;
 			continue;
 		}
 		if (apiAtStart.test(script.slice(index))) {
@@ -2247,69 +2286,69 @@ function interpreterCodeContainsWriteApi(
  * (write/pipe modes, a variable mode, or an unparsed statement) fails closed.
  */
 function isReadOnlyPerlOpen(script: string, index: number): boolean {
+	const prefix = script.slice(0, index);
+	// Custom functions and methods can ignore a read-looking mode operand.
+	if (/[\p{ID_Continue}:'$@%&]$/u.test(prefix) || /(?:->|::|&)\s*(?:#[^\n]*\n\s*)*$/.test(prefix)) return false;
 	const rest = script.slice(index);
-	if (!/^open\b/.test(rest)) return false;
-	const parenthesized = /^open\s*\(/.exec(rest);
-	const body = parenthesized ? rest.slice(parenthesized[0].length) : rest.slice("open".length);
-	const statementEnd = body.search(/[;\n}]/);
-	const statement = statementEnd < 0 ? body : body.slice(0, statementEnd);
-
-	// Parse arguments properly: count commas to find the MODE position (second argument)
-	// and extract only that argument.
-	let depth = 0;
-	let inString = false;
+	const open = /^(?:CORE::)?open\b/.exec(rest);
+	if (!open) return false;
+	const parenthesized = /^(?:CORE::)?open\s*\(/.exec(rest);
+	const body = parenthesized ? rest.slice(parenthesized[0].length) : rest.slice(open[0].length);
+	const delimiters: string[] = [];
 	let stringChar = "";
-	let commaCount = 0;
 	let modeStart = -1;
 	let modeEnd = -1;
+	let end = body.length;
+	let closed = !parenthesized;
 
-	for (let i = 0; i < statement.length; i++) {
-		const ch = statement[i];
+	for (let i = 0; i < body.length; i++) {
+		const ch = body[i];
 
-		if (inString) {
-			if (ch === "\\" && i + 1 < statement.length) {
-				i++; // skip escape sequence
+		if (stringChar) {
+			if (ch === "\\" && i + 1 < body.length) {
+				i++;
 				continue;
 			}
-			if (ch === stringChar) {
-				inString = false;
-			}
+			if (ch === stringChar) stringChar = "";
 			continue;
 		}
 
 		if (ch === "'" || ch === '"') {
-			inString = true;
 			stringChar = ch;
 			continue;
 		}
 
-		if (ch === "(") depth++;
-		else if (ch === ")") depth--;
-		else if (ch === "," && depth === 0) {
-			commaCount++;
-			if (commaCount === 1) {
-				// This comma separates first and second arguments
-				modeStart = i + 1;
-			}
-			if (commaCount === 2) {
-				// This comma ends the mode argument
-				modeEnd = i;
+		if (ch === "#" || ch === "`") return false;
+		if (ch === "(" || ch === "[" || ch === "{") delimiters.push(ch);
+		else if (ch === ")" || ch === "]" || ch === "}") {
+			if (delimiters.length === 0) {
+				if (ch !== ")" && (parenthesized || ch !== "}")) return false;
+				end = i;
+				closed = ch === ")" || !parenthesized;
 				break;
 			}
+			if (delimiters.pop() !== ({ ")": "(", "]": "[", "}": "{" } as const)[ch]) return false;
+		} else if (ch === ";" && delimiters.length === 0) {
+			end = i;
+			break;
+		} else if (ch === "," && delimiters.length === 0) {
+			if (modeStart < 0) modeStart = i + 1;
+			else if (modeEnd < 0) modeEnd = i;
+			else return false;
 		}
 	}
 
-	if (modeStart === -1) return false; // Can't find MODE argument
-	if (modeEnd === -1) modeEnd = statement.length;
-
-	const modeArg = statement.slice(modeStart, modeEnd).trim();
-
-	// Extract the mode value if it's a quoted string; if it's a variable, fail closed
-	const quotedMode = /^(['"])(.*?)\1$/.exec(modeArg);
-	if (!quotedMode) return false; // Variable mode, fail closed
-
-	const mode = quotedMode[2].trim();
-	return mode.startsWith("<") && !mode.startsWith("<+");
+	if (!closed || delimiters.length !== 0 || stringChar || modeStart < 0) return false;
+	if (
+		!/^(?:(?:my|our|local)\s+)?[$*]?(?:::)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*$/.test(body.slice(0, modeStart - 1).trim())
+	)
+		return false;
+	if (modeEnd >= 0 && !body.slice(modeEnd + 1, end).trim()) return false;
+	const modeArg = body.slice(modeStart, modeEnd < 0 ? end : modeEnd).trim();
+	const quotedMode = /^(?:'((?:[^'\\]|\\\\)*)'|"((?:[^"\\$@]|\\\\)*)")$/.exec(modeArg);
+	if (!quotedMode) return false;
+	const mode = (quotedMode[1] ?? quotedMode[2]).trim();
+	return mode.startsWith("<") && !mode.startsWith("<+") && !mode.includes("|");
 }
 
 function skipJavaScriptTemplate(script: string, index: number): number {
@@ -2926,14 +2965,55 @@ function collectAwkProgramWrites(command: string, targets: ExtractedTargets): vo
 	}
 }
 
-function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
+function hasPerlStartupAssignment(dequotedView: string): boolean {
+	return commandListSegments(dequotedView.replace(/([<>])&(?=\s*(?:\d|-))/g, "$1")).some(segment => {
+		const command = commandPositionWords(segment)[0];
+		if (command && ["export", "declare", "typeset", "local", "readonly"].includes(command))
+			return /(?:^|\s)PERL5(?:OPT|DB)[=_]/.test(segment);
+		let operand = false;
+		let wrapper = false;
+		let env = false;
+		for (const word of segment.trim().split(/\s+/)) {
+			if (operand) {
+				operand = false;
+				continue;
+			}
+			if (SHELL_REDIRECTION_TOKEN_RE.test(word)) {
+				operand = /^\d*[<>]+$/.test(word);
+				continue;
+			}
+			if (SHELL_RESERVED_PREFIX_WORDS.has(word)) continue;
+			if (SHELL_COMMAND_WRAPPER_WORDS.has(word) || word === "env") {
+				wrapper = true;
+				env ||= word === "env";
+				continue;
+			}
+			if (wrapper && word.startsWith("-")) {
+				operand = ["-n", "-u", "--unset", "-C", "--chdir", "-a", "--argv0"].includes(word);
+				continue;
+			}
+			if (env && /^PERL5(?:OPT|DB)[=_]/.test(word)) return true;
+			if (!/^\w+=/.test(word)) break;
+			if (/^PERL5(?:OPT|DB)=/.test(word)) return true;
+		}
+		return false;
+	});
+}
+
+function extractBashTargets(args: unknown, depth = 0, perlStartupConfigured = false): ExtractedTargets {
 	const record = getRecord(args);
 	const command = safeString(record?.command);
+	const env = getRecord(record?.env);
 	const targets: ExtractedTargets = { paths: [], unknown: false };
 	if (!command.trim()) {
 		targets.unknown = true;
 		return targets;
 	}
+	const heredoc = maskHeredocBodies(command);
+	const scanned = maskQuotedSpans(heredoc.masked);
+	perlStartupConfigured ||=
+		Boolean(env?.PERL5OPT || env?.PERL5DB || process.env.PERL5OPT || process.env.PERL5DB) ||
+		hasPerlStartupAssignment(scanned.dequoted);
 	// A literal `sh|bash|zsh -c '<script>'` payload is a real command list. Its
 	// mutations never match the top-level patterns, so recurse into it; anything
 	// deeper than a bounded depth is not statically analyzable and fails closed.
@@ -2943,7 +3023,7 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 			targets.unknown = true;
 			break;
 		}
-		const nested = extractBashTargets({ command: match[2] ?? match[4] ?? "" }, depth + 1);
+		const nested = extractBashTargets({ command: match[2] ?? match[4] ?? "" }, depth + 1, perlStartupConfigured);
 		for (const nestedPath of nested.paths) addPath(targets, nestedPath);
 		if (nested.unknown) targets.unknown = true;
 		if (nested.explicitMutation) targets.explicitMutation = true;
@@ -2953,14 +3033,13 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 	// so `echo "$(rm -rf src/x.ts)"` would otherwise scan clean. Heredoc masking
 	// removes literal data-consumer bodies first; the extractor then ignores
 	// inert `#` tails without touching quote/escape bytes needed by extraction.
-	const heredoc = maskHeredocBodies(command);
 	for (const substitution of extractSubstitutionBodies(heredoc.masked)) {
 		if (depth >= 2 || !substitution.balanced) {
 			targets.explicitMutation = true;
 			targets.unknown = true;
 			break;
 		}
-		const nested = extractBashTargets({ command: substitution.body }, depth + 1);
+		const nested = extractBashTargets({ command: substitution.body }, depth + 1, perlStartupConfigured);
 		for (const nestedPath of nested.paths) addPath(targets, nestedPath);
 		if (nested.unknown) targets.unknown = true;
 		if (nested.explicitMutation) targets.explicitMutation = true;
@@ -2976,7 +3055,6 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 	// uses the quote-preserving syntax view; command extraction uses its
 	// dequoted executable-word view so quoted operands and split command words
 	// remain visible without turning prose into syntax.
-	const scanned = maskQuotedSpans(heredoc.masked);
 	if (scanned.unmodeled) {
 		// A live substitution construct we cannot balance (for example a
 		// `case` pattern whose `)` is not the substitution close) must never
@@ -3068,7 +3146,7 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 	}
 	// `sed w file` and `s///w file` write without `-i`. `awk 'print > "file"'`
 	// writes inside the program, which is not a shell redirection.
-	collectInterpreterOneLinerWrites(heredoc.masked, targets, depth);
+	collectInterpreterOneLinerWrites(heredoc.masked, targets, depth, perlStartupConfigured);
 	collectSedScriptWrites(heredoc.masked, targets);
 	collectAwkProgramWrites(heredoc.masked, targets);
 	return targets;
