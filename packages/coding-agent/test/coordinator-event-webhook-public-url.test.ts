@@ -29,7 +29,9 @@ function outbox(dir: string, eventId: string): string {
 }
 
 function mockFetchOk() {
-	return spyOn(globalThis, "fetch").mockImplementation(async () => new Response("ok", { status: 200 }));
+	return spyOn(globalThis, "fetch").mockImplementation(
+		(async () => new Response("ok", { status: 200 })) as unknown as typeof fetch,
+	);
 }
 
 async function withoutProxy<T>(run: () => Promise<T>): Promise<T> {
@@ -290,12 +292,15 @@ describe("event webhook public destinations", () => {
 
 	it("posts a resolved public address instead of the original hostname", async () => {
 		await withoutProxy(async () => {
-			const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+			const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async (
+				input: Parameters<typeof fetch>[0],
+				init?: Parameters<typeof fetch>[1],
+			) => {
 				const href = input instanceof URL ? input.href : String(input);
 				expect(new URL(href).hostname).toBe("1.1.1.1");
 				expect(new Headers(init?.headers).get("host")).toBe("sink.example.test");
 				return new Response("ok", { status: 200 });
-			});
+			}) as unknown as typeof fetch);
 			try {
 				const outcome = await post("https://sink.example.test/hook", { resolver: async () => ["1.1.1.1"] });
 				expect(outcome.ok).toBe(true);
