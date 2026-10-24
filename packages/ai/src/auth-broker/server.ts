@@ -559,18 +559,24 @@ function serveSnapshotStream(
 export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServerHandle {
 	const bind = parseBind(opts.bind ?? DEFAULT_AUTH_BROKER_BIND);
 	let tokens = new Set<string>(opts.bearerTokens);
+	let bearerReadSerial = 0;
+	let bearerPublishedSerial = 0;
 	assertAuthenticatedOrLoopback(bind, tokens.size, "auth-broker");
 	async function bearerAllowList(signal: AbortSignal): Promise<ReadonlySet<string>> {
 		const read = opts.readBearerTokens;
 		if (!read || signal.aborted) return tokens;
+		const serial = ++bearerReadSerial;
 		let next: readonly string[];
 		try {
 			next = await read();
 		} catch {
 			return tokens;
 		}
-		if (signal.aborted || next.length === 0) return tokens;
+		// A read that started earlier must not replace a list already published
+		// by a later read, and this request authenticates with that current list.
+		if (signal.aborted || next.length === 0 || serial < bearerPublishedSerial) return tokens;
 		tokens = new Set(next);
+		bearerPublishedSerial = serial;
 		return tokens;
 	}
 	const version = opts.version;

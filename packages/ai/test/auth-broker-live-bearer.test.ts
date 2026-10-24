@@ -96,6 +96,52 @@ describe("auth-broker live bearer allow-list", () => {
 		expect(await metadataStatus(fixture.handle.url, "other-bearer")).toBe(401);
 	});
 
+	test("refuses a stale bearer read that finishes after a replacement", async () => {
+		let releaseStale: (value: readonly string[]) => void = () => {
+			throw new Error("stale read was not armed");
+		};
+		const stale = new Promise<readonly string[]>(resolve => {
+			releaseStale = resolve;
+		});
+		let holdFirst = true;
+		let markStarted: () => void = () => {};
+		const started = new Promise<void>(resolve => {
+			markStarted = resolve;
+		});
+		let mode: "replacement" | "empty" | "throw" = "replacement";
+		const fixture = await startBroker({
+			bearerTokens: ["boot-bearer"],
+			readBearerTokens: () => {
+				if (holdFirst) {
+					holdFirst = false;
+					markStarted();
+					return stale;
+				}
+				if (mode === "replacement") return ["rotated-bearer"];
+				if (mode === "empty") return [];
+				throw new Error("token file unreadable");
+			},
+		});
+
+		const late = metadataStatus(fixture.handle.url, "boot-bearer");
+		const which = await Promise.race([started.then(() => "started" as const), late.then(() => "settled" as const)]);
+		expect(await metadataStatus(fixture.handle.url, "rotated-bearer")).toBe(200);
+		if (which === "started") {
+			releaseStale(["boot-bearer"]);
+			expect(await late).toBe(401);
+			expect(await metadataStatus(fixture.handle.url, "boot-bearer")).toBe(401);
+			expect(await metadataStatus(fixture.handle.url, "rotated-bearer")).toBe(200);
+
+			mode = "empty";
+			expect(await metadataStatus(fixture.handle.url, "boot-bearer")).toBe(401);
+			expect(await metadataStatus(fixture.handle.url, "rotated-bearer")).toBe(200);
+
+			mode = "throw";
+			expect(await metadataStatus(fixture.handle.url, "boot-bearer")).toBe(401);
+			expect(await metadataStatus(fixture.handle.url, "rotated-bearer")).toBe(200);
+		}
+	});
+
 	test("still allows the boot bearer when the reader cannot load a replacement", async () => {
 		const fixture = await startBroker({
 			bearerTokens: ["boot-bearer"],
