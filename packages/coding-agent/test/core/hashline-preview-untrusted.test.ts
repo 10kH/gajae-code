@@ -83,8 +83,11 @@ async function truncateFramed(
 	} as AgentToolContext;
 	const wrapped = wrapToolWithMetaNotice({
 		name: "edit",
+		label: "Edit",
+		description: "edit",
+		parameters: {},
 		execute: async () => produced,
-	} as AgentTool);
+	} as unknown as AgentTool);
 	const result = await wrapped.execute("edit-trunc", {}, undefined, undefined, context);
 	const raw = toolText(result);
 	const excerpt = stripOutputNotice(raw, result.details?.meta).trimEnd();
