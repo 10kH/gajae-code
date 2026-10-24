@@ -454,6 +454,16 @@ function frameStoredLocalExecution(text: string): string {
 }
 
 /**
+ * Frame debug tool text at the model boundary. Output capture and pre-admission
+ * spill already cut the excerpt; do not slice this string again.
+ */
+function frameDebugToolResult(message: ToolResultMessage): (TextContent | ImageContent)[] {
+	const content = getPrunedToolResultContent(message);
+	if (message.toolName !== "debug") return content;
+	return content.map(block => (block.type === "text" ? { ...block, text: wrapUntrustedContent(block.text) } : block));
+}
+
+/**
  * Transform AgentMessages (including custom types) to LLM-compatible Messages.
  *
  * This is used by:
@@ -555,7 +565,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 				case "toolResult":
 					return {
 						...m,
-						content: getPrunedToolResultContent(m as ToolResultMessage),
+						content: frameDebugToolResult(m as ToolResultMessage),
 						attribution: m.attribution ?? "agent",
 					};
 				default:
