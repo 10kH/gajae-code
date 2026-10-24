@@ -37,7 +37,7 @@ function formatSchema(schema: unknown): string {
 }
 
 /** Model-facing schema prose cap, including the untrusted-content fence. */
-export const YIELD_SCHEMA_TEXT_MAX_BYTES = 4096;
+const YIELD_SCHEMA_TEXT_MAX_BYTES = 4096;
 
 const SCHEMA_PROSE_KEYS = new Set(["description", "title", "$comment"]);
 const SCHEMA_LITERAL_KEYS = new Set(["default", "const", "enum", "examples", "example"]);

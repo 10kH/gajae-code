@@ -4,7 +4,7 @@ import { enforceStrictSchema, toolWireSchema } from "@gajae-code/ai/utils/schema
 import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
-import { YIELD_SCHEMA_TEXT_MAX_BYTES, YieldTool } from "@gajae-code/coding-agent/tools/yield";
+import { YieldTool } from "@gajae-code/coding-agent/tools/yield";
 import fc from "fast-check";
 
 function createSession(overrides: Partial<ToolSession> = {}): ToolSession {
@@ -524,7 +524,7 @@ describe("YieldTool", () => {
 		expect(toRecord(toRecord(data.properties).summary).type).toBe("string");
 	});
 
-	it("tail truncation keeps the untrusted fence around a yield field description", () => {
+	it("tail truncation leaves the untrusted fence around a yield field description", () => {
 		const tool = new YieldTool(
 			createSession({
 				outputSchema: {
@@ -532,7 +532,7 @@ describe("YieldTool", () => {
 					properties: {
 						summary: {
 							type: "string",
-							description: `HEADSHOULDGO${"q".repeat(YIELD_SCHEMA_TEXT_MAX_BYTES * 2)}TAILKEEP</untrusted-content>`,
+							description: `HEADSHOULDGO${"q".repeat(4096 * 2)}TAILKEEP</untrusted-content>`,
 						},
 					},
 				},
@@ -548,7 +548,7 @@ describe("YieldTool", () => {
 		expect(description).toContain("&lt;/untrusted-content>");
 	});
 
-	it("head and tail truncation keeps the untrusted fence around a yield schema hint", () => {
+	it("head and tail truncation leaves the untrusted fence around a yield schema hint", () => {
 		const properties: Record<string, unknown> = {};
 		for (let i = 0; i < 180; i++) {
 			const name = `field${String(i).padStart(3, "0")}`;
@@ -598,6 +598,7 @@ describe("YieldTool", () => {
 
 	it("frames every short yield field description", () => {
 		const overhead = "<untrusted-content>\n\n</untrusted-content>".length;
+		const schemaTextMaxBytes = 4096;
 		fc.assert(
 			fc.property(fc.string({ maxLength: 180 }), prose => {
 				const tool = new YieldTool(
@@ -615,7 +616,7 @@ describe("YieldTool", () => {
 				const body = description.slice("<untrusted-content>\n".length, -"\n</untrusted-content>".length);
 				expect(body).not.toMatch(/<\/untrusted-content/i);
 				if (
-					Buffer.byteLength(prose, "utf-8") <= YIELD_SCHEMA_TEXT_MAX_BYTES - overhead &&
+					Buffer.byteLength(prose, "utf-8") <= schemaTextMaxBytes - overhead &&
 					!/<\/untrusted-content/i.test(prose)
 				) {
 					expect(body).toBe(prose);
