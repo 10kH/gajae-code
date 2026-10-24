@@ -446,6 +446,31 @@ export function wrapUntrustedContent(content: string): string {
 }
 
 /**
+ * Break reserved prompt tags in workspace rule text so a rule file cannot close
+ * `<system-interrupt>` or `<system-reminder>`. Ordinary markup such as `<Button>`
+ * stays intact.
+ */
+export function neutralizeReservedPromptTag(value: string): string {
+	return value.replace(
+		/<\/?\s*(?:system-interrupt|system-reminder|untrusted-content|rules)(?=[\s>/]|$)/gi,
+		tag => `&lt;${tag.slice(1)}`,
+	);
+}
+
+/** Attribute-encode a TTSR name or path, and neutralize reserved tags in the body. */
+export function ttsrPromptFields(rule: { name: string; path: string; content: string }): {
+	name: string;
+	path: string;
+	content: string;
+} {
+	return {
+		name: escapePromptMetadata(rule.name),
+		path: escapePromptMetadata(rule.path),
+		content: neutralizeReservedPromptTag(rule.content),
+	};
+}
+
+/**
  * Frame stored `!` / `$` text at the model boundary. The command runner already
  * cut the excerpt that was recorded; do not slice this string again.
  */
