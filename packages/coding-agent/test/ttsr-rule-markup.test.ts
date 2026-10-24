@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, type AgentTool } from "@gajae-code/agent-core";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { getBundledModel, type Message, type ToolCall, type ToolResultMessage } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
@@ -94,7 +94,7 @@ describe("TTSR rule markup", () => {
 	}
 
 	function createSession(rules: Rule[], options: { streamText?: string; streamToolArgs?: boolean } = {}) {
-		const tool = new WriteTool(createToolSession());
+		const tool = new WriteTool(createToolSession()) as AgentTool;
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const ttsrManager = new TtsrManager({ interruptMode: "never", contextMode: "keep" });
 		for (const rule of rules) ttsrManager.addRule(rule);
@@ -105,7 +105,10 @@ describe("TTSR rule markup", () => {
 				type: "toolCall",
 				id: "write-1",
 				name: "write",
-				arguments: { path: path.join(tempDir, "a.ts"), content: "regex-marker\nexport const value = 1;\n" },
+				arguments: {
+					path: path.join(tempDir, "a.ts"),
+					content: "regex-marker\nexport const value = 1;\n",
+				},
 			},
 		];
 		const agent = new Agent({
