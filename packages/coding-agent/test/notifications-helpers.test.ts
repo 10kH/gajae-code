@@ -3,6 +3,7 @@ import {
 	asksFromAskInput,
 	idleDedupeKey,
 	imageAttachmentsFromMessage,
+	messageRequestsTools,
 	notificationActionPayload,
 	summaryFromMessage,
 	summaryFromMessages,
@@ -103,6 +104,21 @@ describe("notifications helpers", () => {
 		expect(summaryFromMessage({ content: [] })).toBeUndefined();
 		expect(summaryFromMessage(undefined)).toBeUndefined();
 		expect(summaryFromMessage({ content: "   " })).toBeUndefined();
+	});
+
+	test("messageRequestsTools detects tool-call blocks only", () => {
+		expect(
+			messageRequestsTools({
+				content: [
+					{ type: "text", text: "Checking." },
+					{ type: "toolCall", id: "c1", name: "bash", arguments: {} },
+				],
+			}),
+		).toBe(true);
+		expect(messageRequestsTools({ content: [{ type: "text", text: "Done." }] })).toBe(false);
+		expect(messageRequestsTools({ content: "Done." })).toBe(false);
+		expect(messageRequestsTools({ content: [null, "toolCall"] })).toBe(false);
+		expect(messageRequestsTools(undefined)).toBe(false);
 	});
 
 	test("summaryFromMessage truncates long content", () => {

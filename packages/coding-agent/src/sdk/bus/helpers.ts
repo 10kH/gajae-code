@@ -82,6 +82,15 @@ export function summaryFromMessage(message: unknown, max = 280): string | undefi
 	return joined ? truncate(joined, max) : undefined;
 }
 
+/** Whether an assistant message requested tool calls, i.e. the agent loop continues after it. */
+export function messageRequestsTools(message: unknown): boolean {
+	const content = (message as { content?: unknown } | null | undefined)?.content;
+	return (
+		Array.isArray(content) &&
+		content.some(block => block && typeof block === "object" && (block as { type?: unknown }).type === "toolCall")
+	);
+}
+
 /**
  * Extract an idle summary from an `agent_end` event's settled message list: the
  * last message that yields text (i.e. the final assistant message; tool-result
