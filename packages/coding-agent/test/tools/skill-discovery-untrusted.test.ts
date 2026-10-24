@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolContext } from "@gajae-code/agent-core";
+import type { AgentTool, AgentToolContext, AgentToolResult } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createReadonlySessionManager, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
@@ -96,6 +96,20 @@ function spillContext(overrides: Record<string, number>): {
 	};
 }
 
+function asWrapped(tool: SkillDiscoveryTool): AgentTool {
+	return tool as AgentTool;
+}
+
+type FramedResult = {
+	content: Array<{ type: string; text?: string }>;
+	details?: { meta?: Parameters<typeof stripOutputNotice>[1] };
+	isError?: boolean;
+};
+
+function asFramed(result: AgentToolResult): FramedResult {
+	return result as unknown as FramedResult;
+}
+
 function modelExcerpt(result: {
 	content: Array<{ type: string; text?: string }>;
 	details?: { meta?: Parameters<typeof stripOutputNotice>[1] };
@@ -163,13 +177,15 @@ describe("skill_discovery untrusted catalog", () => {
 		const description = `HEADMARKER ${CLOSER} ${"x".repeat(24 * 1024)}`;
 		await writeSkill(cwd, "table-helper", description, `tail-marker format tables ${CLOSER}`);
 		const { context, saved } = spillContext({ "tools.artifactHeadBytes": 0 });
-		const tool = wrapToolWithMetaNotice(new SkillDiscoveryTool(createSession(cwd, home)));
-		const result = await tool.execute(
-			"discover-tail",
-			{ query: "table-helper", source: "project" },
-			undefined,
-			undefined,
-			context,
+		const tool = asWrapped(wrapToolWithMetaNotice(new SkillDiscoveryTool(createSession(cwd, home))));
+		const result = asFramed(
+			await tool.execute(
+				"discover-tail",
+				{ query: "table-helper", source: "project" },
+				undefined,
+				undefined,
+				context,
+			),
 		);
 		expect(result.isError).toBeFalsy();
 		const { raw, excerpt } = modelExcerpt(result);
@@ -194,13 +210,15 @@ describe("skill_discovery untrusted catalog", () => {
 		const description = `HEADMARKER ${CLOSER} ${"y".repeat(24 * 1024)}`;
 		await writeSkill(cwd, "table-helper", description, `tail-marker format tables ${CLOSER}`);
 		const { context, saved } = spillContext({ "tools.artifactHeadBytes": 4 });
-		const tool = wrapToolWithMetaNotice(new SkillDiscoveryTool(createSession(cwd, home)));
-		const result = await tool.execute(
-			"discover-both",
-			{ query: "table-helper", source: "project" },
-			undefined,
-			undefined,
-			context,
+		const tool = asWrapped(wrapToolWithMetaNotice(new SkillDiscoveryTool(createSession(cwd, home))));
+		const result = asFramed(
+			await tool.execute(
+				"discover-both",
+				{ query: "table-helper", source: "project" },
+				undefined,
+				undefined,
+				context,
+			),
 		);
 		expect(result.isError).toBeFalsy();
 		const { raw, excerpt } = modelExcerpt(result);
