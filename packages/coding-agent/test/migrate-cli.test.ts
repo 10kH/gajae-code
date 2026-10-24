@@ -11,16 +11,17 @@ import { renderHuman } from "../src/migrate/report";
 
 function symlinkSupported(): boolean {
 	const probe = fsSync.mkdtempSync(path.join(os.tmpdir(), "migrate-link-probe-"));
+	let supported = true;
 	try {
 		fsSync.symlinkSync("target", path.join(probe, "link"));
-		return true;
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
-		if (code === "EPERM" || code === "EACCES") return false;
-		throw error;
+		if (code !== "EPERM" && code !== "EACCES") throw error;
+		supported = false;
 	} finally {
 		fsSync.rmSync(probe, { recursive: true, force: true });
 	}
+	return supported;
 }
 
 const SYMLINKS = symlinkSupported();
