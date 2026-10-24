@@ -105,7 +105,8 @@ describe("vim tool untrusted frame", () => {
 			expect(body).not.toContain(RAW_CLOSE);
 			expect(body).not.toContain(WS_CLOSE);
 			expect(body).not.toContain(CASE_CLOSE);
-			const shown = (result.details as FramedResult["details"])?.viewportLines?.map(line => line.text).join("\n") ?? "";
+			const shown =
+				(result.details as FramedResult["details"])?.viewportLines?.map(line => line.text).join("\n") ?? "";
 			expect(shown).toContain(RAW_CLOSE);
 			expect(shown).not.toContain(OPEN.trim());
 			expect(await Bun.file(path.join(dir, "evil.ts")).text()).toBe(`${source}\n`);
@@ -120,7 +121,8 @@ describe("vim tool untrusted frame", () => {
 			const text = textOf(result);
 			expect(text).toContain("  export const kept = 1;");
 			expect(text).toContain("const tail = 1;");
-			const shown = (result.details as FramedResult["details"])?.viewportLines?.map(line => line.text).join("\n") ?? "";
+			const shown =
+				(result.details as FramedResult["details"])?.viewportLines?.map(line => line.text).join("\n") ?? "";
 			expect(shown).toContain("  export const kept = 1;");
 			expect(shown).not.toContain("<untrusted-content>");
 			expect(await Bun.file(path.join(dir, "kept.ts")).text()).toBe(source);
