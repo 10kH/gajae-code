@@ -36,32 +36,60 @@ function formatSchema(schema: unknown): string {
 	}
 }
 
-/** Model-facing schema prose cap, including the untrusted-content fence. */
+/** Finished fence, after closer escaping, stays within this many bytes. */
 const YIELD_SCHEMA_TEXT_MAX_BYTES = 4096;
 
 const SCHEMA_PROSE_KEYS = new Set(["description", "title", "$comment"]);
 const SCHEMA_LITERAL_KEYS = new Set(["default", "const", "enum", "examples", "example"]);
+const SCHEMA_MAP_KEYS = new Set([
+	"properties",
+	"patternProperties",
+	"dependencies",
+	"dependentSchemas",
+	"$defs",
+	"definitions",
+]);
+const SCHEMA_LIST_KEYS = new Set(["anyOf", "oneOf", "allOf", "prefixItems"]);
+
+function cutSchemaExcerpt(text: string, budget: number, direction: "tail" | "head-tail"): string {
+	if (budget <= 0) return "";
+	const limits = { maxBytes: budget, maxLines: 10_000 };
+	const cut =
+		direction === "tail"
+			? truncateTail(text, limits)
+			: truncateMiddle(text, {
+					...limits,
+					maxHeadBytes: Math.floor(budget / 2),
+					maxHeadLines: 5_000,
+				});
+	return cut.content;
+}
 
 /**
- * Truncate repository schema text first, then frame it. The fence is the last
- * step so a tail or head-and-tail cut cannot drop the opening tag.
+ * Truncate repository schema text first, then frame it. Closer escaping can grow
+ * the excerpt, so the raw budget shrinks until the finished fence fits. The
+ * fence itself is never sliced.
  */
 function frameYieldSchemaText(text: string, direction: "tail" | "head-tail"): string {
-	const overhead = "<untrusted-content>\n\n</untrusted-content>".length;
-	const budget = Math.max(1, YIELD_SCHEMA_TEXT_MAX_BYTES - overhead);
+	let budget = Buffer.byteLength(text, "utf-8");
 	let excerpt = text;
-	if (Buffer.byteLength(text, "utf-8") > budget) {
-		const limits = { maxBytes: budget, maxLines: 10_000 };
-		excerpt =
-			direction === "tail"
-				? truncateTail(text, limits).content
-				: truncateMiddle(text, {
-						...limits,
-						maxHeadBytes: Math.floor(budget / 2),
-						maxHeadLines: 5_000,
-					}).content;
+	let framed = wrapUntrustedContent(excerpt);
+	while (Buffer.byteLength(framed, "utf-8") > YIELD_SCHEMA_TEXT_MAX_BYTES) {
+		const framedBytes = Buffer.byteLength(framed, "utf-8");
+		const scaled = Math.floor((budget * YIELD_SCHEMA_TEXT_MAX_BYTES) / Math.max(1, framedBytes));
+		const next = Math.max(0, Math.min(budget - 1, scaled));
+		if (next === 0) return wrapUntrustedContent("");
+		budget = next;
+		excerpt = cutSchemaExcerpt(text, budget, direction);
+		framed = wrapUntrustedContent(excerpt);
 	}
-	return wrapUntrustedContent(excerpt);
+	return framed;
+}
+
+function frameSchemaMap(map: Record<string, unknown>, seen: WeakSet<object>): Record<string, unknown> {
+	const output: Record<string, unknown> = {};
+	for (const name of Object.keys(map)) output[name] = frameSchemaProse(map[name], seen);
+	return output;
 }
 
 function frameSchemaProse(value: unknown, seen: WeakSet<object>, keepRootDescription = false): unknown {
@@ -72,6 +100,14 @@ function frameSchemaProse(value: unknown, seen: WeakSet<object>, keepRootDescrip
 	const output: Record<string, unknown> = {};
 	for (const key of Object.keys(value)) {
 		const child = (value as Record<string, unknown>)[key];
+		if (SCHEMA_MAP_KEYS.has(key) && child && typeof child === "object" && !Array.isArray(child)) {
+			output[key] = frameSchemaMap(child as Record<string, unknown>, seen);
+			continue;
+		}
+		if (SCHEMA_LIST_KEYS.has(key) && Array.isArray(child)) {
+			output[key] = child.map(item => frameSchemaProse(item, seen));
+			continue;
+		}
 		if (SCHEMA_LITERAL_KEYS.has(key)) {
 			output[key] = child;
 			continue;
