@@ -113,6 +113,10 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal rollback compensation, not a user-facing SDK control seam",
 	"agent_session:restoreModelSelectionForRollback":
 		"internal rollback compensation, not a user-facing SDK control seam",
+	"agent_session:beginModelSelectionUsage":
+		"internal model-usage ordering slot for a selection transaction, not a user-facing SDK control seam",
+	"agent_session:recordModelSelectionUsage":
+		"internal model-usage bookkeeping after a completed selection transaction, not a user-facing SDK control seam",
 	"agent_session:materializeActiveDefaultModelProfileAssignment":
 		"internal extension selection materialization seam, not a user-facing SDK control seam",
 	"agent_session:registerToolSessionCleanup":
@@ -127,6 +131,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal tool-selection predicate used to preserve the --no-tools boundary, not a user-facing SDK control seam",
 	"agent_session:getEffectiveActiveWorkflowSkillState":
 		"internal restored-or-live workflow guard for session rescope, not a user-facing SDK control seam",
+	"agent_session:refreshEffectiveActiveWorkflowSkillState":
+		"internal durable workflow identity refresh before session safety checks, not an independent public SDK operation",
 	"agent_session:replaceOwnedMcpManager":
 		"internal cwd-rebinding helper for owned MCP authority after move_session, not a user-facing SDK control seam",
 	"agent_session:replaceNamedCustomTools":
@@ -165,6 +171,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"test-only parked terminal persistence seam, not a user-facing SDK control seam",
 	"agent_session:flushParkedAgentEndForCoordinatorPersistForTests":
 		"test-only parked terminal flush seam, not a user-facing SDK control seam",
+	"agent_session:waitForAgentEndHandlingForTests":
+		"test-only SDK terminal-event handler completion barrier, not a user-facing SDK control seam",
 	"agent_session:setCancelAndSubmitAbortOutcomeProviderForTests":
 		"test-only cancellation seam, not a user-facing SDK control seam",
 	"agent_session:awaitDisposeCompletion": "test-only disposal completion seam, not a user-facing SDK control seam",
@@ -199,6 +207,12 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:onJobFold": "internal fold-event plumbing feeding the bash_folded event frame, not a control seam",
 
 	"agent_session:getSelectedMCPToolNames": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:getActiveMCPToolNames":
+		"internal MCP bridge subset used by mode controllers to preserve live selections across tool swaps; not a user-facing SDK control seam",
+	"agent_session:hasMCPToolSelectionAuthority":
+		"internal MCP-selection authority predicate used by catalog and mode-transition reconciliation; not a user-facing SDK control seam",
+	"agent_session:hasCommittedMCPToolSelectionAuthority":
+		"internal committed MCP-selection authority predicate used by catalog reconciliation; not a user-facing SDK control seam",
 	"agent_session:isToolDiscoveryEnabled": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getDiscoverableToolSearchIndex": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getSelectedDiscoveredToolNames": "internal accessor/plumbing, not a user-facing control seam",

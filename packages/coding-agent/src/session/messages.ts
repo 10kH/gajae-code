@@ -432,6 +432,28 @@ export function createCustomMessage(
 }
 
 /**
+ * Same closer escape as URL and tool framing: whitespace between the tag name
+ * and ">" still closes the element, so those spellings are neutralized too.
+ */
+export function escapeUntrustedContent(content: string): string {
+	return content
+		.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>")
+		.replace(/<\/untrusted-content[ \t\n\r\f]+>/gi, "&lt;/untrusted-content>");
+}
+
+export function wrapUntrustedContent(content: string): string {
+	return `<untrusted-content>\n${escapeUntrustedContent(content)}\n</untrusted-content>`;
+}
+
+/**
+ * Frame stored `!` / `$` text at the model boundary. The command runner already
+ * cut the excerpt that was recorded; do not slice this string again.
+ */
+function frameStoredLocalExecution(text: string): string {
+	return wrapUntrustedContent(text);
+}
+
+/**
  * Transform AgentMessages (including custom types) to LLM-compatible Messages.
  *
  * This is used by:
@@ -449,7 +471,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 					}
 					return {
 						role: "user",
-						content: [{ type: "text", text: bashExecutionToText(m) }],
+						content: [{ type: "text", text: frameStoredLocalExecution(bashExecutionToText(m)) }],
 						attribution: "user",
 						timestamp: m.timestamp,
 					};
@@ -459,7 +481,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 					}
 					return {
 						role: "user",
-						content: [{ type: "text", text: pythonExecutionToText(m) }],
+						content: [{ type: "text", text: frameStoredLocalExecution(pythonExecutionToText(m)) }],
 						attribution: "user",
 						timestamp: m.timestamp,
 					};

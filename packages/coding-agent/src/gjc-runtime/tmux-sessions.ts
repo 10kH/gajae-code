@@ -347,6 +347,24 @@ function environmentForProviderAuthority(
 	};
 }
 
+/**
+ * tmux lets a client write UTF-8 only when it was started with `-u`, runs inside tmux
+ * (`$TMUX`), or the first set of LC_ALL/LC_CTYPE/LANG names UTF-8. Any other client gets
+ * every byte outside printable ASCII replaced with `_`, including the tab separators and
+ * non-ASCII names and paths parsed here. A detached Broker inherits its launcher's locale,
+ * and launchd or a service manager provides none, so every native tmux client this module
+ * runs for managed-session creation, inspection, and mutation requests UTF-8 output instead
+ * of depending on the caller's environment. The flag precedes the subcommand, so the Linux
+ * owner-isolation server proof inherits it from the new-session control prefix. psmux has
+ * its own client flags and never receives it. Interactive attach is deliberately excluded:
+ * its output goes to the user's terminal, whose locale is authoritative.
+ */
+const NATIVE_TMUX_UTF8_CLIENT_FLAG = "-u";
+
+function tmuxClientFlags(isPsmux: boolean): string[] {
+	return isPsmux ? [] : [NATIVE_TMUX_UTF8_CLIENT_FLAG];
+}
+
 function runTmux(
 	args: string[],
 	env: NodeJS.ProcessEnv = process.env,
@@ -361,7 +379,11 @@ function runTmux(
 	let result: Bun.SyncSubprocess<"pipe", "pipe">;
 	try {
 		result = Bun.spawnSync(
-			[tmuxCommand, ...(authority ? buildTmuxProviderCommand(authority, args[0]!, args.slice(1)) : args)],
+			[
+				tmuxCommand,
+				...tmuxClientFlags(authority ? authority.kind !== "native-tmux" : binary.isPsmux),
+				...(authority ? buildTmuxProviderCommand(authority, args[0]!, args.slice(1)) : args),
+			],
 			{
 				stdout: "pipe",
 				stderr: "pipe",
@@ -799,6 +821,7 @@ export function createGjcTmuxSession(
 				})();
 	const tmuxArgv = [
 		tmuxCommand,
+		...tmuxClientFlags(provider.kind !== "native-tmux"),
 		...buildTmuxProviderCommand(provider, "new-session", [
 			"-d",
 			"-s",
@@ -818,11 +841,14 @@ export function createGjcTmuxSession(
 				pidProven: false,
 			};
 		}
-		const result = Bun.spawnSync([tmuxCommand, "display-message", "-p", "#{pid}"], {
-			stdout: "pipe",
-			stderr: "pipe",
-			env,
-		});
+		const result = Bun.spawnSync(
+			[tmuxCommand, ...tmuxClientFlags(provider.kind !== "native-tmux"), "display-message", "-p", "#{pid}"],
+			{
+				stdout: "pipe",
+				stderr: "pipe",
+				env,
+			},
+		);
 		if (result.exitCode !== 0) {
 			const diagnostic = result.stderr.toString();
 			return /no server running|failed to connect|error connecting/.test(diagnostic)
@@ -1325,11 +1351,14 @@ function requireSafeTmuxServerForMutation(
 		return { pid: 1, startTime: "test" };
 	}
 	if (process.platform !== "linux") return { pid: 1, startTime: "not-applicable", pidProven: false };
-	const result = Bun.spawnSync([tmuxCommand, "display-message", "-p", "#{pid}"], {
-		stdout: "pipe",
-		stderr: "pipe",
-		env,
-	});
+	const result = Bun.spawnSync(
+		[tmuxCommand, ...tmuxClientFlags(resolveGjcTmuxBinary({ env }).isPsmux), "display-message", "-p", "#{pid}"],
+		{
+			stdout: "pipe",
+			stderr: "pipe",
+			env,
+		},
+	);
 	if (result.exitCode !== 0) throw new Error("gjc_tmux_owner_isolation_server_unverifiable");
 	const pid = Number(result.stdout.toString().trim());
 	if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("gjc_tmux_owner_isolation_server_unverifiable");

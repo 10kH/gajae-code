@@ -12,6 +12,7 @@ import {
 } from "../../config/file-lock";
 import { repo } from "../../utils/git";
 import { endpointIncarnation } from "./endpoint-authority";
+import { brokerLockHostIdentity } from "./lock-host-identity";
 import { processIncarnation } from "./process-incarnation";
 import {
 	assertSupportedSessionIndexEventVersion,
@@ -848,6 +849,7 @@ const SESSION_INDEX_REPLAY_FRESHNESS_MS = 2_000;
  * heartbeat for long enough that live hosts project as dead.
  */
 const SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS = 4;
+const SESSION_HEARTBEAT_STALE_WARNING_INTERVAL_MS = 60_000;
 /** One elapsed budget for queueing, probing and every reacquisition in a pass. */
 export const SESSION_HEARTBEAT_CHECKPOINT_BUDGET_MS = 15_000;
 const STALE_OBSERVATION: unique symbol = Symbol("stale-heartbeat-observation");
@@ -860,13 +862,26 @@ const SESSION_GENERATION_PROBE_LIMIT = 32;
  * is named in a slow-operation warning when it holds the lock beyond the
  * observation window and (b) the lock budget cannot silently drift per call
  * site.
+ *
+ * Every acquisition also carries this installation's host identity.
+ * `staleLockSnapshot` treats a host-qualified owner as foreign when the acquirer
+ * omits `ownerHostId`, so a same-host process that died holding the lock is never
+ * reclaimed and broker startup burns its whole retry budget. Identity is applied
+ * under the options a caller passed for budget and cancellation, so startup,
+ * heartbeat, and ordinary index transactions share one reclaim rule: a proven-dead
+ * same-host owner can be recovered, and a live or cross-host owner cannot.
  */
-function withSessionIndexLock<T>(
+async function sessionIndexLockOptions(agentDir: string, options: FileLockOptions): Promise<FileLockOptions> {
+	return { ...options, ...(await brokerLockHostIdentity(agentDir)) };
+}
+
+async function withSessionIndexLock<T>(
 	operation: string,
 	agentDir: string,
 	callback: () => Promise<T>,
 	options: FileLockOptions = SESSION_INDEX_LOCK_OPTIONS,
 ): Promise<T> {
+	const lockOptions = await sessionIndexLockOptions(agentDir, options);
 	return withFileLock(
 		logFor(agentDir),
 		async () => {
@@ -886,7 +901,7 @@ function withSessionIndexLock<T>(
 				clearTimeout(note);
 			}
 		},
-		options,
+		lockOptions,
 	);
 }
 function isValidSnapshot(snapshot: unknown): snapshot is { indexSeq: number; events: SessionIndexEvent[] } {
@@ -1194,6 +1209,7 @@ export class SessionIndex {
 	#observationDeps: SessionIndexObservationDeps;
 	#events: SessionIndexEvent[] = [];
 	#warnings: string[] = [];
+	#lastHeartbeatStaleWarningAt = Number.NEGATIVE_INFINITY;
 	#logOffset = 0;
 	#corruptSuffix = false;
 	/**
@@ -2434,9 +2450,22 @@ export class SessionIndex {
 			for (let attempt = 0; ; attempt++) {
 				if (signal.aborted || performance.now() >= deadline) return 0;
 				const result = await this.#checkpointLiveHeartbeatsOnce(now, signal, deadline);
-				if (result !== STALE_OBSERVATION || attempt + 1 >= SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS)
-					return result === STALE_OBSERVATION ? 0 : result;
-				now = Date.now();
+				if (result === STALE_OBSERVATION) {
+					if (attempt + 1 >= SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS) {
+						const warningAt = performance.now();
+						if (warningAt - this.#lastHeartbeatStaleWarningAt >= SESSION_HEARTBEAT_STALE_WARNING_INTERVAL_MS) {
+							this.#lastHeartbeatStaleWarningAt = warningAt;
+							logger.warn("sdk broker: skipped session heartbeat checkpoint after repeated stale observations", {
+								indexPath: path.resolve(logFor(this.#agentDir)),
+								attempts: attempt + 1,
+							});
+						}
+						return 0;
+					}
+					now = Date.now();
+					continue;
+				}
+				return result;
 			}
 		};
 		try {
@@ -2452,7 +2481,7 @@ export class SessionIndex {
 				// an idle cycle: the blocked-renewal caller needs the reason and path.
 				const blocked = await describeRetainedLockTransition(
 					path.resolve(logFor(this.#agentDir)),
-					SESSION_INDEX_LOCK_OPTIONS,
+					await sessionIndexLockOptions(this.#agentDir, SESSION_INDEX_LOCK_OPTIONS),
 				);
 				if (blocked) throw blocked;
 				return 0;

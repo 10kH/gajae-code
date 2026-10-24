@@ -1810,7 +1810,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "interaction",
 			label: "Prompt Suggestions",
 			description:
-				"Predict your likely next prompt after each turn (smol-model call) and show it as ghost text; Tab accepts",
+				"Predict your likely next message after each completed turn (one extra call to the session model with the full conversation) and show it as ghost text; Tab accepts, Esc dismisses",
 		},
 	},
 
@@ -3603,6 +3603,11 @@ export const SETTINGS_SCHEMA = {
 		default: [] as string[],
 	},
 
+	"mcp.discoveryDeferAutoload": {
+		type: "boolean",
+		default: false,
+	},
+
 	"mcp.notifications": {
 		type: "boolean",
 		default: false,
@@ -4450,6 +4455,20 @@ function validSettingValue(definition: (typeof SETTINGS_SCHEMA)[SettingPath], va
 }
 
 /**
+ * Identity and destination fields adopted from the notification config file.
+ * `config.patch` must not rewrite them; local provider commands still do.
+ */
+const NOTIFICATION_BINDING_PATCH_PATHS = new Set<SettingPath>([
+	"notifications.telegram.chatId",
+	"notifications.discord.applicationId",
+	"notifications.discord.guildId",
+	"notifications.discord.parentChannelId",
+	"notifications.slack.workspaceId",
+	"notifications.slack.channelId",
+	"notifications.slack.authorizedUserId",
+]);
+
+/**
  * Validate an external (SDK `config.patch`) path/value set against the
  * settings schema before any durable write. Dotted sub-paths of record
  * settings (e.g. `modelRoles.default`) are validated against the record's
@@ -4465,6 +4484,13 @@ export function validateSettingPatch(patch: Record<string, unknown>): Array<{ pa
 			issues.push({
 				path,
 				detail: "The versioned model-profile ownership record is internal and cannot be patched generically.",
+			});
+			continue;
+		}
+		if (NOTIFICATION_BINDING_PATCH_PATHS.has(path as SettingPath)) {
+			issues.push({
+				path,
+				detail: "Notification binding fields cannot be changed through config.patch.",
 			});
 			continue;
 		}

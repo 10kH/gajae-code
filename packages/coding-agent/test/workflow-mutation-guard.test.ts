@@ -3119,6 +3119,217 @@ describe("bash scanner quoting model", () => {
 		expect(decision.blocked).toBe(true);
 	});
 
+	it("allows parenthesized Perl two-argument explicit reads", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		for (const command of [
+			`perl -e 'open(F, "<input.txt"); print <F>;'`,
+			`perl -e "open(F, '<input.txt'); print <F>;"`,
+			`perl -e "open F, '<input.txt'; print <F>;"`,
+			`perl -e "open(F, '<', 'input.txt'); print <F>;"`,
+			`perl -e 'open(F, "<",\n "input.txt"); print <F>;'`,
+			`perl -e 'my %files = (input => "input.txt"); open(F, "<", $files{input}); print <F>;'`,
+			`perl -e 'if (open F, "<", "input.txt") { print <F>; }'`,
+			`perl -e 'open(my $fh, "<input.txt"); print <$fh>;'`,
+			`perl -e 'open(main::F, "<", "input.txt");'`,
+			`perl -e 'open(*F, "<", "input.txt");'`,
+			`perl -e 'CORE::open(F, "<input.txt"); print <F>;'`,
+			`perl -e 'CORE::open F, "<", "input.txt"; print <F>;'`,
+			`perl -e 'print "use Project::Helper"; open(F, "<input.txt");'`,
+			`perl -e 'my $use = 1; open(F, "<", "input.txt"); print 1;'`,
+			`perl -e 'my $no = 1; open(F, "<input.txt"); print 1;'`,
+			`printf '%s' PERL5OPT=-MConfig; perl -e 'open(F, "<input.txt");'`,
+			`env printf '%s' PERL5OPT=-MConfig; perl -e 'open(F, "<input.txt");'`,
+			`cat <<'DATA'\nPERL5OPT=-MConfig\nDATA\nperl -e 'open(F, "<input.txt");'`,
+			String.raw`perl -e 'print "\$literal"; open(F, "<input.txt");'`,
+			String.raw`perl -e 'print "mail\@example"; open(F, "<input.txt");'`,
+			String.raw`perl -e 'print "\\\$literal"; open(F, "<input.txt");'`,
+			String.raw`perl -e 'open F, "<input\\file"; print <F>;'`,
+			String.raw`perl -e 'open(F, "<input\\file"); print <F>;'`,
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked, command).toBe(false);
+		}
+	});
+
+	it("denies nonbuiltin Perl calls with read-looking open suffixes", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		for (const source of [
+			`Project::Helper::reopen(F, "<src/product.ts")`,
+			`Project::Helper::réopen(F, "<src/product.ts")`,
+			`reopen(F, "<src/product.ts")`,
+			`Project::Helper::open(F, "<src/product.ts")`,
+			`Project::Helper->open(F, "<src/product.ts")`,
+			`Project::Helper -> open(F, "<src/product.ts")`,
+			`Project::Helper -> # note\nopen(F, "<src/product.ts")`,
+			`Project::Helper -> # first\n# second\nopen(F, "<src/product.ts")`,
+			`Project::Helper:: # note\nopen(F, "<src/product.ts")`,
+			`& # note\nopen(F, "<src/product.ts")`,
+			`Project::Helper::CORE::open(F, "<src/product.ts")`,
+			`Project::Helper -> CORE::open(F, "<src/product.ts")`,
+			`CORE::GLOBAL::open(F, "<src/product.ts")`,
+			`&open(F, "<src/product.ts")`,
+		]) {
+			const command = `perl -e ${quoteBashSingle(source)}`;
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked, command).toBe(true);
+			expect(decision.reason, command).toBe("unknown-target");
+		}
+	});
+
+	it("denies Perl imports that can override a bare read-looking open", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		for (const command of [
+			`PERL5LIB=lib perl -e 'use Project::Helper "open"; open(F, "<src/product.ts");'`,
+			`PERL5LIB=lib perl -MProject::Helper -e 'Project::Helper::reopen(F, "<src/product.ts");'`,
+			`PERL5LIB=lib perl -MProject::Helper=open -e 'open(F, "<src/product.ts");'`,
+			`PERL5LIB=lib perl -wMProject::Helper=open -e 'open(F, "<src/product.ts");'`,
+			String.raw`PERL5LIB=lib perl -\MProject::Helper=open -e 'open(F, "<src/product.ts");'`,
+			String.raw`PERL5LIB=lib perl -w\MProject::Helper=open -e 'open(F, "<src/product.ts");'`,
+			String.raw`PERL5LIB=lib perl -e 'open(F, "<src/product.ts");' -\MProject::Helper=open`,
+			`PERL5LIB=lib perl -e 'print "@{[do { use Project::Helper qw(open); 1 }]}"; open(F, "<src/product.ts");'`,
+			String.raw`PERL5LIB=lib perl -e 'print "\\@{[do { use Project::Helper qw(open); 1 }]}"; open(F, "<src/product.ts");'`,
+			`PERL5LIB=lib perl -M Project::Helper=open -e 'open(F, "<src/product.ts");'`,
+			`PERL5LIB=lib perl -mProject::Helper -e 'open(F, "<src/product.ts");'`,
+			`PERL5OPT=-MPlanted PERL5LIB=lib perl -e 'open(F, "<src/product.ts");'`,
+			`env PERL5OPT=-MPlanted PERL5LIB=lib perl -e 'open(F, "<src/product.ts");'`,
+			`export PERL5OPT=-MPlanted; perl -e 'open(F, "<src/product.ts");'`,
+			`export 'PERL5OPT=-MPlanted'; perl -e 'my $use = 1; open(F, "<src/product.ts");'`,
+			`</dev/null PERL5OPT=-MPlanted; export PERL5OPT; perl -e 'my $use = 1; open(F, "<src/product.ts");'`,
+			`< /dev/null PERL5OPT=-MPlanted; export PERL5OPT; perl -e 'my $use = 1; open(F, "<src/product.ts");'`,
+			`2>&1 PERL5OPT=-MPlanted; export PERL5OPT; perl -e 'my $use = 1; open(F, "<src/product.ts");'`,
+			`2>& 1 PERL5OPT=-MPlanted; export PERL5OPT; perl -e 'my $use = 1; open(F, "<src/product.ts");'`,
+			`export "PERL5DB=Planted"; perl -e 'my $no = 1; open(F, "<src/product.ts");'`,
+			`declare -x 'PERL5OPT=-MPlanted'; perl -e 'open(F, "<src/product.ts");'`,
+			`readonly 'PERL5OPT=-MPlanted'; export PERL5OPT; perl -e 'open(F, "<src/product.ts");'`,
+			`PERL5OPT=-MPlanted bash -c ${quoteBashSingle(`perl -e 'open(F, "<src/product.ts");'`)}`,
+			`PERL5DB=Planted perl -d -e 'open(F, "<src/product.ts");'`,
+			`PERL5LIB=lib perl -d:Planted -e 'open(F, "<src/product.ts");'`,
+			`PERL5LIB=lib perl -wd:Planted -e 'open(F, "<src/product.ts");'`,
+			`perl -e 'no Project::Helper; open(F, "<src/product.ts");'`,
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked, command).toBe(true);
+			expect(decision.reason, command).toBe("unknown-target");
+		}
+	});
+
+	it("carries tool startup environment into nested Perl reads without blocking unrelated commands", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		const perl = `perl -e 'my $use = 1; open(F, "<input.txt");'`;
+		for (const command of [perl, `bash -c ${quoteBashSingle(perl)}`, `echo "$(${perl})"`, `printf safe`]) {
+			for (const variable of ["PERL5OPT", "PERL5DB"]) {
+				const decision = await getWorkflowMutationDecision({
+					cwd,
+					sessionId: "session-a",
+					tool: tool("bash"),
+					args: { command, env: { [variable]: "-MPlanted" } },
+				});
+				expect(decision.blocked, command).toBe(command !== "printf safe");
+			}
+		}
+	});
+
+	it("denies inherited Perl startup code without changing the test process environment", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		for (const variable of ["PERL5OPT", "PERL5DB"]) {
+			const result = Bun.spawnSync(
+				[
+					process.execPath,
+					"--eval",
+					`import { getWorkflowMutationDecision } from "@gajae-code/coding-agent/skill-state/workflow-mutation-guard";
+const decision = await getWorkflowMutationDecision({
+  cwd: ${JSON.stringify(cwd)}, sessionId: "session-a", tool: { name: "bash" },
+  args: { command: 'perl -e \\'open(F, "<input.txt");\\'' }
+});
+process.stdout.write(JSON.stringify(decision));`,
+				],
+				{ env: { ...process.env, PERL5OPT: "", PERL5DB: "", [variable]: "-MPlanted" } },
+			);
+			expect(result.exitCode, result.stderr.toString()).toBe(0);
+			expect(JSON.parse(result.stdout.toString())).toMatchObject({ blocked: true, reason: "unknown-target" });
+		}
+	});
+
+	it("preserves Perl open classification across seeded quoted delimiters", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		const guardContext = await readWorkflowGuardContext(cwd, { sessionId: "session-a" });
+		const random = makeSeededRandom(0x6947);
+		for (const delimiter of [",", ")", "(", ";", "}", "\n"]) {
+			const filename = `input-${seededToken(random, 8)}${delimiter}.txt`;
+			const literal = `"${filename}"`;
+			const space = " ".repeat(1 + Math.floor(random() * 3));
+			for (const parenthesized of [false, true]) {
+				for (const threeArgs of [false, true]) {
+					for (const mode of ["<", ">", ">>", "+<", "<+", "|-"]) {
+						const args = threeArgs ? `F,${space}"${mode}", ${literal}` : `F,${space}"${mode}${filename}"`;
+						const source = parenthesized ? `open(${args}); print 1;` : `open ${args}; print 1;`;
+						const command = `perl -e ${quoteBashAnsiC(source)}`;
+						const decision = await getWorkflowMutationDecision({
+							cwd,
+							sessionId: "session-a",
+							guardContext,
+							tool: tool("bash"),
+							args: { command },
+						});
+						expect(decision.blocked, command).toBe(mode !== "<");
+					}
+				}
+			}
+		}
+	});
+
+	it("denies variable, pipe, and unparsed Perl open operands", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		for (const source of [
+			`open(F, $mode, "input.txt");`,
+			`open(F, "<$file");`,
+			`open(F, "<@files");`,
+			String.raw`open(F, "<input\nfile");`,
+			String.raw`open(F, "<input\\$file");`,
+			String.raw`open(F, "<input\\file|");`,
+			`open(F, "<input.txt|");`,
+			`open(F, "<input.txt";`,
+			`open(F, "<input.txt);`,
+			`open(F, "<" . $file);`,
+			`open(F, "<input.txt",);`,
+			`open(F, q{<input.txt});`,
+			`open F, $mode or die "<";`,
+			`open(F # , "<input.txt")\n, ">src/product.ts"); print F "PWNED";`,
+			`open(q{F, "<input.txt")}, ">src/product.ts");`,
+			`open(F, "<", "input.txt";`,
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command: `perl -e ${quoteBashSingle(source)}` },
+			});
+			expect(decision.blocked, source).toBe(true);
+		}
+	});
+
 	it("classifies Perl open mode operand, not unrelated strings", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");
@@ -3137,15 +3348,98 @@ describe("bash scanner quoting model", () => {
 	it("detects imported os.system callable aliases in Python", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");
-		// from os import system as run; run(...) should be detected
-		const decision = await getWorkflowMutationDecision({
-			cwd,
-			sessionId: "session-a",
-			tool: tool("bash"),
-			args: {
-				command: `python3 -c 'from os import system as run; run("printf PWNED > src/product.ts")'`,
-			},
-		});
-		expect(decision.blocked).toBe(true);
+		const call = `run("printf PWNED > src/product.ts")`;
+		const scripts = [
+			`from os import system as run; ${call}`,
+			`from os import system as unused; from os import system as run; ${call}`,
+			`from os import system as run; from os import system as unused; ${call}`,
+			`from os import system as unused\nfrom os import system as run\n${call}`,
+			`from os import system as unused, system as run; ${call}`,
+			`from os import getcwd, system as run, system as unused; ${call}`,
+			`from os import (system as unused,\n # another alias\n system as run,); ${call}`,
+			`from os import system as unused; from os import system; system("printf PWNED > src/product.ts")`,
+			`from os import *; system("printf PWNED > src/product.ts")`,
+			`# from os import system as unused\nfrom os import system as run; ${call}`,
+			`note = "from os import system as unused"; from os import system as run; ${call}`,
+			`from os import system as unused; from os import system as run; run(command)`,
+			`from os import system as run\nprint(f"""{run("printf PWNED > src/product.ts")}""")`,
+			`from os import system as run\nprint(f"""{run\\\n("printf PWNED > src/product.ts")}""")`,
+			`from os import system as run\nprint(f"""{42:{run("printf PWNED > src/product.ts")}}""")`,
+			`from os import system as run\nprint(f"""{f"{"x"}{run('printf PWNED > src/product.ts')}"}""")`,
+			`note = """escaped \\""" marker"""; from os import system as run; ${call}`,
+			`from os import system as unused, \\\n    system as run\n${call}`,
+		];
+		for (const script of scripts) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command: `python3 -c ${quoteBashSingle(script)}` },
+			});
+			expect({ script, blocked: decision.blocked, reason: decision.reason }).toEqual({
+				script,
+				blocked: true,
+				reason: "unknown-target",
+			});
+		}
+	});
+
+	it("allows unused Python system imports and inert alias calls", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		for (const script of [
+			`from os import system as unused; from os import system as run; print("status")`,
+			`from os import system as run; # run(command)\nprint("status")`,
+			`from os import system as run; print("run(command)")`,
+			`from os import system as run; note = """run(command)"""; print(note)`,
+			`note = "from os import system as run"; print("run(command)")`,
+			`# from os import system as run\nrun = print; run("status")`,
+			`from os import getcwd as run; print(run())`,
+			`from os import system as unused, \\\n    system as run\nprint("status")`,
+			`note = """escaped \\""" from os import system as run; run(command)"""; print(note)`,
+			`from os import system as run; print(f"run(command)")`,
+			`from os import system as run; print(f"{{run(command)}}")`,
+			`from os import system as run; print(f"{42}: run(command)")`,
+			`from os import system as run; print(f"""{'run(command)'}""")`,
+			`from os import system as run; print(f"{42:run(command)}")`,
+			`from os import system as run; print(f"{run}{(42)}")`,
+			`from os import system as run; print(f"""{f"{"x"}{42}"}""")`,
+			`from os import system as run; print(f"""{f"{'run(command)'}"}""")`,
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command: `python3 -c ${quoteBashSingle(script)}` },
+			});
+			expect({ script, blocked: decision.blocked }).toEqual({ script, blocked: false });
+		}
+	});
+
+	it("keeps generated Python system aliases blocked at every import position", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		const guardContext = await readWorkflowGuardContext(cwd, { sessionId: "session-a" });
+		const random = makeSeededRandom(6947);
+		for (let sample = 0; sample < 12; sample++) {
+			const names = Array.from({ length: 3 }, () => `alias_${seededToken(random, 8)}`);
+			for (const name of names) {
+				for (const imports of [
+					names.map(alias => `from os import system as ${alias}`).join("; "),
+					`from os import (${names.map(alias => `system as ${alias}`).join(", ")})`,
+					`from os import ${names.map(alias => `system as ${alias}`).join(", \\\n    ")}`,
+				]) {
+					const script = `${imports}; ${name}("printf data > src/generated-${sample}.ts")`;
+					const decision = await getWorkflowMutationDecision({
+						cwd,
+						sessionId: "session-a",
+						guardContext,
+						tool: tool("bash"),
+						args: { command: `python3 -c ${quoteBashSingle(script)}` },
+					});
+					expect({ script, blocked: decision.blocked }).toEqual({ script, blocked: true });
+				}
+			}
+		}
 	});
 });
