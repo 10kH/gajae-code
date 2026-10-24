@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolContext } from "@gajae-code/agent-core";
+import type { AgentTool, AgentToolContext } from "@gajae-code/agent-core";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { EditTool } from "@gajae-code/coding-agent/edit";
 import { createReadonlySessionManager, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -79,7 +79,7 @@ async function truncateFramed(produced: FramedResult, overrides: Record<string, 
 		description: "edit",
 		parameters: {},
 		execute: async () => produced,
-	} as unknown as EditTool);
+	} as unknown as AgentTool);
 	const result = await wrapped.execute("edit-trunc", {}, undefined, undefined, context);
 	const raw = textOf(result);
 	const excerpt = stripOutputNotice(raw, result.details?.meta).trimEnd();
