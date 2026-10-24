@@ -83,7 +83,7 @@ function plantUnreadableLegacyDatabase(agentDir: string): void {
 
 describe("agent settings pending-retirement marker", () => {
 	test.skipIf(process.platform === "win32" || !symlinkAllowed)(
-		"a symlinked pending-retirement marker leaves the outside file unchanged",
+		"a symlinked pending-retirement marker does not write the source hash outside",
 		async () => {
 			const home = await tempDir();
 			const cwd = await tempDir();
