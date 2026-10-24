@@ -14,6 +14,8 @@ import {
 	tryEnforceStrictSchema,
 	validateJsonSchemaValue,
 } from "@gajae-code/ai/utils/schema";
+import { wrapUntrustedContent } from "../session/messages";
+import { truncateMiddle, truncateTail } from "../session/streaming-output";
 import { subprocessToolRegistry } from "../task/subprocess-tool-registry";
 import type { ToolSession } from ".";
 import { jtdToJsonSchema, normalizeSchema } from "./jtd-to-json-schema";
@@ -32,6 +34,59 @@ function formatSchema(schema: unknown): string {
 	} catch {
 		return "[unserializable schema]";
 	}
+}
+
+/** Model-facing schema prose cap, including the untrusted-content fence. */
+export const YIELD_SCHEMA_TEXT_MAX_BYTES = 4096;
+
+const SCHEMA_PROSE_KEYS = new Set(["description", "title", "$comment"]);
+const SCHEMA_LITERAL_KEYS = new Set(["default", "const", "enum", "examples", "example"]);
+
+/**
+ * Truncate repository schema text first, then frame it. The fence is the last
+ * step so a tail or head-and-tail cut cannot drop the opening tag.
+ */
+function frameYieldSchemaText(text: string, direction: "tail" | "head-tail"): string {
+	const overhead = "<untrusted-content>\n\n</untrusted-content>".length;
+	const budget = Math.max(1, YIELD_SCHEMA_TEXT_MAX_BYTES - overhead);
+	let excerpt = text;
+	if (Buffer.byteLength(text, "utf-8") > budget) {
+		const limits = { maxBytes: budget, maxLines: 10_000 };
+		excerpt =
+			direction === "tail"
+				? truncateTail(text, limits).content
+				: truncateMiddle(text, {
+						...limits,
+						maxHeadBytes: Math.floor(budget / 2),
+						maxHeadLines: 5_000,
+					}).content;
+	}
+	return wrapUntrustedContent(excerpt);
+}
+
+function frameSchemaProse(value: unknown, seen: WeakSet<object>, keepRootDescription = false): unknown {
+	if (!value || typeof value !== "object") return value;
+	if (seen.has(value)) return value;
+	seen.add(value);
+	if (Array.isArray(value)) return value.map(item => frameSchemaProse(item, seen));
+	const output: Record<string, unknown> = {};
+	for (const key of Object.keys(value)) {
+		const child = (value as Record<string, unknown>)[key];
+		if (SCHEMA_LITERAL_KEYS.has(key)) {
+			output[key] = child;
+			continue;
+		}
+		if (keepRootDescription && key === "description") {
+			output[key] = child;
+			continue;
+		}
+		if (SCHEMA_PROSE_KEYS.has(key) && typeof child === "string") {
+			output[key] = frameYieldSchemaText(child, "tail");
+			continue;
+		}
+		output[key] = frameSchemaProse(child, seen);
+	}
+	return output;
 }
 
 function formatJsonSchemaIssues(issues: ReadonlyArray<JsonSchemaValidationIssue> | undefined): string {
@@ -139,8 +194,8 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 
 			const schemaHint = formatSchema(normalizedSchema ?? session.outputSchema);
 			const schemaDescription = schemaError
-				? `Structured JSON output (output schema invalid; accepting unconstrained object): ${schemaError}`
-				: `Structured output matching the schema:\n${schemaHint}`;
+				? `Structured JSON output (output schema invalid; accepting unconstrained object):\n${frameYieldSchemaText(schemaError, "tail")}`
+				: `Structured output matching the schema:\n${frameYieldSchemaText(schemaHint, "head-tail")}`;
 			let sanitizedSchema: Record<string, unknown> | undefined;
 			if (
 				!schemaError &&
@@ -170,7 +225,7 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 				if (hasUnresolvedRefs(resolved)) {
 					throw new Error("schema contains unresolved $ref after dereferencing");
 				}
-				dataSchema = resolved;
+				dataSchema = frameSchemaProse(resolved, new WeakSet(), true) as Record<string, unknown>;
 			} else {
 				this.strict = false;
 				dataSchema = looseRecordSchema(
@@ -183,7 +238,9 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 		} catch (err) {
 			const errorMsg = err instanceof Error ? err.message : String(err);
 			parameters = wrapYieldParameters(
-				looseRecordSchema(`Structured JSON output (schema processing failed: ${errorMsg})`),
+				looseRecordSchema(
+					`Structured JSON output (schema processing failed):\n${frameYieldSchemaText(errorMsg, "tail")}`,
+				),
 			);
 			validate = undefined;
 			this.strict = false;
