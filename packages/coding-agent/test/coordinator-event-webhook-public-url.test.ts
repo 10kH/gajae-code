@@ -211,6 +211,10 @@ describe("event webhook public destinations", () => {
 		const dir = await tempRoot();
 		const tokenFile = path.join(dir, "token");
 		await fs.writeFile(tokenFile, "secret-token\n");
+		// An earlier case sets HTTP_PROXY. Bun 1.4.0 keeps that proxy after the
+		// variable is removed, so this loopback connect has to opt out explicitly.
+		const previousNoProxy = process.env.NO_PROXY;
+		process.env.NO_PROXY = "127.0.0.1,localhost";
 		try {
 			await deliverEventWebhook(
 				dir,
@@ -227,6 +231,8 @@ describe("event webhook public destinations", () => {
 			);
 			expect(seen).toEqual([{ body: '{"id":"event-loopback"}', authorization: "Bearer secret-token" }]);
 		} finally {
+			if (previousNoProxy === undefined) delete process.env.NO_PROXY;
+			else process.env.NO_PROXY = previousNoProxy;
 			server.stop(true);
 		}
 	});
