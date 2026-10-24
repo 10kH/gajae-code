@@ -1,10 +1,29 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
+import fc from "fast-check";
 import { MigrateArgsError, resolveSources, runMigrate } from "../src/cli/migrate-cli";
+import { readSourceText } from "../src/migrate/adapters/index";
 import { renderHuman } from "../src/migrate/report";
+
+function symlinkSupported(): boolean {
+	const probe = fsSync.mkdtempSync(path.join(os.tmpdir(), "migrate-link-probe-"));
+	try {
+		fsSync.symlinkSync("target", path.join(probe, "link"));
+		return true;
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "EPERM" || code === "EACCES") return false;
+		throw error;
+	} finally {
+		fsSync.rmSync(probe, { recursive: true, force: true });
+	}
+}
+
+const SYMLINKS = symlinkSupported();
 
 let home: string;
 let cwd: string;
@@ -291,5 +310,202 @@ describe("runMigrate", () => {
 			cwd,
 		});
 		expect(report.sources).toEqual(["claude-code", "opencode"]);
+	});
+
+	test("still allows a regular project CLAUDE.md", async () => {
+		await fs.writeFile(path.join(cwd, "CLAUDE.md"), "Project instructions.");
+		const report = await runMigrate({
+			from: ["claude-code"],
+			project: true,
+			force: false,
+			dryRun: true,
+			json: true,
+			homeDir: home,
+			cwd,
+		});
+		expect(report.actions).toContainEqual(
+			expect.objectContaining({ type: "instruction", name: "CLAUDE.md", status: "imported" }),
+		);
+	});
+
+	test("still allows a regular project CLAUDE.md when the project path uses a dot segment", async () => {
+		await fs.mkdir(path.join(cwd, "nested"));
+		await fs.writeFile(path.join(cwd, "CLAUDE.md"), "Project instructions.");
+		const report = await runMigrate({
+			from: ["claude-code"],
+			project: true,
+			force: false,
+			dryRun: true,
+			json: true,
+			homeDir: home,
+			cwd: path.join(cwd, "nested", ".."),
+		});
+		expect(report.actions).toContainEqual(
+			expect.objectContaining({ type: "instruction", name: "CLAUDE.md", status: "imported" }),
+		);
+	});
+
+	test("still allows a regular project CLAUDE.md when the project path has a trailing slash", async () => {
+		await fs.writeFile(path.join(cwd, "CLAUDE.md"), "Project instructions.");
+		const report = await runMigrate({
+			from: ["claude-code"],
+			project: true,
+			force: false,
+			dryRun: true,
+			json: true,
+			homeDir: home,
+			cwd: `${cwd}${path.sep}`,
+		});
+		expect(report.actions).toContainEqual(
+			expect.objectContaining({ type: "instruction", name: "CLAUDE.md", status: "imported" }),
+		);
+	});
+
+	test.skipIf(!SYMLINKS)("still allows a project opened through a symlinked directory", async () => {
+		const linkParent = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-cli-linked-"));
+		const link = path.join(linkParent, "repo");
+		try {
+			await fs.writeFile(path.join(cwd, "CLAUDE.md"), "Project instructions.");
+			await fs.symlink(cwd, link, "dir");
+			const report = await runMigrate({
+				from: ["claude-code"],
+				project: true,
+				force: false,
+				dryRun: true,
+				json: true,
+				homeDir: home,
+				cwd: link,
+			});
+			expect(report.actions).toContainEqual(
+				expect.objectContaining({ type: "instruction", name: "CLAUDE.md", status: "imported" }),
+			);
+		} finally {
+			await fs.rm(linkParent, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform === "win32")(
+		"still allows a regular source whose name contains a backslash",
+		async () => {
+			const file = path.join(cwd, "a\\b");
+			await fs.writeFile(file, "backslash-name");
+			const read = await readSourceText(file, "claude-code", "instruction", cwd);
+			expect(read).toEqual({ text: "backslash-name" });
+		},
+	);
+
+	test.skipIf(!SYMLINKS)("project CLAUDE.md symlink is not copied into AGENTS.md", async () => {
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-cli-secret-"));
+		const marker = "FAKE-SECRET-KEY-MATERIAL-0123456789";
+		const secret = path.join(outside, "secret.txt");
+		try {
+			await fs.writeFile(secret, marker);
+			await fs.symlink(secret, path.join(cwd, "CLAUDE.md"));
+			const report = await runMigrate({
+				from: ["claude-code"],
+				project: true,
+				force: false,
+				dryRun: false,
+				json: true,
+				homeDir: home,
+				cwd,
+			});
+			expect(
+				report.actions.find(action => action.type === "instruction" && action.name === "CLAUDE.md")?.status,
+			).not.toBe("imported");
+			expect(report.actions).toContainEqual(expect.objectContaining({ type: "source", status: "failed_io" }));
+			const agents = path.join(cwd, ".gjc", "AGENTS.md");
+			if (await exists(agents)) expect(await fs.readFile(agents, "utf-8")).not.toContain(marker);
+			expect(await fs.readFile(secret, "utf-8")).toBe(marker);
+		} finally {
+			await fs.rm(outside, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(!SYMLINKS)("settings behind a symlinked .claude directory are not imported", async () => {
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-cli-settings-"));
+		try {
+			await fs.writeFile(path.join(outside, "settings.json"), JSON.stringify({ model: "claude-sonnet-4-5" }));
+			await fs.symlink(outside, path.join(cwd, ".claude"), "dir");
+			const report = await runMigrate({
+				from: ["claude-code"],
+				project: true,
+				force: false,
+				dryRun: true,
+				json: true,
+				homeDir: home,
+				cwd,
+			});
+			expect(report.manualActions.some(action => action.area.includes("settings.json"))).toBe(false);
+			expect(report.actions).toContainEqual(expect.objectContaining({ type: "source", status: "failed_io" }));
+		} finally {
+			await fs.rm(outside, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(!SYMLINKS)("a symlinked skill file is not imported", async () => {
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-cli-skill-"));
+		const marker = "SKILL-LINK-SECRET";
+		const skill = path.join(home, ".claude", "skills", "alpha", "SKILL.md");
+		try {
+			await fs.writeFile(path.join(outside, "secret.md"), marker);
+			await fs.rm(skill);
+			await fs.symlink(path.join(outside, "secret.md"), skill);
+			const report = await runMigrate({
+				from: ["claude-code"],
+				project: true,
+				force: false,
+				dryRun: false,
+				json: true,
+				homeDir: home,
+				cwd,
+			});
+			expect(report.actions.find(action => action.type === "skill" && action.name === "alpha")?.status).not.toBe(
+				"imported",
+			);
+			const written = path.join(cwd, ".gjc", "skills", "alpha", "SKILL.md");
+			if (await exists(written)) expect(await fs.readFile(written, "utf-8")).not.toContain(marker);
+		} finally {
+			await fs.rm(outside, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform === "win32")("a fifo migrate source is not read", async () => {
+		const fifo = path.join(cwd, "pipe-source");
+		const made = Bun.spawnSync(["mkfifo", fifo]);
+		expect(made.exitCode).toBe(0);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const result = await Promise.race([
+			readSourceText(fifo, "claude-code", "instruction", cwd).finally(() => {
+				if (timer) clearTimeout(timer);
+			}),
+			new Promise<string>(resolve => {
+				timer = setTimeout(() => resolve("blocked"), 1500);
+			}),
+		]);
+		if (timer) clearTimeout(timer);
+		expect(result).not.toBe("blocked");
+		expect(result).toMatchObject({ diagnostic: { status: "failed_io" } });
+	});
+
+	test("property: migrate source containment stays inside the root, fc.property seed 17011, numRuns 64", async () => {
+		const { migrateSourceInsideRoot } = await import("../src/migrate/adapters/index.ts");
+		fc.assert(
+			fc.property(
+				fc.array(fc.stringMatching(/^[A-Za-z0-9][A-Za-z0-9._-]{0,7}$/), { minLength: 0, maxLength: 4 }),
+				fc.stringMatching(/^[A-Za-z0-9][A-Za-z0-9._-]{0,7}$/),
+				(segments, name) => {
+					const root = path.join("/proj", "repo");
+					const inside = path.join(root, ...segments, name);
+					expect(migrateSourceInsideRoot(root, inside)).toBe(true);
+					expect(migrateSourceInsideRoot(root, path.join(root, ".", name))).toBe(true);
+					expect(migrateSourceInsideRoot(root, path.join(root, "..", name))).toBe(false);
+					expect(migrateSourceInsideRoot(root, inside)).toBe(
+						migrateSourceInsideRoot(path.resolve(root), path.resolve(inside)),
+					);
+				},
+			),
+			{ seed: 17011, numRuns: 64 },
+		);
 	});
 });
