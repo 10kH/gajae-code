@@ -489,7 +489,7 @@ describe("runMigrate", () => {
 	});
 
 	test("property: migrate source containment stays inside the root, fc.property seed 17011, numRuns 64", async () => {
-		const { migrateSourceInsideRoot } = await import("../src/migrate/adapters/index.ts");
+		const { migrateSourceInsideRoot } = await import("../src/migrate/adapters/index");
 		fc.assert(
 			fc.property(
 				fc.array(fc.stringMatching(/^[A-Za-z0-9][A-Za-z0-9._-]{0,7}$/), { minLength: 0, maxLength: 4 }),
