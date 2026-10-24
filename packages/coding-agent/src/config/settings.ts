@@ -407,6 +407,8 @@ const PROJECT_LAYER_DENIED_SETTINGS = new Set<SettingPath>([
 	"task.agentModelOverrides",
 	"clipboard.transport",
 	"clipboard.sshHost",
+	// Operator extension disable list. A project file must not clear or replace it.
+	"disabledExtensions",
 ]);
 const LEGACY_THEME_NAME_REPLACEMENTS = {
 	dark: "red-claw",
