@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { kProviderResolvedToolCall } from "@gajae-code/ai/utils/block-symbols";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { TOOL_ACTIVITY_CAPABILITY } from "../src/sdk/bus/telegram-daemon";
 import { POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY } from "../src/sdk/host/host";
@@ -1343,6 +1344,53 @@ test("lean keeps the final answer when a same-run autonomous follow-up settles a
 		expect(finalAnswerOf(turnStreams()[0]!)).toBe(true);
 		await sleep(150);
 		expect(turnStreams().length).toBe(1);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("lean keeps a provider-resolved final answer when a same-run async result follows it", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+		const finalAnswer = "Final report: the provider ran the checks and they pass.";
+		const followUp = "The background job finished as well.";
+
+		await handlers.get("agent_start")!({ type: "agent_start" }, ctx);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Run the checks." } },
+			ctx,
+		);
+		// Devin ACP reports tools its own agent ran as display-only blocks on a
+		// completed turn; the agent loop never dispatches them, so the turn settles.
+		const message = {
+			role: "assistant",
+			content: [
+				{ type: "text", text: finalAnswer },
+				{
+					type: "toolCall",
+					id: "devin-0",
+					name: "bash",
+					arguments: { command: "bun test" },
+					[kProviderResolvedToolCall]: true,
+				},
+			],
+			stopReason: "stop",
+		};
+		await handlers.get("message_end")!({ type: "message_end", message }, ctx);
+		await handlers.get("turn_end")!({ type: "turn_end", turnIndex: 0, message }, ctx);
+		await toolLoopTurn(handlers, ctx, 1, followUp, { steering: "1 background job has completed." });
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+
+		await waitFor(() => turnStreams().length === 1, 3000, "settled receipt");
+		const text = turnStreams()[0]!.text ?? "";
+		expect(text).toContain(finalAnswer);
+		expect(text).toContain(followUp);
+		expect(text.indexOf(finalAnswer)).toBeLessThan(text.indexOf(followUp));
 	} finally {
 		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
 		else process.env.GJC_NOTIFICATIONS = prevEnv;

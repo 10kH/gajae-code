@@ -195,7 +195,7 @@ import {
 } from "./existing-thread-readiness";
 import {
 	imageAttachmentsFromMessage,
-	messageRequestsTools,
+	messageContinuesToolLoop,
 	notificationActionPayload,
 	summaryFromMessage,
 	truncate,
@@ -10917,7 +10917,7 @@ export function createNotificationsExtension(
 			: rt.redact
 				? undefined
 				: summaryFromMessage(event.message, turnTextMax());
-		const settled = !messageRequestsTools(event.message);
+		const settled = !messageContinuesToolLoop(event.message);
 		if (rt.policySuspended) {
 			deferProvisionalReceipt(rt, text, settled, rt.liveRef);
 			rt.turnClosed = true;

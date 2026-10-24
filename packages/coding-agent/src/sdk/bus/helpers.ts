@@ -5,6 +5,7 @@
  * dedupe keys) is unit-testable without a live session or the native server.
  */
 
+import { isProviderResolvedToolCall } from "@gajae-code/ai/utils/block-symbols";
 import { buildRedactedAction, type RedactableAction } from "./config";
 
 /** A pending ask derived from an `ask` tool call. */
@@ -82,12 +83,21 @@ export function summaryFromMessage(message: unknown, max = 280): string | undefi
 	return joined ? truncate(joined, max) : undefined;
 }
 
-/** Whether an assistant message requested tool calls, i.e. the agent loop continues after it. */
-export function messageRequestsTools(message: unknown): boolean {
-	const content = (message as { content?: unknown } | null | undefined)?.content;
-	return (
-		Array.isArray(content) &&
-		content.some(block => block && typeof block === "object" && (block as { type?: unknown }).type === "toolCall")
+/**
+ * Whether the agent loop continues after an assistant message by dispatching its
+ * tool calls. Mirrors the loop's own predicate: an errored or aborted turn ends
+ * the run, and provider-resolved `toolCall` blocks (e.g. tools a Devin ACP agent
+ * already ran) are display-only, so a completed turn carrying only those settles.
+ */
+export function messageContinuesToolLoop(message: unknown): boolean {
+	const { content, stopReason } = (message ?? {}) as { content?: unknown; stopReason?: unknown };
+	if (!Array.isArray(content) || stopReason === "error" || stopReason === "aborted") return false;
+	return content.some(
+		block =>
+			block !== null &&
+			typeof block === "object" &&
+			(block as { type?: unknown }).type === "toolCall" &&
+			!isProviderResolvedToolCall(block),
 	);
 }
 
