@@ -77,6 +77,18 @@ const projectHost = fc
 	})
 	.map(chars => `h${chars.join("")}`);
 
+const NON_OBJECT_CLIPBOARD_PARENTS = [null, [], "native", false] as const;
+
+const projectClipboardCase = fc.oneof(
+	projectHost.map(host => ({ clipboard: { transport: "ssh", sshHost: host }, forbidden: host })),
+	fc.constantFrom(
+		{ clipboard: null, forbidden: undefined },
+		{ clipboard: false, forbidden: undefined },
+		{ clipboard: "native", forbidden: undefined },
+		{ clipboard: [] as unknown[], forbidden: undefined },
+	),
+);
+
 function sshHostOf(cmd: string[] | undefined): string | undefined {
 	if (!cmd) return undefined;
 	const marker = cmd.lastIndexOf("--");
@@ -85,7 +97,7 @@ function sshHostOf(cmd: string[] | undefined): string | undefined {
 
 async function writeLayers(options: {
 	globalClipboard?: Record<string, unknown>;
-	projectClipboard?: Record<string, unknown>;
+	projectClipboard?: unknown;
 	projectExtra?: Record<string, unknown>;
 	surface?: Surface;
 }): Promise<{ project: string; agent: string }> {
@@ -99,7 +111,7 @@ async function writeLayers(options: {
 	if (options.globalClipboard) globalDoc.clipboard = options.globalClipboard;
 	await Bun.write(path.join(agent, "config.yml"), YAML.stringify(globalDoc));
 	const projectDoc: Record<string, unknown> = { ...(options.projectExtra ?? {}) };
-	if (options.projectClipboard) projectDoc.clipboard = options.projectClipboard;
+	if (options.projectClipboard !== undefined) projectDoc.clipboard = options.projectClipboard;
 	if (Object.keys(projectDoc).length > 0) {
 		const surface = options.surface ?? "config.yml";
 		if (surface === "config.yml") {
@@ -212,30 +224,56 @@ describe("project clipboard ssh destination", () => {
 		expect(snap.get("clipboard.sshHost")).toBe(OPERATOR_HOST);
 	});
 
+	for (const surface of ["config.yml", "settings.json"] as const) {
+		for (const parent of NON_OBJECT_CLIPBOARD_PARENTS) {
+			it(`does not let a ${surface} clipboard parent ${JSON.stringify(parent)} replace the user ssh host`, async () => {
+				const paths = await writeLayers({
+					globalClipboard: { transport: "ssh", sshHost: OPERATOR_HOST },
+					projectClipboard: parent,
+					surface,
+				});
+				await initAt(paths);
+				pasteStdout = "operator-paste";
+				const outcome = await copyToClipboard(CANARY);
+				expect(outcome).toEqual({ status: "verified", transport: "ssh" });
+				expect(settings.get("clipboard.sshHost")).toBe(OPERATOR_HOST);
+				expect(sshHostOf(calls[0]?.cmd)).toBe(OPERATOR_HOST);
+				expect(written.join("")).toBe(CANARY);
+				expect(await pasteFromClipboard()).toBe("operator-paste");
+				expect(calls[1]?.cmd.at(-1)).toBe("pbpaste");
+				expect(sshHostOf(calls[1]?.cmd)).toBe(OPERATOR_HOST);
+			});
+		}
+	}
+
 	it("project ssh host never replaces the user clipboard host", async () => {
 		await fc.assert(
 			fc.asyncProperty(
 				fc.constantFrom<Surface>("config.yml", "settings.json"),
-				projectHost,
-				async (surface, host) => {
+				projectClipboardCase,
+				async (surface, project) => {
 					calls.length = 0;
 					written.length = 0;
+					pasteStdout = "operator-paste";
 					const paths = await writeLayers({
 						globalClipboard: { transport: "ssh", sshHost: OPERATOR_HOST },
-						projectClipboard: { transport: "ssh", sshHost: host },
+						projectClipboard: project.clipboard,
 						surface,
 					});
 					await initAt(paths);
 					const outcome = await copyToClipboard(CANARY);
 					const cmd = calls[0]?.cmd;
+					const pasted = await pasteFromClipboard();
 					return (
 						outcome.transport === "ssh" &&
 						settings.get("clipboard.transport") === "ssh" &&
 						settings.get("clipboard.sshHost") === OPERATOR_HOST &&
 						sshHostOf(cmd) === OPERATOR_HOST &&
 						cmd?.at(-1) === "pbcopy" &&
-						!cmd?.includes(host) &&
-						written.join("") === CANARY
+						(project.forbidden === undefined || !cmd?.includes(project.forbidden)) &&
+						written.join("") === CANARY &&
+						pasted === "operator-paste" &&
+						sshHostOf(calls[1]?.cmd) === OPERATOR_HOST
 					);
 				},
 			),
