@@ -22,6 +22,21 @@ import { SdkClientError } from "../src/sdk/client/client";
 import { type SessionRouterClient, sessionAttachmentAuthorityId } from "../src/sdk/router";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 
+// The session broker resolves hardware identity with ioreg, which lives in /usr/sbin.
+// Bun.spawnSync looks up a bare command with the process start PATH unless `env` is set.
+if (!process.env.PATH?.split(":").includes("/usr/sbin")) {
+	process.env.PATH = `${process.env.PATH ?? ""}:/usr/sbin`;
+}
+const spawnSync = Bun.spawnSync.bind(Bun);
+Bun.spawnSync = ((command, options) => {
+	const path = options?.env?.PATH ?? process.env.PATH ?? "";
+	const nextPath = path.split(":").includes("/usr/sbin") ? path : `${path}:/usr/sbin`;
+	return spawnSync(command, {
+		...options,
+		env: { ...process.env, ...options?.env, PATH: nextPath },
+	});
+}) as typeof Bun.spawnSync;
+
 type SlackPost = { channel: string; text: string; threadTs?: string; clientMsgId: string };
 
 async function withStageTimeout<T>(label: string, promise: Promise<T>, timeoutMs = 15_000): Promise<T> {
