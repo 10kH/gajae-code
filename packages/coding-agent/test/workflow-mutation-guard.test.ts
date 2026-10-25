@@ -2941,6 +2941,169 @@ describe("bash scanner quoting model", () => {
 		expect(decision.blocked).toBe(true);
 	});
 
+	it("blocks assignment aliases of output streams across shell quoting", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		const guardContext = await readWorkflowGuardContext(cwd, { sessionId: "session-a" });
+		const random = makeSeededRandom(0x6947);
+		for (let sample = 0; sample < 8; sample++) {
+			const alias = `s${seededToken(random, 6)}`;
+			for (const stream of ["stdout", "stderr"]) {
+				for (const source of [
+					`const ${alias}=process.${stream};${alias}["write"]=process.getBuiltinModule("fs")["writeFileSync"];process.${stream}.write("src/product.ts","PWNED")`,
+					`// status\rconst ${alias}=process.${stream};${alias}["write"]=process.getBuiltinModule("fs")["writeFileSync"];process.${stream}.write("src/product.ts","PWNED")`,
+					`// status\u2028const ${alias}=process.${stream};${alias}["write"]=writer;process.${stream}.write("src/product.ts","PWNED")`,
+					`// status\u2029const ${alias}=process.${stream};${alias}["write"]=writer;process.${stream}.write("src/product.ts","PWNED")`,
+					`let ${alias};${alias}=process.${stream};Object.assign(${alias},{write:writer});process.${stream}.write("src/product.ts","PWNED")`,
+					`const ${alias}=process["${stream}"];Reflect.set(${alias},"write",writer);process.${stream}.write("src/product.ts","PWNED")`,
+					`const ${alias}=process./**/${stream};${alias}["write"]=writer;process.${stream}.write("src/product.ts","PWNED")`,
+					`const ${alias}=process["std\\x${stream === "stdout" ? "6fut" : "65rr"}"];${alias}["write"]=writer;process.${stream}.write("src/product.ts","PWNED")`,
+					`const ${alias}=process.std\\u00${stream === "stdout" ? "6fut" : "65rr"};${alias}["write"]=writer;process.${stream}.write("src/product.ts","PWNED")`,
+					`\`\${(s=>s["write"]=process.getBuiltinModule("fs")["writeFileSync"])(process.${stream})}\`;process.${stream}.write("src/product.ts","PWNED")`,
+					`const {${stream}:${alias}}=process;${alias}["write"]=writer;process.${stream}.write("src/product.ts","PWNED")`,
+					`const ${alias}=Bun.${stream};${alias}["write"]=writer;Bun.${stream}.write("src/product.ts","PWNED")`,
+					`const ${alias}=require("node:process").${stream};${alias}["write"]=process.getBuiltinModule("fs")["writeFileSync"];process.${stream}.write("src/product.ts","PWNED")`,
+					`const ${alias}=globalThis["process"].${stream};${alias}["write"]=writer;process.${stream}.write("src/product.ts","PWNED")`,
+					`const ${alias}=process.getBuiltinModule("process").${stream};${alias}["write"]=writer;process.${stream}.write("src/product.ts","PWNED")`,
+					`const ${alias}=require/**/("node:process").${stream};${alias}["write"]=(p=>process.binding("fs")["writeFileUtf8"](p,"PWNED",577,438));process.${stream}.write("src/product.ts","PWNED")`,
+					`const sink=(p,d)=>process.binding("fs")["writeFileUtf8"](p,d,577,438);\`\${/[}]/,(s=>s["write"]=sink)(process.${stream})}\`;process.${stream}.write("src/product.ts","PWNED")`,
+					`const sink=(p,d)=>process.binding("fs")["writeFileUtf8"](p,d,577,438);let n=1;n++ / (s=>s["write"]=sink)(process.${stream}) / 1;process.${stream}.write("src/product.ts","PWNED")`,
+					`const sink=(p,d)=>process.binding("fs")["writeFileUtf8"](p,d,577,438);let n=1;\`\${n-- / (s=>s["write"]=sink)(process.${stream}) / 1}\`;process.${stream}.write("src/product.ts","PWNED")`,
+					`const sink=(p,d)=>process.binding("fs")["writeFileUtf8"](p,d,577,438);const holder={return:1};holder.return / (s=>s["write"]=sink)(process.${stream}) / 1;process.${stream}.write("src/product.ts","PWNED")`,
+					`const sink=(p,d)=>process.binding("fs")["writeFileUtf8"](p,d,577,438);const ${alias}=module["require"]("node:process").${stream};${alias}["write"]=sink;process.${stream}.write("src/product.ts","PWNED")`,
+					`const ${alias}=module["r"+"equire"]("node:process").${stream};${alias}["write"]=writer;process.${stream}.write("src/product.ts","PWNED")`,
+					`const myFunction=({}).constructor.constructor;const ${alias}=myFunction("return process")()["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
+					`const myFunction=({})./**/constructor./**/constructor;const ${alias}=myFunction("return process")()["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
+					`const myFunction=({})/**/["constructor"]/**/["constructor"];const ${alias}=myFunction("return process")()["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
+					`const r=/[//]/;const myFunction=({})["constructor"]["constructor"];const ${alias}=myFunction("return process")()["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
+					`const myFunction=({})?.["constructor"]?.["constructor"];const ${alias}=myFunction("return process")()["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
+					`const myFunction=({})[\`constructor\`][/**/"constructor"/**/];const ${alias}=myFunction("return process")()["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
+					`console.log(\`\${({}).constructor.constructor("return 1")()}\`)`,
+					`const ${alias}=pro\\u0063ess["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
+					`const factory=require("node:module")["createRequire"];const loader=factory(process.cwd()+"/probe.js");const ${alias}=loader("node:process")["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
+					...["globalThis", "global"].flatMap(root =>
+						[`${root}["module"]["require"]`, `${root}["require"]`].map(
+							loader =>
+								`const ${alias}=${loader}("node:process")["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
+						),
+					),
+					`const ${alias}=module["require"]("node:process")["${stream}"];${alias}["write"]=writer;process.${stream}.write("status")`,
+					`\`\${/[}]/,(s=>s["write"]=writer)(process.${stream})}\`;process.${stream}.write("status")`,
+					`let n=1;n++ / (s=>s["write"]=writer)(process.${stream}) / 1;process.${stream}.write("status")`,
+					`const h={return:1};h. return / (s=>s["write"]=writer)(process.${stream}) / 1;process.${stream}.write("status")`,
+					`if(true) if(true) /=/;(s=>s["write"]=writer)(process.${stream});/x/;process.${stream}.write("status")`,
+					...["h.if()", "h. if()", "h./**/if()", "$if()", "h.catch()"].map(
+						callee =>
+							`const h={if:()=>1,catch:()=>1};const $if=()=>1;${callee} / (s=>s["write"]=writer)(process.${stream}) / 1;process.${stream}.write("status")`,
+					),
+					`const r=/"/;const h={return:1};h.return / (s=>s["write"]=writer)(process.${stream}) / 1;process.${stream}.write("status")`,
+					...["\n", "\r", "\u2028", "\u2029"].map(
+						terminator =>
+							`const h={return:1};h.// note${terminator}return / (s=>s["write"]=writer)(process.${stream}) / 1;process.${stream}.write("status")`,
+					),
+					`console.log(\`\${(()=>{if(Boolean(1)) /[}}]/.test("}");const s=process.${stream};s["write"]=writer})()}\`);process.${stream}.write("status")`,
+					`console.log(\`\${process.binding("fs")["writeFileUtf8"]("src/product.ts","PWNED",577,438)}\`)`,
+				]) {
+					for (const operand of [quoteBashSingle(source), quoteBashDouble(source), quoteBashAnsiC(source)]) {
+						const command = `node -e ${operand}`;
+						const decision = await getWorkflowMutationDecision({
+							cwd,
+							sessionId: "session-a",
+							guardContext,
+							tool: tool("bash"),
+							args: { command },
+						});
+						expect(decision.blocked, command).toBe(true);
+						expect(decision.reason, command).toBe("unknown-target");
+					}
+				}
+			}
+		}
+	});
+
+	it("allows ordinary output with unrelated arrows and inert stream aliases", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		for (const source of [
+			`const format = x => x.toUpperCase();process.stdout.write(format("status"))`,
+			`const format = (x) => x;process.stderr.write(format("status"))`,
+			`process.stdout.write(["status"].map(x => x).join(""))`,
+			`/* const s=process.stdout;s.write=writer */ process.stdout.write("status")`,
+			`console.log("const s=process.stdout;s.write=writer");process.stdout.write("status")`,
+			`process.stdout.write(process.env.HOME)`,
+			`const subprocess=0;console.log(subprocess)`,
+			`const isBun=false;console.log(isBun)`,
+			`const process$=0;console.log(process$)`,
+			`process.stdout.write(\`status \${1}\`)`,
+			`process.stdout.write(\`const s=process.stdout\`)`,
+			`process.stdout.write(\`process complete \${1}\`)`,
+			`console.log(\`cwd=\${process.cwd()}\`)`,
+			`console.log(process.stdout.isTTY)`,
+			`console.log(process.stderr.columns, process.stdout.rows)`,
+			`process.stdout.write(\`status \${\`nested \${1}\`}\`)`,
+			`console.log(\`\${/[{]/.test("{")}\`)`,
+			`console.log(\`\${/[}]/.test("}")}\`)`,
+			`console.log(\`\${8 / 2}\`)`,
+			`console.log(\`\${({value: "}"}).value}\`)`,
+			`console.log(\`require("node:process") \${1}\`)`,
+			`console.log('require("process")')`,
+			`/* require("node:process") */ process.stdout.write("status")`,
+			`console.log(require/**/("node:path").basename("src/product.ts"))`,
+			`const mygetBuiltinModule=1;console.log(mygetBuiltinModule)`,
+			`console.log(\`\${1 /* } */ + 2}\`)`,
+			`process.stdout.write(Array.from([1,2]).join(""))`,
+			`console.log(Buffer.from("status","utf8"))`,
+			`const holder={return:8};console.log(holder.return / 2)`,
+			`console.log(module.filename, module.id, module.loaded)`,
+			`console.log('module["require"]("node:process")')`,
+			`function f(){return /x/.test("x")} console.log(f())`,
+			`console.log(Math.max(1, 2) / 2)`,
+			`const getBuiltinModule = id => id; console.log(getBuiltinModule("node:path"))`,
+			`if (true) /x/.test("x"); console.log("inspection")`,
+			`console.log(process.stdout.fd, process.stderr.fd)`,
+			`const myFunction = value => value; console.log(myFunction("status"))`,
+			`console.log(({constructor$:1}).constructor$)`,
+			`console.log(["constructor"].join(""))`,
+			`const data=/**/["constructor"];console.log(data.join(""))`,
+			`const r=/[//]/;const data=["constructor"];console.log(r.test("/"),data.join(""))`,
+			`console.log(8 / ["constructor"].length)`,
+		]) {
+			const command = `node -e ${quoteBashSingle(source)}`;
+			expect((await decideBash(cwd, command)).blocked, command).toBe(false);
+		}
+	});
+
+	it("applies the stream trust policy to JavaScript eval cells", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		for (const [code, blocked] of [
+			[`const s=process.stdout;s.write=fs.writeFileSync;s.write("src/product.ts","data")`, true],
+			[`const s=process.stderr;s["write"]=writer;process.stderr.write("status")`, true],
+			[`console.log("status");process.stdout.write("status")`, false],
+			[`console.log(process.stdout.fd);await read("package.json")`, false],
+			[`fs.writeFileSync("src/product.ts","data")`, true],
+			[`const make=({})./**/constructor./**/constructor;make("return process")()`, true],
+			[`const make=({})/**/["constructor"]/**/["constructor"];make("return process")()`, true],
+			[`const r=/[//]/;const make=({})["constructor"]["constructor"];make("return process")()`, true],
+			[`const make=({})?.["constructor"]?.["constructor"];make("return process")()`, true],
+			[`const make=({})[\`con\${"structor"}\`][\`con\${"structor"}\`];make("return process")()`, true],
+			[`globalThis["eval"]("process.stdout.write=write")`, true],
+			[`global["eval"]("process.stderr.write=write")`, true],
+			[`globalThis["Function"]("return process")()`, true],
+			[`const make=({})[\`constructor\`][/**/"constructor"/**/];make("return process")()`, true],
+			[`console.log(({constructor$:1}).constructor$)`, false],
+			[`console.log(8 / ["constructor"].length)`, false],
+		] as const) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("eval"),
+				args: { cells: [{ language: "js", code }] },
+			});
+			expect(decision.blocked, code).toBe(blocked);
+		}
+	});
+
 	it("blocks aliased stdout stream mutations", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");

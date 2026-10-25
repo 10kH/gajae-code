@@ -19,6 +19,7 @@ import {
 	normalizeDiscordConversation,
 } from "./discord-conversation";
 import type { DiscordInboundEvent, DiscordMessageComponent, DiscordProvider, DiscordThread } from "./discord-provider";
+import { scrubReplayedProviderText } from "./engine";
 
 const FAILURE = "This conversation is no longer available.";
 
@@ -106,6 +107,8 @@ export interface DiscordNotificationInput {
 	actionId?: string;
 	options?: string[];
 	publicationId?: string;
+	/** Present only for an explicit presentation redact opt-out. Absent keeps the safe scrub. */
+	literal?: true;
 }
 
 type DiscordInboundEffectPayload =
@@ -466,7 +469,16 @@ export class DiscordNotificationDaemon {
 		const effectId = pendingActionId
 			? authoritative.pendingActionEffectId!
 			: `notification:${authoritative.threadId}:${input.publicationId ?? randomUUID()}`;
-		await this.#postEffect(effectId, authoritative, input.content, components, pendingActionId !== undefined);
+		await this.#postEffect(
+			effectId,
+			authoritative,
+			input.content,
+			components,
+			pendingActionId !== undefined,
+			false,
+			false,
+			input.literal === true,
+		);
 
 		return authoritative;
 	}
@@ -2187,6 +2199,7 @@ export class DiscordNotificationDaemon {
 		actionPublication = false,
 		closing = false,
 		allowInactive = false,
+		keepLiteral = false,
 	): Promise<void> {
 		const nonce = discordEffectNonce(id);
 		const existingEffect = await this.#effects.read<{
@@ -2195,6 +2208,7 @@ export class DiscordNotificationDaemon {
 			nonce: string;
 			components?: DiscordMessageComponent[];
 			attachmentAuthorityId?: string;
+			literal?: true;
 		}>(id);
 		const payload = existingEffect?.payload ?? {
 			threadId: record.threadId!,
@@ -2202,6 +2216,7 @@ export class DiscordNotificationDaemon {
 			nonce,
 			...(record.attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId: record.attachmentAuthorityId }),
 			...(components ? { components } : {}),
+			...(keepLiteral ? { literal: true as const } : {}),
 		};
 		if (payload.attachmentAuthorityId !== record.attachmentAuthorityId)
 			throw new DiscordAttachmentBindingError("Discord provider effect belongs to another attachment.");
@@ -2225,9 +2240,14 @@ export class DiscordNotificationDaemon {
 						status: "reconciled",
 					};
 				await ensure();
+				if (id.startsWith("notification:") && typeof payload.content !== "string")
+					throw new Error(`Discord effect ${id} has no replayable frame body`);
+				const content = id.startsWith("notification:")
+					? scrubReplayedProviderText(id, payload.content, payload.literal === true)
+					: payload.content;
 				const posted = await this.options.provider.postMessage({
 					threadId: payload.threadId,
-					content: payload.content,
+					content,
 					nonce: payload.nonce,
 					...(payload.components ? { components: payload.components } : {}),
 				});
