@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { SelectListTheme, SymbolTheme } from "@gajae-code/tui";
 import {
 	type AutocompleteItem,
 	type AutocompleteProvider,
@@ -12,7 +13,6 @@ import {
 } from "@gajae-code/tui/autocomplete";
 import { Editor } from "@gajae-code/tui/components/editor";
 import { SelectList } from "@gajae-code/tui/components/select-list";
-import type { SelectListTheme, SymbolTheme } from "@gajae-code/tui";
 import { visibleWidth } from "@gajae-code/tui/utils";
 import fc from "fast-check";
 import { defaultEditorTheme } from "./test-themes";
@@ -824,8 +824,7 @@ describe("Editor autocomplete layout", () => {
 	});
 });
 
-const TERMINAL_CONTROL =
-	/[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
+const TERMINAL_CONTROL = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
 const ORDINARY_LABEL_SEED = 20261025;
 const HOSTILE_LABEL_SEED = 20261026;
 const LABEL_PROPERTY_RUNS = 64;
