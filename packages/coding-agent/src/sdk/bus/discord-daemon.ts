@@ -10,6 +10,7 @@ import {
 	type ChatEffectLease,
 	type ChatEffectReceipt,
 } from "./chat-effect-journal";
+import { loadNotificationConfigFile } from "./config";
 import { ConversationStore } from "./conversation-store";
 
 import {
@@ -22,6 +23,48 @@ import type { DiscordInboundEvent, DiscordMessageComponent, DiscordProvider, Dis
 import { scrubReplayedProviderText } from "./engine";
 
 const FAILURE = "This conversation is no longer available.";
+
+function actorRecord(value: unknown): Record<string, unknown> | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	return value as Record<string, unknown>;
+}
+
+function trimmedActorId(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const trimmed = value.trim();
+	return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/** Ids named by the global Discord notification config. An absent or malformed list is empty. */
+export function discordActorIdsFromConfig(value: unknown): ReadonlySet<string> {
+	const ids = new Set<string>();
+	const discord = actorRecord(actorRecord(actorRecord(value)?.notifications)?.discord);
+	if (!discord) return ids;
+	const single = trimmedActorId(discord.authorizedUserId);
+	if (single) ids.add(single);
+	if (Array.isArray(discord.authorizedUserIds)) {
+		for (const item of discord.authorizedUserIds) {
+			const id = trimmedActorId(item);
+			if (id) ids.add(id);
+		}
+	}
+	return ids;
+}
+
+/** True only when the author is a non-blank id present in the allowlist. */
+export function discordInboundActorAllowed(authorId: string, allowed: ReadonlySet<string>): boolean {
+	const author = authorId.trim();
+	return author.length > 0 && allowed.has(author);
+}
+
+function explicitActorAllowlist(ids: readonly string[]): ReadonlySet<string> {
+	const allowed = new Set<string>();
+	for (const id of ids) {
+		const trimmed = trimmedActorId(id);
+		if (trimmed) allowed.add(trimmed);
+	}
+	return allowed;
+}
 
 export class DiscordAttachmentBindingError extends Error {
 	constructor(message = "Discord session attachment changed before outbound publication.") {
@@ -96,6 +139,8 @@ export interface DiscordNotificationDaemonOptions {
 		attachment: SessionAttachment,
 		idempotencyKey: string,
 	) => Promise<boolean>;
+	/** When set, this is the only inbound allowlist. When omitted, the global config file is read. Empty fails closed. */
+	authorizedActorIds?: readonly string[];
 }
 
 export interface DiscordNotificationInput {
@@ -670,6 +715,7 @@ export class DiscordNotificationDaemon {
 
 	async handleInbound(event: DiscordInboundEvent): Promise<void> {
 		if (event.bot || event.authorId === this.options.provider.botUserId) return;
+		if (!discordInboundActorAllowed(event.authorId, await this.#allowedActorIds())) return;
 		await this.#reconcileTerminalInboundReceipts();
 		const record = await this.#byThread(event.guildId, event.parentId, event.threadId);
 		if (!record?.sessionId) {
@@ -703,6 +749,17 @@ export class DiscordNotificationDaemon {
 	#track<T>(work: Promise<T>, sessionId?: string): Promise<T> {
 		this.#activeWork.set(work, sessionId);
 		return work.finally(() => this.#activeWork.delete(work));
+	}
+
+	async #allowedActorIds(): Promise<ReadonlySet<string>> {
+		if (this.options.authorizedActorIds) return explicitActorAllowlist(this.options.authorizedActorIds);
+		try {
+			const loaded = loadNotificationConfigFile(this.options.agentDir);
+			if (loaded.status !== "ok") return new Set();
+			return discordActorIdsFromConfig(loaded.value);
+		} catch {
+			return new Set();
+		}
 	}
 
 	async #claimInbound(

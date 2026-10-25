@@ -485,6 +485,11 @@ describe("chat daemon worker", () => {
 			},
 		);
 
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.writeFile(
+			path.join(agentDir, "config.yml"),
+			'notifications:\n  discord:\n    authorizedUserId: "human"\n',
+		);
 		const replayedThread = provider.waitForThreadCount(1);
 		await runtime.start();
 		await client.waitForRequest(frame => frame.type === "event_replay");
@@ -1614,6 +1619,11 @@ describe("chat daemon worker", () => {
 						clearInterval: (() => {}) as typeof clearInterval,
 					},
 				},
+			);
+			await fs.mkdir(agentDir, { recursive: true });
+			await fs.writeFile(
+				path.join(agentDir, "config.yml"),
+				'notifications:\n  discord:\n    authorizedUserId: "human"\n',
 			);
 			const replayedThread = provider.waitForThreadCount(1);
 			await runtime.start();
