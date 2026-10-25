@@ -1379,7 +1379,11 @@ function addCodingAgentSdkProductionHostTask(tasks: Map<string, Task>): void {
 // collisions fall back to package-level checks instead of selecting arbitrary tests.
 function mappedTestsFor(changedPath: string, packages: readonly WorkspacePackage[], testFiles: readonly string[]): string[] {
 	if (isTestFilePath(changedPath)) {
-		return testFiles.includes(changedPath) ? [changedPath] : [];
+		// Discovery can miss a test added in this diff. An existing package test is
+		// still its own focused task. A deleted path is in neither the index nor the
+		// checkout, so it stays off the plan.
+		if (testFiles.includes(changedPath) || packageTestExists(changedPath)) return [changedPath];
+		return [];
 	}
 	const base = path.posix.basename(changedPath).replace(/\.(tsx?|jsx?|mts|cts)$/, "");
 	if (base === "") {
@@ -1435,6 +1439,26 @@ function isEmbeddedDocsSourcePath(changedPath: string): boolean {
 
 function isTestFilePath(changedPath: string): boolean {
 	return /\.test\.tsx?$/.test(changedPath);
+}
+
+export function isPackageTestPath(changedPath: string): boolean {
+	return changedPath.startsWith("packages/") && !changedPath.includes("node_modules/") && /\.test\.tsx?$/.test(changedPath);
+}
+
+function packageTestExists(changedPath: string): boolean {
+	if (!isPackageTestPath(changedPath)) return false;
+	if (changedPath.split("/").some(part => part === "" || part === "." || part === "..")) return false;
+	return fsSync.existsSync(path.join(repoRoot, changedPath));
+}
+
+/** Existing package tests with no `test:<path>` task. A path that is not on disk is not an omission. */
+export function omittedPackageTestPaths(
+	paths: readonly string[],
+	taskKeys: readonly string[],
+	fileExists: (changedPath: string) => boolean = packageTestExists,
+): string[] {
+	const keys = new Set(taskKeys);
+	return paths.filter(changedPath => isPackageTestPath(changedPath) && fileExists(changedPath) && !keys.has(`test:${changedPath}`));
 }
 
 function isCiHarnessScriptPath(changedPath: string): boolean {
@@ -2309,6 +2333,10 @@ async function loadCanonicalPlan(): Promise<Task[] | null> {
 		new Set(tasks.map(task => task.key)).size !== tasks.length ||
 		new Set(tasks.map(task => task.identity)).size !== tasks.length
 	) throw new Error("affected-plan-invalid: duplicate task key or identity");
+	if (decoded.mode === "pr") {
+		const omitted = omittedPackageTestPaths(paths, tasks.map(task => task.key));
+		if (omitted.length > 0) throw new Error(`affected-plan-invalid: changed package test omitted from canonical plan: ${omitted.join(", ")}`);
+	}
 	const matrixKey = Bun.env.CI_DEV_MATRIX_KEY?.trim();
 	if (matrixKey) {
 		const task = tasks.find(candidate => candidate.key === matrixKey);
