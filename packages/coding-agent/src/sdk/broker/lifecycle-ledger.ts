@@ -76,6 +76,8 @@ export interface LifecycleLedgerEntry {
 	fingerprint?: string;
 	/** True only when a session.close request supplied immutable generation authority. */
 	closeAuthorityBound?: boolean;
+	/** Set only on unkeyed rows that mirror a spawn-authority claim; see `hasLegacyIdentity`. */
+	spawnAnchor?: true;
 	version: typeof SDK_STATE_VERSION;
 	identity: string;
 	requestHash: string;
@@ -199,6 +201,7 @@ function isLifecycleLedgerEntry(value: unknown): value is LifecycleLedgerEntry {
 		typeof entry.ts === "number" &&
 		Number.isSafeInteger(entry.ts) &&
 		(entry.operationKey === undefined || typeof entry.operationKey === "string") &&
+		(entry.spawnAnchor === undefined || entry.spawnAnchor === true) &&
 		(entry.fingerprint === undefined || typeof entry.fingerprint === "string")
 	);
 }
@@ -288,8 +291,10 @@ function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
 export class LifecycleLedger {
 	#file: string;
 	#corruptFile: string;
+	#spawnAnchorsFile: string;
 	#entries: LifecycleLedgerEntry[] = [];
 	#byIdentity = new Map<string, LifecycleLedgerEntry>();
+	#unmarkedSpawnAnchors: ReadonlySet<string> = new Set();
 	#limits: Required<LifecycleLedgerLimits>;
 	#rowCount = 0;
 	#byteCount = 0;
@@ -311,6 +316,7 @@ export class LifecycleLedger {
 	constructor(agentDir: string, limits: LifecycleLedgerLimits = {}) {
 		this.#file = path.join(agentDir, "sdk", "lifecycle-ledger.jsonl");
 		this.#corruptFile = `${this.#file}.corrupt`;
+		this.#spawnAnchorsFile = path.join(agentDir, "sdk", "lifecycle-ledger.spawn-anchors.json");
 		this.#limits = {
 			maxBytes: limits.maxBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxBytes,
 			maxLineBytes: limits.maxLineBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxLineBytes,
@@ -326,6 +332,11 @@ export class LifecycleLedger {
 		await fs.mkdir(path.dirname(this.#file), { recursive: true, mode: 0o700 });
 		this.#entries = [];
 		this.#byIdentity.clear();
+		this.#unmarkedSpawnAnchors = new Set();
+		// Evidence for deriving the unmarked-anchor record once; see #loadUnmarkedSpawnAnchors.
+		const firstSeenTs = new Map<string, number>();
+		const firstSeenAfterKeyed = new Set<string>();
+		let sawKeyedRow = false;
 		this.#warnings = [];
 		this.#rowCount = 0;
 		this.#byteCount = 0;
@@ -354,6 +365,10 @@ export class LifecycleLedger {
 					if (!isLifecycleLedgerEntry(value)) throw new Error("invalid ledger entry");
 					const entry = value;
 					const prior = this.#byIdentity.get(entry.identity);
+					if (!firstSeenTs.has(entry.identity)) {
+						firstSeenTs.set(entry.identity, entry.ts);
+						if (sawKeyedRow) firstSeenAfterKeyed.add(entry.identity);
+					}
 					const invalidHistory =
 						invalidIdentities.has(entry.identity) ||
 						uncertainAfterCorruption.has(entry.identity) ||
@@ -387,6 +402,7 @@ export class LifecycleLedger {
 						}
 						continue;
 					}
+					if (entry.operationKey !== undefined && entry.state === "accepted") sawKeyedRow = true;
 					this.#entries.push(entry);
 					this.#byIdentity.set(entry.identity, entry);
 				} catch (error) {
@@ -399,6 +415,11 @@ export class LifecycleLedger {
 			}
 		}
 		if (tornTail) await this.#sealTornTail();
+		await this.#loadUnmarkedSpawnAnchors({
+			firstSeenTs,
+			firstSeenAfterKeyed,
+			quarantined: new Set([...invalidIdentities, ...uncertainAfterCorruption]),
+		});
 		for (const [identity, uncertain] of syntheticUncertain) {
 			this.#byIdentity.set(identity, uncertain);
 			if (this.#entries.some(entry => entry.identity === identity && entry.state === "accepted"))
@@ -813,9 +834,11 @@ export class LifecycleLedger {
 	/**
 	 * Live legacy rows predate the operation/key index. Their opaque identities
 	 * cannot establish that a different target is safe, so callers must reject
-	 * rather than create a second admission. A fresh session.create may ignore
-	 * final legacy rows: exact legacy identities are still resolved before this
-	 * check, and uncertain rows retain their session-scoped fences.
+	 * rather than create a second admission. Spawn-claim anchors are unkeyed but
+	 * are not legacy requests and never fence (see #isSpawnAnchor). A fresh
+	 * session.create may ignore final legacy rows: exact legacy identities are
+	 * still resolved before this check, and uncertain rows retain their
+	 * session-scoped fences.
 	 *
 	 * A session-targeted request passes `sessionTarget` to ignore terminal legacy
 	 * rows that record only other sessions, unless the row is the caller's key
@@ -839,6 +862,7 @@ export class LifecycleLedger {
 		return [...this.#byIdentity.values()].some(
 			entry =>
 				entry.operationKey === undefined &&
+				!this.#isSpawnAnchor(entry) &&
 				!(options.ignoreFinalRows && final(entry.state)) &&
 				!unrelatedTerminal(entry) &&
 				!excludedIdentities?.has(entry.identity),
@@ -918,6 +942,98 @@ export class LifecycleLedger {
 		this.#byteCount += line.length;
 		return entry;
 	}
+	/**
+	 * Spawn-claim anchors are unkeyed rows that only mirror a spawn-authority claim;
+	 * they are never target-inclusive lifecycle requests, so they never fence a
+	 * different admission, even after their claim leaves the spawn-authority
+	 * journal. Anchors carry `spawnAnchor: true` in the row itself, which survives
+	 * migration, compaction, eviction and restarts. Anchors written before that
+	 * marker existed are listed once in {@link #spawnAnchorsFile}. Identities are
+	 * HMACs of the operation and caller key under the agent directory's broker key,
+	 * so a listed identity can only match a `session.spawn` row of that directory.
+	 */
+	#isSpawnAnchor(entry: LifecycleLedgerEntry): boolean {
+		return entry.spawnAnchor === true || this.#unmarkedSpawnAnchors.has(entry.identity);
+	}
+	/**
+	 * Loads the unmarked-anchor record, deriving it once when it is missing or
+	 * damaged. An unmarked identity counts as an anchor only when both its file
+	 * position and its first-row `ts` fall strictly after the first operation-keyed
+	 * accepted row, and none of its history was quarantined or made uncertain by a
+	 * corrupt row. Index-aware writers start unkeyed identities only for spawn
+	 * mirrors, so a genuine legacy row precedes every keyed row on both signals.
+	 * Legacy migration rewrites a keyed row in place ahead of later legacy rows
+	 * (file order) but stamps it with the current time; eviction deletes only keyed
+	 * terminal rows and never reorders or re-stamps survivors, so it only moves the
+	 * boundary later. Requiring both signals keeps genuine legacy rows fenced.
+	 */
+	async #loadUnmarkedSpawnAnchors(evidence: {
+		readonly firstSeenTs: ReadonlyMap<string, number>;
+		readonly firstSeenAfterKeyed: ReadonlySet<string>;
+		readonly quarantined: ReadonlySet<string>;
+	}): Promise<void> {
+		try {
+			const value: unknown = JSON.parse(await fs.readFile(this.#spawnAnchorsFile, "utf8"));
+			if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+				const record = value as { version?: unknown; identities?: unknown };
+				if (
+					record.version === 1 &&
+					Array.isArray(record.identities) &&
+					record.identities.every(identity => typeof identity === "string")
+				) {
+					this.#unmarkedSpawnAnchors = new Set(record.identities as string[]);
+					return;
+				}
+			}
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+		}
+		let firstKeyedTs: number | undefined;
+		for (const entry of this.#entries)
+			if (entry.operationKey !== undefined && entry.state === "accepted")
+				firstKeyedTs = firstKeyedTs === undefined ? entry.ts : Math.min(firstKeyedTs, entry.ts);
+		const anchors = new Set<string>();
+		if (firstKeyedTs !== undefined)
+			for (const latest of this.#byIdentity.values()) {
+				const firstSeen = evidence.firstSeenTs.get(latest.identity);
+				if (
+					latest.operationKey === undefined &&
+					latest.spawnAnchor !== true &&
+					evidence.firstSeenAfterKeyed.has(latest.identity) &&
+					!evidence.quarantined.has(latest.identity) &&
+					firstSeen !== undefined &&
+					firstSeen > firstKeyedTs
+				)
+					anchors.add(latest.identity);
+			}
+		const temporary = path.join(
+			path.dirname(this.#spawnAnchorsFile),
+			`.lifecycle-ledger-anchors.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
+		);
+		let renamed = false;
+		try {
+			const h = await fs.open(
+				temporary,
+				fsSync.constants.O_WRONLY |
+					fsSync.constants.O_CREAT |
+					fsSync.constants.O_EXCL |
+					fsSync.constants.O_NOFOLLOW,
+				0o600,
+			);
+			try {
+				await h.writeFile(`${JSON.stringify({ version: 1, identities: [...anchors].sort() })}\n`);
+				await h.sync();
+			} finally {
+				await h.close();
+			}
+			await fs.rename(temporary, this.#spawnAnchorsFile);
+			renamed = true;
+			await this.#syncDirectory();
+		} finally {
+			if (!renamed) await fs.unlink(temporary).catch(() => {});
+		}
+		this.#unmarkedSpawnAnchors = anchors;
+	}
 	async begin(
 		identity: string,
 		requestHash: string,
@@ -926,6 +1042,7 @@ export class LifecycleLedger {
 			fingerprint?: string;
 			intendedSessionId?: string;
 			closeAuthorityBound?: boolean;
+			spawnAnchor?: true;
 		} = {},
 	): Promise<BeginResult> {
 		return this.#mutate(async () => this.#begin(identity, requestHash, metadata));
@@ -939,6 +1056,7 @@ export class LifecycleLedger {
 			fingerprint?: string;
 			intendedSessionId?: string;
 			closeAuthorityBound?: boolean;
+			spawnAnchor?: true;
 		},
 	): Promise<BeginResult> {
 		const prior = this.#byIdentity.get(identity);
@@ -953,6 +1071,7 @@ export class LifecycleLedger {
 					fingerprint: metadata.fingerprint,
 					intendedSessionId: metadata.intendedSessionId,
 					closeAuthorityBound: metadata.closeAuthorityBound,
+					spawnAnchor: metadata.spawnAnchor,
 					state: "accepted",
 					ts: Date.now(),
 				}),

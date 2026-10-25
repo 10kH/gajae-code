@@ -388,6 +388,17 @@ not settle earlier effects.
   `accepted`, `effect_started`, `awaiting_ready`, and `terminal_uncertain` legacy
   history stays fenced even for an apparently unrelated empty session. Recovery
   after restart marking a row `terminal_uncertain` is not proof of no effect.
+- `session.spawn` claim mirrors are not legacy requests and never fence, even
+  after their claim leaves the spawn-authority journal. Current brokers mark them
+  with `spawnAnchor: true` in the row. Mirrors written before that marker are
+  listed once in `sdk/lifecycle-ledger.spawn-anchors.json`
+  (`{"version":1,"identities":[...]}`, mode 0600) when it is missing or
+  unparseable; after that it is read as-is and never rewritten. An unmarked
+  identity is listed only when its first row follows the first operation-keyed
+  accepted row in both file order and `ts` and none of its history was
+  quarantined or left uncertain by a corrupt row. Deleting the file re-derives it
+  from the current ledger on the next broker open; removing a wrongly listed
+  identity restores that row's fence. Never add identities by hand.
 
 This diagnostic identifies the actual admission guard without exposing ledger
 identities, request hashes, filesystem paths, credentials, or broker free text.
