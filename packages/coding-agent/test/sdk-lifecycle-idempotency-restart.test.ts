@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
 import { deriveIdempotencyIdentity, deriveLegacyIdentity } from "../src/sdk/broker/identity";
+import { setLifecycleCommandResolverForTest } from "../src/sdk/broker/lifecycle";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
 
 function lifecycleFingerprint(operation: string, input: Record<string, unknown>): string {
@@ -80,6 +81,389 @@ describe("SDK lifecycle ledger", () => {
 		await ledger.begin("legacy-target-a", "request-a");
 		expect(ledger.hasLegacyIdentity()).toBe(true);
 		expect(ledger.findByOperationKey("session.create\0caller-key")).toBeUndefined();
+	});
+	it("does not fence on marked spawn anchors, including orphaned ones, across restarts", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-orphan-anchor-"));
+		try {
+			const ledger = await new LifecycleLedger(dir).open();
+			// A spawn-claim anchor whose claim later left the spawn-authority journal,
+			// written both before and after any operation-keyed row.
+			await ledger.begin("early-spawn-anchor", "binding-mac-1", { spawnAnchor: true });
+			await ledger.begin("keyed-create", "request-k", { operationKey: "session.create\0k", fingerprint: "f" });
+			await ledger.transition("keyed-create", "terminal_ok", { response: { sessionId: "s" } });
+			await ledger.begin("orphan-spawn-anchor", "binding-mac-2", { spawnAnchor: true });
+			expect(ledger.hasLegacyIdentity()).toBe(false);
+			const reopened = await new LifecycleLedger(dir).open();
+			expect(reopened.get("orphan-spawn-anchor")).toMatchObject({ state: "accepted", spawnAnchor: true });
+			expect(reopened.hasLegacyIdentity()).toBe(false);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("keeps fencing pre-index legacy rows once keyed rows and anchors follow", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-preindex-mixed-"));
+		try {
+			const ledger = await new LifecycleLedger(dir).open();
+			await ledger.begin("legacy-target-a", "request-a");
+			await ledger.begin("keyed-create", "request-k", { operationKey: "session.create\0k", fingerprint: "f" });
+			await ledger.begin("later-spawn-anchor", "binding-mac", { spawnAnchor: true });
+			// An unmarked unkeyed row written after the index is still not proven to be an anchor.
+			await ledger.begin("later-unmarked", "request-u");
+			const reopened = await new LifecycleLedger(dir).open();
+			expect(reopened.hasLegacyIdentity(new Set(), { ignoreFinalRows: true })).toBe(true);
+			expect(reopened.hasLegacyIdentity(new Set(["legacy-target-a"]), { ignoreFinalRows: true })).toBe(true);
+			expect(
+				reopened.hasLegacyIdentity(new Set(["legacy-target-a", "later-unmarked"]), { ignoreFinalRows: true }),
+			).toBe(false);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("keeps fencing other pre-index legacy rows after one is migrated and the broker restarts", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-preindex-migrated-"));
+		try {
+			const ledger = await new LifecycleLedger(dir).open();
+			await ledger.begin("legacy-a", "request-a", { intendedSessionId: "session-a" });
+			await ledger.transition("legacy-a", "terminal_ok", { response: { sessionId: "session-a" } });
+			// B is still live: it cannot prove which target it was for.
+			await ledger.begin("legacy-b", "request-b", { intendedSessionId: "session-b" });
+			// Migration rewrites A's latest row with operation metadata ahead of B's anchor.
+			await ledger.migrateIdentity("legacy-a", "keyed-a", { operationKey: "session.close\0a", fingerprint: "f" });
+			const anchorsRecord = path.join(dir, "sdk", "lifecycle-ledger.spawn-anchors.json");
+			// Also re-derive the unmarked-anchor record from the migrated ledger.
+			for (const reset of [async () => {}, async () => fs.rm(anchorsRecord)]) {
+				await reset();
+				const reopened = await new LifecycleLedger(dir).open();
+				expect(reopened.get("legacy-a")?.operationKey).toBe("session.close\0a");
+				expect(reopened.hasLegacyIdentity()).toBe(true);
+				expect(reopened.hasLegacyIdentity(new Set(["legacy-b"]))).toBe(false);
+			}
+
+			const broker = new Broker({ agentDir: dir });
+			setLifecycleCommandResolverForTest(broker, () => ({ file: path.join(dir, "missing-gjc"), args: [] }));
+			try {
+				await broker.start();
+				await expect(
+					broker.handleRequest("session.close", { sessionId: "session-c" }, "fresh-close-c"),
+				).resolves.toEqual({
+					ok: false,
+					error: {
+						code: "legacy_lifecycle_ambiguous",
+						message: "legacy lifecycle request has an ambiguous target",
+					},
+				});
+			} finally {
+				setLifecycleCommandResolverForTest(broker, undefined);
+				await broker.stop();
+			}
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("does not promote a spawn anchor to legacy when eviction removes the keyed row before it", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-anchor-eviction-"));
+		try {
+			const limits = { maxRows: 4 };
+			const ledger = await new LifecycleLedger(dir, limits).open();
+			await ledger.begin("keyed-k", "request-k", { operationKey: "session.create\0k", fingerprint: "fk" });
+			await ledger.transition("keyed-k", "terminal_ok", { response: { sessionId: "k" } });
+			await ledger.begin("spawn-anchor-s", "binding-mac", { spawnAnchor: true });
+			await ledger.begin("keyed-j", "request-j", { operationKey: "session.create\0j", fingerprint: "fj" });
+			await ledger.transition("keyed-j", "terminal_ok", { response: { sessionId: "j" } });
+			const reopened = await new LifecycleLedger(dir, limits).open();
+			// K was evicted; S is now the first row in the file.
+			expect(reopened.get("keyed-k")).toBeUndefined();
+			expect(reopened.get("spawn-anchor-s")?.state).toBe("accepted");
+			expect(reopened.hasLegacyIdentity(new Set(), { ignoreFinalRows: true })).toBe(false);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("derives the unmarked-anchor record once for a ledger written before the marker", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-unmarked-anchors-"));
+		try {
+			const ledgerPath = path.join(dir, "sdk", "lifecycle-ledger.jsonl");
+			const record = path.join(dir, "sdk", "lifecycle-ledger.spawn-anchors.json");
+			await fs.mkdir(path.dirname(ledgerPath), { recursive: true, mode: 0o700 });
+			const keyed = { operationKey: "session.create\0k", fingerprint: "f" };
+			// An older writer: legacy L, then keyed K, then unmarked anchors, one sharing K's ts.
+			await fs.writeFile(
+				ledgerPath,
+				[
+					lifecycleRow("legacy-l", "request-l", "accepted", 10),
+					lifecycleRow("keyed-k", "request-k", "accepted", 20, keyed),
+					lifecycleRow("same-ms-unmarked", "binding-mac-0", "accepted", 20),
+					lifecycleRow("old-anchor-s", "binding-mac", "accepted", 30),
+				]
+					.map(row => `${JSON.stringify(row)}\n`)
+					.join(""),
+			);
+			const expected = { version: 1, identities: ["old-anchor-s"] };
+			for (const damage of [
+				async () => {},
+				async () => fs.writeFile(record, "{not json"),
+				async () => fs.writeFile(record, "null\n"),
+				async () => fs.rm(record),
+			]) {
+				await damage();
+				const reopened = await new LifecycleLedger(dir).open();
+				expect(JSON.parse(await fs.readFile(record, "utf8"))).toEqual(expected);
+				expect(reopened.hasLegacyIdentity(new Set(["legacy-l", "same-ms-unmarked"]))).toBe(false);
+				expect(reopened.hasLegacyIdentity(new Set(["same-ms-unmarked"]))).toBe(true);
+				expect(reopened.hasLegacyIdentity(new Set(["legacy-l"]))).toBe(true);
+			}
+			// The record is derived once: rows appended later are not reclassified by it.
+			const ledger = await new LifecycleLedger(dir).open();
+			await ledger.begin("late-unmarked", "request-late");
+			const reopened = await new LifecycleLedger(dir).open();
+			expect(JSON.parse(await fs.readFile(record, "utf8"))).toEqual(expected);
+			expect(reopened.hasLegacyIdentity(new Set(["legacy-l", "same-ms-unmarked"]))).toBe(true);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("keeps fencing a pre-index legacy row whose anchor was lost", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-legacy-unanchored-"));
+		try {
+			const ledgerPath = path.join(dir, "sdk", "lifecycle-ledger.jsonl");
+			await fs.mkdir(path.dirname(ledgerPath), { recursive: true, mode: 0o700 });
+			// No unmarked-anchor record yet. L's accepted anchor is gone, leaving an
+			// effect_started row that names session S; it sits after the keyed row.
+			await fs.writeFile(
+				ledgerPath,
+				[
+					lifecycleRow("keyed-k", "request-k", "accepted", 1, {
+						operationKey: "session.create\0k",
+						fingerprint: "f",
+					}),
+					lifecycleRow("legacy-l", "request-l", "effect_started", 2, { intendedSessionId: "session-s" }),
+				]
+					.map(row => `${JSON.stringify(row)}\n`)
+					.join(""),
+			);
+			for (let open = 0; open < 2; open += 1) {
+				const reopened = await new LifecycleLedger(dir).open();
+				expect(reopened.get("legacy-l")?.state).toBe("terminal_uncertain");
+				expect(reopened.hasLegacyIdentity()).toBe(true);
+			}
+			const broker = new Broker({ agentDir: dir });
+			setLifecycleCommandResolverForTest(broker, () => ({ file: path.join(dir, "missing-gjc"), args: [] }));
+			try {
+				await broker.start();
+				await expect(
+					broker.handleRequest("session.close", { sessionId: "session-s" }, "fresh-close-s"),
+				).resolves.toEqual({
+					ok: false,
+					error: {
+						code: "legacy_lifecycle_ambiguous",
+						message: "legacy lifecycle request has an ambiguous target",
+					},
+				});
+			} finally {
+				setLifecycleCommandResolverForTest(broker, undefined);
+				await broker.stop();
+			}
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it.each([
+		["older", -5],
+		["same-millisecond", 0],
+		["newer", 5],
+	])("does not let another ledger's anchor record unfence a restored %s legacy ledger", async (_name, offset) => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-legacy-restored-"));
+		try {
+			const ledgerPath = path.join(dir, "sdk", "lifecycle-ledger.jsonl");
+			// A ledger whose record lists its own unmarked anchor.
+			await fs.mkdir(path.dirname(ledgerPath), { recursive: true, mode: 0o700 });
+			const now = Date.now();
+			await fs.writeFile(
+				ledgerPath,
+				[
+					lifecycleRow("keyed-k", "request-k", "accepted", now, {
+						operationKey: "session.create\0k",
+						fingerprint: "f",
+					}),
+					lifecycleRow("old-anchor-s", "binding-mac", "accepted", now + 1),
+				]
+					.map(row => `${JSON.stringify(row)}\n`)
+					.join(""),
+			);
+			const ledger = await new LifecycleLedger(dir).open();
+			expect(ledger.hasLegacyIdentity()).toBe(false);
+			// While stopped, the ledger alone is replaced by an independent legacy-only ledger.
+			await fs.writeFile(
+				ledgerPath,
+				`${JSON.stringify(lifecycleRow("legacy-l", "request-l", "accepted", now + offset, { intendedSessionId: "session-l" }))}\n`,
+			);
+			const restored = await new LifecycleLedger(dir).open();
+			expect(restored.get("legacy-l")?.state).toBe("accepted");
+			expect(restored.hasLegacyIdentity()).toBe(true);
+			expect(restored.hasLegacyIdentity(new Set(["legacy-l"]))).toBe(false);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("keeps fencing a pre-index legacy row after migration, compaction and eviction re-derive the record", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-preindex-evicted-"));
+		try {
+			const limits = { maxRows: 6 };
+			const record = path.join(dir, "sdk", "lifecycle-ledger.spawn-anchors.json");
+			const ledger = await new LifecycleLedger(dir, limits).open();
+			await ledger.begin("legacy-a", "request-a", { intendedSessionId: "session-a" });
+			await ledger.transition("legacy-a", "terminal_ok", { response: { sessionId: "session-a" } });
+			await ledger.begin("legacy-b", "request-b", { intendedSessionId: "session-b" });
+			// Migration rewrites A in place, ahead of B, as a keyed row stamped now.
+			await ledger.migrateIdentity("legacy-a", "keyed-a", { operationKey: "session.create\0a", fingerprint: "fa" });
+			// Keyed traffic then forces compactions that evict the oldest keyed terminal rows.
+			for (const name of ["k1", "k2", "k3"]) {
+				await ledger.begin(`keyed-${name}`, `request-${name}`, {
+					operationKey: `session.create\0${name}`,
+					fingerprint: `f${name}`,
+				});
+				await ledger.transition(`keyed-${name}`, "terminal_ok", { response: { sessionId: name } });
+			}
+			const rows = (await fs.readFile(path.join(dir, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
+				.split("\n")
+				.filter(Boolean)
+				.map(line => JSON.parse(line) as { identity: string });
+			expect(rows.length).toBeLessThanOrEqual(limits.maxRows);
+			expect(rows.some(row => row.identity === "legacy-a")).toBe(false);
+			expect(rows[0]?.identity).toBe("legacy-b");
+			for (const reset of [async () => {}, async () => fs.rm(record)]) {
+				await reset();
+				const reopened = await new LifecycleLedger(dir, limits).open();
+				expect(JSON.parse(await fs.readFile(record, "utf8"))).toEqual({ version: 1, identities: [] });
+				expect(reopened.get("legacy-b")?.state).toBe("accepted");
+				expect(reopened.hasLegacyIdentity(new Set(), { ignoreFinalRows: true })).toBe(true);
+				expect(reopened.hasLegacyIdentity(new Set(["legacy-b"]), { ignoreFinalRows: true })).toBe(false);
+			}
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it.each([
+		[
+			"a quarantined history row",
+			[
+				lifecycleRow("unmarked-q", "request-substituted", "terminal_ok", 30, {
+					response: { sessionId: "session-q" },
+				}),
+			],
+		],
+		["a corrupt row that leaves it uncertain", ["{not json"]],
+	])("keeps fencing an unmarked row after the keyed row when it has %s", async (_name, damage) => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-unmarked-quarantined-"));
+		try {
+			const ledgerPath = path.join(dir, "sdk", "lifecycle-ledger.jsonl");
+			const record = path.join(dir, "sdk", "lifecycle-ledger.spawn-anchors.json");
+			await fs.mkdir(path.dirname(ledgerPath), { recursive: true, mode: 0o700 });
+			// U follows the keyed row on both signals, but part of its history is unreadable.
+			const rows: (Record<string, unknown> | string)[] = [
+				lifecycleRow("keyed-k", "request-k", "accepted", 10, {
+					operationKey: "session.create\0k",
+					fingerprint: "f",
+				}),
+				lifecycleRow("unmarked-q", "request-q", "accepted", 20, { intendedSessionId: "session-q" }),
+				...damage,
+			];
+			await fs.writeFile(
+				ledgerPath,
+				rows.map(row => `${typeof row === "string" ? row : JSON.stringify(row)}\n`).join(""),
+			);
+			for (let open = 0; open < 2; open += 1) {
+				const reopened = await new LifecycleLedger(dir).open();
+				expect(JSON.parse(await fs.readFile(record, "utf8"))).toEqual({ version: 1, identities: [] });
+				expect(reopened.get("unmarked-q")?.state).toBe("terminal_uncertain");
+				expect(reopened.hasLegacyIdentity()).toBe(true);
+			}
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("keeps fencing a pre-index legacy row once an earlier live legacy row is migrated ahead of it", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-preindex-live-migrated-"));
+		try {
+			const record = path.join(dir, "sdk", "lifecycle-ledger.spawn-anchors.json");
+			const ledger = await new LifecycleLedger(dir).open();
+			await ledger.begin("legacy-a", "request-a", { intendedSessionId: "session-a" });
+			await ledger.begin("legacy-b", "request-b", { intendedSessionId: "session-b" });
+			// A is still accepted, so migration rewrites its accepted row in place: the first
+			// keyed accepted row now precedes B in the file, but carries the migration time.
+			await ledger.migrateIdentity("legacy-a", "keyed-a", { operationKey: "session.create\0a", fingerprint: "fa" });
+			const rows = (await fs.readFile(path.join(dir, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
+				.split("\n")
+				.filter(Boolean)
+				.map(line => JSON.parse(line) as { identity: string; operationKey?: string });
+			expect(rows[0]).toMatchObject({ identity: "legacy-a", operationKey: "session.create\0a" });
+			expect(rows[1]?.identity).toBe("legacy-b");
+			await fs.rm(record);
+			const reopened = await new LifecycleLedger(dir).open();
+			expect(JSON.parse(await fs.readFile(record, "utf8"))).toEqual({ version: 1, identities: [] });
+			expect(reopened.hasLegacyIdentity()).toBe(true);
+			expect(reopened.hasLegacyIdentity(new Set(["legacy-b"]))).toBe(false);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("keeps fencing a pre-index legacy row stamped after the keyed row by a wall-clock step", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-preindex-skewed-"));
+		try {
+			const ledgerPath = path.join(dir, "sdk", "lifecycle-ledger.jsonl");
+			await fs.mkdir(path.dirname(ledgerPath), { recursive: true, mode: 0o700 });
+			const rows = [
+				lifecycleRow("skewed-legacy", "request-x", "accepted", 40, { intendedSessionId: "session-x" }),
+				lifecycleRow("keyed-k", "request-k", "accepted", 10, {
+					operationKey: "session.create\0k",
+					fingerprint: "f",
+				}),
+			];
+			await fs.writeFile(ledgerPath, rows.map(row => `${JSON.stringify(row)}\n`).join(""));
+			const reopened = await new LifecycleLedger(dir).open();
+			expect(
+				JSON.parse(await fs.readFile(path.join(dir, "sdk", "lifecycle-ledger.spawn-anchors.json"), "utf8")),
+			).toEqual({ version: 1, identities: [] });
+			expect(reopened.hasLegacyIdentity()).toBe(true);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("derives each agent directory's anchor record from that directory's ledger only", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-anchor-per-dir-"));
+		try {
+			const keyed = { operationKey: "session.create\0k", fingerprint: "f" };
+			const seed = async (agentDir: string, rows: Record<string, unknown>[]): Promise<void> => {
+				const ledgerPath = path.join(agentDir, "sdk", "lifecycle-ledger.jsonl");
+				await fs.mkdir(path.dirname(ledgerPath), { recursive: true, mode: 0o700 });
+				await fs.writeFile(ledgerPath, rows.map(row => `${JSON.stringify(row)}\n`).join(""));
+			};
+			const recordPath = (agentDir: string): string =>
+				path.join(agentDir, "sdk", "lifecycle-ledger.spawn-anchors.json");
+			const anchorDir = path.join(root, "anchor-agent");
+			const legacyDir = path.join(root, "legacy-agent");
+			// One identity: an unmarked anchor in one directory, a pre-index legacy row in the other.
+			await seed(anchorDir, [
+				lifecycleRow("keyed-k", "request-k", "accepted", 10, keyed),
+				lifecycleRow("shared-u", "binding-mac", "accepted", 20),
+			]);
+			await seed(legacyDir, [
+				lifecycleRow("shared-u", "request-u", "accepted", 5, { intendedSessionId: "session-u" }),
+				lifecycleRow("keyed-k", "request-k", "accepted", 10, keyed),
+			]);
+			const anchorLedger = await new LifecycleLedger(anchorDir).open();
+			const legacyLedger = await new LifecycleLedger(legacyDir).open();
+			expect(JSON.parse(await fs.readFile(recordPath(anchorDir), "utf8"))).toEqual({
+				version: 1,
+				identities: ["shared-u"],
+			});
+			expect(JSON.parse(await fs.readFile(recordPath(legacyDir), "utf8"))).toEqual({ version: 1, identities: [] });
+			expect((await fs.stat(recordPath(anchorDir))).mode & 0o777).toBe(0o600);
+			expect(anchorLedger.hasLegacyIdentity()).toBe(false);
+			expect(legacyLedger.hasLegacyIdentity()).toBe(true);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 	it("re-admits a durably accepted row after restart before any effect starts", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-accepted-"));

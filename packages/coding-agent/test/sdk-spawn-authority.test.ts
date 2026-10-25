@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { Broker, spawnRegistrationMatches } from "../src/sdk/broker/broker";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { setLifecycleCommandResolverForTest } from "../src/sdk/broker/lifecycle";
+import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
 import type { IndexedSession } from "../src/sdk/broker/session-index";
 import {
 	isSpawnClaimV2,
@@ -349,6 +350,45 @@ describe("SpawnAuthorityStore", () => {
 		} finally {
 			await broker.stop();
 		}
+	});
+
+	it("marks the spawn mirror so it never fences once its claim leaves the journal", async () => {
+		const agentDir = await temp();
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: { verifyMasterCapability: async () => ({ allowed: true }) },
+			spawnSubstrateProvider: spawnSubstrateFake,
+			spawnPromptLayer: spawnPromptLayerFake,
+		});
+		await broker.start();
+		try {
+			await expect(
+				broker.handleRequest(
+					"session.spawn",
+					{
+						task: "spawn-anchor-task",
+						masterCapability: "spawn-anchor-capability",
+						ownerSessionId: "spawn-anchor-owner",
+						attestationEpoch: "spawn-anchor-epoch",
+						cwd: agentDir,
+					},
+					"spawn-anchor-key",
+				),
+			).resolves.toMatchObject({ ok: true, result: { code: "spawn_accepted" } });
+		} finally {
+			await broker.stop();
+		}
+		const rows = (await Bun.file(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl")).text())
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as { operationKey?: string; spawnAnchor?: boolean });
+		const mirrors = rows.filter(row => row.operationKey === undefined);
+		expect(mirrors.length).toBeGreaterThan(0);
+		expect(mirrors.every(row => row.spawnAnchor === true)).toBe(true);
+		// Without the spawn-authority claims (the orphaned case), the mirror still does not fence.
+		const reopened = await new LifecycleLedger(agentDir).open();
+		expect(reopened.hasLegacyIdentity(new Set(), { ignoreFinalRows: true })).toBe(false);
+		expect(reopened.hasLegacyIdentity()).toBe(false);
 	});
 });
 
