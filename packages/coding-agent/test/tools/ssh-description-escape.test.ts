@@ -227,6 +227,16 @@ describe("ssh tool description", () => {
 		}
 	});
 
+	it("a long host name is not truncated and its tail stays inside the fence", async () => {
+		const tail = "x".repeat(4000);
+		const name = `host-${tail}`;
+		const tool = await loadTool({ [name]: { host: "203.0.113.80" } });
+		const body = fencedHostBody(tool!.description);
+		expect(body.split("\n")).toHaveLength(1);
+		expect(body).toContain(`- host-${tail} (203.0.113.80) | `);
+		expect(body.split(tail)).toHaveLength(2);
+	});
+
 	it("property: ssh host description encoding, fc.property seed 2026102601, numRuns 64", async () => {
 		const injectedName = fc.constantFrom(
 			NEWLINE_NAME,
