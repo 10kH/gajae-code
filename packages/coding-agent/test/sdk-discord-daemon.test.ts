@@ -208,6 +208,90 @@ async function withDaemon(
 	}
 }
 
+async function inboundEffectIds(agentDir: string): Promise<string[]> {
+	const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+	return (await journal.list())
+		.filter(effect => effect.kind === "discord.inbound.command" || effect.kind === "discord.inbound.action")
+		.map(effect => effect.id);
+}
+
+/** Config-file actor admission. Does not inject the fixture allowlist. */
+async function withConfigDaemon(
+	configBody: string | undefined,
+	run: (
+		daemon: DiscordNotificationDaemon,
+		agentDir: string,
+		commands: string[],
+		frames: Record<string, unknown>[],
+	) => Promise<void>,
+	authorizedActorIds?: readonly string[],
+): Promise<void> {
+	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-discord-actor-config-"));
+	let daemon: DiscordNotificationDaemon | undefined;
+	const commands: string[] = [];
+	const frames: Record<string, unknown>[] = [];
+	try {
+		if (configBody !== undefined) await fs.writeFile(path.join(agentDir, "config.yml"), configBody);
+		actionCustomIds.clear();
+		daemon = new DiscordNotificationDaemon({
+			agentDir,
+			guildId: "guild",
+			parentChannelId: "parent",
+			provider: new FakeDiscordProvider(),
+			resolveAttachment: async (sessionId, expectedGeneration = 1) => ({
+				sessionId,
+				generation: expectedGeneration,
+				isCurrent: () => true,
+				send: frame => {
+					frames.push(frame);
+				},
+				sendMaintenance: () => {},
+			}),
+			onCommand: async (_sessionId, command) => {
+				commands.push(command);
+				return true;
+			},
+			...(authorizedActorIds === undefined ? {} : { authorizedActorIds }),
+		});
+		await run(daemon, agentDir, commands, frames);
+	} finally {
+		await daemon?.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+}
+
+async function sendCommandAndAction(daemon: DiscordNotificationDaemon, authorId: string): Promise<void> {
+	const conversation = await daemon.notify({
+		sessionId: "session",
+		endpointGeneration: 1,
+		content: "Choose",
+		actionId: "ask",
+		options: ["Yes"],
+	});
+	const threadId = conversation.threadId!;
+	await daemon.handleInbound({
+		id: "actor-command",
+		guildId: "guild",
+		parentId: "parent",
+		threadId,
+		authorId,
+		content: TURN_PROMPT,
+	});
+	await daemon.handleInbound({
+		id: "actor-action",
+		guildId: "guild",
+		parentId: "parent",
+		threadId,
+		authorId,
+		interaction: {
+			id: "interaction-actor-action",
+			token: "token-actor-action",
+			customId: actionCustomIds.get(threadId)!,
+			value: "yes",
+		},
+	});
+}
+
 function inbound(threadId: string, id: string, generation = 1, customId?: string): DiscordInboundEvent {
 	return {
 		id,
@@ -3145,6 +3229,60 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			await daemon?.stop();
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
+	});
+
+	test("drops a command and a component action when discord actor config is missing", async () => {
+		await withConfigDaemon(undefined, async (daemon, agentDir, commands, frames) => {
+			await sendCommandAndAction(daemon, "owner-100");
+			expect(commands).toEqual([]);
+			expect(frames).toEqual([]);
+			expect(await inboundEffectIds(agentDir)).toEqual([]);
+		});
+	});
+
+	test("drops a command and a component action when the discord actor list is empty", async () => {
+		await withConfigDaemon(
+			"notifications:\n  discord:\n    authorizedUserIds: []\n",
+			async (daemon, agentDir, commands, frames) => {
+				await sendCommandAndAction(daemon, "owner-100");
+				expect(commands).toEqual([]);
+				expect(frames).toEqual([]);
+				expect(await inboundEffectIds(agentDir)).toEqual([]);
+			},
+		);
+	});
+
+	test("drops a command and a component action when the discord actor config cannot be read", async () => {
+		await withConfigDaemon("notifications: [\n", async (daemon, agentDir, commands, frames) => {
+			await sendCommandAndAction(daemon, "owner-100");
+			expect(commands).toEqual([]);
+			expect(frames).toEqual([]);
+			expect(await inboundEffectIds(agentDir)).toEqual([]);
+		});
+	});
+
+	test("drops a command and a component action when the explicit actor override is empty", async () => {
+		await withConfigDaemon(
+			'notifications:\n  discord:\n    authorizedUserId: "owner-100"\n',
+			async (daemon, agentDir, commands, frames) => {
+				await sendCommandAndAction(daemon, "owner-100");
+				expect(commands).toEqual([]);
+				expect(frames).toEqual([]);
+				expect(await inboundEffectIds(agentDir)).toEqual([]);
+			},
+			[],
+		);
+	});
+
+	test("still allows a command and a component action for an authorizedUserIds actor", async () => {
+		await withConfigDaemon(
+			'notifications:\n  discord:\n    authorizedUserIds:\n      - " owner-100 "\n',
+			async (daemon, _agentDir, commands, frames) => {
+				await sendCommandAndAction(daemon, "owner-100");
+				expect(commands).toEqual([TURN_PROMPT]);
+				expect(frames).toMatchObject([{ type: "reply", id: "ask", answer: "yes" }]);
+			},
+		);
 	});
 
 	test.skipIf(
