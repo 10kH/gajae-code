@@ -25,9 +25,10 @@ import { startProductionSdkHost } from "./helpers/sdk-production-host";
 
 type SlackPost = { channel: string; text: string; threadTs?: string; clientMsgId: string };
 
-/** Broker startup reads a platform id tool. Skip when that tool is not on PATH. */
+/** Darwin and Windows broker startup shells out for a machine id. Linux reads a file. */
 function hardwareIdToolOnPath(): boolean {
-	const name = process.platform === "win32" ? "reg.exe" : "ioreg";
+	const name = process.platform === "win32" ? "reg.exe" : process.platform === "darwin" ? "ioreg" : "";
+	if (!name) return true;
 	return (process.env.PATH ?? "")
 		.split(path.delimiter)
 		.filter(Boolean)
