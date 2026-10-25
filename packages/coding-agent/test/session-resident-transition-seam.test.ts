@@ -1085,7 +1085,7 @@ describe("resident-store transition seam", () => {
 					SessionManagerTestHooks.beforeColdRollbackCommit = file => {
 						expect(file).toBe(source.sessionFile);
 						expect(source.sm.getSessionId()).toBe(targetId);
-						expect(source.sm.getHeader()?.id).toBe(targetId);
+						expect(source.sm.getHeader()).toMatchObject({ id: targetId, cwd: target.cwd });
 						expect(source.sm.getSessionFile()).toBe(target.sessionFile);
 						expect(source.sm.getLeafId()).toBe(targetLeaf);
 						expect(source.sm.residentTextCacheDirForTests()).toBe(liveCache);
@@ -1113,7 +1113,7 @@ describe("resident-store transition seam", () => {
 						expect(fs.existsSync(candidateCache)).toBe(false);
 						expect(residentDataCacheDirs()).toEqual([liveCache]);
 						expect(source.sm.getSessionId()).toBe(targetId);
-						expect(source.sm.getHeader()?.id).toBe(targetId);
+						expect(source.sm.getHeader()).toMatchObject({ id: targetId, cwd: target.cwd });
 						expect(source.sm.getSessionFile()).toBe(target.sessionFile);
 						expect(source.sm.getLeafId()).toBe(targetLeaf);
 						expectReadable(source.sm, targetText);
@@ -1123,7 +1123,8 @@ describe("resident-store transition seam", () => {
 						expect(residentDataCacheDirs()).toEqual([candidateCache]);
 						expect(fs.existsSync(liveCache)).toBe(false);
 						expect(source.sm.getSessionId()).toBe(snapshot.sessionId);
-						expect(source.sm.getHeader()?.id).toBe(snapshot.sessionId);
+						// Lifecycle-preallocated IDs can be shared; cwd distinguishes the installed header.
+						expect(source.sm.getHeader()).toMatchObject({ id: snapshot.sessionId, cwd: source.cwd });
 						expect(source.sm.getSessionFile()).toBe(source.sessionFile);
 						expect(source.sm.getLeafId()).toBe(compactId);
 						const beforeRead = source.sm.getSessionMemoryStats();
