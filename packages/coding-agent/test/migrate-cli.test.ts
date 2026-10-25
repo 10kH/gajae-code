@@ -396,6 +396,52 @@ describe("runMigrate", () => {
 		},
 	);
 
+	test.skipIf(!SYMLINKS)(
+		"still imports a rootless Codex or OpenCode config when its final component is a symlink",
+		async () => {
+			const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-cli-rootless-"));
+			const codexReal = path.join(outside, "config.toml");
+			const openReal = path.join(outside, "opencode.json");
+			try {
+				await fs.writeFile(codexReal, '[mcp_servers.codexSrv]\ncommand = "cdx"\n');
+				await fs.writeFile(openReal, JSON.stringify({ mcp: { ocSrv: { type: "local", command: "ocb" } } }));
+				await fs.mkdir(path.join(home, ".codex"), { recursive: true });
+				await fs.mkdir(path.join(home, ".config", "opencode"), { recursive: true });
+				await fs.symlink(codexReal, path.join(home, ".codex", "config.toml"));
+				await fs.symlink(openReal, path.join(home, ".config", "opencode", "opencode.json"));
+				await fs.writeFile(path.join(home, ".codex", "AGENTS.md"), "Keep the Codex notes.");
+				const report = await runMigrate({
+					from: ["codex", "opencode"],
+					project: false,
+					force: false,
+					dryRun: true,
+					json: true,
+					homeDir: home,
+					cwd,
+				});
+				expect(report.actions).toContainEqual(
+					expect.objectContaining({ type: "mcp", source: "codex", name: "codexSrv", status: "imported" }),
+				);
+				expect(report.actions).toContainEqual(
+					expect.objectContaining({ type: "mcp", source: "opencode", name: "ocSrv", status: "imported" }),
+				);
+				expect(report.actions).toContainEqual(
+					expect.objectContaining({
+						type: "instruction",
+						source: "codex",
+						name: "AGENTS.md",
+						status: "imported",
+					}),
+				);
+				expect(report.actions.some(action => action.type === "source" && action.status === "failed_io")).toBe(
+					false,
+				);
+			} finally {
+				await fs.rm(outside, { recursive: true, force: true });
+			}
+		},
+	);
+
 	test.skipIf(!SYMLINKS)("project CLAUDE.md symlink is not copied into AGENTS.md", async () => {
 		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-cli-secret-"));
 		const marker = "FAKE-SECRET-KEY-MATERIAL-0123456789";

@@ -64,16 +64,12 @@ function unsafeSource(message: string): NodeJS.ErrnoException {
 /**
  * Resolve `target` without following a symlink at or below `root`.
  * The root itself may be a symlink (a project opened through a linked path).
- * Without `root`, only the final component is refused.
+ * Without `root`, return the path so the read can follow a final symlink.
+ * Codex and OpenCode pass no root; Claude Code passes a project or home root.
  */
 async function locateSource(target: string, root: string | undefined, kind: "file" | "dir"): Promise<string> {
 	const resolved = path.resolve(target);
-	if (root === undefined) {
-		if (kind === "dir") return resolved;
-		const stat = await fs.lstat(resolved);
-		if (stat.isSymbolicLink() || !stat.isFile()) throw unsafeSource(`refusing non-regular source: ${resolved}`);
-		return resolved;
-	}
+	if (root === undefined) return resolved;
 	if (!migrateSourceInsideRoot(root, resolved)) throw unsafeSource(`source escapes root: ${resolved}`);
 	const relative = path.relative(path.resolve(root), resolved);
 	const parts = relative === "" ? [] : relative.split(path.sep).filter(part => part !== "" && part !== ".");
@@ -96,6 +92,9 @@ async function locateSource(target: string, root: string | undefined, kind: "fil
 }
 
 async function readRegularSource(filePath: string, root?: string): Promise<string> {
+	// No-follow applies only when a project or home root is passed. Rootless
+	// reads keep the previous `readFile` follow (Codex and OpenCode configs).
+	if (root === undefined) return fs.readFile(filePath, "utf-8");
 	const openPath = await locateSource(filePath, root, "file");
 	const handle = await fs.open(openPath, SOURCE_READ_FLAGS);
 	try {
