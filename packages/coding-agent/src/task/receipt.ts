@@ -124,10 +124,75 @@ function normalizeReviewFindingSeverity(severity: unknown, priority: unknown): s
 	return undefined;
 }
 
-function buildSafeSynopsis(raw: SingleResult, outputRef: TaskResultReceipt["outputRef"]): string {
+/**
+ * A setup-failure summary can repeat repository agent frontmatter.
+ * The task-summary template interpolates the synopsis with noEscape, so strip
+ * terminal controls and escape "<" before that text is placed in the result.
+ * Tabs and newlines stay; a summary with neither controls nor "<" is unchanged.
+ */
+function consumeTerminalSequence(value: string, escapeIndex: number): number | undefined {
+	const next = value[escapeIndex + 1];
+	if (!next) return undefined;
+	if (next === "[") {
+		for (let index = escapeIndex + 2; index < value.length; index++) {
+			const code = value.charCodeAt(index);
+			if (code >= 0x40 && code <= 0x7e) return index;
+			if ((code >= 0x20 && code <= 0x2f) || (code >= 0x30 && code <= 0x3f)) continue;
+			return undefined;
+		}
+		return undefined;
+	}
+	if (next === "]" || next === "P" || next === "_" || next === "^" || next === "X") {
+		for (let index = escapeIndex + 2; index < value.length; index++) {
+			if (value[index] === "\u0007") return index;
+			if (value[index] === "\u001b" && value[index + 1] === "\\") return index + 1;
+		}
+		return undefined;
+	}
+	const code = next.charCodeAt(0);
+	if (code >= 0x40 && code <= 0x5f) return escapeIndex + 1;
+	return undefined;
+}
+
+function stripTerminalControls(value: string): string {
+	let result = "";
+	for (let index = 0; index < value.length; index++) {
+		const char = value[index]!;
+		const code = char.charCodeAt(0);
+		if (char === "\u001b") {
+			const end = consumeTerminalSequence(value, index);
+			index = end ?? index;
+			continue;
+		}
+		if (code === 0x09 || code === 0x0a) {
+			result += char;
+			continue;
+		}
+		if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f)) continue;
+		result += char;
+	}
+	return result;
+}
+
+function escapeSynopsisText(value: string): string {
+	if (!value.includes("<")) return value;
+	let output = "";
+	for (const char of value) output += char === "<" ? "&lt;" : char;
+	return output;
+}
+
+function sanitizeSetupFailureSummary(summary: string): string {
+	return escapeSynopsisText(stripTerminalControls(summary));
+}
+
+function buildSafeSynopsis(
+	raw: SingleResult,
+	outputRef: TaskResultReceipt["outputRef"],
+	setupFailureSummary?: string,
+): string {
 	const status = getStatus(raw);
 	if (raw.setupFailure) {
-		return `Task ${status} during setup: ${raw.setupFailure.summary}`;
+		return `Task ${status} during setup: ${setupFailureSummary ?? ""}`;
 	}
 	if (raw.modelSubstitutionWarning) {
 		return `Task ${status}; requested model substituted from ${raw.modelSubstitutionWarning.requested} to ${raw.modelSubstitutionWarning.effective}.`;
@@ -283,7 +348,8 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 				durability: "session" as const,
 			}
 		: undefined;
-	const preview = buildSafeSynopsis(raw, outputRef);
+	const setupFailureSummary = raw.setupFailure ? sanitizeSetupFailureSummary(raw.setupFailure.summary) : undefined;
+	const preview = buildSafeSynopsis(raw, outputRef, setupFailureSummary);
 	const extractedToolCounts = raw.extractedToolData
 		? Object.fromEntries(
 				Object.entries(raw.extractedToolData).map(([tool, values]) => [
@@ -325,14 +391,14 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		duplicateDisposition: raw.duplicateDisposition,
 		localErrorSummary: raw.localErrorSummary,
 		errorSummary:
-			raw.setupFailure?.summary ??
+			setupFailureSummary ??
 			raw.localErrorSummary?.summary ??
 			(raw.error
 				? "Error recorded."
 				: raw.persistence?.outcome === "recovery_available"
 					? "Changes were not persisted to the owner worktree."
 					: undefined),
-		setupFailure: raw.setupFailure ? { summary: raw.setupFailure.summary } : undefined,
+		setupFailure: setupFailureSummary !== undefined ? { summary: setupFailureSummary } : undefined,
 		abortSummary: raw.abortReason ? "Abort reason recorded." : undefined,
 		preview,
 		previewTruncated: false,
