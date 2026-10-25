@@ -1963,7 +1963,7 @@ export class Broker {
 		setOwner(true);
 		inFlight.claimId = decision.claim.claimId;
 		inFlight.phase = decision.claim.state;
-		await this.ledger.begin(lifecycleIdentity, decision.claim.bindingMac);
+		await this.ledger.begin(lifecycleIdentity, decision.claim.bindingMac, { spawnAnchor: true });
 		return await this.#driveSpawn(lifecycleIdentity, decision.claim, admission, inFlight, decision.recovery);
 	}
 
@@ -4237,7 +4237,7 @@ export class Broker {
 			await this.#spawnAuthority.open();
 			for (const claim of this.#spawnAuthority.claims()) {
 				const mirror = this.ledger.get(claim.lifecycleIdentity);
-				if (!mirror) await this.ledger.begin(claim.lifecycleIdentity, claim.bindingMac);
+				if (!mirror) await this.ledger.begin(claim.lifecycleIdentity, claim.bindingMac, { spawnAnchor: true });
 				else if (mirror.requestHash !== claim.bindingMac)
 					throw new Error("Spawn claim lifecycle mirror binding differs from durable authority.");
 			}
