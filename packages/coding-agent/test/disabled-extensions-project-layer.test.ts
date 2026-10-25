@@ -8,6 +8,7 @@ import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { resetAgentDirFromEnvironment } from "@gajae-code/utils";
 import fc from "fast-check";
+import { safeRmSync } from "../../../scripts/safe-cleanup";
 import { cleanupTempHome, type TempHomeState } from "./helpers/temp-home-cleanup";
 
 const PROBE = "operator-disabled-probe";
@@ -30,7 +31,7 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 	clearCache();
 	for (const root of roots.splice(0)) {
-		fs.rmSync(root, { recursive: true, force: true });
+		safeRmSync(root, { recursive: true, force: true });
 	}
 });
 
