@@ -394,9 +394,10 @@ not settle earlier effects.
   listed once in `sdk/lifecycle-ledger.spawn-anchors.json`
   (`{"version":1,"identities":[...]}`, mode 0600) when it is missing or
   unparseable; after that it is read as-is and never rewritten. An unmarked
-  identity is listed only when its first row follows the first operation-keyed
-  accepted row in both file order and `ts` and none of its history was
-  quarantined or left uncertain by a corrupt row. Deleting the file re-derives it
+  identity is listed only when its first row's `ts` is strictly later than some
+  operation-keyed accepted row that precedes it in file order, and none of its
+  history was quarantined or left uncertain by a corrupt row. Keyed rows written
+  after it never count, even when a clock step back stamps them earlier. Deleting the file re-derives it
   from the current ledger on the next broker open; removing a wrongly listed
   identity restores that row's fence. Never add identities by hand.
 
