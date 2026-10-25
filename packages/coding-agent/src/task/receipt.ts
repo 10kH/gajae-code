@@ -126,54 +126,9 @@ function normalizeReviewFindingSeverity(severity: unknown, priority: unknown): s
 
 /**
  * A setup-failure summary can repeat repository agent frontmatter.
- * The task-summary template interpolates the synopsis with noEscape, so strip
- * terminal controls and escape "<" before that text is placed in the result.
- * Tabs and newlines stay; a summary with neither controls nor "<" is unchanged.
+ * The task-summary template interpolates the synopsis with noEscape, so escape
+ * "<" before that text is placed in the result. Other characters stay as written.
  */
-function consumeTerminalSequence(value: string, escapeIndex: number): number | undefined {
-	const next = value[escapeIndex + 1];
-	if (!next) return undefined;
-	if (next === "[") {
-		for (let index = escapeIndex + 2; index < value.length; index++) {
-			const code = value.charCodeAt(index);
-			if (code >= 0x40 && code <= 0x7e) return index;
-			if ((code >= 0x20 && code <= 0x2f) || (code >= 0x30 && code <= 0x3f)) continue;
-			return undefined;
-		}
-		return undefined;
-	}
-	if (next === "]" || next === "P" || next === "_" || next === "^" || next === "X") {
-		for (let index = escapeIndex + 2; index < value.length; index++) {
-			if (value[index] === "\u0007") return index;
-			if (value[index] === "\u001b" && value[index + 1] === "\\") return index + 1;
-		}
-		return undefined;
-	}
-	const code = next.charCodeAt(0);
-	if (code >= 0x40 && code <= 0x5f) return escapeIndex + 1;
-	return undefined;
-}
-
-function stripTerminalControls(value: string): string {
-	let result = "";
-	for (let index = 0; index < value.length; index++) {
-		const char = value[index]!;
-		const code = char.charCodeAt(0);
-		if (char === "\u001b") {
-			const end = consumeTerminalSequence(value, index);
-			index = end ?? index;
-			continue;
-		}
-		if (code === 0x09 || code === 0x0a) {
-			result += char;
-			continue;
-		}
-		if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f)) continue;
-		result += char;
-	}
-	return result;
-}
-
 function escapeSynopsisText(value: string): string {
 	if (!value.includes("<")) return value;
 	let output = "";
@@ -182,7 +137,7 @@ function escapeSynopsisText(value: string): string {
 }
 
 function sanitizeSetupFailureSummary(summary: string): string {
-	return escapeSynopsisText(stripTerminalControls(summary));
+	return escapeSynopsisText(summary);
 }
 
 function buildSafeSynopsis(

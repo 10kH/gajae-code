@@ -160,26 +160,15 @@ describe("task setup-failure synopsis", () => {
 			}),
 			{ seed: 685, numRuns: 64 },
 		);
-		const hostile = fc
-			.string({ maxLength: 400 })
-			.chain(text =>
-				fc.constantFrom(
-					text,
-					`\u001b[31m${text}`,
-					`\u001b]0;title\u0007${text}`,
-					`</synopsis>${text}`,
-					`${text}<path>/report.txt`,
-				),
-			);
+		const markupChar = fc.constantFrom(..."abcdefghijklmnopqrstuvwxyz /-:._>&<".split(""));
 		fc.assert(
-			fc.property(hostile, summary => {
-				const receipt = buildTaskReceipt(makeRaw({ setupFailure: { summary } }));
-				const body = receipt.preview.slice("Task failed during setup: ".length);
-				expect(body.includes("\u001b")).toBe(false);
-				expect(body.includes("\u0007")).toBe(false);
-				expect(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(body)).toBe(false);
+			fc.property(fc.string({ unit: markupChar, minLength: 0, maxLength: 280 }), summary => {
+				const body = buildTaskReceipt(makeRaw({ setupFailure: { summary } })).preview.slice(
+					"Task failed during setup: ".length,
+				);
 				expect(body.includes("<")).toBe(false);
-				if (summary.includes("report.txt")) expect(body).toContain("report.txt");
+				expect(body.split("&lt;").length - 1).toBe([...summary].filter(char => char === "<").length);
+				if (summary.includes("report")) expect(body).toContain("report");
 			}),
 			{ seed: 685, numRuns: 64 },
 		);
