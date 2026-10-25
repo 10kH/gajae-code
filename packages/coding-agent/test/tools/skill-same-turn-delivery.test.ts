@@ -124,4 +124,92 @@ describe("SkillTool delivery through a live AgentSession", () => {
 		expect(calls).toBe(3);
 		expect(assistantIndexes).toHaveLength(3);
 	});
+
+	it("drops a callee prompt whose preparation outlives a terminal abort of the source run", async () => {
+		const skillDir = path.join(tempDir.path(), "ultragoal");
+		await fs.mkdir(skillDir, { recursive: true });
+		const skillContent = "---\nname: ultragoal\n---\n# Ultragoal\nTrack execution.";
+		const filePath = path.join(skillDir, "SKILL.md");
+		await fs.writeFile(filePath, skillContent, "utf8");
+		const skill: Skill = {
+			name: "ultragoal",
+			description: "ultragoal test skill",
+			filePath,
+			baseDir: skillDir,
+			source: "test",
+			content: skillContent,
+		};
+
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		let calls = 0;
+		const mock = createMockModel({
+			handler: () => {
+				calls += 1;
+				if (calls === 1)
+					return { content: [{ type: "toolCall", name: "skill", arguments: { name: "ultragoal" } }] };
+				return { content: [`answer ${calls}`] };
+			},
+		});
+
+		// The terminal abort lands while the tool callback is mid-preparation: the
+		// session id is read once before the activation await and again after it,
+		// right before the prompt is built. The callback outlives the abort and
+		// resumes toward the send on its own.
+		let sessionIdReads = 0;
+		let sendAttempts = 0;
+		let abortDone: Promise<void> | undefined;
+		const toolSession: ToolSession = {
+			cwd: os.tmpdir(),
+			hasUI: false,
+			skills: [skill],
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings: Settings.isolated(),
+			getSessionId: () => {
+				sessionIdReads += 1;
+				if (sessionIdReads === 2) abortDone = session!.abort({ cause: "user_interrupt" });
+				return "skill-abort-race";
+			},
+			sendCustomMessage: (message, options) => {
+				sendAttempts += 1;
+				return session!.sendCustomMessage(message, options);
+			},
+		};
+		const skillTool = SkillTool.createIf(toolSession);
+		if (!skillTool) throw new Error("Expected skill tool");
+
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [skillTool as unknown as AgentTool], messages: [] },
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+
+		await session.prompt("go").catch(() => undefined);
+		// The abort really landed mid-preparation, not before or after the tool ran.
+		expect(abortDone).toBeDefined();
+		await abortDone;
+		await session.waitForIdle();
+		// Give the orphaned callback a bounded window to finish preparing and reach
+		// its send point; a regression exits the wait as soon as it sends.
+		const deadline = Date.now() + 1000;
+		while (sendAttempts === 0 && Date.now() < deadline) await Bun.sleep(10);
+		await session.waitForIdle();
+
+		const skillPrompts = session.agent.state.messages.filter(
+			m => m.role === "custom" && (m as { customType?: string }).customType === SKILL_PROMPT_MESSAGE_TYPE,
+		);
+		expect(sendAttempts).toBe(0);
+		expect(skillPrompts).toHaveLength(0);
+		// The aborted run made one model call; nothing restarted it.
+		expect(calls).toBe(1);
+	});
 });

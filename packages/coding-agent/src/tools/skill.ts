@@ -42,7 +42,7 @@ import {
 	isCanonicalGjcWorkflowSkillFilesystemAlias,
 } from "../skill-state/canonical-skills";
 import type { ToolSession } from ".";
-import { ToolError } from "./tool-errors";
+import { ToolError, throwIfAborted } from "./tool-errors";
 
 const TERMINAL_PHASES = new Set(["complete", "completed", "handoff", "failed", "cancelled", "canceled", "inactive"]);
 
@@ -262,6 +262,11 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 				sessionId: this.#session.getSessionId?.() ?? activeState?.session_id?.trim() ?? undefined,
 			});
 
+			// `untilAborted` rejects the tool on abort but does not stop this callback.
+			// A prompt prepared after the source run was aborted must be dropped: a
+			// steer the ended run cannot admit falls back to an independent follow-up
+			// and would restart the run the user just stopped.
+			throwIfAborted(signal);
 			await sendCustomMessage(
 				{
 					customType: SKILL_PROMPT_MESSAGE_TYPE,
