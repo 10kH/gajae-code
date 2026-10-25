@@ -84,6 +84,31 @@ test("property: injected terminal controls are absent from the cell, fc.property
 	);
 });
 
+test("still allows CR and CRLF markdown breaks", () => {
+	const lf = "# One\n\nTwo\n\n```\nconst value = 1;\n```\n";
+	const crlf = lf.replaceAll("\n", "\r\n");
+	const cr = lf.replaceAll("\n", "\r");
+	const rendered = renderCell(lf);
+	expect(renderCell(crlf)).toBe(rendered);
+	expect(renderCell(cr)).toBe(rendered);
+	expect(rendered).toContain("One");
+	expect(rendered).toContain("Two");
+	expect(rendered).toContain("const value = 1;");
+	expect(rendered).not.toContain("OneTwo");
+});
+
+test("keeps markdown newline meaning, fc.property seed 66723, numRuns 64", () => {
+	const line = fc.stringMatching(/^[A-Za-z][A-Za-z0-9 ]{0,12}$/);
+	fc.assert(
+		fc.property(line, line, fc.constantFrom("\n", "\r\n", "\r"), (heading, paragraph, br) => {
+			const lf = `# ${heading}\n\n${paragraph}\n\n\`\`\`\nconst value = 1;\n\`\`\`\n`;
+			const mixed = `# ${heading}${br}${br}${paragraph}${br}${br}\`\`\`${br}const value = 1;${br}\`\`\`${br}`;
+			return renderCell(mixed) === renderCell(lf);
+		}),
+		{ seed: 66723, numRuns: 64 },
+	);
+});
+
 test("keeps printable markdown letters, fc.property seed 66722, numRuns 64", () => {
 	fc.assert(
 		fc.property(fc.stringMatching(/^[A-Za-z][A-Za-z ]{0,30}$/), text => {

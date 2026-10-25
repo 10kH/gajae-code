@@ -167,10 +167,10 @@ export function renderMarkdownCell(options: MarkdownCellOptions, theme: Theme): 
 	// Markdown component manages its own wrapping at the inner content width.
 	// `renderOutputBlock` adds a `│ ` prefix + `│` suffix → 3 visible columns.
 	const innerWidth = Math.max(20, width - 3);
-	// Repository markdown is untrusted. The Markdown component writes text as-is
-	// and only later adds its own hyperlink sequences, so strip terminal controls
-	// from the source before that render.
-	const markdownSource = sanitizeText(content);
+	// Repository markdown is untrusted. Turn CR/CRLF into LF before sanitizeText,
+	// which drops CR: a lone CR is a markdown break on the previous renderer and
+	// must not be written raw. Then strip other controls before Markdown.
+	const markdownSource = sanitizeText(content.replace(/\r\n/g, "\n").replace(/\r/g, "\n"));
 	const allLines = markdownSource.trim()
 		? new Markdown(markdownSource, 0, 0, getMarkdownTheme()).render(innerWidth)
 		: [];
