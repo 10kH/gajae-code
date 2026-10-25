@@ -212,8 +212,6 @@ import {
 	logger,
 	prompt,
 	safeErrorDescription,
-	sanitizeDisplayLine,
-	sanitizeText,
 	Snowflake,
 } from "@gajae-code/utils";
 import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append-only-mode";
@@ -2123,17 +2121,69 @@ function getEditDestructiveIntent(args: unknown): { kind: "delete" | "move"; pat
 }
 
 const PERMISSION_TITLE_PREVIEW = 80;
+const APPROVAL_FORMAT_RE = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
 
-/** Strip terminal controls before a title is cut, so an escape cannot hide the approved text. */
-function permissionPromptTitle(value: string, max?: number): string {
-	const cleaned = sanitizeDisplayLine(value);
-	if (max === undefined || cleaned.length <= max) return cleaned;
-	return cleaned.slice(0, max);
+/** One visible token per control byte. This string is display-only. */
+function encodeApprovalControl(code: number): string {
+	if (code <= 0x1f) return `^${String.fromCharCode(code + 0x40)}`;
+	if (code === 0x7f) return "^?";
+	return `<${code.toString(16)}>`;
 }
 
-/** Strip controls on the whole command, then drop bidi marks. Line breaks stay. */
+/**
+ * Encode control bytes and keep every printable byte in order.
+ * An OSC payload is shell text, so deleting it would hide a command that still runs.
+ */
+function visibleApprovalText(value: string, flattenNewlines: boolean): string {
+	let out = "";
+	for (let index = 0; index < value.length; ) {
+		const code = value.codePointAt(index) ?? 0;
+		const width = code > 0xffff ? 2 : 1;
+		if (code >= 0xd800 && code <= 0xdfff) {
+			out += `<${code.toString(16)}>`;
+			index += 1;
+			continue;
+		}
+		if (flattenNewlines && (code === 0x0a || code === 0x0d)) {
+			out += " ";
+			index += width;
+			while (index < value.length) {
+				const next = value.codePointAt(index) ?? 0;
+				if (next !== 0x0a && next !== 0x0d) break;
+				index += next > 0xffff ? 2 : 1;
+			}
+			continue;
+		}
+		if (code === 0x0a) {
+			out += "\n";
+			index += width;
+			continue;
+		}
+		if (code <= 0x1f || code === 0x7f || (code >= 0x80 && code <= 0x9f)) {
+			out += encodeApprovalControl(code);
+			index += width;
+			continue;
+		}
+		if (APPROVAL_FORMAT_RE.test(String.fromCodePoint(code))) {
+			index += width;
+			continue;
+		}
+		out += String.fromCodePoint(code);
+		index += width;
+	}
+	return out;
+}
+
+/** Encode controls before the title is cut, so an escape cannot hide the approved text. */
+function permissionPromptTitle(value: string, max?: number): string {
+	const visible = visibleApprovalText(value, true);
+	if (max === undefined || visible.length <= max) return visible;
+	return visible.slice(0, max);
+}
+
+/** Encode controls on the whole command. Line breaks stay. */
 function permissionPromptBody(value: string): string {
-	return sanitizeText(value).replace(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu, "");
+	return visibleApprovalText(value, false);
 }
 
 function getPermissionIntent(
