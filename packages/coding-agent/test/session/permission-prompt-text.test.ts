@@ -158,6 +158,27 @@ test("keeps a plain delete path in the approval title", async () => {
 	expect(call.title).toBe("Delete src/app.ts");
 });
 
+test("keeps a root delete path in the approval title", async () => {
+	const call = await prompt("delete", { path: "/" });
+	expect(call.title).toBe("Delete /");
+});
+
+test("keeps a trailing-separator delete path in the approval title", async () => {
+	const call = await prompt("delete", { path: "src/app/" });
+	expect(call.title).toBe("Delete src/app/");
+});
+
+test("keeps a windows drive delete path in the approval title", async () => {
+	const call = await prompt("delete", { path: "C:\\src\\app.ts" });
+	expect(call.title).toBe("Delete C:\\src\\app.ts");
+});
+
+test("keeps an empty monitor command off the approval body", async () => {
+	const call = await prompt("monitor", { command: "" });
+	expect(call.title).toBe("monitor");
+	expect(promptBody(call)).toBe("");
+});
+
 test("keeps a move approval title for two plain paths", async () => {
 	const call = await prompt("move", { oldPath: "src/a.ts", newPath: "src/b.ts" });
 	expect(call.title).toBe("Move src/a.ts to src/b.ts");
