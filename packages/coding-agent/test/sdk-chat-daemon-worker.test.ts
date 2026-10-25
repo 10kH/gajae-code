@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
@@ -22,22 +23,16 @@ import { SdkClientError } from "../src/sdk/client/client";
 import { type SessionRouterClient, sessionAttachmentAuthorityId } from "../src/sdk/router";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 
-// The session broker resolves hardware identity with ioreg, which lives in /usr/sbin.
-// Bun.spawnSync looks up a bare command with the process start PATH unless `env` is set.
-if (!process.env.PATH?.split(":").includes("/usr/sbin")) {
-	process.env.PATH = `${process.env.PATH ?? ""}:/usr/sbin`;
-}
-const spawnSync = Bun.spawnSync.bind(Bun);
-Bun.spawnSync = ((command, options) => {
-	const path = options?.env?.PATH ?? process.env.PATH ?? "";
-	const nextPath = path.split(":").includes("/usr/sbin") ? path : `${path}:/usr/sbin`;
-	return spawnSync(command, {
-		...options,
-		env: { ...process.env, ...options?.env, PATH: nextPath },
-	});
-}) as typeof Bun.spawnSync;
-
 type SlackPost = { channel: string; text: string; threadTs?: string; clientMsgId: string };
+
+/** Broker startup reads a platform id tool. Skip when that tool is not on PATH. */
+function hardwareIdToolOnPath(): boolean {
+	const name = process.platform === "win32" ? "reg.exe" : "ioreg";
+	return (process.env.PATH ?? "")
+		.split(path.delimiter)
+		.filter(Boolean)
+		.some(dir => existsSync(path.join(dir, name)));
+}
 
 async function withStageTimeout<T>(label: string, promise: Promise<T>, timeoutMs = 15_000): Promise<T> {
 	const timeout = Promise.withResolvers<T>();
@@ -370,7 +365,7 @@ async function deliverLeanFinalThroughProductionHost(
 	return count();
 }
 
-describe("chat daemon worker", () => {
+describe.skipIf(!hardwareIdToolOnPath())("chat daemon worker", () => {
 	let root = "";
 	afterEach(async () => {
 		if (root) await fs.rm(root, { recursive: true, force: true });
