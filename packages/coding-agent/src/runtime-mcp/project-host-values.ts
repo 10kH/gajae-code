@@ -37,13 +37,16 @@ export function isUntrustedProjectMcpSource(source: SourceMeta | undefined, tool
  * lifecycle `mcpServers` into a tools-only mcp.json. That file is project-level
  * and tools-only, so the short-circuit above would treat model-supplied `!`
  * and sensitive host names as trusted. The directory name is the provenance
- * mark: an explicit `--mcp-config` outside this directory stays trusted.
+ * mark. Only directory segments count, so a file named with this prefix
+ * outside that directory stays trusted.
  */
 export const LIFECYCLE_MCP_CONFIG_DIR_PREFIX = "gjc-acp-mcp-";
 
 export function isUntrustedLifecycleToolsOnlySource(source: SourceMeta | undefined, toolsOnly: boolean): boolean {
 	if (!toolsOnly || source?.level !== "project" || !source.path) return false;
-	return source.path.split(/[\\/]/).some(part => part.startsWith(LIFECYCLE_MCP_CONFIG_DIR_PREFIX));
+	const parts = source.path.split(/[\\/]/).filter(part => part.length > 0);
+	const directories = parts.slice(0, -1);
+	return directories.some(part => part.startsWith(LIFECYCLE_MCP_CONFIG_DIR_PREFIX));
 }
 
 export type ProjectHostValueDecision =

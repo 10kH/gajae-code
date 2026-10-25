@@ -239,29 +239,90 @@ describe("lifecycle tools-only MCP host values", () => {
 		}
 	}, 20_000);
 
+	it("still allows shell and sensitive host substitution for an explicit tools-only file named with the lifecycle prefix", async () => {
+		const root = await tempDir();
+		const marker = path.join(root, "named-marker");
+		const bangScript = path.join(root, "named-bang.mjs");
+		const reportPath = path.join(root, "named-env.json");
+		const scriptPath = path.join(root, "named-report.mjs");
+		await fs.writeFile(
+			bangScript,
+			`import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(marker)}, "1"); process.stdout.write(${JSON.stringify(SHELL_TEXT)});\n`,
+		);
+		await fs.writeFile(
+			scriptPath,
+			[
+				"import fs from 'node:fs';",
+				"fs.writeFileSync(process.env.REPORT, JSON.stringify({",
+				"  BANG: process.env.BANG ?? null,",
+				"  LEAK: process.env.LEAK ?? null,",
+				"}));",
+				"process.exit(0);",
+				"",
+			].join("\n"),
+		);
+		const configPath = path.join(root, `${LIFECYCLE_DIR_PREFIX}explicit.json`);
+		await writeJson(configPath, {
+			mcpServers: {
+				report: {
+					type: "stdio",
+					command: process.execPath,
+					args: [scriptPath],
+					timeout: 3000,
+					noInheritEnv: true,
+					env: {
+						REPORT: reportPath,
+						BANG: `!"${process.execPath}" "${bangScript}"`,
+						LEAK: HOST_KEY,
+					},
+				},
+			},
+		});
+		const previous = process.env[HOST_KEY];
+		process.env[HOST_KEY] = HOST_VALUE;
+		const manager = new MCPManager(root, null, { toolsOnly: true });
+		try {
+			await manager.discoverAndConnect({ configPath, filterExa: false });
+			expect(await waitUntil(async () => exists(reportPath), 4000)).toBe(true);
+			const report = JSON.parse(await fs.readFile(reportPath, "utf8")) as Record<string, string | null>;
+			expect(await exists(marker)).toBe(true);
+			expect(report.BANG).toBe(SHELL_TEXT);
+			expect(report.LEAK).toBe(HOST_VALUE);
+		} finally {
+			restoreEnv(HOST_KEY, previous);
+			await manager.disconnectAll().catch(() => {});
+		}
+	}, 20_000);
+
 	it("property: lifecycle tools-only directory trust, fc.property seed 20261025, numRuns 64", () => {
+		const plainDir = fc
+			.string({ minLength: 1, maxLength: 12 })
+			.filter(
+				segment =>
+					!/[\\/]/.test(segment) &&
+					!segment.startsWith(LIFECYCLE_DIR_PREFIX) &&
+					segment !== "." &&
+					segment !== "..",
+			);
 		fc.assert(
 			fc.property(
-				fc.string({ maxLength: 24 }),
+				plainDir,
 				fc.boolean(),
 				fc.constantFrom("user" as const, "project" as const),
-				fc.boolean(),
-				fc.boolean(),
-				(segment, toolsOnly, level, inLifecycleDir, missing) => {
+				(dir, toolsOnly, level) => {
 					const classify = projectHostValues.isUntrustedLifecycleToolsOnlySource;
 					expect(typeof classify).toBe("function");
-					const source: SourceMeta | undefined = missing
-						? undefined
-						: {
-								provider: "native",
-								providerName: "GJC",
-								level,
-								path: path.join(inLifecycleDir ? `${LIFECYCLE_DIR_PREFIX}${segment}` : segment, "mcp.json"),
-							};
-					const untrusted = classify(source, toolsOnly);
-					const prefixed =
-						source?.path.split(/[\\/]/).some(part => part.startsWith(LIFECYCLE_DIR_PREFIX)) === true;
-					expect(untrusted).toBe(toolsOnly && source?.level === "project" && prefixed);
+					const meta = (filePath: string): SourceMeta => ({
+						provider: "native",
+						providerName: "GJC",
+						level,
+						path: filePath,
+					});
+					expect(classify(meta(path.join(dir, `${LIFECYCLE_DIR_PREFIX}explicit.json`)), toolsOnly)).toBe(false);
+					expect(classify(meta(path.join(`${LIFECYCLE_DIR_PREFIX}${dir}`, "mcp.json")), toolsOnly)).toBe(
+						toolsOnly && level === "project",
+					);
+					expect(classify(undefined, toolsOnly)).toBe(false);
 				},
 			),
 			{ seed: 20261025, numRuns: 64 },
