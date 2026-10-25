@@ -407,6 +407,53 @@ describe("SDK lifecycle ledger", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
+	it("keeps fencing a pre-index legacy row when the clock steps back after an earlier row's migration", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-preindex-migrated-rollback-"));
+		const now = spyOn(Date, "now");
+		try {
+			const record = path.join(dir, "sdk", "lifecycle-ledger.spawn-anchors.json");
+			const ledger = await new LifecycleLedger(dir).open();
+			now.mockReturnValue(1_000);
+			await ledger.begin("legacy-a", "request-a", { intendedSessionId: "session-a" });
+			now.mockReturnValue(2_000);
+			await ledger.begin("legacy-b", "request-b", { intendedSessionId: "session-b" });
+			// A's accepted row is rewritten in place ahead of B with the migration time.
+			now.mockReturnValue(3_000);
+			await ledger.migrateIdentity("legacy-a", "keyed-a", { operationKey: "session.create\0a", fingerprint: "fa" });
+			// The clock then steps back before B's timestamp and a later keyed row is appended.
+			now.mockReturnValue(500);
+			await ledger.begin("keyed-k", "request-k", { operationKey: "session.create\0k", fingerprint: "fk" });
+			now.mockRestore();
+			await fs.rm(record);
+			for (let open = 0; open < 2; open += 1) {
+				const reopened = await new LifecycleLedger(dir).open();
+				expect(JSON.parse(await fs.readFile(record, "utf8"))).toEqual({ version: 1, identities: [] });
+				expect(reopened.get("legacy-b")?.state).toBe("accepted");
+				expect(reopened.hasLegacyIdentity()).toBe(true);
+				expect(reopened.hasLegacyIdentity(new Set(["legacy-b"]))).toBe(false);
+			}
+			const broker = new Broker({ agentDir: dir });
+			setLifecycleCommandResolverForTest(broker, () => ({ file: path.join(dir, "missing-gjc"), args: [] }));
+			try {
+				await broker.start();
+				await expect(
+					broker.handleRequest("session.close", { sessionId: "session-z" }, "fresh-close-z"),
+				).resolves.toEqual({
+					ok: false,
+					error: {
+						code: "legacy_lifecycle_ambiguous",
+						message: "legacy lifecycle request has an ambiguous target",
+					},
+				});
+			} finally {
+				setLifecycleCommandResolverForTest(broker, undefined);
+				await broker.stop();
+			}
+		} finally {
+			now.mockRestore();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 	it("keeps fencing a pre-index legacy row stamped after the keyed row by a wall-clock step", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-preindex-skewed-"));
 		try {

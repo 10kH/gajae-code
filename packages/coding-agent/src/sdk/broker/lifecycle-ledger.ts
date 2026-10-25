@@ -334,9 +334,11 @@ export class LifecycleLedger {
 		this.#byIdentity.clear();
 		this.#unmarkedSpawnAnchors = new Set();
 		// Evidence for deriving the unmarked-anchor record once; see #loadUnmarkedSpawnAnchors.
-		const firstSeenTs = new Map<string, number>();
+		// Identities whose first row is stamped after a keyed accepted row ahead of it.
+		const seenIdentities = new Set<string>();
 		const firstSeenAfterKeyed = new Set<string>();
-		let sawKeyedRow = false;
+		// Earliest `ts` among keyed accepted rows read so far (file order).
+		let precedingKeyedTs: number | undefined;
 		this.#warnings = [];
 		this.#rowCount = 0;
 		this.#byteCount = 0;
@@ -365,9 +367,10 @@ export class LifecycleLedger {
 					if (!isLifecycleLedgerEntry(value)) throw new Error("invalid ledger entry");
 					const entry = value;
 					const prior = this.#byIdentity.get(entry.identity);
-					if (!firstSeenTs.has(entry.identity)) {
-						firstSeenTs.set(entry.identity, entry.ts);
-						if (sawKeyedRow) firstSeenAfterKeyed.add(entry.identity);
+					if (!seenIdentities.has(entry.identity)) {
+						seenIdentities.add(entry.identity);
+						if (precedingKeyedTs !== undefined && entry.ts > precedingKeyedTs)
+							firstSeenAfterKeyed.add(entry.identity);
 					}
 					const invalidHistory =
 						invalidIdentities.has(entry.identity) ||
@@ -402,7 +405,8 @@ export class LifecycleLedger {
 						}
 						continue;
 					}
-					if (entry.operationKey !== undefined && entry.state === "accepted") sawKeyedRow = true;
+					if (entry.operationKey !== undefined && entry.state === "accepted")
+						precedingKeyedTs = precedingKeyedTs === undefined ? entry.ts : Math.min(precedingKeyedTs, entry.ts);
 					this.#entries.push(entry);
 					this.#byIdentity.set(entry.identity, entry);
 				} catch (error) {
@@ -416,7 +420,6 @@ export class LifecycleLedger {
 		}
 		if (tornTail) await this.#sealTornTail();
 		await this.#loadUnmarkedSpawnAnchors({
-			firstSeenTs,
 			firstSeenAfterKeyed,
 			quarantined: new Set([...invalidIdentities, ...uncertainAfterCorruption]),
 		});
@@ -957,18 +960,19 @@ export class LifecycleLedger {
 	}
 	/**
 	 * Loads the unmarked-anchor record, deriving it once when it is missing or
-	 * damaged. An unmarked identity counts as an anchor only when both its file
-	 * position and its first-row `ts` fall strictly after the first operation-keyed
-	 * accepted row, and none of its history was quarantined or made uncertain by a
+	 * damaged. An unmarked identity counts as an anchor only when its first row's
+	 * `ts` is strictly later than some operation-keyed accepted row that precedes it
+	 * in the file, and none of its history was quarantined or made uncertain by a
 	 * corrupt row. Index-aware writers start unkeyed identities only for spawn
-	 * mirrors, so a genuine legacy row precedes every keyed row on both signals.
-	 * Legacy migration rewrites a keyed row in place ahead of later legacy rows
-	 * (file order) but stamps it with the current time; eviction deletes only keyed
-	 * terminal rows and never reorders or re-stamps survivors, so it only moves the
-	 * boundary later. Requiring both signals keeps genuine legacy rows fenced.
+	 * mirrors, and appends and compaction keep identities in first-write order, so
+	 * the only keyed rows ahead of a genuine legacy row are legacy rows migrated in
+	 * place, which carry the migration time and therefore never predate it. Only rows
+	 * ahead of an identity are compared: a keyed row appended later, even one stamped
+	 * earlier by a clock step back, cannot vouch for it. Eviction deletes only keyed
+	 * terminal rows and never reorders or re-stamps survivors, so it only removes
+	 * evidence and leaves a row fenced.
 	 */
 	async #loadUnmarkedSpawnAnchors(evidence: {
-		readonly firstSeenTs: ReadonlyMap<string, number>;
 		readonly firstSeenAfterKeyed: ReadonlySet<string>;
 		readonly quarantined: ReadonlySet<string>;
 	}): Promise<void> {
@@ -988,24 +992,15 @@ export class LifecycleLedger {
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
 		}
-		let firstKeyedTs: number | undefined;
-		for (const entry of this.#entries)
-			if (entry.operationKey !== undefined && entry.state === "accepted")
-				firstKeyedTs = firstKeyedTs === undefined ? entry.ts : Math.min(firstKeyedTs, entry.ts);
 		const anchors = new Set<string>();
-		if (firstKeyedTs !== undefined)
-			for (const latest of this.#byIdentity.values()) {
-				const firstSeen = evidence.firstSeenTs.get(latest.identity);
-				if (
-					latest.operationKey === undefined &&
-					latest.spawnAnchor !== true &&
-					evidence.firstSeenAfterKeyed.has(latest.identity) &&
-					!evidence.quarantined.has(latest.identity) &&
-					firstSeen !== undefined &&
-					firstSeen > firstKeyedTs
-				)
-					anchors.add(latest.identity);
-			}
+		for (const latest of this.#byIdentity.values())
+			if (
+				latest.operationKey === undefined &&
+				latest.spawnAnchor !== true &&
+				evidence.firstSeenAfterKeyed.has(latest.identity) &&
+				!evidence.quarantined.has(latest.identity)
+			)
+				anchors.add(latest.identity);
 		const temporary = path.join(
 			path.dirname(this.#spawnAnchorsFile),
 			`.lifecycle-ledger-anchors.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
