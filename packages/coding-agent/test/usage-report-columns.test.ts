@@ -2,7 +2,10 @@ import { beforeAll, describe, expect, test } from "bun:test";
 import type { UsageLimit, UsageReport } from "@gajae-code/ai";
 import { renderUsageReports } from "@gajae-code/coding-agent/modes/controllers/command-controller";
 import { getThemeByName, setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
-import { formatLimitDetail } from "@gajae-code/coding-agent/slash-commands/helpers/usage-report";
+import {
+	collectCachedUsageReports,
+	formatLimitDetail,
+} from "@gajae-code/coding-agent/slash-commands/helpers/usage-report";
 
 function stripAnsi(text: string): string {
 	return text.replace(/\x1b\[[0-9;]*m/g, "");
@@ -192,5 +195,76 @@ describe("usage text rows", () => {
 
 		expect(formatLimitDetail(past, NOW)).not.toContain("resets in");
 		expect(formatLimitDetail(windowless, NOW)).not.toContain("resets in");
+	});
+
+	test("collectCachedUsageReports forwards inventory identity when cached report metadata was stripped", () => {
+		const strippedReport: UsageReport = {
+			provider: "google-antigravity",
+			fetchedAt: NOW,
+			limits: [
+				{
+					id: "gemini-3-flash:default:5h",
+					label: "Gemini",
+					scope: { provider: "google-antigravity", modelId: "gemini-3-flash", windowId: "5h" },
+					window: { id: "5h", label: "5 Hour", durationMs: 5 * 3_600_000, resetsAt: NOW + 2 * 3_600_000 },
+					amount: {
+						unit: "percent",
+						usedFraction: 0.25,
+						remainingFraction: 0.75,
+						used: 25,
+						remaining: 75,
+						limit: 100,
+					},
+					status: "ok",
+				},
+			],
+		};
+		const runtime = {
+			session: {
+				sessionId: "sess-1",
+				credentialSessionId: "sess-1",
+				modelRegistry: {
+					getAvailable: () => [{ provider: "google-antigravity" }],
+					getProviderBaseUrl: () => undefined,
+					getAuthStorageOwner: () => undefined,
+					authStorage: {
+						getGeneration: () => 1,
+						listCredentialInventory: () => [
+							{
+								id: 51,
+								provider: "google-antigravity",
+								credentialType: "oauth",
+								disabled: false,
+								disabledCause: null,
+								identityLabel: "byteworx71@gmail.com",
+								oauthIdentity: { label: "byteworx71@gmail.com" },
+							},
+						],
+						getCachedCredentialHealth: () => ({ status: "ok", reason: null }),
+						getCachedUsageReport: () => ({
+							report: strippedReport,
+							fetchedAt: NOW,
+							freshUntil: NOW + 60_000,
+							retainUntil: NOW + 3_600_000,
+							freshness: "fresh",
+						}),
+						getSessionCredentialRowId: () => 51,
+						getSelectedOAuthCredentialRowId: () => 51,
+						getPreferredOAuthCredentialRowId: () => undefined,
+						getSelectedApiKeyCredentialRowId: () => undefined,
+						getProspectiveApiKeyCredentialRowId: () => undefined,
+						hasRuntimeApiKey: () => false,
+						hasLiteralConfigApiKey: () => false,
+						isConfigApiKeyUsable: () => undefined,
+					},
+				},
+			},
+		};
+		const collected = collectCachedUsageReports(runtime as never);
+		expect(collected).toHaveLength(1);
+		expect(collected[0]?.metadata?.email).toBe("byteworx71@gmail.com");
+		const rendered = stripAnsi(renderUsageReports(collected, theme, NOW, 100));
+		expect(rendered).toContain("byteworx71@gmail.com");
+		expect(rendered).not.toContain("account 1");
 	});
 });

@@ -2,7 +2,13 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { CompactionCancelledError, type CompactionOutcome } from "@gajae-code/agent-core/compaction";
-import { getEnvApiKey, type ToolCall, type UsageLimit, type UsageReport } from "@gajae-code/ai/core";
+import {
+	collapseUsageLimitsForDisplay,
+	getEnvApiKey,
+	type ToolCall,
+	type UsageLimit,
+	type UsageReport,
+} from "@gajae-code/ai/core";
 import type { ProviderDetails } from "@gajae-code/ai/provider-details";
 import { type Keybinding, Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@gajae-code/tui";
 import { formatBytes, formatDuration, sanitizeDisplayLine, setProjectDir } from "@gajae-code/utils";
@@ -1906,7 +1912,7 @@ function resolveFraction(limit: UsageLimit): number | undefined {
 
 function resolveProviderUsageTotal(reports: UsageReport[]): number {
 	return reports
-		.flatMap(report => report.limits)
+		.flatMap(report => collapseUsageLimitsForDisplay(report.limits))
 		.map(limit => resolveFraction(limit) ?? 0)
 		.reduce((sum, value) => sum + value, 0);
 }
@@ -2225,7 +2231,7 @@ export function renderUsageReports(
 			{ label: string; windowLabel: string; limits: UsageLimit[]; reports: UsageReport[] }
 		>();
 		for (const report of providerReports) {
-			for (const limit of report.limits) {
+			for (const limit of collapseUsageLimitsForDisplay(report.limits)) {
 				const windowId = limit.window?.id ?? limit.scope.windowId ?? "default";
 				const key = `${formatLimitTitle(limit)}|${windowId}`;
 				const windowLabel = limit.window?.label ?? windowId;
@@ -2253,7 +2259,10 @@ export function renderUsageReports(
 				const reportIndex = reportIndexes.get(report) ?? 0;
 				return {
 					report,
-					total: report.limits.reduce((sum, limit) => sum + (resolveFraction(limit) ?? 0), 0),
+					total: collapseUsageLimitsForDisplay(report.limits).reduce(
+						(sum, limit) => sum + (resolveFraction(limit) ?? 0),
+						0,
+					),
 					label: firstLimit
 						? formatAccountLabel(firstLimit, report, reportIndex)
 						: formatUnlimitedReportLabel(report, reportIndex),
@@ -2265,7 +2274,23 @@ export function renderUsageReports(
 			accountRank.set(entry.report, rank);
 		});
 
-		const renderableGroups = Array.from(limitGroups.values()).map(group => {
+		const orderedGroups = Array.from(limitGroups.values());
+		const labelOrder = new Map<string, number>();
+		for (const group of orderedGroups) {
+			if (!labelOrder.has(group.label)) labelOrder.set(group.label, labelOrder.size);
+		}
+		const windowOrder = (windowLabel: string): number => {
+			const lower = windowLabel.toLowerCase();
+			if (lower.includes("5 hour") || lower === "5h") return 0;
+			if (lower.includes("7 day") || lower.includes("weekly") || lower === "7d") return 1;
+			return 2;
+		};
+		orderedGroups.sort((a, b) => {
+			const labelDiff = (labelOrder.get(a.label) ?? 0) - (labelOrder.get(b.label) ?? 0);
+			if (labelDiff !== 0) return labelDiff;
+			return windowOrder(a.windowLabel) - windowOrder(b.windowLabel);
+		});
+		const renderableGroups = orderedGroups.map(group => {
 			const entries = group.limits.map((limit, index) => ({
 				limit,
 				report: group.reports[index],
