@@ -388,18 +388,25 @@ not settle earlier effects.
   `accepted`, `effect_started`, `awaiting_ready`, and `terminal_uncertain` legacy
   history stays fenced even for an apparently unrelated empty session. Recovery
   after restart marking a row `terminal_uncertain` is not proof of no effect.
-- `session.spawn` claim mirrors are not legacy requests and never fence, even
-  after their claim leaves the spawn-authority journal. Current brokers mark them
-  with `spawnAnchor: true` in the row. Mirrors written before that marker are
-  listed once in `sdk/lifecycle-ledger.spawn-anchors.json`
-  (`{"version":1,"identities":[...]}`, mode 0600) when it is missing or
-  unparseable; after that it is read as-is and never rewritten. An unmarked
-  identity is listed only when its first row's `ts` is strictly later than some
-  operation-keyed accepted row that precedes it in file order, and none of its
-  history was quarantined or left uncertain by a corrupt row. Keyed rows written
-  after it never count, even when a clock step back stamps them earlier. Deleting the file re-derives it
-  from the current ledger on the next broker open; removing a wrongly listed
-  identity restores that row's fence. Never add identities by hand.
+- `session.spawn` claim mirrors are not legacy requests. Current brokers mark
+  each mirror with `spawnAnchor: true` in its row, and a marked mirror never
+  fences, even after its claim leaves `sdk/spawn-authority.jsonl`. Mirrors
+  written by brokers that predate the marker have no durable field, position, or
+  timestamp that proves they are mirrors (in-place legacy migration rewrites
+  row timestamps), so the broker never infers them: they stay fenced like any
+  other unkeyed row.
+- Operator release of a pre-marker mirror: with the broker stopped, write
+  `sdk/lifecycle-ledger.spawn-anchor-attestation.json` as
+  `{"version":1,"identities":["<identity>", ...]}` and start the broker. List
+  only identities you can match to a `claim.lifecycleIdentity` in a preserved
+  copy of `sdk/spawn-authority.jsonl` or other first-hand evidence; listing a
+  genuine legacy request removes its fence. The broker never writes or derives
+  this file. It honors a listed identity only while that identity's entire
+  history is a single unkeyed, unmarked `accepted` row with no session target
+  and no quarantined or corruption-uncertain history; other entries, and the
+  whole file when it is malformed, are ignored and stay fenced. A still-fenced
+  identity keeps returning `legacy_lifecycle_ambiguous`. Removing an identity
+  restores its fence at the next broker start.
 
 This diagnostic identifies the actual admission guard without exposing ledger
 identities, request hashes, filesystem paths, credentials, or broker free text.

@@ -291,10 +291,10 @@ function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
 export class LifecycleLedger {
 	#file: string;
 	#corruptFile: string;
-	#spawnAnchorsFile: string;
+	#spawnAnchorAttestationFile: string;
 	#entries: LifecycleLedgerEntry[] = [];
 	#byIdentity = new Map<string, LifecycleLedgerEntry>();
-	#unmarkedSpawnAnchors: ReadonlySet<string> = new Set();
+	#attestedSpawnAnchors: ReadonlySet<string> = new Set();
 	#limits: Required<LifecycleLedgerLimits>;
 	#rowCount = 0;
 	#byteCount = 0;
@@ -316,7 +316,7 @@ export class LifecycleLedger {
 	constructor(agentDir: string, limits: LifecycleLedgerLimits = {}) {
 		this.#file = path.join(agentDir, "sdk", "lifecycle-ledger.jsonl");
 		this.#corruptFile = `${this.#file}.corrupt`;
-		this.#spawnAnchorsFile = path.join(agentDir, "sdk", "lifecycle-ledger.spawn-anchors.json");
+		this.#spawnAnchorAttestationFile = path.join(agentDir, "sdk", "lifecycle-ledger.spawn-anchor-attestation.json");
 		this.#limits = {
 			maxBytes: limits.maxBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxBytes,
 			maxLineBytes: limits.maxLineBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxLineBytes,
@@ -332,13 +332,7 @@ export class LifecycleLedger {
 		await fs.mkdir(path.dirname(this.#file), { recursive: true, mode: 0o700 });
 		this.#entries = [];
 		this.#byIdentity.clear();
-		this.#unmarkedSpawnAnchors = new Set();
-		// Evidence for deriving the unmarked-anchor record once; see #loadUnmarkedSpawnAnchors.
-		// Identities whose first row is stamped after a keyed accepted row ahead of it.
-		const seenIdentities = new Set<string>();
-		const firstSeenAfterKeyed = new Set<string>();
-		// Earliest `ts` among keyed accepted rows read so far (file order).
-		let precedingKeyedTs: number | undefined;
+		this.#attestedSpawnAnchors = new Set();
 		this.#warnings = [];
 		this.#rowCount = 0;
 		this.#byteCount = 0;
@@ -367,11 +361,6 @@ export class LifecycleLedger {
 					if (!isLifecycleLedgerEntry(value)) throw new Error("invalid ledger entry");
 					const entry = value;
 					const prior = this.#byIdentity.get(entry.identity);
-					if (!seenIdentities.has(entry.identity)) {
-						seenIdentities.add(entry.identity);
-						if (precedingKeyedTs !== undefined && entry.ts > precedingKeyedTs)
-							firstSeenAfterKeyed.add(entry.identity);
-					}
 					const invalidHistory =
 						invalidIdentities.has(entry.identity) ||
 						uncertainAfterCorruption.has(entry.identity) ||
@@ -405,8 +394,6 @@ export class LifecycleLedger {
 						}
 						continue;
 					}
-					if (entry.operationKey !== undefined && entry.state === "accepted")
-						precedingKeyedTs = precedingKeyedTs === undefined ? entry.ts : Math.min(precedingKeyedTs, entry.ts);
 					this.#entries.push(entry);
 					this.#byIdentity.set(entry.identity, entry);
 				} catch (error) {
@@ -419,10 +406,7 @@ export class LifecycleLedger {
 			}
 		}
 		if (tornTail) await this.#sealTornTail();
-		await this.#loadUnmarkedSpawnAnchors({
-			firstSeenAfterKeyed,
-			quarantined: new Set([...invalidIdentities, ...uncertainAfterCorruption]),
-		});
+		await this.#loadAttestedSpawnAnchors(new Set([...invalidIdentities, ...uncertainAfterCorruption]));
 		for (const [identity, uncertain] of syntheticUncertain) {
 			this.#byIdentity.set(identity, uncertain);
 			if (this.#entries.some(entry => entry.identity === identity && entry.state === "accepted"))
@@ -952,85 +936,65 @@ export class LifecycleLedger {
 	 * Spawn-claim anchors are unkeyed rows that only mirror a spawn-authority claim;
 	 * they are never target-inclusive lifecycle requests, so they never fence a
 	 * different admission, even after their claim leaves the spawn-authority
-	 * journal. Anchors carry `spawnAnchor: true` in the row itself, which survives
-	 * migration, compaction, eviction and restarts. Anchors written before that
-	 * marker existed are listed once in {@link #spawnAnchorsFile}. Identities are
-	 * HMACs of the operation and caller key under the agent directory's broker key,
-	 * so a listed identity can only match a `session.spawn` row of that directory.
+	 * journal. Current writers mark them with `spawnAnchor: true` in the row, which
+	 * survives migration, compaction, eviction and restarts.
+	 *
+	 * Mirrors written before that marker carry no durable field that tells them
+	 * apart from a pre-index legacy request: file position and `ts` are not
+	 * provenance, because `migrateIdentity` rewrites accepted legacy rows in place
+	 * with the current wall clock. Such rows therefore stay fenced unless an
+	 * operator lists them in {@link #spawnAnchorAttestationFile}; see
+	 * {@link #loadAttestedSpawnAnchors}.
 	 */
 	#isSpawnAnchor(entry: LifecycleLedgerEntry): boolean {
-		return entry.spawnAnchor === true || this.#unmarkedSpawnAnchors.has(entry.identity);
+		return entry.spawnAnchor === true || this.#attestedSpawnAnchors.has(entry.identity);
 	}
 	/**
-	 * Loads the unmarked-anchor record, deriving it once when it is missing or
-	 * damaged. An unmarked identity counts as an anchor only when its first row's
-	 * `ts` is strictly later than some operation-keyed accepted row that precedes it
-	 * in the file, and none of its history was quarantined or made uncertain by a
-	 * corrupt row. Index-aware writers start unkeyed identities only for spawn
-	 * mirrors, and appends and compaction keep identities in first-write order, so
-	 * the only keyed rows ahead of a genuine legacy row are legacy rows migrated in
-	 * place, which carry the migration time and therefore never predate it. Only rows
-	 * ahead of an identity are compared: a keyed row appended later, even one stamped
-	 * earlier by a clock step back, cannot vouch for it. Eviction deletes only keyed
-	 * terminal rows and never reorders or re-stamps survivors, so it only removes
-	 * evidence and leaves a row fenced.
+	 * Loads the operator-written spawn-anchor attestation. The broker never writes
+	 * or derives this file. A listed identity is exempt only while its whole
+	 * history is the single unkeyed, unmarked `accepted` row a spawn mirror writes,
+	 * with no session target and no quarantined or corruption-uncertain history; any
+	 * other listed identity, and every identity of an unreadable file, stays fenced.
 	 */
-	async #loadUnmarkedSpawnAnchors(evidence: {
-		readonly firstSeenAfterKeyed: ReadonlySet<string>;
-		readonly quarantined: ReadonlySet<string>;
-	}): Promise<void> {
+	async #loadAttestedSpawnAnchors(quarantined: ReadonlySet<string>): Promise<void> {
+		let value: unknown;
 		try {
-			const value: unknown = JSON.parse(await fs.readFile(this.#spawnAnchorsFile, "utf8"));
-			if (typeof value === "object" && value !== null && !Array.isArray(value)) {
-				const record = value as { version?: unknown; identities?: unknown };
-				if (
-					record.version === 1 &&
-					Array.isArray(record.identities) &&
-					record.identities.every(identity => typeof identity === "string")
-				) {
-					this.#unmarkedSpawnAnchors = new Set(record.identities as string[]);
-					return;
-				}
-			}
+			value = JSON.parse(await fs.readFile(this.#spawnAnchorAttestationFile, "utf8"));
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			if (!(error instanceof SyntaxError)) throw error;
 		}
-		const anchors = new Set<string>();
-		for (const latest of this.#byIdentity.values())
+		const record = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
+		if (
+			record?.version !== 1 ||
+			!Array.isArray(record.identities) ||
+			!record.identities.every(identity => typeof identity === "string")
+		) {
+			this.#warnings.push("Malformed spawn-anchor attestation ignored");
+			return;
+		}
+		const rowCounts = new Map<string, number>();
+		for (const entry of this.#entries) rowCounts.set(entry.identity, (rowCounts.get(entry.identity) ?? 0) + 1);
+		const attested = new Set<string>();
+		let rejected = 0;
+		for (const identity of new Set(record.identities as string[])) {
+			const entry = this.#byIdentity.get(identity);
 			if (
-				latest.operationKey === undefined &&
-				latest.spawnAnchor !== true &&
-				evidence.firstSeenAfterKeyed.has(latest.identity) &&
-				!evidence.quarantined.has(latest.identity)
+				entry !== undefined &&
+				rowCounts.get(identity) === 1 &&
+				!quarantined.has(identity) &&
+				entry.state === "accepted" &&
+				entry.operationKey === undefined &&
+				entry.spawnAnchor === undefined &&
+				entry.fingerprint === undefined &&
+				entry.intendedSessionId === undefined &&
+				entry.closeAuthorityBound === undefined
 			)
-				anchors.add(latest.identity);
-		const temporary = path.join(
-			path.dirname(this.#spawnAnchorsFile),
-			`.lifecycle-ledger-anchors.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
-		);
-		let renamed = false;
-		try {
-			const h = await fs.open(
-				temporary,
-				fsSync.constants.O_WRONLY |
-					fsSync.constants.O_CREAT |
-					fsSync.constants.O_EXCL |
-					fsSync.constants.O_NOFOLLOW,
-				0o600,
-			);
-			try {
-				await h.writeFile(`${JSON.stringify({ version: 1, identities: [...anchors].sort() })}\n`);
-				await h.sync();
-			} finally {
-				await h.close();
-			}
-			await fs.rename(temporary, this.#spawnAnchorsFile);
-			renamed = true;
-			await this.#syncDirectory();
-		} finally {
-			if (!renamed) await fs.unlink(temporary).catch(() => {});
+				attested.add(identity);
+			else rejected += 1;
 		}
-		this.#unmarkedSpawnAnchors = anchors;
+		if (rejected > 0) this.#warnings.push("Spawn-anchor attestation entries that are not spawn-mirror rows ignored");
+		this.#attestedSpawnAnchors = attested;
 	}
 	async begin(
 		identity: string,

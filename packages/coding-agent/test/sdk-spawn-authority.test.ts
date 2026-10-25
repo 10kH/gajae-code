@@ -390,6 +390,86 @@ describe("SpawnAuthorityStore", () => {
 		expect(reopened.hasLegacyIdentity(new Set(), { ignoreFinalRows: true })).toBe(false);
 		expect(reopened.hasLegacyIdentity()).toBe(false);
 	});
+
+	it("admits after the spawn-authority journal is deleted and the broker restarts, fencing pre-marker mirrors until attested", async () => {
+		const agentDir = await temp();
+		const sdkDir = path.join(agentDir, "sdk");
+		const ledgerPath = path.join(sdkDir, "lifecycle-ledger.jsonl");
+		const journalPath = path.join(sdkDir, "spawn-authority.jsonl");
+		const attestationPath = path.join(sdkDir, "lifecycle-ledger.spawn-anchor-attestation.json");
+		const options = {
+			agentDir,
+			masterCapabilityVerifier: { verifyMasterCapability: async () => ({ allowed: true }) },
+			spawnSubstrateProvider: spawnSubstrateFake,
+			spawnPromptLayer: spawnPromptLayerFake,
+		};
+		const spawner = new Broker(options);
+		await spawner.start();
+		try {
+			await expect(
+				spawner.handleRequest(
+					"session.spawn",
+					{
+						task: "journal-loss-task",
+						masterCapability: "journal-loss-capability",
+						ownerSessionId: "journal-loss-owner",
+						attestationEpoch: "journal-loss-epoch",
+						cwd: agentDir,
+					},
+					"journal-loss-key",
+				),
+			).resolves.toMatchObject({ ok: true, result: { code: "spawn_accepted" } });
+		} finally {
+			await spawner.stop();
+		}
+		const closeUnrelated = async (key: string) => {
+			const broker = new Broker(options);
+			setLifecycleCommandResolverForTest(broker, () => ({ file: path.join(agentDir, "missing-gjc"), args: [] }));
+			await broker.start();
+			try {
+				expect(broker.ledger.get(mirrorIdentity)).toBeDefined();
+				return await broker.handleRequest("session.close", { sessionId: "unrelated-session" }, key);
+			} finally {
+				setLifecycleCommandResolverForTest(broker, undefined);
+				await broker.stop();
+			}
+		};
+		const ledgerRows = async () =>
+			(await fs.readFile(ledgerPath, "utf8"))
+				.split("\n")
+				.filter(Boolean)
+				.map(line => JSON.parse(line) as Record<string, unknown>);
+		const mirrors = (await ledgerRows()).filter(row => row.operationKey === undefined);
+		expect(mirrors).toHaveLength(1);
+		expect(mirrors[0]).toMatchObject({ state: "accepted", spawnAnchor: true });
+		const mirrorIdentity = mirrors[0]!.identity as string;
+		const ambiguous = {
+			ok: false,
+			error: { code: "legacy_lifecycle_ambiguous", message: "legacy lifecycle request has an ambiguous target" },
+		};
+		const notIndexed = { ok: false, error: { code: "not_found", message: "session is not indexed" } };
+
+		// The claim leaves the journal entirely; the marked mirror still never fences.
+		await fs.rm(journalPath);
+		await expect(closeUnrelated("after-journal-loss")).resolves.toEqual(notIndexed);
+
+		// The same mirror written by a pre-marker broker stays fenced: nothing durable proves it.
+		const rows = await ledgerRows();
+		const premarker = rows.map(row => {
+			if (row.identity !== mirrorIdentity) return row;
+			const { spawnAnchor: _marker, ...rest } = row;
+			return rest;
+		});
+		await fs.writeFile(ledgerPath, premarker.map(row => `${JSON.stringify(row)}\n`).join(""));
+		await fs.rm(journalPath, { force: true });
+		await expect(closeUnrelated("premarker-unattested")).resolves.toEqual(ambiguous);
+		expect(await Bun.file(attestationPath).exists()).toBe(false);
+
+		// An operator attestation for that identity lifts the fence after the next restart.
+		await fs.writeFile(attestationPath, `${JSON.stringify({ version: 1, identities: [mirrorIdentity] })}\n`);
+		await fs.rm(journalPath, { force: true });
+		await expect(closeUnrelated("premarker-attested")).resolves.toEqual(notIndexed);
+	});
 });
 
 describe("Broker spawn flow driver", () => {
