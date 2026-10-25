@@ -10,7 +10,7 @@ import { Agent, type AgentTool } from "@gajae-code/agent-core";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
-import { sanitizeDisplayLine } from "@gajae-code/utils";
+import { sanitizeDisplayLine, sanitizeText } from "@gajae-code/utils";
 import fc from "fast-check";
 import * as z from "zod/v4";
 import { Settings } from "../../src/config/settings";
@@ -209,10 +209,7 @@ test("approval prompt text stays free of terminal controls for generated command
 			const visible = sanitizeDisplayLine(command);
 			expect(call.title).toBe(visible.length === 0 ? "monitor" : visible.slice(0, 80));
 			expect(call.title).not.toMatch(TITLE_CONTROL);
-			const visibleBody = command
-				.split(/\r?\n/u)
-				.map(line => sanitizeDisplayLine(line))
-				.join("\n");
+			const visibleBody = sanitizeText(command).replace(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu, "");
 			expect(promptBody(call)).toBe(command.length > 0 ? `$ ${visibleBody}` : "");
 			expect(promptBody(call)).not.toMatch(BODY_CONTROL);
 			expect((call.rawInput as { command?: string }).command).toBe(command);

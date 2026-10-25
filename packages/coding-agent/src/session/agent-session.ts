@@ -213,6 +213,7 @@ import {
 	prompt,
 	safeErrorDescription,
 	sanitizeDisplayLine,
+	sanitizeText,
 	Snowflake,
 } from "@gajae-code/utils";
 import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append-only-mode";
@@ -2130,12 +2131,9 @@ function permissionPromptTitle(value: string, max?: number): string {
 	return cleaned.slice(0, max);
 }
 
-/** Same control strip as a title, keeping line breaks so a multi-line command stays readable. */
+/** Strip controls on the whole command, then drop bidi marks. Line breaks stay. */
 function permissionPromptBody(value: string): string {
-	return value
-		.split(/\r?\n/u)
-		.map(line => sanitizeDisplayLine(line))
-		.join("\n");
+	return sanitizeText(value).replace(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu, "");
 }
 
 function getPermissionIntent(
