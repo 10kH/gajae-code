@@ -351,6 +351,8 @@ export interface MCPDiscoverOptions {
 	onConnecting?: (serverNames: string[]) => void;
 	/** Load only this explicit MCP config file. */
 	configPath?: string;
+	/** This exact file was written by the lifecycle host, not chosen by the caller. */
+	lifecycleOrigin?: boolean;
 	/** Idle retention for shared MCP pool entries. */
 	sharedPoolIdleMs?: number;
 }
@@ -1219,6 +1221,7 @@ export class MCPManager {
 			autoloadOnly: options?.autoloadOnly,
 			nativeOnly: options?.nativeOnly,
 			configPath: options?.configPath,
+			lifecycleOrigin: options?.lifecycleOrigin,
 		});
 		omitUnapprovedProjectStdio(configs, sources, this.#allowUntrustedProjectStdio, this.#toolsOnly);
 		if (this.#toolCacheServerNames !== undefined) {

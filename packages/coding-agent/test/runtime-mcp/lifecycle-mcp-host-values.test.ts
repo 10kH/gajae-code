@@ -1,12 +1,14 @@
 /**
  * Lifecycle mcpServers are written under a tools-only temp directory and then
- * loaded as an exact config. That load must drop `!` shell values and keep
- * sensitive host names as text, while an explicit tools-only file outside
- * that directory still resolves them.
+ * loaded as an exact config. The lifecycle host marks that load. It must drop
+ * `!` shell values and keep sensitive host names as text, and it must not
+ * expand a sensitive header placeholder from the host. An explicit tools-only
+ * file stays trusted even under a directory of that prefix.
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import fc from "fast-check";
@@ -112,7 +114,11 @@ describe("lifecycle tools-only MCP host values", () => {
 		process.env[HOST_KEY] = HOST_VALUE;
 		const manager = new MCPManager(root, null, { toolsOnly: true });
 		try {
-			await manager.discoverAndConnect({ configPath: path.join(configDir, "mcp.json"), filterExa: false });
+			await manager.discoverAndConnect({
+				configPath: path.join(configDir, "mcp.json"),
+				filterExa: false,
+				lifecycleOrigin: true,
+			});
 			expect(await waitUntil(async () => exists(reportPath), 4000)).toBe(true);
 			const report = JSON.parse(await fs.readFile(reportPath, "utf8")) as Record<string, string | null>;
 			expect(await exists(marker)).toBe(false);
@@ -148,7 +154,11 @@ describe("lifecycle tools-only MCP host values", () => {
 		const manager = new MCPManager(root, null, { toolsOnly: true });
 		try {
 			await manager
-				.discoverAndConnect({ configPath: path.join(configDir, "mcp.json"), filterExa: false })
+				.discoverAndConnect({
+					configPath: path.join(configDir, "mcp.json"),
+					filterExa: false,
+					lifecycleOrigin: true,
+				})
 				.catch(() => {});
 			expect(await waitUntil(async () => exists(marker), 1500)).toBe(false);
 		} finally {
@@ -199,7 +209,11 @@ describe("lifecycle tools-only MCP host values", () => {
 		process.env[PUBLIC_NAME] = PUBLIC_VALUE;
 		const manager = new MCPManager(root, null, { toolsOnly: true });
 		try {
-			await manager.discoverAndConnect({ configPath: path.join(configDir, "mcp.json"), filterExa: false });
+			await manager.discoverAndConnect({
+				configPath: path.join(configDir, "mcp.json"),
+				filterExa: false,
+				lifecycleOrigin: true,
+			});
 			expect(await waitUntil(async () => exists(reportPath), 4000)).toBe(true);
 			const report = JSON.parse(await fs.readFile(reportPath, "utf8")) as Record<string, string | null>;
 			expect(report.MODE).toBe("debug");
@@ -294,7 +308,110 @@ describe("lifecycle tools-only MCP host values", () => {
 		}
 	}, 20_000);
 
-	it("property: lifecycle tools-only directory trust, fc.property seed 20261025, numRuns 64", () => {
+	it("does not send a lifecycle sensitive header placeholder's host value to the endpoint", async () => {
+		const root = await tempDir();
+		const configDir = await fs.mkdtemp(path.join(root, LIFECYCLE_DIR_PREFIX));
+		const received: string[] = [];
+		const server = http.createServer((req, res) => {
+			received.push(JSON.stringify(req.headers));
+			res.statusCode = 400;
+			res.end("no");
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", () => resolve());
+		});
+		const address = server.address();
+		if (address === null || typeof address === "string") throw new Error("listener has no port");
+		await writeJson(path.join(configDir, "mcp.json"), {
+			mcpServers: {
+				remote: {
+					type: "http",
+					url: `http://127.0.0.1:${address.port}/mcp`,
+					timeout: 1000,
+					headers: { Authorization: `\${${HOST_KEY}}` },
+				},
+			},
+		});
+		const previous = process.env[HOST_KEY];
+		process.env[HOST_KEY] = HOST_VALUE;
+		const manager = new MCPManager(root, null, { toolsOnly: true });
+		try {
+			const connect = manager
+				.discoverAndConnect({
+					configPath: path.join(configDir, "mcp.json"),
+					filterExa: false,
+					lifecycleOrigin: true,
+				})
+				.catch(() => {});
+			expect(await waitUntil(async () => received.length > 0, 4000)).toBe(true);
+			await connect;
+			const seen = received.join("\n");
+			expect(seen).toContain(`\${${HOST_KEY}}`);
+			expect(seen).not.toContain(HOST_VALUE);
+		} finally {
+			restoreEnv(HOST_KEY, previous);
+			await manager.disconnectAll().catch(() => {});
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	}, 20_000);
+
+	it("still resolves shell and sensitive host values for an explicit exact config under a matching ancestor", async () => {
+		const root = await tempDir();
+		const configDir = await fs.mkdtemp(path.join(root, LIFECYCLE_DIR_PREFIX));
+		const marker = path.join(root, "ancestor-marker");
+		const bangScript = path.join(root, "ancestor-bang.mjs");
+		const reportPath = path.join(root, "ancestor-env.json");
+		const scriptPath = path.join(root, "ancestor-report.mjs");
+		await fs.writeFile(
+			bangScript,
+			`import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(marker)}, "1"); process.stdout.write(${JSON.stringify(SHELL_TEXT)});\n`,
+		);
+		await fs.writeFile(
+			scriptPath,
+			[
+				"import fs from 'node:fs';",
+				"fs.writeFileSync(process.env.REPORT, JSON.stringify({",
+				"  BANG: process.env.BANG ?? null,",
+				"  LEAK: process.env.LEAK ?? null,",
+				"}));",
+				"process.exit(0);",
+				"",
+			].join("\n"),
+		);
+		await writeJson(path.join(configDir, "mcp.json"), {
+			mcpServers: {
+				report: {
+					type: "stdio",
+					command: process.execPath,
+					args: [scriptPath],
+					timeout: 3000,
+					noInheritEnv: true,
+					env: {
+						REPORT: reportPath,
+						BANG: `!"${process.execPath}" "${bangScript}"`,
+						LEAK: HOST_KEY,
+					},
+				},
+			},
+		});
+		const previous = process.env[HOST_KEY];
+		process.env[HOST_KEY] = HOST_VALUE;
+		const manager = new MCPManager(root, null, { toolsOnly: true });
+		try {
+			await manager.discoverAndConnect({ configPath: path.join(configDir, "mcp.json"), filterExa: false });
+			expect(await waitUntil(async () => exists(reportPath), 4000)).toBe(true);
+			const report = JSON.parse(await fs.readFile(reportPath, "utf8")) as Record<string, string | null>;
+			expect(await exists(marker)).toBe(true);
+			expect(report.BANG).toBe(SHELL_TEXT);
+			expect(report.LEAK).toBe(HOST_VALUE);
+		} finally {
+			restoreEnv(HOST_KEY, previous);
+			await manager.disconnectAll().catch(() => {});
+		}
+	}, 20_000);
+
+	it("property: lifecycle origin is explicit, fc.property seed 20261025, numRuns 64", () => {
 		const plainDir = fc
 			.string({ minLength: 1, maxLength: 12 })
 			.filter(
@@ -318,10 +435,12 @@ describe("lifecycle tools-only MCP host values", () => {
 						level,
 						path: filePath,
 					});
-					expect(classify(meta(path.join(dir, `${LIFECYCLE_DIR_PREFIX}explicit.json`)), toolsOnly)).toBe(false);
-					expect(classify(meta(path.join(`${LIFECYCLE_DIR_PREFIX}${dir}`, "mcp.json")), toolsOnly)).toBe(
+					const underAncestor = meta(path.join(`${LIFECYCLE_DIR_PREFIX}${dir}`, "mcp.json"));
+					expect(classify(underAncestor, toolsOnly)).toBe(false);
+					expect(classify({ ...underAncestor, lifecycleOrigin: true }, toolsOnly)).toBe(
 						toolsOnly && level === "project",
 					);
+					expect(classify(meta(path.join(dir, `${LIFECYCLE_DIR_PREFIX}explicit.json`)), toolsOnly)).toBe(false);
 					expect(classify(undefined, toolsOnly)).toBe(false);
 				},
 			),
