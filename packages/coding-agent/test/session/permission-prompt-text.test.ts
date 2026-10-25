@@ -19,8 +19,8 @@ import type { ClientBridgePermissionToolCall } from "../../src/session/client-br
 import { convertToLlm } from "../../src/session/messages";
 import { SessionManager } from "../../src/session/session-manager";
 
-const TITLE_CONTROL = /[\u0000-\u001f\u007f-\u009f\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
-const BODY_CONTROL = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
+const TITLE_CONTROL = /[\u0000-\u0008\u000a-\u001f\u007f-\u009f\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
+const BODY_CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
 const OSC52 = "\u001b]52;c;cHduZWQ=\u0007";
 const OSC8_OPEN = "\u001b]8;;https://attacker.invalid\u0007";
 const OSC8_CLOSE = "\u001b]8;;\u0007";
@@ -190,8 +190,21 @@ test("keeps a github push approval title", async () => {
 });
 
 test("approval prompt text stays free of terminal controls for generated commands", async () => {
+	const unit = fc.constantFrom(
+		..."abcdefghijklmnopqrstuvwxyzABC 0123456789._/-",
+		"\u001b",
+		"\u0000",
+		"\u0007",
+		"\n",
+		"\r",
+		"\t",
+		"\u007f",
+		"\u009b",
+		"\u202e",
+		"\u200e",
+	);
 	await fc.assert(
-		fc.asyncProperty(fc.string({ maxLength: 90 }), async command => {
+		fc.asyncProperty(fc.string({ maxLength: 90, unit }), async command => {
 			const call = await prompt("monitor", { command });
 			const visible = sanitizeDisplayLine(command);
 			expect(call.title).toBe(visible.length === 0 ? "monitor" : visible.slice(0, 80));
