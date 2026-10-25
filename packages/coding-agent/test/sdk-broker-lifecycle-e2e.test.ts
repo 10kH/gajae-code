@@ -9422,11 +9422,11 @@ test("delayed lifecycle host cleanup does not unregister a file-only same-genera
 		child.kill("SIGTERM");
 		expect(await child.exited).toBe(0);
 		const reopened = await new SessionIndex(agentDir).open();
-		const appendedRows = (await fs.readFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), "utf8"))
-			.split("\n")
-			.filter(Boolean)
-			.map(line => JSON.parse(line) as SessionIndexEvent)
-			.filter(event => event.indexSeq > successor.indexSeq);
+		const appendedRows = (
+			Bun.JSONL.parse(
+				await Bun.file(path.join(agentDir, "sdk", "sessions", "index.jsonl")).text(),
+			) as SessionIndexEvent[]
+		).filter(event => event.indexSeq > successor.indexSeq);
 		const current = reopened.listSessionIdentities().find(session => session.sessionId === sessionId)!;
 		expect(current).toMatchObject({ terminal: false, endpointFileId: successor.endpointFileId });
 		expect(endpointIncarnation(current, sessionId)).toBe(endpointIncarnation(successor, sessionId));
