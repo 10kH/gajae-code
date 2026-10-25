@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import { logger } from "@gajae-code/utils";
 import type { SdkStartupFailure, SdkStartupRollbackResult } from "../startup-capability";
 import { parseLifecycleJson } from "./lifecycle-codec";
 import { assertSupportedStateVersion, SDK_STATE_VERSION } from "./state-version";
@@ -955,14 +956,27 @@ export class LifecycleLedger {
 	 * history is the single unkeyed, unmarked `accepted` row a spawn mirror writes,
 	 * with no session target and no quarantined or corruption-uncertain history; any
 	 * other listed identity, and every identity of an unreadable file, stays fenced.
+	 * The file is optional and only ever lifts fences, so failing to read it leaves
+	 * the attested set empty instead of failing the ledger open.
 	 */
 	async #loadAttestedSpawnAnchors(quarantined: ReadonlySet<string>): Promise<void> {
+		let text: string;
+		try {
+			text = await fs.readFile(this.#spawnAnchorAttestationFile, "utf8");
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "ENOENT") return;
+			this.#warnings.push("Unreadable spawn-anchor attestation ignored");
+			logger.warn("sdk broker: spawn-anchor attestation is unreadable; pre-marker mirrors stay fenced", {
+				code: code ?? "unknown",
+			});
+			return;
+		}
 		let value: unknown;
 		try {
-			value = JSON.parse(await fs.readFile(this.#spawnAnchorAttestationFile, "utf8"));
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-			if (!(error instanceof SyntaxError)) throw error;
+			value = JSON.parse(text);
+		} catch {
+			value = undefined;
 		}
 		const record = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
 		if (

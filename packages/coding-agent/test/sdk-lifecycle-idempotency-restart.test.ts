@@ -208,6 +208,24 @@ describe("SDK lifecycle ledger", () => {
 				expect(reopened.warnings).toContain("Malformed spawn-anchor attestation ignored");
 				expect(await fs.readFile(attestation, "utf8")).toBe(malformed);
 			}
+			// An attestation that cannot be read is ignored: the ledger still opens fenced.
+			await fs.rm(attestation);
+			await fs.mkdir(attestation);
+			const directory = await new LifecycleLedger(dir).open();
+			expect(directory.hasLegacyIdentity(new Set(legacy))).toBe(true);
+			expect(directory.warnings).toContain("Unreadable spawn-anchor attestation ignored");
+			await fs.rmdir(attestation);
+			if (process.platform !== "win32" && process.getuid?.() !== 0) {
+				await fs.writeFile(attestation, `${JSON.stringify({ version: 1, identities: ["old-anchor-s"] })}\n`);
+				await fs.chmod(attestation, 0o000);
+				try {
+					const unreadable = await new LifecycleLedger(dir).open();
+					expect(unreadable.hasLegacyIdentity(new Set(legacy))).toBe(true);
+					expect(unreadable.warnings).toContain("Unreadable spawn-anchor attestation ignored");
+				} finally {
+					await fs.chmod(attestation, 0o600);
+				}
+			}
 			// The operator lists every unkeyed identity; only the mirror-shaped row is honored.
 			const listed = `${JSON.stringify({ version: 1, identities: ["old-anchor-s", ...legacy, "absent"] })}\n`;
 			await fs.writeFile(attestation, listed);

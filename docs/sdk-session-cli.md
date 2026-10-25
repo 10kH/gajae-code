@@ -404,7 +404,9 @@ not settle earlier effects.
   this file. It honors a listed identity only while that identity's entire
   history is a single unkeyed, unmarked `accepted` row with no session target
   and no quarantined or corruption-uncertain history; other entries, and the
-  whole file when it is malformed, are ignored and stay fenced. A still-fenced
+  whole file when it is malformed or cannot be read (for example a directory or
+  a file without read permission), are ignored and stay fenced. An unreadable
+  file is logged as a broker warning and never stops the broker from starting. A still-fenced
   identity keeps returning `legacy_lifecycle_ambiguous`. Removing an identity
   restores its fence at the next broker start.
 

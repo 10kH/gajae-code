@@ -465,6 +465,21 @@ describe("SpawnAuthorityStore", () => {
 		await expect(closeUnrelated("premarker-unattested")).resolves.toEqual(ambiguous);
 		expect(await Bun.file(attestationPath).exists()).toBe(false);
 
+		// An unreadable attestation never blocks broker start; the mirror stays fenced.
+		await fs.mkdir(attestationPath);
+		await expect(closeUnrelated("premarker-attestation-directory")).resolves.toEqual(ambiguous);
+		await fs.rmdir(attestationPath);
+		if (process.platform !== "win32" && process.getuid?.() !== 0) {
+			await fs.writeFile(attestationPath, `${JSON.stringify({ version: 1, identities: [mirrorIdentity] })}\n`);
+			await fs.chmod(attestationPath, 0o000);
+			try {
+				await expect(closeUnrelated("premarker-attestation-unreadable")).resolves.toEqual(ambiguous);
+			} finally {
+				await fs.chmod(attestationPath, 0o600);
+			}
+			await fs.rm(attestationPath);
+		}
+
 		// An operator attestation for that identity lifts the fence after the next restart.
 		await fs.writeFile(attestationPath, `${JSON.stringify({ version: 1, identities: [mirrorIdentity] })}\n`);
 		await fs.rm(journalPath, { force: true });
