@@ -177,6 +177,51 @@ describe("copy annotations under a copying TUI", () => {
 		expect(written).not.toContain("\x1b_AGJC_COPY");
 	});
 
+	for (const padding of [0, 1, 4]) {
+		for (const backwards of [false, true]) {
+			test(`highlights exactly the copied cells (padding ${padding}, backwards ${backwards})`, async () => {
+				const component = new Markdown("앞쪽 문장 **실제 연결** `검증` 승인 끝", padding, 0, theme);
+				const expected = "실제 연결 검증 승인";
+				const row = plain(component.render(80)[0]);
+				const start = visibleWidth(row.slice(0, row.indexOf(expected)));
+				const end = start + visibleWidth(expected) - 1;
+				const [from, to] = backwards ? [end, start] : [start, end];
+				const terminal = new VirtualTerminal(80, 12);
+				let copied: string | undefined;
+				const tui = new TUI(terminal, undefined, {
+					enableMouse: true,
+					copySelection: text => {
+						copied = text;
+					},
+					widthSettleMs: 0,
+				});
+				tui.addChild(component);
+				try {
+					tui.start();
+					await terminal.waitForRender();
+					terminal.sendInput(`\x1b[<0;${from + 1};1M`);
+					terminal.sendInput(`\x1b[<32;${to + 1};1M`);
+					await terminal.waitForRender();
+					// Read effective xterm cell state so the check does not reuse renderer slicing.
+					let inverse = false;
+					let highlighted = "";
+					const firstRow = terminal.getViewportAnsi().split("\n")[0];
+					for (const [token] of firstRow.matchAll(/\x1b\[[0-9;]*m|[^\x1b]+/gu)) {
+						if (token.startsWith("\x1b[")) inverse = token.slice(2, -1).split(";").includes("7");
+						else if (inverse) highlighted += token;
+					}
+					expect(highlighted).toBe(expected);
+					terminal.sendInput(`\x1b[<0;${to + 1};1m`);
+					await terminal.waitForRender();
+					expect(copied).toBe(expected);
+				} finally {
+					tui.stop();
+					tui.dispose();
+				}
+			});
+		}
+	}
+
 	test("a growing streamed token keeps already-painted rows byte-stable", () => {
 		const md = new Markdown("", 1, 0, theme);
 		let text = "intro\n\n```ts";

@@ -4111,8 +4111,14 @@ export class TUI extends Container {
 			);
 			const after = columns.end < width ? sliceByColumn(rendered, columns.end, width - columns.end, false) : "";
 			const painted = `${before}\x1b[7m${selected}\x1b[27m${after}`;
-			const head = originColumn > 0 ? sliceByColumn(painted, 0, originColumn, false) : "";
-			const tail = originColumn < width ? sliceByColumn(painted, originColumn, width - originColumn, false) : "";
+			// Segment extraction keeps later reverse-video controls out of the prefix.
+			const { before: head, after: tail } = extractSegments(
+				painted,
+				originColumn,
+				originColumn,
+				width - originColumn,
+				false,
+			);
 			highlighted[lineIndex] = `${head}${originMarker}${tail}${annotationSuffix}`;
 		}
 		return highlighted;
