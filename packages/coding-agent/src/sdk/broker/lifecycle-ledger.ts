@@ -695,6 +695,9 @@ export class LifecycleLedger {
 		this.#warnings.push("Malformed lifecycle ledger entry quarantined");
 	}
 	async #syncDirectory(): Promise<void> {
+		// Windows does not support fsync on directory handles; the temporary file is
+		// still synced before its atomic rename. Same rule as lifecycle.ts syncDirectory.
+		if (process.platform === "win32") return;
 		const directory = await fs.open(path.dirname(this.#file), fsSync.constants.O_RDONLY);
 		try {
 			await directory.sync();

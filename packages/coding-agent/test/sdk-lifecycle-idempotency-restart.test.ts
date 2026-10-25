@@ -222,6 +222,37 @@ describe("SDK lifecycle ledger", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
+	it.each([
+		["skips", "win32"],
+		["keeps", "linux"],
+	])("%s the directory fsync when first writing the anchor record on %s", async (_name, platform) => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-anchor-dirsync-"));
+		const sdkDir = path.join(dir, "sdk");
+		const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+		const open = fs.open;
+		const directoryOpen = spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
+			if (file === sdkDir) throw Object.assign(new Error("EPERM: directory fsync unsupported"), { code: "EPERM" });
+			return open(file, flags, mode);
+		});
+		try {
+			Object.defineProperty(process, "platform", { configurable: true, value: platform });
+			const opening = new LifecycleLedger(dir).open();
+			if (platform === "win32") {
+				await opening;
+				expect(directoryOpen.mock.calls.some(([file]) => file === sdkDir)).toBe(false);
+			} else {
+				await expect(opening).rejects.toThrow("EPERM");
+			}
+			// The synced record is renamed into place before the directory barrier either way.
+			expect(
+				JSON.parse(await fs.readFile(path.join(sdkDir, "lifecycle-ledger.spawn-anchors.json"), "utf8")),
+			).toEqual({ version: 1, identities: [] });
+		} finally {
+			if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
+			directoryOpen.mockRestore();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 	it("keeps fencing a pre-index legacy row whose anchor was lost", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-legacy-unanchored-"));
 		try {
