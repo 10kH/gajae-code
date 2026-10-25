@@ -10943,11 +10943,14 @@ export class AgentSession {
 	 * Subscribe to agent events.
 	 * Session persistence is handled internally (saves messages on message_end).
 	 * Multiple listeners can be added. Returns unsubscribe function for this listener.
+	 * Live observers can leave queued startup fallback notices for the first replaying consumer.
 	 */
-	subscribe(listener: AgentSessionEventListener): () => void {
+	subscribe(listener: AgentSessionEventListener, options?: { replayPendingFallbackSwitches?: boolean }): () => void {
 		this.#eventListeners.push(listener);
 		this.#rebuildEventListenerSnapshot();
-		for (const event of this.#pendingFallbackSwitches.splice(0)) listener(event);
+		if (options?.replayPendingFallbackSwitches !== false) {
+			for (const event of this.#pendingFallbackSwitches.splice(0)) listener(event);
+		}
 
 		// Return unsubscribe function for this specific listener
 		return () => {
