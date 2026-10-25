@@ -209,8 +209,14 @@ describe("/model batch assignments", () => {
 	});
 
 	test("property: model assignment status matches the single-line selector", async () => {
+		const selectorArb = fc.oneof(
+			fc.string({ maxLength: 48 }),
+			fc.string({ maxLength: 24 }).map(text => `${text}\u001b]52;c;cHduZWQ=\u0007`),
+			fc.string({ maxLength: 24 }).map(text => `${text}\r\nextra row`),
+			fc.string({ maxLength: 24 }).map(text => `  ${text}:high  `),
+		);
 		await fc.assert(
-			fc.asyncProperty(fc.string({ maxLength: 48 }), async selector => {
+			fc.asyncProperty(selectorArb, async selector => {
 				const { output, runtime, settings } = createRuntime();
 				settings.setModelRole("default", selector);
 				await executeAcpBuiltinSlashCommand("/model roles", runtime);
