@@ -11,6 +11,12 @@ import * as fs from "node:fs/promises";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
+import { AuthStorage, getBundledModel } from "@gajae-code/ai";
+import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { createAgentSession } from "@gajae-code/coding-agent/sdk";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import fc from "fast-check";
 import { safeRmSync } from "../../../../scripts/safe-cleanup";
 import type { SourceMeta } from "../../src/capability/types";
@@ -132,6 +138,96 @@ describe("lifecycle tools-only MCP host values", () => {
 		} finally {
 			restoreEnv(HOST_KEY, previous);
 			await manager.disconnectAll().catch(() => {});
+		}
+	}, 20_000);
+
+	it("deferred lifecycle start drops ! and sensitive host env in the child", async () => {
+		const root = await tempDir();
+		const configDir = await fs.mkdtemp(path.join(root, LIFECYCLE_DIR_PREFIX));
+		const marker = path.join(root, "deferred-bang-marker");
+		const bangScript = path.join(root, "deferred-bang.mjs");
+		const reportPath = path.join(root, "deferred-child-env.json");
+		const scriptPath = path.join(root, "deferred-report.mjs");
+		await fs.writeFile(
+			bangScript,
+			`import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(marker)}, "1"); process.stdout.write(${JSON.stringify(SHELL_TEXT)});\n`,
+		);
+		await fs.writeFile(
+			scriptPath,
+			[
+				"import fs from 'node:fs';",
+				"fs.writeFileSync(process.env.REPORT, JSON.stringify({",
+				"  BANG: process.env.BANG ?? null,",
+				"  LEAK: process.env.LEAK ?? null,",
+				"  HOST: process.env.OPENAI_API_KEY ?? null,",
+				"}));",
+				"process.exit(0);",
+				"",
+			].join("\n"),
+		);
+		await writeJson(path.join(configDir, "mcp.json"), {
+			mcpServers: {
+				report: {
+					type: "stdio",
+					command: process.execPath,
+					args: [scriptPath],
+					timeout: 3000,
+					noInheritEnv: true,
+					env: {
+						REPORT: reportPath,
+						BANG: `!"${process.execPath}" "${bangScript}"`,
+						LEAK: HOST_KEY,
+					},
+				},
+			},
+		});
+		const previous = process.env[HOST_KEY];
+		process.env[HOST_KEY] = HOST_VALUE;
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-lifecycle-agent-"));
+		tempDirs.push(agentDir);
+		const previousAgentDir = getAgentDir();
+		setAgentDir(agentDir);
+		const authStorage = await AuthStorage.create(":memory:");
+		const modelRegistry = new ModelRegistry(authStorage);
+		try {
+			const { session, startDeferredMcpConfig } = await createAgentSession({
+				cwd: root,
+				agentDir,
+				modelRegistry,
+				sessionManager: SessionManager.inMemory(),
+				settings: Settings.isolated({}),
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableLsp: false,
+				toolNames: ["read"],
+				mcpConfigPath: path.join(configDir, "mcp.json"),
+				lifecycleMcpOrigin: true,
+				deferMcpConfigStartup: true,
+			});
+			try {
+				expect(startDeferredMcpConfig).toBeDefined();
+				await startDeferredMcpConfig!();
+				expect(await waitUntil(async () => exists(reportPath), 4000)).toBe(true);
+				const report = JSON.parse(await fs.readFile(reportPath, "utf8")) as Record<string, string | null>;
+				expect(await exists(marker)).toBe(false);
+				expect(report.BANG).toBeNull();
+				expect(report.LEAK).toBe(HOST_KEY);
+				expect(report.LEAK).not.toBe(HOST_VALUE);
+				expect(report.HOST).toBeNull();
+				expect(JSON.stringify(report)).not.toContain(HOST_VALUE);
+				expect(JSON.stringify(report)).not.toContain(SHELL_TEXT);
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			setAgentDir(previousAgentDir);
+			restoreEnv(HOST_KEY, previous);
+			await modelRegistry.dispose();
+			authStorage.close();
 		}
 	}, 20_000);
 

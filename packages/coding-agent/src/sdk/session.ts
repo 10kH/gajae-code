@@ -3791,10 +3791,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					lifecycleOrigin: lifecycleMcpOrigin,
 				};
 			} else {
-				const result = await owned.discoverAndConnect({
-					configPath: explicitMcpConfigPath,
-					lifecycleOrigin: lifecycleMcpOrigin,
-				});
+				const result = lifecycleMcpOrigin
+					? await owned.discoverAndConnect({
+							configPath: explicitMcpConfigPath,
+							lifecycleOrigin: true,
+						})
+					: await owned.discoverAndConnect({ configPath: explicitMcpConfigPath });
 				const resultTools = result.tools as CustomTool[];
 				exactMcpToolNames.push(...resultTools.map(tool => tool.name));
 				customTools.push(...resultTools);
@@ -6091,7 +6093,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						if (exact) {
 							const result = await exact.manager.discoverAndConnect({
 								configPath: exact.configPath,
-								lifecycleOrigin: exact.lifecycleOrigin,
+								...(exact.lifecycleOrigin === true ? { lifecycleOrigin: true } : {}),
 							});
 							// A slash control may commit while the deferred startup flight is
 							// loading. Re-read the manager's fenced publication rather than
