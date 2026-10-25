@@ -260,6 +260,153 @@ async function withConfigDaemon(
 	}
 }
 
+async function seedRecoveredCommand(
+	agentDir: string,
+	threadId: string,
+	eventId: string,
+	authorId?: string,
+	withReceipt = true,
+): Promise<string> {
+	const effectId = `discord:app:guild:parent:${threadId}:${eventId}`;
+	await new ChatEffectJournal({ agentDir, transport: "discord" }).enqueue({
+		id: effectId,
+		kind: "discord.inbound.command",
+		transport: "discord",
+		sessionId: "session",
+		endpointGeneration: 1,
+		payload: {
+			type: "command",
+			content: TURN_PROMPT,
+			idempotencyKey: effectId,
+			routing: {
+				guildId: "guild",
+				parentId: "parent",
+				threadId,
+				eventId,
+				kind: "command",
+				...(authorId === undefined ? {} : { authorId }),
+			},
+		},
+	});
+	if (!withReceipt) return effectId;
+	const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" });
+	const key = `app:guild:parent:${threadId}`;
+	const mapping = await store.read(key);
+	if (!mapping) throw new Error("missing conversation");
+	await store.write(key, mapping.generation, {
+		...mapping,
+		generation: mapping.generation + 1,
+		updatedAt: 1,
+		inboundDispatches: [
+			...(mapping.inboundDispatches ?? []),
+			{
+				key: eventId,
+				eventId,
+				kind: "command",
+				endpointGeneration: 1,
+				effectId,
+				idempotencyKey: effectId,
+			},
+		],
+	});
+	return effectId;
+}
+
+async function seedDeferredAction(
+	agentDir: string,
+	threadId: string,
+	eventId: string,
+	actionId: string,
+	actionNonce: string,
+	authorId?: string,
+): Promise<string> {
+	const effectId = `discord:app:guild:parent:${threadId}:${eventId}`;
+	const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+	await journal.enqueue({
+		id: effectId,
+		kind: "discord.inbound.action",
+		transport: "discord",
+		sessionId: "session",
+		endpointGeneration: 1,
+		payload: {
+			type: "reply",
+			id: actionId,
+			answer: "yes",
+			idempotencyKey: effectId,
+			routing: {
+				guildId: "guild",
+				parentId: "parent",
+				threadId,
+				eventId,
+				interactionId: `interaction-${eventId}`,
+				kind: "action",
+				actionId,
+				actionNonce,
+				...(authorId === undefined ? {} : { authorId }),
+			},
+		},
+	});
+	const lease = await journal.claim(effectId, "owner", 1_000);
+	if (!lease) throw new Error("missing action lease");
+	await journal.record(effectId, { owner: "owner", epoch: lease.epoch }, "accepted", { status: "deferred" });
+	const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" });
+	const key = `app:guild:parent:${threadId}`;
+	const mapping = await store.read(key);
+	if (!mapping) throw new Error("missing conversation");
+	await store.write(key, mapping.generation, {
+		...mapping,
+		generation: mapping.generation + 1,
+		updatedAt: mapping.updatedAt,
+		inboundDispatches: [
+			...(mapping.inboundDispatches ?? []),
+			{
+				key: eventId,
+				eventId,
+				interactionId: `interaction-${eventId}`,
+				kind: "action",
+				actionId,
+				actionNonce,
+				endpointGeneration: 1,
+				effectId,
+				idempotencyKey: effectId,
+			},
+		],
+	});
+	return effectId;
+}
+
+async function recoverCommands(
+	agentDir: string,
+	provider: FakeDiscordProvider,
+	onCommand: (command: string) => void,
+	frames?: Record<string, unknown>[],
+): Promise<void> {
+	const restarted = discordDaemon({
+		agentDir,
+		guildId: "guild",
+		parentChannelId: "parent",
+		provider,
+		resolveAttachment: async sessionId => ({
+			sessionId,
+			generation: 1,
+			isCurrent: () => true,
+			send: frame => {
+				frames?.push(frame);
+			},
+			sendMaintenance: () => {},
+		}),
+		onCommand: async (_sessionId, command) => {
+			onCommand(command);
+			return true;
+		},
+	});
+	try {
+		await restarted.start();
+	} finally {
+		await restarted.stop();
+	}
+}
+
 async function sendCommandAndAction(daemon: DiscordNotificationDaemon, authorId: string): Promise<void> {
 	const conversation = await daemon.notify({
 		sessionId: "session",
@@ -2087,6 +2234,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						threadId: conversation.threadId!,
 						eventId: "orphan-command",
 						kind: "command",
+						authorId: "member",
 					},
 				},
 			});
@@ -2295,6 +2443,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						threadId: conversation.threadId!,
 						eventId: "recovered",
 						kind: "command",
+						authorId: "member",
 					},
 				},
 			});
@@ -2625,6 +2774,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						threadId: conversation.threadId!,
 						eventId: "leased-command",
 						kind: "command",
+						authorId: "member",
 					},
 				},
 			});
@@ -3283,6 +3433,107 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				expect(frames).toMatchObject([{ type: "reply", id: "ask", answer: "yes" }]);
 			},
 		);
+	});
+
+	test("startup recovery drops an authorless durable command and an authorless orphan", async () => {
+		const commands: string[] = [];
+		await withDaemon(async (daemon, provider, agentDir) => {
+			const conversation = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
+			const threadId = conversation.threadId!;
+			const receiptEffectId = await seedRecoveredCommand(agentDir, threadId, "authorless-receipt");
+			const orphanEffectId = await seedRecoveredCommand(agentDir, threadId, "authorless-orphan", undefined, false);
+			const before = provider.messages.length;
+			await recoverCommands(agentDir, provider, command => commands.push(command));
+			expect(commands).toEqual([]);
+			expect(provider.messages.length).toBe(before);
+			expect(JSON.stringify(provider.messages)).not.toContain("turn.prompt");
+			const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+			expect(await journal.read(receiptEffectId)).toMatchObject({
+				state: "terminal",
+				receipt: { status: "actor_unauthorized" },
+			});
+			expect(await journal.read(orphanEffectId)).toMatchObject({
+				state: "terminal",
+				receipt: { status: "actor_unauthorized" },
+			});
+		});
+	});
+
+	test("startup recovery drops a durable command whose author is not on the allowlist", async () => {
+		const commands: string[] = [];
+		await withDaemon(async (daemon, provider, agentDir) => {
+			const conversation = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
+			await seedRecoveredCommand(agentDir, conversation.threadId!, "unlisted-recovery", "stranger-200");
+			const before = provider.messages.length;
+			await recoverCommands(agentDir, provider, command => commands.push(command));
+			expect(commands).toEqual([]);
+			expect(provider.messages.length).toBe(before);
+			expect(JSON.stringify(provider.messages)).not.toContain("turn.prompt");
+		});
+	});
+
+	test("still allows startup recovery of a listed actor command with surrounding whitespace", async () => {
+		const commands: string[] = [];
+		await withDaemon(async (daemon, provider, agentDir) => {
+			const conversation = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
+			await seedRecoveredCommand(agentDir, conversation.threadId!, "listed-recovery", " member ");
+			await recoverCommands(agentDir, provider, command => commands.push(command));
+			expect(commands).toEqual([TURN_PROMPT]);
+		});
+	});
+
+	test("startup recovery drops an authorless deferred component action", async () => {
+		const commands: string[] = [];
+		const frames: Record<string, unknown>[] = [];
+		await withDaemon(async (daemon, provider, agentDir) => {
+			const conversation = await daemon.notify({
+				sessionId: "session",
+				endpointGeneration: 1,
+				content: "Choose",
+				actionId: "ask",
+				options: ["Yes"],
+			});
+			const mapping = await new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" }).read(
+				`app:guild:parent:${conversation.threadId}`,
+			);
+			expect(mapping?.pendingActionNonce).toBeTruthy();
+			await seedDeferredAction(
+				agentDir,
+				conversation.threadId!,
+				"authorless-action",
+				mapping!.pendingActionId!,
+				mapping!.pendingActionNonce!,
+			);
+			await recoverCommands(agentDir, provider, command => commands.push(command), frames);
+			expect(commands).toEqual([]);
+			expect(frames).toEqual([]);
+		});
+	});
+
+	test("still allows startup recovery of a listed actor deferred component action", async () => {
+		const frames: Record<string, unknown>[] = [];
+		await withDaemon(async (daemon, provider, agentDir) => {
+			const conversation = await daemon.notify({
+				sessionId: "session",
+				endpointGeneration: 1,
+				content: "Choose",
+				actionId: "ask",
+				options: ["Yes"],
+			});
+			const mapping = await new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" }).read(
+				`app:guild:parent:${conversation.threadId}`,
+			);
+			await seedDeferredAction(
+				agentDir,
+				conversation.threadId!,
+				"listed-action",
+				mapping!.pendingActionId!,
+				mapping!.pendingActionNonce!,
+				" member ",
+			);
+			await recoverCommands(agentDir, provider, () => {}, frames);
+			expect(frames).toMatchObject([{ type: "reply", id: "ask", answer: "yes" }]);
+		});
 	});
 
 	test.skipIf(

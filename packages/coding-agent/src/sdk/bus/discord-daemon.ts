@@ -181,6 +181,8 @@ type DiscordInboundRouting = {
 	kind: "command" | "action";
 	actionId?: string;
 	actionNonce?: string;
+	/** Present only after an allowlisted live claim. Older durable claims omit it. */
+	authorId?: string;
 };
 
 function backfilledEffectIncarnationId(record: DiscordConversation): string {
@@ -751,6 +753,11 @@ export class DiscordNotificationDaemon {
 		return work.finally(() => this.#activeWork.delete(work));
 	}
 
+	async #reauthorizeInboundActor(effect: ChatEffect<DiscordInboundEffectPayload>): Promise<boolean> {
+		const authorId = effect.payload?.routing?.authorId;
+		return discordInboundActorAllowed(typeof authorId === "string" ? authorId : "", await this.#allowedActorIds());
+	}
+
 	async #allowedActorIds(): Promise<ReadonlySet<string>> {
 		if (this.options.authorizedActorIds) return explicitActorAllowlist(this.options.authorizedActorIds);
 		try {
@@ -781,6 +788,7 @@ export class DiscordNotificationDaemon {
 		let valid = false;
 		const effectId = `discord:${record.appId}:${record.guildId}:${record.parentChannelId}:${record.threadId}:${event.id}`;
 		const idempotencyKey = effectId;
+		const authorId = trimmedActorId(event.authorId);
 		const routing: DiscordInboundRouting = {
 			guildId: event.guildId,
 			parentId: event.parentId,
@@ -790,6 +798,7 @@ export class DiscordNotificationDaemon {
 			...(event.interaction ? { interactionId: event.interaction.id } : {}),
 			kind: command ? "command" : "action",
 			...(!command ? { actionId: route!.actionId, actionNonce: route!.actionNonce } : {}),
+			...(authorId === undefined ? {} : { authorId }),
 		};
 		const payload: DiscordInboundEffectPayload = command
 			? { type: "command", content: event.content!, idempotencyKey, routing }
@@ -932,6 +941,13 @@ export class DiscordNotificationDaemon {
 			return;
 		}
 		record = current;
+		// Startup and lease recovery claim durable effects directly. Re-check the
+		// author stored on that effect against the current allowlist before any
+		// callback or SDK delivery. A missing or unlisted author fails closed.
+		if (!(await this.#reauthorizeInboundActor(effect))) {
+			await this.#terminalizeInbound(record, receipt, "actor_unauthorized", lease);
+			return;
+		}
 		if (receipt.kind === "action" && !this.#hasDurableDeferIntent(effect)) {
 			// Callback tokens cannot survive a restart. Persist the intent before remote
 			// I/O so recovery can safely resume SDK delivery whether defer reached Discord
