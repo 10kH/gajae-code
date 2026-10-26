@@ -130,6 +130,25 @@ describe("/ssh list display", () => {
 		expect(shown).toContain("[user.example, user=me, port=2200]");
 	});
 
+	it("still allows a numeric host and username beside an ordinary host", async () => {
+		writeHosts("project", {
+			plain: { host: "example.com", username: "deploy", port: 2222 },
+			numUser: { host: "localhost", username: 123 },
+			numHost: { host: 123, username: "deploy" },
+			strNeighbor: { host: "123", username: "123" },
+		});
+
+		const { run, errors, text } = panel();
+		await run();
+		const shown = text();
+
+		expect(errors).toEqual([]);
+		expect(shown).toContain("[example.com, user=deploy, port=2222]");
+		expect(shown).toContain("[localhost, user=123]");
+		expect(shown).toContain("[123, user=deploy]");
+		expect(shown).toContain("[123, user=123]");
+	});
+
 	it("property ssh list terminal label seed 692202610", async () => {
 		const imported = await import("../src/modes/controllers/ssh-command-controller");
 		const sshListTerminalLabel = imported.sshListTerminalLabel;

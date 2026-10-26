@@ -345,8 +345,8 @@ export class SSHCommandController {
 	 */
 	#formatHostDetails(config: { host?: string; username?: string; port?: number | string }): string {
 		const parts: string[] = [];
-		if (config.host) parts.push(sshListTerminalLabel(config.host));
-		if (config.username) parts.push(`user=${sshListTerminalLabel(config.username)}`);
+		if (config.host) parts.push(sshListTerminalLabel(String(config.host)));
+		if (config.username) parts.push(`user=${sshListTerminalLabel(String(config.username))}`);
 		if (config.port && config.port !== 22) parts.push(`port=${sshListTerminalLabel(String(config.port))}`);
 		return theme.fg("dim", parts.length > 0 ? `[${parts.join(", ")}]` : "");
 	}
