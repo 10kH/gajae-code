@@ -87,7 +87,7 @@ describe("compiled main CLI handoff", () => {
 			expect(help).toMatchObject({ exitCode: 0, stderr: "" });
 			expect(help.stdout).toMatch(/\busage\b/i);
 			expect(help.stdout).toContain("--model");
-			expect(help.stdout).toContain("sdk");
+			expect(help.stdout).toContain(VERSION);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
