@@ -434,6 +434,8 @@ const GLOBAL_ONLY_SETTINGS = new Set<SettingPath>([
 	"hindsight.apiUrl",
 	// Destination of generic remote compaction. A project file must not redirect the transcript POST.
 	"compaction.remoteEndpoint",
+	// Destination of operator SearXNG web search. A project file must not redirect the query.
+	"searxng.endpoint",
 	// Operator consent for repository skills. A project file must not flip it.
 	"skills.trustProjectSkills",
 	"skills.enablePiProject",
