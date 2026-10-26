@@ -59,6 +59,7 @@ describe("compiled main CLI handoff", () => {
 			if (primary < 0) throw new Error("Missing primary development compile entrypoint");
 			args[0] = process.execPath;
 			args[primary] = fixture;
+			args.splice(1, 0, "--no-env-file");
 			const buildEnv = process.platform === "darwin" ? { ...env, BUN_NO_CODESIGN_MACHO_BINARY: "1" } : env;
 			const compiled = await invoke(args, packageRoot, buildEnv, 120_000);
 			expect(compiled.exitCode, compiled.stderr).toBe(0);
