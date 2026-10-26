@@ -437,6 +437,19 @@ omitting the key, or supplying `operator:false` fails closed without invoking
 the terminal-abort surface. Non-operator terminal abort retains its existing
 connection-ownership semantics.
 
+The route reaches every session host on the current gjc, including a TUI or a
+direct CLI session the Broker did not launch. A Broker-launched host is bound by
+its lifecycle request id; any other host publishes a process-local random marker
+in its own endpoint registration in the Broker-owned session index, and the
+Broker echoes exactly that marker. The marker never appears in endpoint
+discovery, `session list`, or any SDK response, so an endpoint-token holder
+cannot forge it. When the operator abort stops a turn, the host's terminal shows
+`Turn stopped by a remote operator.` A host that published no marker (a gjc that
+predates the operator route) is refused before dispatch with
+`authorization_denied`, `outcomeCertainty: "not-applied"`, and diagnostic
+`sdk_operator_control_unsupported`; unlike `endpoint_stale`, retrying the same
+request cannot succeed until the session restarts on a current gjc.
+
 `session.get_endpoint` is refused unconditionally: endpoint credentials remain
 an SDK-core implementation detail. The raw hatch validates operation names and
 adapter dispositions up front and never renders endpoint-disclosure results.
