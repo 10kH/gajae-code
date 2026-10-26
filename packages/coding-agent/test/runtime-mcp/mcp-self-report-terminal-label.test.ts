@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -11,6 +11,7 @@ import type { SourceMeta } from "../../src/capability/types";
 import { MCPCommandController } from "../../src/modes/controllers/runtime-mcp-command-controller";
 import { getThemeByName, setThemeInstance } from "../../src/modes/theme/theme";
 import type { InteractiveModeContext } from "../../src/modes/types";
+import * as oauthDiscovery from "../../src/runtime-mcp/oauth-discovery";
 import { handleMcpAcp } from "../../src/slash-commands/helpers/mcp";
 import type { SlashCommandRuntime } from "../../src/slash-commands/types";
 
@@ -437,6 +438,270 @@ describe("MCP self-report terminal labels", () => {
 				expect(plain.text.includes("connection refused")).toBe(true);
 			}),
 			{ seed: 698202610, numRuns: 64 },
+		);
+	});
+
+	async function writeUserConfig(body: unknown): Promise<void> {
+		await fs.writeFile(path.join(agentDir, "mcp.json"), JSON.stringify(body));
+	}
+
+	function bindSession(ctx: InteractiveModeContext): void {
+		(ctx.session as { refreshMCPTools: (tools: unknown) => Promise<void> }).refreshMCPTools = async () => {};
+	}
+
+	function reloadManager(name: string, extra: Record<string, unknown> = {}): InteractiveModeContext["mcpManager"] {
+		return {
+			isConnectionSetMutationBlocked: () => false,
+			disconnectAll: async () => {},
+			discoverAndConnect: async () => ({ errors: new Map() }),
+			getTools: () => [],
+			waitForConnection: async (asked: string) => {
+				expect(asked).toBe(name);
+			},
+			getConnectionStatus: () => "connected",
+			disconnectServer: async (asked: string) => {
+				expect(asked).toBe(name);
+			},
+			getSource: () => undefined,
+			reconnectServer: async (asked: string) => {
+				expect(asked).toBe(name);
+				return { ok: true };
+			},
+			withPreparedLease: async () => {
+				throw new Error("401 unauthorized");
+			},
+			...extra,
+		} as unknown as InteractiveModeContext["mcpManager"];
+	}
+
+	class FastReauthController extends MCPCommandController {
+		override handleOAuthFlow(
+			..._args: Parameters<MCPCommandController["handleOAuthFlow"]>
+		): ReturnType<MCPCommandController["handleOAuthFlow"]> {
+			return Promise.resolve({
+				credentialId: "mcp_oauth_status",
+				tokenEndpoint: "http://127.0.0.1:9/token",
+				clientId: "status-client",
+			});
+		}
+	}
+
+	async function showStatusCommands(
+		name: string,
+		shown: string,
+	): Promise<{ text: string; rows: string; errors: string[] }> {
+		const chunks: string[] = [];
+		const rowChunks: string[] = [];
+		const errors: string[] = [];
+		const record = (rendered: Component[], commandErrors: string[]) => {
+			chunks.push(commandText(rendered));
+			rowChunks.push(renderedRows(rendered));
+			errors.push(...commandErrors);
+		};
+
+		{
+			const { ctx, rendered, errors: commandErrors } = tui();
+			bindSession(ctx);
+			ctx.mcpManager = reloadManager(name);
+			await new MCPCommandController(ctx).handle(`/mcp reconnect ${name}`);
+			record(rendered, commandErrors);
+		}
+
+		{
+			const { ctx, rendered, errors: commandErrors } = tui();
+			bindSession(ctx);
+			ctx.mcpManager = reloadManager(name, {
+				reconnectServer: async () => {
+					throw new Error(`down${OSC52}now`);
+				},
+			});
+			await new MCPCommandController(ctx).handle(`/mcp reconnect ${name}`);
+			record(rendered, commandErrors);
+		}
+
+		{
+			const { ctx, rendered, errors: commandErrors } = tui();
+			await writeUserConfig({ mcpServers: { [name]: { command: "true" } } });
+			await new MCPCommandController(ctx).handle(`/mcp enable ${name}`);
+			record(rendered, commandErrors);
+		}
+
+		{
+			const { ctx, rendered, errors: commandErrors } = tui();
+			await writeUserConfig({ mcpServers: { [name]: { command: "true", enabled: false } } });
+			await new MCPCommandController(ctx).handle(`/mcp disable ${name}`);
+			record(rendered, commandErrors);
+		}
+
+		{
+			const { ctx, rendered, errors: commandErrors } = tui();
+			bindSession(ctx);
+			await writeUserConfig({ disabledServers: [name] });
+			ctx.mcpManager = reloadManager(name, {
+				waitForConnection: async (asked: string) => {
+					expect(asked).toBe(name);
+					const connecting = commandText(rendered);
+					expect(connecting).toContain(`Connecting to "${shown}"`);
+					noOsc(connecting);
+					noOsc(renderedRows(rendered));
+					chunks.push(connecting);
+					rowChunks.push(renderedRows(rendered));
+				},
+			});
+			await new MCPCommandController(ctx).handle(`/mcp enable ${name}`);
+			record(rendered, commandErrors);
+		}
+
+		{
+			const { ctx, rendered, errors: commandErrors } = tui();
+			bindSession(ctx);
+			await writeUserConfig({ mcpServers: {} });
+			ctx.mcpManager = reloadManager(name, {
+				getSource: (asked: string) => (asked === name ? { provider: "cursor" } : undefined),
+			});
+			await new MCPCommandController(ctx).handle(`/mcp enable ${name}`);
+			record(rendered, commandErrors);
+		}
+
+		{
+			const { ctx, rendered, errors: commandErrors } = tui();
+			bindSession(ctx);
+			await writeUserConfig({ mcpServers: {} });
+			ctx.mcpManager = reloadManager(name, {
+				getSource: (asked: string) => (asked === name ? { provider: "cursor" } : undefined),
+			});
+			await new MCPCommandController(ctx).handle(`/mcp disable ${name}`);
+			record(rendered, commandErrors);
+		}
+
+		{
+			const { ctx, rendered, errors: commandErrors } = tui();
+			bindSession(ctx);
+			await writeUserConfig({ mcpServers: { [name]: { command: "true", enabled: true } } });
+			ctx.mcpManager = reloadManager(name);
+			await new MCPCommandController(ctx).handle(`/mcp disable ${name}`);
+			record(rendered, commandErrors);
+		}
+
+		{
+			const { ctx, rendered, errors: commandErrors } = tui();
+			bindSession(ctx);
+			await writeUserConfig({ mcpServers: { [name]: { command: "true" } } });
+			ctx.mcpManager = reloadManager(name);
+			await new MCPCommandController(ctx).handle(`/mcp unauth ${name}`);
+			record(rendered, commandErrors);
+		}
+
+		{
+			const { ctx, rendered, errors: commandErrors } = tui();
+			await writeUserConfig({
+				mcpServers: { [name]: { type: "http", url: "http://127.0.0.1:9/mcp", enabled: false } },
+			});
+			await new MCPCommandController(ctx).handle(`/mcp reauth ${name}`);
+			record(rendered, commandErrors);
+		}
+
+		{
+			const { ctx, rendered, errors: commandErrors } = tui();
+			await writeUserConfig({ mcpServers: { [name]: { command: "true" } } });
+			await new MCPCommandController(ctx).handle(`/mcp reauth ${name}`);
+			record(rendered, commandErrors);
+		}
+
+		const discovery = spyOn(oauthDiscovery, "discoverOAuthEndpoints").mockResolvedValue({
+			authorizationUrl: "https://example.com/authorize",
+			tokenUrl: "https://example.com/token",
+		});
+		try {
+			const { ctx, rendered, errors: commandErrors } = tui();
+			bindSession(ctx);
+			await writeUserConfig({
+				mcpServers: { [name]: { type: "http", url: "http://127.0.0.1:9/mcp" } },
+			});
+			ctx.mcpManager = reloadManager(name);
+			await new FastReauthController(ctx).handle(`/mcp reauth ${name}`);
+			expect(discovery).toHaveBeenCalled();
+			record(rendered, commandErrors);
+		} finally {
+			discovery.mockRestore();
+		}
+
+		return { text: chunks.join("\n"), rows: rowChunks.join("\n"), errors };
+	}
+
+	it("strips OSC from reconnect, enable, disable, unauth, and reauth status lines", async () => {
+		const name = `bad${OSC52}name`;
+		const shown = await showStatusCommands(name, "badname");
+		expect(shown.errors.join("\n")).not.toContain(name);
+		noOsc(shown.text);
+		noOsc(shown.rows);
+		noOsc(shown.errors.join("\n"));
+		expect(shown.text).not.toContain(name);
+		expect(shown.text).not.toContain("bWFsaWNpb3Vz");
+		expect(shown.text).toContain('Reconnecting to "badname"');
+		expect(shown.text).toContain('Reconnected to "badname"');
+		expect(shown.text).toContain('Server "badname" is already enabled.');
+		expect(shown.text).toContain('Server "badname" is already disabled.');
+		expect(shown.text).toContain('Enabled "badname"');
+		expect(shown.text).toContain('Connecting to "badname"');
+		expect(shown.text).toContain('Connected to "badname"');
+		expect(shown.text).toContain('Disabled "badname"');
+		expect(shown.text).toContain('Reauthorizing "badname"...');
+		expect(shown.errors.join("\n")).toContain('Failed to reconnect to "badname": downnow');
+		expect(shown.errors.join("\n")).toContain('Server "badname" is disabled. Run /mcp enable badname first.');
+		expect(shown.errors.join("\n")).toContain('Server "badname" does not use a remote MCP transport.');
+	});
+
+	it("still allows an ordinary mixed-case server name in reconnect, enable, disable, unauth, and reauth", async () => {
+		const name = "Notes_Server";
+		const shown = await showStatusCommands(name, name);
+		expect(shown.errors.join("\n")).toContain(`Failed to reconnect to "${name}": downnow`);
+		expect(shown.text).toContain(`Reconnecting to "${name}"`);
+		expect(shown.text).toContain(`Reconnected to "${name}"`);
+		expect(shown.text).toContain(`Server "${name}" is already enabled.`);
+		expect(shown.text).toContain(`Server "${name}" is already disabled.`);
+		expect(shown.text).toContain(`Enabled "${name}"`);
+		expect(shown.text).toContain(`Connecting to "${name}"`);
+		expect(shown.text).toContain(`Connected to "${name}"`);
+		expect(shown.text).toContain(`Disabled "${name}"`);
+		expect(shown.text).toContain(`Disabled "${name}" (user config)`);
+		expect(shown.text).toContain(`Cleared auth for "${name}" (user config)`);
+		expect(shown.text).toContain(`Reauthorizing "${name}"...`);
+		expect(shown.text).toContain(`Reauthorized "${name}" (user config)`);
+		expect(shown.errors.join("\n")).toContain(`Server "${name}" is disabled. Run /mcp enable ${name} first.`);
+		expect(shown.errors.join("\n")).toContain(`Server "${name}" does not use a remote MCP transport.`);
+	});
+
+	it("property: reconnect status label drops controls, seed 698202611, 64 inputs", async () => {
+		const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-".split("");
+		const safe = fc.array(fc.constantFrom(...alphabet), { minLength: 1, maxLength: 16 }).map(chars => chars.join(""));
+		const noise = fc.string({ maxLength: 8 }).map(value => value.replace(/\s/gu, ""));
+		await fc.assert(
+			fc.asyncProperty(safe, noise, async (label, extra) => {
+				const hostile = `${label}\x1b]52;c;YQ==\x07${extra}`;
+				const { ctx, rendered, errors } = tui();
+				bindSession(ctx);
+				ctx.mcpManager = reloadManager(hostile);
+				await new MCPCommandController(ctx).handle(`/mcp reconnect ${hostile}`);
+				const text = commandText(rendered);
+				expect(errors).toEqual([]);
+				expect(text.includes("\x1b]")).toBe(false);
+				expect(text.includes("\x9d")).toBe(false);
+				expect(renderedRows(rendered).includes("\x1b]")).toBe(false);
+				expect(text.includes('Reconnected to "')).toBe(true);
+				expect(text.includes(label)).toBe(true);
+				expect(text.includes(hostile)).toBe(false);
+
+				const plain = tui();
+				bindSession(plain.ctx);
+				plain.ctx.mcpManager = reloadManager(label);
+				await new MCPCommandController(plain.ctx).handle(`/mcp reconnect ${label}`);
+				const plainText = commandText(plain.rendered);
+				expect(plain.errors).toEqual([]);
+				expect(plainText).toContain(`Reconnecting to "${label}"`);
+				expect(plainText).toContain(`Reconnected to "${label}"`);
+			}),
+			{ seed: 698202611, numRuns: 64 },
 		);
 	});
 });

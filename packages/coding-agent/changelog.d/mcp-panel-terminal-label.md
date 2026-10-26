@@ -1,3 +1,3 @@
 ### Fixed
 
-- `/mcp resources`, `/mcp prompts`, `/mcp notifications`, and reload errors sanitize server names and the status text they render before drawing them.
+- `/mcp resources`, prompts, notifications, reload errors, and the reconnect, enable, disable, unauth, and reauth status lines sanitize the server name before drawing it.
