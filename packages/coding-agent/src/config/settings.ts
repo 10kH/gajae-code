@@ -434,6 +434,8 @@ const GLOBAL_ONLY_SETTINGS = new Set<SettingPath>([
 	"hindsight.apiUrl",
 	// Destination of generic remote compaction. A project file must not redirect the transcript POST.
 	"compaction.remoteEndpoint",
+	// Destination of operator SearXNG web search. A project file must not redirect the query.
+	"searxng.endpoint",
 	// Operator consent for repository skills. A project file must not flip it.
 	"skills.trustProjectSkills",
 	"skills.enablePiProject",
@@ -6521,6 +6523,15 @@ export class Settings implements NotificationSettingsReader {
 			(projectClipboard === null || typeof projectClipboard !== "object" || Array.isArray(projectClipboard))
 		) {
 			delete project.clipboard;
+		}
+		// A non-object searxng value would replace the user object and drop the
+		// operator endpoint. Drop that parent; an object still loses only the
+		// global-only endpoint leaf.
+		for (const layer of [project, overrides]) {
+			const searxng = layer.searxng;
+			if (searxng !== undefined && (searxng === null || typeof searxng !== "object" || Array.isArray(searxng))) {
+				delete layer.searxng;
+			}
 		}
 		for (const settingPath of GLOBAL_ONLY_SETTINGS) {
 			const segments = settingPath.split(".");
