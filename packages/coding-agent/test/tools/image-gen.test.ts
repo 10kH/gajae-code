@@ -356,7 +356,10 @@ describe("imageGenTool", () => {
 		await expect(
 			imageGenTool.execute(
 				"call-image-edit",
-				{ subject: "edit this image", input: [{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" }] },
+				{
+					subject: "edit this image",
+					input: [{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" }],
+				},
 				undefined,
 				ctx,
 			),
