@@ -489,6 +489,7 @@ describe("MCP self-report terminal labels", () => {
 	async function showStatusCommands(
 		name: string,
 		shown: string,
+		hostileError = false,
 	): Promise<{ text: string; rows: string; errors: string[] }> {
 		const chunks: string[] = [];
 		const rowChunks: string[] = [];
@@ -512,7 +513,7 @@ describe("MCP self-report terminal labels", () => {
 			bindSession(ctx);
 			ctx.mcpManager = reloadManager(name, {
 				reconnectServer: async () => {
-					throw new Error(`down${OSC52}now`);
+					throw new Error(hostileError ? `down${OSC52}now` : "connection refused");
 				},
 			});
 			await new MCPCommandController(ctx).handle(`/mcp reconnect ${name}`);
@@ -631,7 +632,7 @@ describe("MCP self-report terminal labels", () => {
 
 	it("strips OSC from reconnect, enable, disable, unauth, and reauth status lines", async () => {
 		const name = `bad${OSC52}name`;
-		const shown = await showStatusCommands(name, "badname");
+		const shown = await showStatusCommands(name, "badname", true);
 		expect(shown.errors.join("\n")).not.toContain(name);
 		noOsc(shown.text);
 		noOsc(shown.rows);
@@ -655,7 +656,7 @@ describe("MCP self-report terminal labels", () => {
 	it("still allows an ordinary mixed-case server name in reconnect, enable, disable, unauth, and reauth", async () => {
 		const name = "Notes_Server";
 		const shown = await showStatusCommands(name, name);
-		expect(shown.errors.join("\n")).toContain(`Failed to reconnect to "${name}": downnow`);
+		expect(shown.errors.join("\n")).toContain(`Failed to reconnect to "${name}": connection refused`);
 		expect(shown.text).toContain(`Reconnecting to "${name}"`);
 		expect(shown.text).toContain(`Reconnected to "${name}"`);
 		expect(shown.text).toContain(`Server "${name}" is already enabled.`);
