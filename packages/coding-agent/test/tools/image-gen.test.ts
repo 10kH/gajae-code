@@ -318,6 +318,51 @@ describe("imageGenTool", () => {
 		expect(requestBody).not.toHaveProperty("tools");
 		expect(requestBody).not.toHaveProperty("input");
 	});
+	it("rejects image edits for Codex image-only models before fetch", async () => {
+		let fetchCalled = false;
+		const imageModel = {
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			id: "gpt-image-2",
+			name: "GPT Image 2",
+			baseUrl: "",
+			output: ["image"],
+		} as Model;
+		const jwtPayload = Buffer.from(
+			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "codex-account-1" } }),
+		).toString("base64url");
+		const fetchMock: typeof fetch = (async () => {
+			fetchCalled = true;
+			return new Response();
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const ctx: CustomToolContext = {
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: makeMockRegistry(
+				{ getApiKey: async () => `header.${jwtPayload}.signature`, getApiKeyForProvider: async () => undefined },
+				[imageModel],
+			),
+			model: imageModel,
+			settings: makeMockSettings("openai-codex/gpt-image-2"),
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+
+		await expect(
+			imageGenTool.execute(
+				"call-image-edit",
+				{ subject: "edit this image", input: [{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" }] },
+				undefined,
+				ctx,
+			),
+		).rejects.toThrow("Codex image edits are not supported on this route.");
+		expect(fetchCalled).toBe(false);
+	});
 
 	it("e2e writes OpenAI Responses image_generation WebP output to a temp file", async () => {
 		delete Bun.env.OPENAI_BASE_URL;
