@@ -6,6 +6,7 @@ import {
 	type TodoPhase,
 	USER_TODO_EDIT_CUSTOM_TYPE,
 } from "@gajae-code/coding-agent/tools/todo-write";
+import fc from "fast-check";
 
 const OSC_52 = "\u001b]52;c;c2VjcmV0\u0007";
 const OSC_0 = "\u001b]0;evil title\u0007";
@@ -40,6 +41,12 @@ function controllerFor(phases: TodoPhase[]) {
 		showError,
 	} as unknown as InteractiveModeContext;
 	return { controller: new TodoCommandController(ctx), showStatus, showError, entries };
+}
+
+const DISPLAY_CONTROL = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/;
+
+function isDisplaySafe(text: string): boolean {
+	return text.toWellFormed() === text && !DISPLAY_CONTROL.test(text);
 }
 
 function shownText(showStatus: ReturnType<typeof vi.fn>): string {
@@ -146,5 +153,54 @@ describe("/todo status display", () => {
 		await controller.handleTodoCommand('append "extra task"');
 		expect(shownText(showStatus)).toBe("Appended to Docs: Extra task");
 		expect(showError).not.toHaveBeenCalled();
+	});
+
+	it("property: todo status strips controls and keeps safe text, fc.property seed 693, numRuns 128", () => {
+		const safeText = fc
+			.array(
+				fc.oneof(
+					fc.integer({ min: 32, max: 126 }).map(code => String.fromCharCode(code)),
+					fc.constant("\t"),
+					fc.constant("\n"),
+				),
+				{ maxLength: 24 },
+			)
+			.map(chars => chars.join(""));
+		const attack = fc.constantFrom(
+			"",
+			"\u001b]52;c;c2VjcmV0\u0007",
+			"\u001b]0;title\u0007",
+			"\u001b]8;;http://example.test\u0007x\u001b]8;;\u0007",
+			"\u001b[31m",
+			"\u001b[2J",
+			"\u001b",
+			"\u001b[",
+			"\u001b]52;c;QQ",
+			"\u0000",
+			"\r",
+			"\u009b2J",
+			"\u009d0;title\u009c",
+		);
+		const field = fc
+			.tuple(safeText, attack, safeText)
+			.map(([prefix, injected, suffix]) => prefix + injected + suffix);
+		fc.assert(
+			fc.property(field, field, field, (name, content, note) => {
+				const phases: TodoPhase[] = [{ name, tasks: [{ content, status: "pending", notes: [note] }] }];
+				const { controller, showStatus, entries } = controllerFor(phases);
+				void controller.handleTodoCommand("");
+				const shown = showStatus.mock.calls[0]?.[0];
+				if (typeof shown !== "string" || DISPLAY_CONTROL.test(shown)) return false;
+				const stored = entries[0]?.data.phases[0];
+				if (stored?.name !== name || stored.tasks[0]?.content !== content || stored.tasks[0]?.notes?.[0] !== note) {
+					return false;
+				}
+				if (isDisplaySafe(name) && isDisplaySafe(content) && isDisplaySafe(note)) {
+					return shown === phasesToMarkdown(phases).trimEnd();
+				}
+				return true;
+			}),
+			{ seed: 693, numRuns: 128 },
+		);
 	});
 });
