@@ -193,6 +193,8 @@ describe("imageGenTool", () => {
 		const releaseSpy = vi.spyOn(os, "release").mockReturnValue("4.4.302-Minimal™-EAS-QTI_Haptic-R26");
 		const archSpy = vi.spyOn(os, "arch").mockReturnValue("arm64" as NodeJS.Architecture);
 		let userAgent: string | undefined;
+		let requestUrl: string | undefined;
+		let requestBody: unknown;
 
 		const codexModel = {
 			api: "openai-codex-responses",
@@ -207,19 +209,18 @@ describe("imageGenTool", () => {
 		).toString("base64url");
 		const codexApiKey = `header.${jwtPayload}.signature`;
 
-		const fetchMock: typeof fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+		const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			requestUrl = input.toString();
+			requestBody = JSON.parse(String(init?.body));
 			userAgent = new Headers(init?.headers).get("User-Agent") ?? undefined;
 			return new Response(
 				JSON.stringify({
-					output: [
+					data: [
 						{
-							type: "image_generation_call",
-							result: Buffer.from("fake-webp").toString("base64"),
+							b64_json: Buffer.from("fake-webp").toString("base64"),
 							revised_prompt: "A crisp tabby cat portrait.",
-							status: "completed",
 						},
 					],
-					usage: { input_tokens: 10, output_tokens: 20, total_tokens: 30 },
 				}),
 				{ status: 200, headers: { "content-type": "application/json" } },
 			);
@@ -253,6 +254,15 @@ describe("imageGenTool", () => {
 			`^${OPENAI_HEADER_VALUES.ORIGINATOR_CODEX}/[^\\s]+ \\(linux 4\\.4\\.302-Minimal-EAS-QTI_Haptic-R26; arm64\\)$`,
 		);
 		expect(userAgent).toMatch(originatorRegex);
+		expect(requestUrl).toBe("https://chatgpt.com/backend-api/codex/images/generations");
+		expect(requestBody).toMatchObject({
+			model: "gpt-5.5",
+			n: 1,
+			quality: "auto",
+			output_format: "webp",
+		});
+		expect(requestBody).not.toHaveProperty("tools");
+		expect(requestBody).not.toHaveProperty("input");
 		expect(userAgent).toMatch(/^[\x20-\x7e]+$/);
 		platformSpy.mockRestore();
 		releaseSpy.mockRestore();

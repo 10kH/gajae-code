@@ -396,6 +396,14 @@ interface OpenAIHostedImageRequest {
 	store: false;
 	stream?: boolean;
 }
+interface CodexImagesRequest {
+	model: string;
+	prompt: string;
+	n: 1;
+	quality: "auto";
+	size?: string;
+	output_format: typeof OPENAI_IMAGE_OUTPUT_FORMAT;
+}
 
 interface OpenAIImageGenerationCall {
 	id?: string;
@@ -403,6 +411,10 @@ interface OpenAIImageGenerationCall {
 	result?: string;
 	revised_prompt?: string;
 	status?: string;
+}
+interface CodexImagesResponse {
+	data?: Array<{ b64_json?: string; revised_prompt?: string }>;
+	error?: { message?: string };
 }
 
 interface OpenAIOutputText {
@@ -1237,6 +1249,29 @@ function createOpenAIInlineImage(data: string): InlineImageData {
 	const mimeType = parseImageMetadata(bytes)?.mimeType ?? OPENAI_IMAGE_MIME_TYPE;
 	return { data, mimeType };
 }
+function isCodexImageModel(model: Model): boolean {
+	return model.api === "openai-codex-responses" || model.provider === "openai-codex";
+}
+function buildCodexImagesRequest(model: Model, promptText: string, params: ImageGenParams): CodexImagesRequest {
+	const size = resolveOpenAIImageSize(params.aspect_ratio, params.image_size);
+	return {
+		model: model.id,
+		prompt: promptText,
+		n: 1,
+		quality: "auto",
+		output_format: OPENAI_IMAGE_OUTPUT_FORMAT,
+		...(size ? { size } : {}),
+	};
+}
+function collectCodexImagesResult(response: CodexImagesResponse): OpenAIHostedImageResult {
+	const images: InlineImageData[] = [];
+	let revisedPrompt: string | undefined;
+	for (const item of response.data ?? []) {
+		if (item.b64_json) images.push(createOpenAIInlineImage(item.b64_json));
+		if (item.revised_prompt) revisedPrompt = item.revised_prompt;
+	}
+	return { images, revisedPrompt };
+}
 
 function collectOpenAIHostedImageResult(response: OpenAIHostedImageResponse): OpenAIHostedImageResult {
 	const images: InlineImageData[] = [];
@@ -1299,13 +1334,12 @@ export function getOpenAIImageBaseUrlForTest(model: Model, authCredentialType?: 
 
 function getOpenAIResponsesUrl(model: Model, authCredentialType?: "api_key" | "oauth"): string {
 	const baseUrl = getOpenAIBaseUrl(model, authCredentialType);
-	if (model.api !== "openai-codex-responses" && model.provider !== "openai-codex") {
-		return `${baseUrl}/responses`;
+	if (isCodexImageModel(model)) {
+		const path = URL_PATHS.CODEX_IMAGES_GENERATIONS;
+		const baseWithSlash = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+		return new URL(path.slice(1), baseWithSlash).toString();
 	}
-	const baseWithSlash = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-	return new URL(URL_PATHS.RESPONSES.slice(1), baseWithSlash)
-		.toString()
-		.replace(URL_PATHS.RESPONSES, URL_PATHS.CODEX_RESPONSES);
+	return `${baseUrl}/responses`;
 }
 
 function buildOpenAIImageHeaders(model: Model, apiKey: string, sessionId: string | undefined): Headers {
@@ -1393,8 +1427,13 @@ async function generateOpenAIHostedImage(
 	options?: { authCredentialType?: "api_key" | "oauth" },
 ): Promise<OpenAIHostedImageResult> {
 	const promptText = assemblePrompt(params);
-	const stream = model.api === "openai-codex-responses" || model.provider === "openai-codex";
-	const requestBody = buildOpenAIHostedImageRequest(model, promptText, params, inputImages, stream);
+	const codex = isCodexImageModel(model);
+	if (codex && inputImages.length > 0) {
+		throw new Error("Codex image edits are not supported on this route.");
+	}
+	const requestBody = codex
+		? buildCodexImagesRequest(model, promptText, params)
+		: buildOpenAIHostedImageRequest(model, promptText, params, inputImages, false);
 	const response = await fetchImageProvider(
 		getOpenAIResponsesUrl(model, options?.authCredentialType),
 		{
@@ -1405,19 +1444,21 @@ async function generateOpenAIHostedImage(
 		},
 		apiKey,
 	);
-
 	if (!response.ok) {
 		const errorText = await readProviderResponseText(response, apiKey, signal);
 		throw new Error(
 			`OpenAI image request failed (${response.status}): ${getOpenAIResponseErrorMessage(errorText, apiKey)}`,
 		);
 	}
-
+	if (codex) {
+		const rawText = await readProviderResponseText(response, apiKey, signal);
+		const data = parseProviderJson<CodexImagesResponse>(rawText, apiKey);
+		return redactOpenAIHostedImageResult(collectCodexImagesResult(data), apiKey);
+	}
 	const contentType = response.headers.get("content-type") ?? "";
-	if (stream || contentType.includes("text/event-stream")) {
+	if (contentType.includes("text/event-stream")) {
 		return redactOpenAIHostedImageResult(await parseOpenAIHostedImageSse(response, signal, apiKey), apiKey);
 	}
-
 	const rawText = await readProviderResponseText(response, apiKey, signal);
 	const data = parseProviderJson<OpenAIHostedImageResponse>(rawText, apiKey);
 	return redactOpenAIHostedImageResult(collectOpenAIHostedImageResult(data), apiKey);
