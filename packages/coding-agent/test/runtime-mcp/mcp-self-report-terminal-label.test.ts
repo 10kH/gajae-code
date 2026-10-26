@@ -112,6 +112,89 @@ describe("MCP self-report terminal labels", () => {
 		return { ctx, rendered, errors };
 	}
 
+	function installPanels(
+		ctx: InteractiveModeContext,
+		fields: {
+			name: string;
+			uri: string;
+			description: string;
+			mimeType: string;
+			uriTemplate: string;
+			templateDescription: string;
+			prompt: string;
+			promptDescription: string;
+			arg: string;
+			argDescription: string;
+			error: string;
+		},
+	): void {
+		(ctx.session as { refreshMCPTools: (tools: unknown) => Promise<void> }).refreshMCPTools = async () => {};
+		ctx.mcpManager = {
+			isConnectionSetMutationBlocked: () => false,
+			disconnectAll: async () => {},
+			discoverAndConnect: async () => ({ errors: new Map([[fields.name, fields.error]]) }),
+			getTools: () => [],
+			getConnectedServers: () => [fields.name],
+			getServerResources: (asked: string) =>
+				asked === fields.name
+					? {
+							resources: [
+								{
+									uri: fields.uri,
+									name: "readme",
+									description: fields.description,
+									mimeType: fields.mimeType,
+								},
+							],
+							templates: [
+								{
+									uriTemplate: fields.uriTemplate,
+									name: "note",
+									description: fields.templateDescription,
+								},
+							],
+						}
+					: undefined,
+			getServerPrompts: (asked: string) =>
+				asked === fields.name
+					? [
+							{
+								name: fields.prompt,
+								description: fields.promptDescription,
+								arguments: [{ name: fields.arg, description: fields.argDescription, required: true }],
+							},
+						]
+					: undefined,
+			getNotificationState: () => ({
+				enabled: true,
+				subscriptions: new Map([[fields.name, new Set([fields.uri])]]),
+			}),
+			getConnection: (asked: string) =>
+				asked === fields.name
+					? {
+							capabilities: {
+								resources: { subscribe: true, listChanged: true },
+								tools: { listChanged: true },
+								prompts: { listChanged: true },
+							},
+						}
+					: undefined,
+		} as unknown as InteractiveModeContext["mcpManager"];
+	}
+
+	async function showPanels(
+		fields: Parameters<typeof installPanels>[1],
+	): Promise<{ text: string; rows: string; errors: string[] }> {
+		const { ctx, rendered, errors } = tui();
+		installPanels(ctx, fields);
+		const controller = new MCPCommandController(ctx);
+		await controller.handle("/mcp resources");
+		await controller.handle("/mcp prompts");
+		await controller.handle("/mcp notifications");
+		await controller.handle("/mcp reload");
+		return { text: commandText(rendered), rows: renderedRows(rendered), errors };
+	}
+
 	function acp(): { runtime: SlashCommandRuntime; lines: string[] } {
 		const lines: string[] = [];
 		const runtime = {
@@ -244,6 +327,116 @@ describe("MCP self-report terminal labels", () => {
 				expect(wrapped.endsWith(label)).toBe(true);
 			}),
 			{ seed: 413202610, numRuns: 80 },
+		);
+	});
+
+	it("strips OSC from a server name in /mcp resources, prompts, notifications, and reload", async () => {
+		const name = `bad\n${OSC52}name`;
+		const shown = await showPanels({
+			name,
+			uri: `file://notes/${OSC0}readme.txt`,
+			description: `Daily${OSC8}notes`,
+			mimeType: `text/plain${OSC52}`,
+			uriTemplate: `file://notes/${OSC0}{path}`,
+			templateDescription: `A${OSC52}note`,
+			prompt: `sum${OSC52}marize`,
+			promptDescription: `Summarize${OSC0}diff`,
+			arg: `pa${OSC52}th`,
+			argDescription: `File${OSC0}path`,
+			error: `connection${OSC52}refused`,
+		});
+		expect(shown.errors).toEqual([]);
+		noOsc(shown.text);
+		noOsc(shown.rows);
+		expect(shown.text).toContain("bad name");
+		expect(shown.text).not.toContain(name);
+		expect(shown.text).toContain("file://notes/readme.txt");
+		expect(shown.text).toContain("DailyCLICK-MEnotes");
+		expect(shown.text).toContain("[text/plain]");
+		expect(shown.text).toContain("file://notes/{path}");
+		expect(shown.text).toContain("Anote");
+		expect(shown.text).toContain("/bad name:summarize");
+		expect(shown.text).toContain("Summarizediff");
+		expect(shown.text).toContain("path=");
+		expect(shown.text).toContain("Filepath");
+		expect(shown.text).toContain("bad name: connectionrefused");
+	});
+
+	it("still allows an ordinary server name and status line in /mcp panels", async () => {
+		const shown = await showPanels({
+			name: " Notes Server ",
+			uri: "file://Notes/readme.txt",
+			description: "Daily notes (v2)",
+			mimeType: "text/plain",
+			uriTemplate: "file://Notes/{path}",
+			templateDescription: "A note",
+			prompt: "summarize",
+			promptDescription: "Summarize the diff",
+			arg: "path",
+			argDescription: "File path",
+			error: "connection refused",
+		});
+		expect(shown.errors).toEqual([]);
+		expect(shown.text).toContain(" Notes Server ");
+		expect(shown.text).toContain("file://Notes/readme.txt");
+		expect(shown.text).toContain("Daily notes (v2)");
+		expect(shown.text).toContain("[text/plain]");
+		expect(shown.text).toContain("file://Notes/{path}");
+		expect(shown.text).toContain("A note");
+		expect(shown.text).toContain("/ Notes Server :summarize");
+		expect(shown.text).toContain("Summarize the diff");
+		expect(shown.text).toContain("path=");
+		expect(shown.text).toContain("File path");
+		expect(shown.text).toContain(" Notes Server : connection refused");
+	});
+
+	it("property: /mcp panel server labels drop controls, seed 698202610, 64 inputs", async () => {
+		const safe = fc
+			.array(fc.constantFrom(..."abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._- ".split("")), {
+				minLength: 1,
+				maxLength: 24,
+			})
+			.map(chars => chars.join(""));
+		const noisy = fc.string({ maxLength: 24 });
+		await fc.assert(
+			fc.asyncProperty(safe, noisy, async (label, noise) => {
+				const hostile = `${label}${OSC52}${noise}`;
+				const attacked = await showPanels({
+					name: hostile,
+					uri: "file://notes/readme.txt",
+					description: "Daily notes",
+					mimeType: "text/plain",
+					uriTemplate: "file://notes/{path}",
+					templateDescription: "A note",
+					prompt: "summarize",
+					promptDescription: "Summarize the diff",
+					arg: "path",
+					argDescription: "File path",
+					error: "connection refused",
+				});
+				expect(attacked.errors).toEqual([]);
+				expect(attacked.text.includes("\x1b]")).toBe(false);
+				expect(attacked.text.includes("\x9d")).toBe(false);
+				expect(attacked.rows.includes("\x1b]")).toBe(false);
+				expect(attacked.text.includes(label)).toBe(true);
+				const plain = await showPanels({
+					name: label,
+					uri: "file://notes/readme.txt",
+					description: "Daily notes",
+					mimeType: "text/plain",
+					uriTemplate: "file://notes/{path}",
+					templateDescription: "A note",
+					prompt: "summarize",
+					promptDescription: "Summarize the diff",
+					arg: "path",
+					argDescription: "File path",
+					error: "connection refused",
+				});
+				expect(plain.text.includes(label)).toBe(true);
+				expect(plain.text.includes("file://notes/readme.txt")).toBe(true);
+				expect(plain.text.includes("connection refused")).toBe(true);
+			}),
+			{ seed: 698202610, numRuns: 64 },
 		);
 	});
 });

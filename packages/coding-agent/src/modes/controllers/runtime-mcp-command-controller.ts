@@ -1634,7 +1634,7 @@ export class MCPCommandController {
 		if (result.errors.size > 0) {
 			const errorLines = ["", theme.fg("warning", "Some servers failed to connect:"), ""];
 			for (const [serverName, error] of result.errors.entries()) {
-				errorLines.push(`  ${serverName}: ${error}`);
+				errorLines.push(`  ${mcpTerminalLabel(serverName)}: ${mcpTerminalLabel(error)}`);
 			}
 			errorLines.push("");
 			this.#showMessage(errorLines.join("\n"));
@@ -1661,17 +1661,17 @@ export class MCPCommandController {
 			if (resources.length === 0 && templates.length === 0) continue;
 			hasAny = true;
 
-			lines.push(`${theme.fg("accent", name)}:`);
+			lines.push(`${theme.fg("accent", mcpTerminalLabel(name))}:`);
 			for (const r of resources) {
-				const desc = r.description ? ` ${theme.fg("dim", r.description)}` : "";
-				const mime = r.mimeType ? ` ${theme.fg("dim", `[${r.mimeType}]`)}` : "";
-				lines.push(`  ${theme.fg("success", r.uri)}${mime}${desc}`);
+				const desc = r.description ? ` ${theme.fg("dim", mcpTerminalLabel(r.description))}` : "";
+				const mime = r.mimeType ? ` ${theme.fg("dim", `[${mcpTerminalLabel(r.mimeType)}]`)}` : "";
+				lines.push(`  ${theme.fg("success", mcpTerminalLabel(r.uri))}${mime}${desc}`);
 			}
 			if (templates.length > 0) {
 				lines.push(`  ${theme.fg("muted", "Templates:")}`);
 				for (const t of templates) {
-					const desc = t.description ? ` ${theme.fg("dim", t.description)}` : "";
-					lines.push(`    ${theme.fg("accent", t.uriTemplate)}${desc}`);
+					const desc = t.description ? ` ${theme.fg("dim", mcpTerminalLabel(t.description))}` : "";
+					lines.push(`    ${theme.fg("accent", mcpTerminalLabel(t.uriTemplate))}${desc}`);
 				}
 			}
 			lines.push("");
@@ -1702,16 +1702,16 @@ export class MCPCommandController {
 			if (!prompts?.length) continue;
 			hasAny = true;
 
-			lines.push(`${theme.fg("accent", name)}:`);
+			lines.push(`${theme.fg("accent", mcpTerminalLabel(name))}:`);
 			for (const p of prompts) {
-				const commandName = `${name}:${p.name}`;
-				const desc = p.description ? ` ${theme.fg("dim", p.description)}` : "";
+				const commandName = `${mcpTerminalLabel(name)}:${mcpTerminalLabel(p.name)}`;
+				const desc = p.description ? ` ${theme.fg("dim", mcpTerminalLabel(p.description))}` : "";
 				lines.push(`  ${theme.fg("success", `/${commandName}`)}${desc}`);
 				if (p.arguments?.length) {
 					for (const arg of p.arguments) {
 						const required = arg.required ? theme.fg("warning", " *") : "";
-						const argDesc = arg.description ? ` - ${arg.description}` : "";
-						lines.push(`    ${arg.name}=${required}${theme.fg("dim", argDesc)}`);
+						const argDesc = arg.description ? ` - ${mcpTerminalLabel(arg.description)}` : "";
+						lines.push(`    ${mcpTerminalLabel(arg.name)}=${required}${theme.fg("dim", argDesc)}`);
 					}
 				}
 			}
@@ -1757,7 +1757,7 @@ export class MCPCommandController {
 			if (!hasNotifications) continue;
 			hasAny = true;
 
-			lines.push(`${theme.fg("accent", name)}:`);
+			lines.push(`${theme.fg("accent", mcpTerminalLabel(name))}:`);
 			const check = theme.fg("success", "✓");
 			const cross = theme.fg("dim", "✗");
 			if (supportsToolsChanged) lines.push(`  ${check} tools/list_changed`);
@@ -1776,7 +1776,7 @@ export class MCPCommandController {
 				lines.push(`  ${check} resources/subscribe  ${subStatus}`);
 				if (enabled && subscribedUris && subscribedUris.size > 0) {
 					for (const uri of subscribedUris) {
-						lines.push(`    ${theme.fg("success", "✓")} ${theme.fg("dim", uri)}`);
+						lines.push(`    ${theme.fg("success", "✓")} ${theme.fg("dim", mcpTerminalLabel(uri))}`);
 					}
 				}
 			} else if (supportsResources) {
