@@ -215,10 +215,12 @@ describe("imageGenTool", () => {
 			userAgent = new Headers(init?.headers).get("User-Agent") ?? undefined;
 			return new Response(
 				JSON.stringify({
-					data: [
+					output: [
 						{
-							b64_json: Buffer.from("fake-webp").toString("base64"),
+							type: "image_generation_call",
+							result: Buffer.from("fake-webp").toString("base64"),
 							revised_prompt: "A crisp tabby cat portrait.",
+							status: "completed",
 						},
 					],
 				}),
@@ -254,19 +256,67 @@ describe("imageGenTool", () => {
 			`^${OPENAI_HEADER_VALUES.ORIGINATOR_CODEX}/[^\\s]+ \\(linux 4\\.4\\.302-Minimal-EAS-QTI_Haptic-R26; arm64\\)$`,
 		);
 		expect(userAgent).toMatch(originatorRegex);
-		expect(requestUrl).toBe("https://chatgpt.com/backend-api/codex/images/generations");
+		expect(requestUrl).toBe("https://chatgpt.com/backend-api/codex/responses");
 		expect(requestBody).toMatchObject({
 			model: "gpt-5.5",
-			n: 1,
-			quality: "auto",
-			output_format: "webp",
+			stream: true,
 		});
-		expect(requestBody).not.toHaveProperty("tools");
-		expect(requestBody).not.toHaveProperty("input");
+		expect(requestBody).toHaveProperty("tools");
+		expect(requestBody).toHaveProperty("input");
+		expect(requestBody).not.toHaveProperty("output_format");
 		expect(userAgent).toMatch(/^[\x20-\x7e]+$/);
 		platformSpy.mockRestore();
 		releaseSpy.mockRestore();
 		archSpy.mockRestore();
+	});
+	it("posts Codex image-only models to the generations route", async () => {
+		delete Bun.env.OPENAI_BASE_URL;
+		let requestUrl: string | undefined;
+		let requestBody: unknown;
+		const imageModel = {
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			id: "gpt-image-2",
+			name: "GPT Image 2",
+			baseUrl: "",
+			output: ["image"],
+		} as Model;
+		const jwtPayload = Buffer.from(
+			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "codex-account-1" } }),
+		).toString("base64url");
+		const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			requestUrl = input.toString();
+			requestBody = JSON.parse(String(init?.body));
+			return new Response(
+				JSON.stringify({
+					data: [{ b64_json: Buffer.from("fake-webp").toString("base64"), revised_prompt: "A circle." }],
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const ctx: CustomToolContext = {
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: makeMockRegistry(
+				{ getApiKey: async () => `header.${jwtPayload}.signature`, getApiKeyForProvider: async () => undefined },
+				[imageModel],
+			),
+			model: imageModel,
+			settings: makeMockSettings("openai-codex/gpt-image-2"),
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+		const result = await imageGenTool.execute("call-image", { subject: "a circle" }, undefined, ctx);
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+		expect(requestUrl).toBe("https://chatgpt.com/backend-api/codex/images/generations");
+		expect(requestBody).toMatchObject({ model: "gpt-image-2", n: 1, quality: "auto", output_format: "webp" });
+		expect(requestBody).not.toHaveProperty("tools");
+		expect(requestBody).not.toHaveProperty("input");
 	});
 
 	it("e2e writes OpenAI Responses image_generation WebP output to a temp file", async () => {
