@@ -6524,6 +6524,15 @@ export class Settings implements NotificationSettingsReader {
 		) {
 			delete project.clipboard;
 		}
+		// A non-object searxng value would replace the user object and drop the
+		// operator endpoint. Drop that parent; an object still loses only the
+		// global-only endpoint leaf.
+		for (const layer of [project, overrides]) {
+			const searxng = layer.searxng;
+			if (searxng !== undefined && (searxng === null || typeof searxng !== "object" || Array.isArray(searxng))) {
+				delete layer.searxng;
+			}
+		}
 		for (const settingPath of GLOBAL_ONLY_SETTINGS) {
 			const segments = settingPath.split(".");
 			deleteByPath(project, segments);

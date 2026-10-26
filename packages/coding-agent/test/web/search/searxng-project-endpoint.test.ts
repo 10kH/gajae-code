@@ -190,23 +190,76 @@ describe("project SearXNG endpoint", () => {
 		}
 	});
 
+	it("does not let a non-object project searxng value clear the user endpoint", async () => {
+		const parents = [null, false, "", []] as const;
+		for (const parent of parents) {
+			for (const via of ["settings", "config"] as const) {
+				const body = { providers: { webSearch: "searxng" }, searxng: parent };
+				const settings = await load(
+					via === "settings"
+						? { globalEndpoint: OPERATOR, projectSettings: body }
+						: { globalEndpoint: OPERATOR, projectConfig: body },
+				);
+				try {
+					expect(settings.get("searxng.endpoint")).toBe(OPERATOR);
+					expect(settings.get("providers.webSearch")).toBe("searxng");
+				} finally {
+					await settings.close();
+				}
+			}
+		}
+	});
+
+	it("calls the user endpoint when a non-object project parent and SEARXNG_ENDPOINT are both set", async () => {
+		process.env.SEARXNG_ENDPOINT = "https://fallback.example";
+		const settings = await load({
+			globalEndpoint: OPERATOR,
+			projectSettings: { providers: { webSearch: "searxng" }, searxng: null },
+		});
+		try {
+			expect(settings.get("searxng.endpoint")).toBe(OPERATOR);
+			const urls = await runTool(settings);
+			expect(queryOf(urls)).toBe(OPERATOR);
+			expect(urls.join("\n")).not.toContain("fallback.example");
+		} finally {
+			await settings.close();
+		}
+	});
+
+	it("does not let a non-object runtime override clear the user endpoint", async () => {
+		const settings = await load({ globalEndpoint: OPERATOR });
+		try {
+			(settings as unknown as { override: (path: string, value: unknown) => void }).override("searxng", null);
+			expect(settings.get("searxng.endpoint")).toBe(OPERATOR);
+			expect(settings.getGlobal("searxng.endpoint")).toBe(OPERATOR);
+		} finally {
+			await settings.close();
+		}
+	});
+
 	it("property: project endpoint strings stay operator-owned, fc.property seed 65917, numRuns 64", async () => {
+		const parent = fc.oneof(
+			fc.constant(null),
+			fc.constant(false),
+			fc.constant(""),
+			fc.constant([] as unknown[]),
+			fc.record({ endpoint: fc.string({ maxLength: 80 }), language: fc.constant("en") }),
+		);
 		await fc.assert(
-			fc.asyncProperty(fc.string({ maxLength: 80 }), fc.boolean(), async (projectEndpoint, hasGlobal) => {
+			fc.asyncProperty(parent, fc.boolean(), async (projectParent, hasGlobal) => {
+				const objectParent =
+					projectParent !== null && typeof projectParent === "object" && !Array.isArray(projectParent);
 				const settings = await load({
 					globalEndpoint: hasGlobal ? OPERATOR : undefined,
-					projectSettings: {
-						providers: { webSearch: "searxng" },
-						searxng: { endpoint: projectEndpoint, language: "en" },
-					},
+					projectSettings: { providers: { webSearch: "searxng" }, searxng: projectParent },
 				});
 				try {
 					const first = settings.get("searxng.endpoint");
 					expect(settings.get("searxng.endpoint")).toBe(first);
 					expect(first).toBe(hasGlobal ? OPERATOR : undefined);
-					expect(settings.get("searxng.language")).toBe("en");
 					expect(settings.get("providers.webSearch")).toBe("searxng");
-					if (projectEndpoint !== first) expect(first).not.toBe(projectEndpoint);
+					expect(settings.get("searxng.language")).toBe(objectParent ? "en" : undefined);
+					if (objectParent && projectParent.endpoint !== first) expect(first).not.toBe(projectParent.endpoint);
 				} finally {
 					await settings.close();
 				}
