@@ -115,7 +115,11 @@ with those mutations. In particular, a concurrent legacy profile-default setter 
 race profile deletion; callers must not infer profile ownership safety from this
 lock-only mechanism. Runtime intent does not take ownership of durable receipt paths. Synchronous memory-only builders publish without yielding between their check
 and mutation. Earlier queued atomic batches still serialize normally and supply the
-next builder's current input.
+next builder's current input. Internal YAML transaction callbacks must await every
+admitted mutation: a detached mutation that fails before the callback returns may
+not be reflected in the transaction result. Nested YAML operations refuse a busy
+file while holding another file's queue; inherited async callbacks retain this
+conservative restriction until their originating operation finishes.
 
 Ordinary saves also publish effective changes adopted from another scoped owner's
 on-disk edits. Overlapping writes through the shared in-process YAML writer fence
@@ -147,7 +151,8 @@ package root. They are trusted embedding compositions, not new managed operation
   `initializeExtensions(session, { uiContext: service.ui, reportSendError,
   reportRuntimeError, onShutdown })` helper. The latter initializes extension and
   function-hook context and emits `session_start`; it is not a repeated UI setter.
-  `subscribe()`/`snapshot()` expose bounded pending requests; replies require the
+  `subscribe()`/`snapshot()` expose bounded pending requests. Payload size is
+  validated against the detached data retained by the service; replies require the
   matching session, connection and request IDs. Reconnect rotates responder
   authority while preserving pending requests. The host **must call
   `service.dispose()` before awaiting `session.dispose()`**, and before switching
