@@ -5,7 +5,7 @@
 
 ### Fixed
 
-- Refuse active Telegram configuration for foreign or unknown daemon identities while preserving explicit inactive saves, and report completed rollback separately from observer or runtime failures.
+- Refuse active Telegram configuration for foreign or unverifiable daemon identities, require durable settings for notification mutations and external runtime actions, preserve inactive saves with session reconciliation, and report completed persistence separately from rollback or runtime failures.
 - Reject unsafe paths, malformed operations and unjournaled ancestor replacements before applying atomic batches. Stage memory updates, isolate YAML builder inputs and preconditions, return independently owned inverse receipts, and preserve literal model-role keys across reload.
 - Refuse modified or raced smart-routing previews instead of silently applying unseen generated routes. Keep preview authority inside the host while returning detached display snapshots.
 - Forward the actual committed preview through the controller, model selector and panel instead of regenerating unpublished routes after a catalog change or reporting post-save preview failures as failed commits.

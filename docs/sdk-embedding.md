@@ -171,7 +171,10 @@ package root. They are trusted embedding compositions, not new managed operation
   and a manually disposed view is not silently recreated.
 - **Local notification setup:** `createNotificationsEditorOperations` accepts
   `{ settings, session, sessionManager }` and reuses the same service as the TUI.
-  `preflightProposedIdentity`/`commitConfigure` and
+  Mutation and runtime operations require writable durable Settings; memory-only
+  Settings cannot configure or start an external notification daemon. Inactive
+  saves reconcile the current session and report reconciliation failures separately
+  from successful persistence. `preflightProposedIdentity`/`commitConfigure` and
   `prepareProviderConfiguration`/`commitProviderConfiguration` retain preflight,
   CAS and saved-but-activation-failed outcomes. Keep prepared objects in the
   trusted host: they are frozen, instance-bound, one-shot authority, not arbitrary
@@ -228,7 +231,12 @@ activate? })` is the shared service used by the TUI. It provides
 `clearGeneratedSetup` and `setAutoroutingEnabled`. Catalog and provider-order
 callbacks return the embedding session's real model catalog and current priority;
 `isScoped` must report that session's `--models` restriction, not a caller-selected
-permission flag. No managed routing operation is installed by constructing it.
+permission flag. The supported session scope is stable for the lifetime of each
+admitted operation: a host that can change scope must serialize that change with
+routing mutations through their completion. The service checks at admission and
+again in its writer callback, but those checks cannot revoke an already admitted
+write during asynchronous publication. The TUI session fixes its scope at
+construction. No managed routing operation is installed by constructing it.
 
 A preview is instance-bound host authority. Retain the exact returned object in
 the trusted host and send only display data to a renderer; copied, foreign,
@@ -245,8 +253,8 @@ A boolean alone cannot confirm a refresh. Separate callers retain separate proof
 It does not undo an already admitted commit. A guarded refresh retains its original
 preview and provider order, so catalog or order drift cannot silently change its
 payload. Catalog changes are refused rather than silently substituting unseen routes. The TUI likewise refreshes display
-preview after failure but never automatically commits it. Keep scoped-session
-mutations read-only and obtain explicit confirmation before replacing hand edits.
+preview after failure but never automatically commits it. Do not start mutations
+for scoped sessions; obtain explicit confirmation before replacing hand edits.
 
 Refresh reads the **global** recorded setup, not an effective project/runtime
 setup that would otherwise be promoted into global config. Display a pending
