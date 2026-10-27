@@ -9,6 +9,115 @@ const patch: SettingsAtomicPatch[] = [{ path: "temperature", op: "set", value: 0
 
 describe("current-value atomic batch local ownership", () => {
 	for (const durable of [false, true]) {
+		it(`returns a separately owned reversible receipt in ${durable ? "durable" : "memory"}`, async () => {
+			const temp = TempDir.createSync("@gjc-inverse-receipt-");
+			const settings = durable
+				? await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") })
+				: Settings.isolated();
+			try {
+				await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.2 }]);
+				const original = await settings.commitAtomicBatch(patch);
+				await settings.commitAtomicBatch([{ path: "topP", op: "set", value: 0.7 }]);
+				const restored = await original.restore();
+				expect(restored.status).toBe("restored");
+				if (restored.status !== "restored") throw new Error("Expected restore");
+				expect(settings.getGlobal("temperature")).toBe(0.2);
+				expect(settings.getGlobal("topP")).toBe(0.7);
+				expect((await restored.receipt.restore()).status).toBe("restored");
+				expect(settings.getGlobal("temperature")).toBe(0.4);
+				expect((await original.restore()).status).toBe("conflict");
+				const same = await settings.commitAtomicBatch(patch);
+				const sameRestore = await same.restore();
+				expect(sameRestore.status).toBe("restored");
+				expect((await same.restore()).status).toBe("conflict");
+				if (sameRestore.status !== "restored") throw new Error("Expected restore");
+				sameRestore.receipt.discard();
+				expect((await sameRestore.receipt.restore()).status).toBe("discarded");
+				const aba = await settings.commitAtomicBatch(patch);
+				await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.9 }]);
+				await settings.commitAtomicBatch(patch);
+				expect((await aba.restore()).status).toBe("conflict");
+			} finally {
+				await settings.close();
+				temp.removeSync();
+			}
+		});
+
+		it(`preserves disjoint role ownership and literal dotted names in ${durable ? "durable" : "memory"}`, async () => {
+			const temp = TempDir.createSync("@gjc-role-ownership-");
+			const settings = durable
+				? await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") })
+				: Settings.isolated();
+			try {
+				const original = await settings.setGlobalModelRoleAndFlush("default", "test/a");
+				await settings.setGlobalModelRoleAndFlush("custom", "test/b");
+				expect((await original.restore()).status).toBe("restored");
+				const same = await settings.setGlobalModelRoleAndFlush("custom", "test/b");
+				await settings.setGlobalModelRoleAndFlush("custom", "test/b");
+				expect((await same.restore()).status).toBe("conflict");
+				const aba = await settings.setGlobalModelRoleAndFlush("custom", "test/b");
+				await settings.setGlobalModelRoleAndFlush("custom", "test/c");
+				await settings.setGlobalModelRoleAndFlush("custom", "test/b");
+				expect((await aba.restore()).status).toBe("conflict");
+				await settings.setGlobalModelRoleAndFlush("literal.role", "test/d");
+				const prototypeBefore = Object.getOwnPropertyDescriptor(Object.prototype, "gjcRoleMarker");
+				await settings.setGlobalModelRoleAndFlush("__proto__", "test/special");
+				let roles: unknown;
+				await settings.commitAtomicBatchWithCurrent(current => {
+					roles = current.modelRoles;
+					return [];
+				});
+				expect(roles).toMatchObject({ custom: "test/b", "literal.role": "test/d" });
+				expect(Object.getOwnPropertyDescriptor(roles as object, "__proto__")?.value).toBe("test/special");
+				expect(Object.getOwnPropertyDescriptor(Object.prototype, "gjcRoleMarker")).toEqual(prototypeBefore);
+			} finally {
+				await settings.close();
+				temp.removeSync();
+			}
+		});
+
+		for (const builder of [false, true]) {
+			it(`stages caller getters once and fences reentrant writes in ${durable ? "durable" : "memory"} ${builder ? "builder" : "batch"}`, async () => {
+				const temp = TempDir.createSync("@gjc-patch-getter-");
+				const settings = durable
+					? await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") })
+					: Settings.isolated();
+				try {
+					let reads = 0;
+					const once = {
+						get path() {
+							if (++reads > 1) throw new Error("path read twice");
+							return "temperature" as const;
+						},
+						op: "set" as const,
+						value: 0.4,
+					};
+					await (builder
+						? settings.commitAtomicBatchWithCurrent(() => [once])
+						: settings.commitAtomicBatch([once]));
+					expect(reads).toBe(1);
+					const reentrant = {
+						get path() {
+							settings.set("temperature", 0.8);
+							return "temperature" as const;
+						},
+						op: "set" as const,
+						value: 0.1,
+					};
+					await expect(
+						builder
+							? settings.commitAtomicBatchWithCurrent(() => [reentrant])
+							: settings.commitAtomicBatch([reentrant]),
+					).rejects.toThrow("changed");
+					expect(settings.getGlobal("temperature")).toBe(0.8);
+				} finally {
+					await settings.close();
+					temp.removeSync();
+				}
+			});
+		}
+	}
+	for (const durable of [false, true]) {
 		it(`rejects unsafe role paths without partial mutation in ${durable ? "durable" : "memory"} batches`, async () => {
 			const temp = TempDir.createSync("@gjc-safe-roles-");
 			const settings = durable
@@ -77,6 +186,33 @@ describe("current-value atomic batch local ownership", () => {
 			}
 		});
 	}
+	it("restores invalid notification validation before notifying subscribers and reverses it again", async () => {
+		const settings = Settings.isolated({ "notifications.enabled": "invalid" });
+		const seen: string[] = [];
+		settings.onChanged(() => {
+			try {
+				settings.getNotificationSettingsSnapshot();
+				seen.push("valid");
+			} catch {
+				seen.push("invalid");
+			}
+		}, "apply");
+		settings.onChanged(() => {
+			try {
+				settings.getNotificationSettingsSnapshot();
+				seen.push("valid-observer");
+			} catch {
+				seen.push("invalid-observer");
+			}
+		});
+		const receipt = await settings.commitAtomicBatch([{ path: "notifications.enabled", op: "set", value: true }]);
+		const restored = await receipt.restore();
+		expect(restored.status).toBe("restored");
+		if (restored.status !== "restored") throw new Error("Expected restore");
+		expect((await restored.receipt.restore()).status).toBe("restored");
+		expect(seen).toEqual(["valid", "valid-observer", "invalid", "invalid-observer", "valid", "valid-observer"]);
+	});
+
 	it("does not mutate memory or take receipt ownership when a later value cannot be cloned", async () => {
 		const settings = Settings.isolated({ temperature: 0.2, topP: 0.3 });
 		const receipt = await settings.commitAtomicBatch(patch);
