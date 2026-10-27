@@ -36,6 +36,64 @@ describe("current-value atomic batch local ownership", () => {
 		});
 	}
 
+	for (const action of ["override", "clear", "same-value", "ABA"] as const) {
+		it(`fences async memory builders against runtime ${action} intent`, async () => {
+			const settings = Settings.isolated({ temperature: 0.2 }, { overrides: { temperature: 0.3 } });
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const pending = settings.commitAtomicBatchWithCurrent(async () => {
+				entered.resolve();
+				await release.promise;
+				return patch;
+			});
+			await entered.promise;
+			if (action === "clear") settings.clearOverride("temperature");
+			else {
+				settings.override("temperature", action === "same-value" ? 0.3 : 0.7);
+				if (action === "ABA") settings.override("temperature", 0.3);
+			}
+			release.resolve();
+			await expect(pending).rejects.toThrow("changed");
+			expect(settings.getGlobal("temperature")).toBe(0.2);
+			expect(settings.get("temperature")).toBe(action === "clear" ? 0.2 : action === "override" ? 0.7 : 0.3);
+		});
+	}
+
+	it("runtime intent does not take ownership of a durable-layer receipt", async () => {
+		const settings = Settings.isolated({ temperature: 0.2 });
+		const receipt = await settings.commitAtomicBatch(patch);
+		settings.override("temperature", 0.8);
+		expect((await receipt.restore()).status).toBe("restored");
+		expect(settings.getGlobal("temperature")).toBe(0.2);
+		expect(settings.get("temperature")).toBe(0.8);
+	});
+
+	it("fences runtime changes while a durable builder is awaiting", async () => {
+		const temp = TempDir.createSync("@gjc-runtime-builder-");
+		const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") });
+		const release = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		try {
+			settings.set("temperature", 0.2);
+			await settings.flushOrThrow();
+			const pending = settings.commitAtomicBatchWithCurrent(async () => {
+				entered.resolve();
+				await release.promise;
+				return patch;
+			});
+			await entered.promise;
+			settings.override("temperature", 0.8);
+			release.resolve();
+			await expect(pending).rejects.toThrow("changed");
+			expect(settings.getGlobal("temperature")).toBe(0.2);
+			expect(settings.get("temperature")).toBe(0.8);
+		} finally {
+			release.resolve();
+			await settings.close();
+			temp.removeSync();
+		}
+	});
+
 	it("serializes earlier queued atomic batches without treating them as later setters", async () => {
 		const temp = TempDir.createSync("@gjc-current-batch-queue-");
 		const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") });

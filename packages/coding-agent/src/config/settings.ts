@@ -657,6 +657,8 @@ export class Settings implements NotificationSettingsReader {
 	/** Latest dirty patch for each path, owned by its generation. */
 	#modified = new Map<string, SettingsPatch>();
 	#nextGeneration = 0;
+	/** Runtime intent is separate from durable-path CAS ownership. */
+	#runtimeGeneration = 0;
 	#pathRevisions = new Map<string, number>();
 	#nextRevision = 0;
 	/** Pending debounced ordinary save; its queue slot is reserved immediately. */
@@ -1553,13 +1555,21 @@ export class Settings implements NotificationSettingsReader {
 		this.#assertDurableConfigWritable();
 		const admissionRevision = this.#nextRevision;
 		const admissionGeneration = this.#nextGeneration;
+		const admissionRuntimeGeneration = this.#runtimeGeneration;
 		const changedWhilePreparing = () =>
 			new Error("Settings changed while the atomic batch was preparing; build it again.");
 		if (!this.#persist || !this.#configPath) {
 			const before = structuredClone(this.#global);
+			const runtimeBefore = structuredClone(this.#overrides);
 			const built = buildPatches(structuredClone(before));
 			const patches = Array.isArray(built) ? built : await built;
-			if (this.#nextRevision !== admissionRevision || !util.isDeepStrictEqual(before, this.#global)) {
+			if (
+				patches.length > 0 &&
+				(this.#nextRevision !== admissionRevision ||
+					this.#runtimeGeneration !== admissionRuntimeGeneration ||
+					!util.isDeepStrictEqual(before, this.#global) ||
+					!util.isDeepStrictEqual(runtimeBefore, this.#overrides))
+			) {
 				throw changedWhilePreparing();
 			}
 			return this.commitAtomicBatch(patches);
@@ -1574,12 +1584,25 @@ export class Settings implements NotificationSettingsReader {
 				// Use the existing ordinary-patch generation, even if an earlier save
 				// has already flushed a later setter and retired its staged patch.
 				// Earlier queued atomic batches alone do not advance this generation.
-				if (this.#nextGeneration !== admissionGeneration) {
+				if (
+					this.#nextGeneration !== admissionGeneration ||
+					this.#runtimeGeneration !== admissionRuntimeGeneration
+				) {
 					throw changedWhilePreparing();
 				}
 				const builderRevision = this.#nextRevision;
+				const runtimeBefore = structuredClone(this.#overrides);
 				const patches = await buildPatches(structuredClone(current));
-				if (this.#nextRevision !== builderRevision) throw changedWhilePreparing();
+				// Empty batches also serve as lock-only transactions for adjacent
+				// durable work (for example profile deletion). They cannot overtake
+				// any Settings patch; do not report failure after their side effect.
+				if (
+					patches.length > 0 &&
+					(this.#nextRevision !== builderRevision ||
+						this.#runtimeGeneration !== admissionRuntimeGeneration ||
+						!util.isDeepStrictEqual(runtimeBefore, this.#overrides))
+				)
+					throw changedWhilePreparing();
 				assertNonOverlappingAtomicYamlPatches(patches);
 				const durablePatches: AtomicYamlPatch[] = patches.map(patch => {
 					if (!isAtomicSettingsPath(patch.path)) {
@@ -1636,6 +1659,7 @@ export class Settings implements NotificationSettingsReader {
 		if (isNotificationSettingsPath(path)) throw new NotificationSettingsOverrideError(path);
 		const previous = this.get(path);
 		const clonedValue = structuredClone(value);
+		this.#runtimeGeneration++;
 		setByPath(this.#overrides, path.split("."), clonedValue);
 		this.#rebuildMerged();
 		this.#publishSettingsChanges(new Map([[path, previous]]));
@@ -1652,6 +1676,7 @@ export class Settings implements NotificationSettingsReader {
 	 */
 	clearOverride(path: SettingPath): void {
 		const previous = this.get(path);
+		this.#runtimeGeneration++;
 		const segments = path.split(".");
 		let current = this.#overrides;
 		for (let i = 0; i < segments.length - 1; i++) {
