@@ -17,6 +17,9 @@ import { theme } from "../theme/theme";
 /** Longest rendered panel line before truncation. */
 export const MAX_PANEL_LINE_WIDTH = 200;
 
+// Even double-width code points fit alongside the draft label within the line cap.
+const DRAFT_PAGE_CODE_POINTS = 64;
+
 export type SmartRoutingIntent =
 	| {
 			kind: "apply";
@@ -86,6 +89,24 @@ function displaySafe(text: string): string {
 	return truncateToWidth(replaceTabs(sanitizeDisplayLine(text)), MAX_PANEL_LINE_WIDTH);
 }
 
+function draftPageEnd(text: string, start: number): number {
+	let end = start;
+	for (let count = 0; count < DRAFT_PAGE_CODE_POINTS && end < text.length; count++) {
+		end += (text.codePointAt(end) ?? 0) > 0xffff ? 2 : 1;
+	}
+	return end;
+}
+
+function draftPageStart(text: string, end: number): number {
+	let start = end;
+	for (let count = 0; count < DRAFT_PAGE_CODE_POINTS && start > 0; count++) {
+		start--;
+		const code = text.charCodeAt(start);
+		if (code >= 0xdc00 && code <= 0xdfff && start > 0) start--;
+	}
+	return start;
+}
+
 function formatTier(tier: AutoroutingTier, tiers: TierMap | undefined): string {
 	const selectors = tiers?.[tier];
 	return displaySafe(
@@ -126,6 +147,9 @@ export class SmartRoutingPanelComponent extends Container {
 	#allowlistEditing = false;
 	#allowlistBuffer = "";
 	#uncommittedAllowlist: string | undefined;
+	// Maintain the sanitized view on input, never allocate a full draft during rendering.
+	#sanitizedAllowlistBuffer = "";
+	#uncommittedPageStart = 0;
 	#providerOrderHint: AutoroutingProviderOrderHint | undefined;
 	#status = "";
 	#error = "";
@@ -388,7 +412,12 @@ export class SmartRoutingPanelComponent extends Container {
 				new Text(
 					theme.fg(
 						"warning",
-						displaySafe(`Uncommitted allowlist draft (read-only): ${this.#uncommittedAllowlist}`),
+						displaySafe(
+							`Uncommitted allowlist draft (read-only): ${this.#sanitizedAllowlistBuffer.slice(
+								this.#uncommittedPageStart,
+								draftPageEnd(this.#sanitizedAllowlistBuffer, this.#uncommittedPageStart),
+							)}`,
+						),
 					),
 					0,
 					0,
@@ -471,9 +500,11 @@ export class SmartRoutingPanelComponent extends Container {
 		}
 		this.addChild(new Spacer(1));
 		const actions =
-			this.#readOnly || this.#sharedStateInvalidated
-				? "Esc: cancel"
-				: "a: apply · r: refresh · t: toggle · c: clear · Esc: cancel";
+			this.#sharedStateInvalidated && this.#uncommittedAllowlist !== undefined
+				? "PageUp/PageDown: inspect draft · Esc: cancel"
+				: this.#readOnly || this.#sharedStateInvalidated
+					? "Esc: cancel"
+					: "a: apply · r: refresh · t: toggle · c: clear · Esc: cancel";
 		this.addChild(new Text(theme.fg("muted", actions), 0, 0));
 	}
 
@@ -623,13 +654,21 @@ export class SmartRoutingPanelComponent extends Container {
 				: { schema: 1, providers: [...this.#draft.providers] };
 		this.#allowlistEditing = false;
 		this.#allowlistBuffer = "";
+		this.#sanitizedAllowlistBuffer = "";
 		this.#recomputePreview();
 		this.#render();
 	}
 
 	handleInput(data: string): void {
 		if (this.#observeSharedInvalidation()) {
-			if (getKeybindings().matches(data, "tui.select.cancel")) {
+			if (this.#uncommittedAllowlist !== undefined && matchesKey(data, "pageDown")) {
+				const end = draftPageEnd(this.#sanitizedAllowlistBuffer, this.#uncommittedPageStart);
+				if (end < this.#sanitizedAllowlistBuffer.length) this.#uncommittedPageStart = end;
+				this.#render();
+			} else if (this.#uncommittedAllowlist !== undefined && matchesKey(data, "pageUp")) {
+				this.#uncommittedPageStart = draftPageStart(this.#sanitizedAllowlistBuffer, this.#uncommittedPageStart);
+				this.#render();
+			} else if (getKeybindings().matches(data, "tui.select.cancel")) {
 				this.#discardPreview?.(this.#preview);
 				this.#onCancel();
 			}
@@ -673,16 +712,19 @@ export class SmartRoutingPanelComponent extends Container {
 			if (getKeybindings().matches(data, "tui.select.cancel")) {
 				this.#allowlistEditing = false;
 				this.#allowlistBuffer = "";
+				this.#sanitizedAllowlistBuffer = "";
 				this.#render();
 				return;
 			}
 			if (isBackspace(data)) {
 				this.#allowlistBuffer = this.#allowlistBuffer.slice(0, -1);
+				this.#sanitizedAllowlistBuffer = replaceTabs(sanitizeDisplayLine(this.#allowlistBuffer));
 				this.#render();
 				return;
 			}
 			if (isPrintable(data)) {
 				this.#allowlistBuffer += data;
+				this.#sanitizedAllowlistBuffer = replaceTabs(sanitizeDisplayLine(this.#allowlistBuffer));
 				this.#render();
 			}
 			return;
@@ -696,6 +738,7 @@ export class SmartRoutingPanelComponent extends Container {
 		if (data === "m" || data === "M") {
 			this.#allowlistEditing = true;
 			this.#allowlistBuffer = this.#draft.models?.join(", ") ?? "";
+			this.#sanitizedAllowlistBuffer = replaceTabs(sanitizeDisplayLine(this.#allowlistBuffer));
 			this.#render();
 			return;
 		}

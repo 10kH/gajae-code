@@ -1148,6 +1148,68 @@ describe("smart-routing panel hostile render boundary", () => {
 		});
 	}
 
+	test("pages through the entire sanitized uncommitted draft without permitting mutations", () => {
+		let unknown = false;
+		const onSelect = vi.fn(() => undefined);
+		const onCancel = vi.fn();
+		const setup: AutoroutingSetup = {
+			schema: 1,
+			providers: ["anthropic"],
+			models: ["provider/\x1b[2Jok\x07"],
+		};
+		const preview = { setup, tiers: { fast: [], balanced: [], strong: [] } } as unknown as RoutingSettingsPreview;
+		const panel = new SmartRoutingPanelClass({
+			setup,
+			enabled: true,
+			readOnly: false,
+			stale: false,
+			preview,
+			generatePreview: () => preview,
+			isStateUnknown: () => unknown,
+			onSelect,
+			onCancel,
+		});
+		panel.handleInput("m");
+		const typed = `${"x".repeat(220)}-distinct-suffix`;
+		for (const character of typed) panel.handleInput(character);
+		const draft = panel.getDraft();
+		unknown = true;
+		const label = "Uncommitted allowlist draft (read-only): ";
+		const pages: string[] = [];
+		let rowCount = 0;
+		for (let page = 0; page < 4; page++) {
+			const rows = panel.render(240);
+			if (page === 0) rowCount = rows.length;
+			expect(rows).toHaveLength(rowCount);
+			for (const row of rows) {
+				const plain = Bun.stripANSI(row).trimEnd();
+				expect(Bun.stringWidth(plain)).toBeLessThanOrEqual(MAX_PANEL_LINE_WIDTH);
+				expect(plain).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+			}
+			const text = Bun.stripANSI(rows.join("\n"));
+			expect(text).not.toContain("\x1b");
+			expect(text).toContain("PageUp/PageDown: inspect draft");
+			expect(text).toContain("Esc: cancel");
+			const row = rows.map(line => Bun.stripANSI(line).trimEnd()).find(line => line.startsWith(label));
+			if (row === undefined) throw new Error("Expected uncommitted draft row");
+			pages.push(row.slice(label.length));
+			if (page < 3) panel.handleInput("\x1b[6~");
+		}
+		expect(pages[0]).toStartWith("provider/ok");
+		expect(pages[3]).toEndWith("-distinct-suffix");
+		expect(pages.join("")).toBe(`provider/ok${typed}`);
+		panel.handleInput("\x1b[6~");
+		expect(renderText(panel)).toContain(pages[3]);
+		panel.handleInput("\x1b[5~");
+		expect(renderText(panel)).toContain(pages[2]);
+		for (const input of ["\r", "a", "r", "t", "c", "m", "\x7f", "z"]) panel.handleInput(input);
+		expect(panel.getDraft()).toEqual(draft);
+		expect(onSelect).not.toHaveBeenCalled();
+		panel.handleInput("\x1b");
+		expect(onCancel).toHaveBeenCalledTimes(1);
+		expect(onSelect).not.toHaveBeenCalled();
+	});
+
 	test("strips control sequences from provider, allowlist, preset, and tier rows", () => {
 		const rendered = rawRender(hostilePanel());
 		// Only SGR color codes may survive; OSC/CSI-erase/BEL/tab data must not.
