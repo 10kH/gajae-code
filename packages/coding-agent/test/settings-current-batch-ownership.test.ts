@@ -77,6 +77,187 @@ describe("current-value atomic batch local ownership", () => {
 			}
 		});
 	}
+	it("does not mutate memory or take receipt ownership when a later value cannot be cloned", async () => {
+		const settings = Settings.isolated({ temperature: 0.2, topP: 0.3 });
+		const receipt = await settings.commitAtomicBatch(patch);
+		const changes: string[] = [];
+		settings.onChanged(path => changes.push(path));
+		await expect(
+			settings.commitAtomicBatch([
+				{ path: "temperature", op: "set", value: 0.6 },
+				{ path: "temperature", op: "set", value: () => {} },
+			]),
+		).rejects.toThrow();
+		expect(settings.getGlobal("temperature")).toBe(0.4);
+		expect(settings.get("temperature")).toBe(0.4);
+		expect(settings.getGlobal("topP")).toBe(0.3);
+		expect(settings.get("topP")).toBe(0.3);
+		expect(changes).toEqual([]);
+		expect((await receipt.restore()).status).toBe("restored");
+		expect(settings.getGlobal("temperature")).toBe(0.2);
+		expect(settings.get("temperature")).toBe(0.2);
+	});
+
+	it("rejects a cloneable value that cannot be hashed without publishing candidate state", async () => {
+		const settings = Settings.isolated({ temperature: 0.2 });
+		const receipt = await settings.commitAtomicBatch(patch);
+		const changes: string[] = [];
+		settings.onChanged(path => changes.push(path));
+		await expect(
+			settings.commitAtomicBatch([
+				{ path: "temperature", op: "set", value: 0.8 },
+				{ path: "topP", op: "set", value: 1n },
+			]),
+		).rejects.toThrow();
+		expect(settings.getGlobal("temperature")).toBe(0.4);
+		expect(settings.get("temperature")).toBe(0.4);
+		expect(settings.getGlobal("topP")).toBeUndefined();
+		expect(changes).toEqual([]);
+		expect((await receipt.restore()).status).toBe("restored");
+		expect(settings.get("temperature")).toBe(0.2);
+	});
+
+	it("keeps notification state and receipt ownership on candidate hash failure", async () => {
+		const settings = Settings.isolated({ "notifications.redact": false });
+		const receipt = await settings.commitAtomicBatch([{ path: "notifications.redact", op: "set", value: true }]);
+		const changes: string[] = [];
+		settings.onChanged(path => changes.push(path));
+		await expect(
+			settings.commitAtomicBatch([
+				{ path: "notifications.redact", op: "set", value: false },
+				{ path: "topP", op: "set", value: 1n },
+			]),
+		).rejects.toThrow();
+		expect(settings.getGlobal("notifications.redact")).toBe(true);
+		expect(settings.get("notifications.redact")).toBe(true);
+		expect(changes).toEqual([]);
+		expect((await receipt.restore()).status).toBe("restored");
+		expect(settings.get("notifications.redact")).toBe(false);
+	});
+
+	it("preserves repeated-path ordering and restoration", async () => {
+		const settings = Settings.isolated({ temperature: 0.2 });
+		const changes: string[] = [];
+		settings.onChanged(path => changes.push(path));
+		const receipt = await settings.commitAtomicBatch([
+			{ path: "temperature", op: "set", value: 0.6 },
+			{ path: "temperature", op: "unset" },
+			{ path: "temperature", op: "set", value: 0.8 },
+		]);
+		expect(settings.getGlobal("temperature")).toBe(0.8);
+		expect(changes).toEqual(["temperature"]);
+		expect((await receipt.restore()).status).toBe("restored");
+		expect(settings.get("temperature")).toBe(0.2);
+	});
+
+	for (const durable of [false, true]) {
+		for (const builder of [false, true]) {
+			for (const hasValue of [false, true]) {
+				it(`rejects a late malformed operation in ${durable ? "durable" : "memory"} ${builder ? "async builder" : "batch"} (value ${hasValue})`, async () => {
+					const temp = TempDir.createSync("@gjc-invalid-operation-");
+					const settings = durable
+						? await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") })
+						: Settings.isolated({ temperature: 0.2 });
+					try {
+						await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.2 }]);
+						const receipt = await settings.commitAtomicBatch(patch);
+						const configPath = settings.getGlobalConfigPath();
+						const before = configPath ? await Bun.file(configPath).text() : undefined;
+						const changes: string[] = [];
+						settings.onChanged(path => changes.push(path));
+						const malformed = { path: "topP", op: "bad", ...(hasValue ? { value: "secret-patch-value" } : {}) };
+						const patches = [{ path: "temperature", op: "set", value: 0.8 }, malformed] as SettingsAtomicPatch[];
+						const operation = builder
+							? settings.commitAtomicBatchWithCurrent(async () => patches)
+							: settings.commitAtomicBatch(patches);
+						const error = await operation.then(
+							() => undefined,
+							reason => reason,
+						);
+						expect(error).toBeInstanceOf(TypeError);
+						expect(error.message).toContain("Unknown settings atomic patch operation");
+						expect(error.message).not.toContain("secret-patch-value");
+						expect(settings.getGlobal("temperature")).toBe(0.4);
+						expect(settings.get("temperature")).toBe(0.4);
+						expect(changes).toEqual([]);
+						if (configPath && before !== undefined) expect(await Bun.file(configPath).text()).toBe(before);
+						expect((await receipt.restore()).status).toBe("restored");
+						expect(settings.getGlobal("temperature")).toBe(0.2);
+					} finally {
+						await settings.close();
+						temp.removeSync();
+					}
+				});
+			}
+		}
+	}
+
+	it("clears only own overrides without touching an inherited parent", async () => {
+		const settings = Settings.isolated({ "compaction.enabled": true }, { overrides: { temperature: 0.8 } });
+		const changes: string[] = [];
+		settings.onChanged(path => changes.push(path));
+		const original = Object.getOwnPropertyDescriptor(Object.prototype, "compaction");
+		const inherited = { enabled: false };
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		try {
+			Object.defineProperty(Object.prototype, "compaction", {
+				value: inherited,
+				writable: true,
+				configurable: true,
+			});
+			const pending = settings.commitAtomicBatchWithCurrent(async () => {
+				entered.resolve();
+				await release.promise;
+				return patch;
+			});
+			await entered.promise;
+			settings.clearOverride("compaction.enabled");
+			expect(inherited).toEqual({ enabled: false });
+			expect(settings.get("compaction.enabled")).toBe(true);
+			expect(changes).toEqual([]);
+			release.resolve();
+			await expect(pending).rejects.toThrow("changed");
+			settings.clearOverride("temperature");
+			expect(settings.getOverride("temperature")).toBeUndefined();
+			expect(changes).toEqual(["temperature"]);
+		} finally {
+			release.resolve();
+			if (original) Object.defineProperty(Object.prototype, "compaction", original);
+			else delete (Object.prototype as Record<string, unknown>).compaction;
+		}
+	});
+
+	it("does not delete a property through an inherited Object.prototype alias", () => {
+		const settings = Settings.isolated();
+		const changes: string[] = [];
+		settings.onChanged(path => changes.push(path));
+		const display = Object.getOwnPropertyDescriptor(Object.prototype, "display");
+		const tabWidth = Object.getOwnPropertyDescriptor(Object.prototype, "tabWidth");
+		try {
+			Object.defineProperty(Object.prototype, "display", { value: Object.prototype, configurable: true });
+			Object.defineProperty(Object.prototype, "tabWidth", { value: 7, configurable: true });
+			settings.clearOverride("display.tabWidth");
+			expect(Object.getOwnPropertyDescriptor(Object.prototype, "tabWidth")?.value).toBe(7);
+			expect(changes).toEqual([]);
+		} finally {
+			if (display) Object.defineProperty(Object.prototype, "display", display);
+			else delete (Object.prototype as Record<string, unknown>).display;
+			if (tabWidth) Object.defineProperty(Object.prototype, "tabWidth", tabWidth);
+			else delete (Object.prototype as Record<string, unknown>).tabWidth;
+		}
+	});
+
+	for (const parent of [null, 42]) {
+		it(`ignores a scalar or null override parent (${parent})`, () => {
+			const settings = Settings.isolated({}, { overrides: { compaction: parent } as never });
+			const changes: string[] = [];
+			settings.onChanged(path => changes.push(path));
+			settings.clearOverride("compaction.enabled");
+			expect(changes).toEqual([]);
+		});
+	}
+
 	it("publishes synchronous memory builders before a later setter can be overtaken", async () => {
 		const settings = Settings.isolated({ temperature: 0.2 });
 		const pending = settings.commitAtomicBatchWithCurrent(() => patch);
