@@ -8,6 +8,40 @@ import { Settings, type SettingsAtomicPatch } from "../src/config/settings";
 const patch: SettingsAtomicPatch[] = [{ path: "temperature", op: "set", value: 0.4 }];
 
 describe("current-value atomic batch local ownership", () => {
+	it("preserves literal model role names through ordinary flush and disk reload", async () => {
+		const temp = TempDir.createSync("@gjc-literal-roles-reload-");
+		const scope = { cwd: temp.path(), agentDir: path.join(temp.path(), "agent") };
+		const settings = await Settings.loadForScope(scope);
+		let reloaded: Settings | undefined;
+		try {
+			const entries: [string, string | string[]][] = [
+				["default", "test/default"],
+				["", "test/empty"],
+				["literal.role", "test/dotted"],
+				["__proto__", ["test/first", "test/second"]],
+			];
+			for (const [role, selector] of entries) {
+				settings.setGlobalModelRole(role, selector);
+			}
+			await settings.flush();
+			reloaded = await Settings.loadForScope(scope);
+			const roles = reloaded.getModelRoles();
+			expect(roles.default).toBe("test/default");
+			expect(roles[""]).toBe("test/empty");
+			expect(roles["literal.role"]).toBe("test/dotted");
+			expect(Object.getOwnPropertyDescriptor(roles, "__proto__")?.value).toEqual(["test/first", "test/second"]);
+			expect(Object.getPrototypeOf(roles)).toBe(Object.prototype);
+			const overrides = Object.fromEntries([["__proto__", ["test/override"]]]);
+			reloaded.overrideModelRoles(overrides);
+			const overridden = reloaded.getModelRoles();
+			expect(Object.getOwnPropertyDescriptor(overridden, "__proto__")?.value).toEqual(["test/override"]);
+			expect(Object.getPrototypeOf(overridden)).toBe(Object.prototype);
+		} finally {
+			await reloaded?.close();
+			await settings.close();
+			temp.removeSync();
+		}
+	});
 	for (const durable of [false, true]) {
 		it(`returns a separately owned reversible receipt in ${durable ? "durable" : "memory"}`, async () => {
 			const temp = TempDir.createSync("@gjc-inverse-receipt-");
@@ -118,6 +152,36 @@ describe("current-value atomic batch local ownership", () => {
 		}
 	}
 	for (const durable of [false, true]) {
+		it(`rejects nested writes through a scalar role without partial effects in ${durable ? "durable" : "memory"}`, async () => {
+			const temp = TempDir.createSync("@gjc-role-scalar-");
+			const settings = durable
+				? await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") })
+				: Settings.isolated();
+			try {
+				await settings.setGlobalModelRoleAndFlush("custom", "test/selector");
+				await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.2 }]);
+				const configPath = settings.getGlobalConfigPath();
+				const before = configPath ? await Bun.file(configPath).text() : undefined;
+				const patches: SettingsAtomicPatch[] = [
+					{ path: "temperature", op: "set", value: 0.8 },
+					{ path: "modelRoles.custom.child", op: "set", value: "test/new" },
+				];
+				await expect(settings.commitAtomicBatch(patches)).rejects.toThrow("non-record ancestor");
+				await expect(settings.commitAtomicBatchWithCurrent(() => patches)).rejects.toThrow("non-record ancestor");
+				expect(settings.getGlobal("temperature")).toBe(0.2);
+				let roles: unknown;
+				await settings.commitAtomicBatchWithCurrent(current => {
+					roles = current.modelRoles;
+					return [];
+				});
+				expect(roles).toMatchObject({ custom: "test/selector" });
+				if (configPath && before !== undefined) expect(await Bun.file(configPath).text()).toBe(before);
+			} finally {
+				await settings.close();
+				temp.removeSync();
+			}
+		});
+
 		it(`rejects unsafe role paths without partial mutation in ${durable ? "durable" : "memory"} batches`, async () => {
 			const temp = TempDir.createSync("@gjc-safe-roles-");
 			const settings = durable

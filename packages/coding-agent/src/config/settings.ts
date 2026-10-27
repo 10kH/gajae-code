@@ -49,6 +49,7 @@ import {
 	AtomicYamlRetargetError,
 	applyAtomicYamlPatches,
 	applyAtomicYamlPatchesWithCurrent,
+	assertAtomicYamlSetAncestors,
 	assertNonOverlappingAtomicYamlPatches,
 	atomicYamlPathHash,
 	type CasReceipt,
@@ -552,7 +553,14 @@ function shallowModelSelectorRecord(value: unknown): Record<string, ModelSelecto
 
 	const result: Record<string, ModelSelectorValue> = {};
 	for (const [key, item] of Object.entries(record)) {
-		if (isModelSelectorValue(item)) result[key] = Array.isArray(item) ? [...item] : item;
+		if (isModelSelectorValue(item)) {
+			Object.defineProperty(result, key, {
+				value: Array.isArray(item) ? [...item] : item,
+				writable: true,
+				enumerable: true,
+				configurable: true,
+			});
+		}
 	}
 	return result;
 }
@@ -630,11 +638,19 @@ function setRawModelRole(
 }
 
 function settingsPatchKey(patch: SettingsPatch): string {
-	return patch.modelRole ? `modelRoles.${patch.modelRole}` : patch.path;
+	return patch.modelRole !== undefined &&
+		!patch.modelRole.includes(".") &&
+		isSafeAtomicYamlPath(["modelRoles", patch.modelRole])
+		? `modelRoles.${patch.modelRole}`
+		: patch.path;
+}
+
+function settingsPatchStorageKey(patch: SettingsPatch): string {
+	return patch.modelRole === undefined ? patch.path : `\0modelRole:${patch.modelRole}`;
 }
 
 function applySettingsPatch(raw: RawSettings, patch: SettingsPatch): void {
-	if (patch.modelRole) {
+	if (patch.modelRole !== undefined) {
 		setRawModelRole(raw, patch.modelRole, patch.value as ModelSelectorValue | undefined);
 		return;
 	}
@@ -1445,6 +1461,14 @@ export class Settings implements NotificationSettingsReader {
 					? structuredClone(this.#rawNotificationConfig ?? {})
 					: this.#rawNotificationConfig;
 				for (const patch of stagedPatches) {
+					if (patch.op === "set") {
+						const segments = patch.path.split(".");
+						assertAtomicYamlSetAncestors(candidateGlobal, segments);
+						if (isNotificationSettingsPath(patch.path))
+							assertAtomicYamlSetAncestors(candidateRawNotifications!, segments);
+					}
+				}
+				for (const patch of stagedPatches) {
 					const segments = patch.path.split(".");
 					if (patch.op === "set") setByPath(candidateGlobal, segments, patch.value);
 					else deleteByPath(candidateGlobal, segments);
@@ -1987,7 +2011,7 @@ export class Settings implements NotificationSettingsReader {
 		};
 		setRawModelRole(this.#global, role, modelId);
 		this.#pathRevisions.set(settingsPatchKey(patch), revision);
-		this.#modified.set(settingsPatchKey(patch), patch);
+		this.#modified.set(settingsPatchStorageKey(patch), patch);
 		this.#rebuildMerged();
 		this.#queueSave();
 	}
@@ -2084,7 +2108,14 @@ export class Settings implements NotificationSettingsReader {
 	overrideModelRoles(roles: Readonly<Record<string, ModelSelectorValue>>): void {
 		const next = shallowModelSelectorRecord(getByPath(this.#overrides, ["modelRoles"]));
 		for (const [role, modelId] of Object.entries(roles)) {
-			if (modelId) next[role] = Array.isArray(modelId) ? [...modelId] : modelId;
+			if (modelId) {
+				Object.defineProperty(next, role, {
+					value: Array.isArray(modelId) ? [...modelId] : modelId,
+					writable: true,
+					enumerable: true,
+					configurable: true,
+				});
+			}
 		}
 		this.override("modelRoles", next);
 	}
@@ -6391,7 +6422,7 @@ export class Settings implements NotificationSettingsReader {
 						} else {
 							for (const patch of captured) {
 								if (!patch.legacyFallbackMigration) continue;
-								const key = settingsPatchKey(patch);
+								const key = settingsPatchStorageKey(patch);
 								if (this.#modified.get(key)?.generation === patch.generation) this.#modified.delete(key);
 							}
 							captured = captured.filter(patch => !patch.legacyFallbackMigration);
@@ -6406,7 +6437,7 @@ export class Settings implements NotificationSettingsReader {
 				mutationPaths: () => captured.map(settingsPatchKey),
 				committed: current => {
 					for (const patch of captured) {
-						const key = settingsPatchKey(patch);
+						const key = settingsPatchStorageKey(patch);
 						if (this.#modified.get(key)?.generation === patch.generation) this.#modified.delete(key);
 					}
 					this.#captureRawNotificationConfig(current);
@@ -6418,7 +6449,7 @@ export class Settings implements NotificationSettingsReader {
 			.catch(async error => {
 				logger.warn("Settings: background save failed", { error: String(error) });
 				for (const patch of captured) {
-					const key = settingsPatchKey(patch);
+					const key = settingsPatchStorageKey(patch);
 					if (this.#modified.get(key)?.generation === patch.generation) this.#modified.set(key, patch);
 				}
 				if (durableBeforeWrite) {
