@@ -13,7 +13,6 @@ import {
 	parseNotificationSettingsSnapshot,
 	tokenFingerprint,
 } from "./config";
-import { requireDaemonInternalOwnerId } from "./daemon-internal-cli-args";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
 import { doctorDaemonIdentityMatches, doctorDaemonOccupancySettled } from "./doctor-daemon-restart";
 import { type NotificationDebrisSweepReport, sweepNotificationDebris } from "./notification-service";
@@ -309,7 +308,8 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	const smoke = argv.includes("--smoke");
 	const agentDir = argValue(argv, "--agent-dir");
 	if (smoke) return runDaemonSmoke({ agentDir });
-	const ownerId = requireDaemonInternalOwnerId(argv);
+	const ownerId = argValue(argv, "--owner-id");
+	if (!ownerId) throw new Error("missing --owner-id");
 	if (!ownerProcessIsAlive(ownerId, deps)) {
 		recordDaemonCompatibilityDiagnostic("GJC notify daemon exiting because its owner is not alive");
 		return;
