@@ -128,4 +128,28 @@ describe("markdown source controls", () => {
 			{ seed: PROPERTY_SEED, numRuns: PROPERTY_RUNS },
 		);
 	});
+
+	it("tolerates undefined and null text in Markdown constructor and setText", () => {
+		const markdown = new Markdown("", 0, 0, defaultMarkdownTheme);
+
+		// @ts-expect-error testing defensive guard against missing text
+		const fromUndefined = new Markdown(undefined, 0, 0, defaultMarkdownTheme);
+		expect(() => fromUndefined.render(40)).not.toThrow();
+		expect(fromUndefined.render(40)).toEqual([]);
+
+		// @ts-expect-error testing defensive guard against missing text
+		const fromNull = new Markdown(null, 0, 0, defaultMarkdownTheme);
+		expect(() => fromNull.render(40)).not.toThrow();
+		expect(fromNull.render(40)).toEqual([]);
+
+		// @ts-expect-error testing defensive guard against missing text
+		markdown.setText(undefined);
+		expect(() => markdown.render(40)).not.toThrow();
+		expect(markdown.render(40)).toEqual([]);
+
+		// @ts-expect-error testing defensive guard against missing text
+		markdown.setText(null);
+		expect(() => markdown.render(40)).not.toThrow();
+		expect(markdown.render(40)).toEqual([]);
+	});
 });
