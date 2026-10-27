@@ -180,7 +180,7 @@ describe("harness owner socket routing", () => {
 	);
 
 	it.skipIf(process.platform === "win32")(
-		"allows a dot-segment form of the private socket to receive observe",
+		"dials the private socket when the lease path uses dot segments",
 		async () => {
 			const canonical = controlSocketPath(root, SID);
 			const dotted = `${canonical}${path.sep}..${path.sep}${path.basename(canonical)}`;
