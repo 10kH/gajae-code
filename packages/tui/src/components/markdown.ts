@@ -559,7 +559,9 @@ function stripHtmlComments(raw: string): string {
 // Untrusted source is sanitized before marked parses it. Theme SGR, OSC 8, and
 // copy APCs are added later and must stay. sanitizeText drops CR, which is a
 // line break today, so normalize CR/CRLF to LF first.
-function sanitizeMarkdownSource(text: string): string {
+function sanitizeMarkdownSource(text: string | null | undefined): string {
+	// Guard against undefined/null during streaming — partial JSON can leave fields unpopulated.
+	if (typeof text !== "string") return "";
 	return sanitizeText(text.replace(/\r\n/g, "\n").replace(/\r/g, "\n"));
 }
 
