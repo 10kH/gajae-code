@@ -250,7 +250,8 @@ describe("model-profile ownership contract", () => {
 					entered.resolve();
 					await release.promise;
 				}
-				return await realpath(target, options);
+				const encoding = typeof options === "string" ? options : options?.encoding;
+				return encoding === "buffer" ? realpath(target, { encoding: "buffer" }) : realpath(target, { encoding });
 			}) as typeof fs.realpath);
 			try {
 				deletion = registry.deleteCustomModelProfile("first");

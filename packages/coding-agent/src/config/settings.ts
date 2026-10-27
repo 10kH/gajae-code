@@ -1543,8 +1543,10 @@ export class Settings implements NotificationSettingsReader {
 	}
 
 	/**
-	 * Build a batch from current YAML under the shared queue/lock. A newer local
-	 * mutation while queued or awaiting an async builder invalidates this attempt.
+	 * Build a batch from current YAML under the shared queue/lock. New local or
+	 * runtime intent invalidates nonempty batches prepared asynchronously. Such
+	 * builders must not perform irreversible external work before publication.
+	 * Empty batches may serialize adjacent durable actions without a Settings write.
 	 * Synchronous memory builders publish without yielding to another setter.
 	 */
 	async commitAtomicBatchWithCurrent(
