@@ -125,6 +125,7 @@ export class SmartRoutingPanelComponent extends Container {
 	#providerCursor = 0;
 	#allowlistEditing = false;
 	#allowlistBuffer = "";
+	#uncommittedAllowlist: string | undefined;
 	#providerOrderHint: AutoroutingProviderOrderHint | undefined;
 	#status = "";
 	#error = "";
@@ -217,6 +218,7 @@ export class SmartRoutingPanelComponent extends Container {
 			this.#pendingIntent = undefined;
 			this.#confirmation = undefined;
 			if (this.#mode === "confirming") this.#mode = "editing";
+			if (this.#allowlistEditing) this.#uncommittedAllowlist = this.#allowlistBuffer;
 			this.#allowlistEditing = false;
 			this.#allowlistBuffer = "";
 			this.markEffectiveStateUnknown();
@@ -375,6 +377,18 @@ export class SmartRoutingPanelComponent extends Container {
 						displaySafe(
 							`Allowlist: ${this.#draft.models && this.#draft.models.length > 0 ? this.#draft.models.join(", ") : "(all labeled models)"}`,
 						),
+					),
+					0,
+					0,
+				),
+			);
+		}
+		if (this.#uncommittedAllowlist !== undefined) {
+			this.addChild(
+				new Text(
+					theme.fg(
+						"warning",
+						displaySafe(`Uncommitted allowlist draft (read-only): ${this.#uncommittedAllowlist}`),
 					),
 					0,
 					0,
