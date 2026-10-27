@@ -9,6 +9,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { isFileLockAcquireTimeout, withFileLock } from "../config/file-lock";
 
@@ -104,6 +105,57 @@ function ownerSocketPathsMatch(candidate: string, canonical: string): boolean {
 	}
 }
 
+function socketNotePath(root: string, sessionId: string): string {
+	const uid = String(process.getuid?.() ?? "u");
+	const digest = createHash("sha256").update(`${root}\0${sessionId}`).digest("hex").slice(0, 24);
+	const rootDir = process.platform === "win32" ? process.env.LOCALAPPDATA?.trim() || os.homedir() : "/tmp";
+	return path.join(rootDir, `gjc-socknote-${uid}`, `${digest}.json`);
+}
+export function publishOwnerSocketNote(root: string, sessionId: string, socketPath: string): void {
+	try {
+		const file = socketNotePath(root, sessionId);
+		const dir = path.dirname(file);
+		try {
+			fsSync.mkdirSync(dir, { mode: 0o700 });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") return;
+		}
+		const dirStat = fsSync.lstatSync(dir);
+		if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) return;
+		const tmp = `${file}.tmp-${process.pid}`;
+		fsSync.writeFileSync(tmp, JSON.stringify({ socketPath, pid: process.pid }), { mode: 0o600 });
+		fsSync.renameSync(tmp, file);
+	} catch {
+		/* Same-dir routing does not need the note. */
+	}
+}
+function readSocketNote(root: string, sessionId: string): { socketPath: string; pid: number } | null {
+	try {
+		const file = socketNotePath(root, sessionId);
+		if (!fsSync.lstatSync(file).isFile()) return null;
+		const parsed = JSON.parse(fsSync.readFileSync(file, "utf8")) as { socketPath?: unknown; pid?: unknown };
+		if (typeof parsed.socketPath !== "string" || typeof parsed.pid !== "number") return null;
+		return { socketPath: parsed.socketPath, pid: parsed.pid };
+	} catch {
+		return null;
+	}
+}
+export function clearOwnerSocketNote(root: string, sessionId: string): void {
+	const note = readSocketNote(root, sessionId);
+	if (note?.pid === process.pid) fsSync.rmSync(socketNotePath(root, sessionId), { force: true });
+}
+function trustedOwnerSocket(root: string, sessionId: string, endpointPath: string): string | null {
+	try {
+		const computed = controlSocketPath(root, sessionId);
+		if (ownerSocketPathsMatch(endpointPath, computed)) return computed;
+	} catch {
+		/* Fall through to the published note. */
+	}
+	const noted = readSocketNote(root, sessionId);
+	if (!noted || !isOwnerAlive(noted.pid) || !ownerSocketPathsMatch(endpointPath, noted.socketPath)) return null;
+	return noted.socketPath;
+}
+
 /**
  * Path the CLI may dial for this lease endpoint.
  * Returns the private socket, never the lease string.
@@ -111,13 +163,8 @@ function ownerSocketPathsMatch(candidate: string, canonical: string): boolean {
  * A symlink or a non-socket does not.
  */
 export function canonicalLeaseSocket(root: string, sessionId: string, endpointPath: string): string | null {
-	let canonical: string;
-	try {
-		canonical = controlSocketPath(root, sessionId);
-	} catch {
-		return null;
-	}
-	if (!ownerSocketPathsMatch(endpointPath, canonical)) return null;
+	const canonical = trustedOwnerSocket(root, sessionId, endpointPath);
+	if (!canonical) return null;
 	try {
 		const stat = fsSync.lstatSync(canonical);
 		// A symlink or a non-socket at the private path is not dialed.
@@ -134,13 +181,7 @@ export function canonicalLeaseSocket(root: string, sessionId: string, endpointPa
 function leaseHasForeignUnixEndpoint(root: string, sessionId: string, lease: SessionLease): boolean {
 	const endpoint = lease.endpoint;
 	if (endpoint?.kind !== "unix-socket") return false;
-	let canonical: string;
-	try {
-		canonical = controlSocketPath(root, sessionId);
-	} catch {
-		return true;
-	}
-	return !ownerSocketPathsMatch(endpoint.path, canonical);
+	return trustedOwnerSocket(root, sessionId, endpoint.path) === null;
 }
 async function withLeaseMutationLock<T>(root: string, sessionId: string, fn: () => Promise<T>): Promise<T> {
 	const lockPath = leaseMutationLockPath(root, sessionId);

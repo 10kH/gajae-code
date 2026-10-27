@@ -5,6 +5,9 @@ import * as net from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import fc from "fast-check";
+import { RuntimeOwner } from "../../src/harness-control-plane/owner";
+import { acquireLease } from "../../src/harness-control-plane/session-lease";
+import type { HarnessSessionTransport } from "../../src/harness-control-plane/session-transport";
 import { controlSocketPath, sessionPaths, writeSessionState } from "../../src/harness-control-plane/storage";
 import { SESSION_SCHEMA_VERSION, type SessionHandle, type SessionState } from "../../src/harness-control-plane/types";
 import { createHarnessCliEnv, type HarnessCliEnv } from "./cli-workspace-env";
@@ -118,6 +121,52 @@ function listen(socketPath: string, marker: string): Promise<{ received: string[
 			});
 		});
 	});
+}
+
+class IdleTransport implements HarnessSessionTransport {
+	async getState() {
+		return { isStreaming: false, steeringQueueDepth: 0, followupQueueDepth: 0 };
+	}
+	eventCursor(): number {
+		return 0;
+	}
+	async sendPrompt() {
+		return { commandId: "route", ack: true };
+	}
+	async waitForAgentStart() {
+		return null;
+	}
+	async close(): Promise<void> {}
+}
+
+async function withSocketEnv(
+	overrides: Record<string, string | undefined>,
+	fn: (owner: RuntimeOwner) => Promise<void>,
+): Promise<void> {
+	const saved: Record<string, string | undefined> = {};
+	for (const key of Object.keys(overrides)) {
+		saved[key] = process.env[key];
+		const value = overrides[key];
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+	let owner: RuntimeOwner | null = null;
+	try {
+		owner = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			transport: new IdleTransport(),
+			heartbeatMs: 60_000,
+		});
+		await owner.start();
+		await fn(owner);
+	} finally {
+		await owner?.stop();
+		for (const [key, value] of Object.entries(saved)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
 }
 
 async function runHarness(
@@ -290,6 +339,89 @@ describe("harness owner socket routing", () => {
 			} finally {
 				await server.close();
 			}
+		},
+		20_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"routes observe to a live owner when the command omits the socket dir",
+		async () => {
+			const socketDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			extraDirs.push(socketDir);
+			await withSocketEnv({ GJC_HARNESS_SOCKET_DIR: socketDir }, async () => {
+				const res = await runHarness(["observe", "--session", SID], { GJC_HARNESS_SOCKET_DIR: "" });
+				const body = JSON.parse(res.raw) as {
+					evidence?: { ownerRouted?: boolean };
+					state?: { ownerLive?: boolean };
+				};
+				expect(res.code).toBe(0);
+				expect(body.evidence?.ownerRouted).toBe(true);
+				expect(body.state?.ownerLive).toBe(true);
+			});
+		},
+		20_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"routes observe to a live owner when the command socket dir differs",
+		async () => {
+			const socketDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			const otherDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			extraDirs.push(socketDir, otherDir);
+			await withSocketEnv({ GJC_HARNESS_SOCKET_DIR: socketDir }, async () => {
+				const res = await runHarness(["observe", "--session", SID], { GJC_HARNESS_SOCKET_DIR: otherDir });
+				const body = JSON.parse(res.raw) as { evidence?: { ownerRouted?: boolean } };
+				expect(res.code).toBe(0);
+				expect(body.evidence?.ownerRouted).toBe(true);
+			});
+		},
+		20_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"routes observe to a live owner when the command temp dir differs",
+		async () => {
+			const ownerTmp = await mkdtemp(path.join(tmpdir(), "hst-"));
+			const commandTmp = await mkdtemp(path.join(tmpdir(), "hst-"));
+			extraDirs.push(ownerTmp, commandTmp);
+			await withSocketEnv({ TMPDIR: ownerTmp, GJC_HARNESS_SOCKET_DIR: undefined }, async () => {
+				const res = await runHarness(["observe", "--session", SID], {
+					TMPDIR: commandTmp,
+					GJC_HARNESS_SOCKET_DIR: "",
+				});
+				const body = JSON.parse(res.raw) as { evidence?: { ownerRouted?: boolean } };
+				expect(res.code).toBe(0);
+				expect(body.evidence?.ownerRouted).toBe(true);
+			});
+		},
+		20_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"holds a live owner lease when a second acquire uses another socket dir",
+		async () => {
+			const socketDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			const otherDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			extraDirs.push(socketDir, otherDir);
+			await withSocketEnv({ GJC_HARNESS_SOCKET_DIR: socketDir }, async () => {
+				const previous = process.env.GJC_HARNESS_SOCKET_DIR;
+				delete process.env.GJC_HARNESS_SOCKET_DIR;
+				process.env.GJC_HARNESS_SOCKET_DIR = otherDir;
+				try {
+					await expect(
+						acquireLease(root, SID, {
+							ownerId: "owner-other",
+							pid: process.pid,
+							eventsPath: sessionPaths(root, SID).events,
+							endpoint: { kind: "unix-socket", path: controlSocketPath(root, SID) },
+							ttlMs: 10_000,
+						}),
+					).rejects.toThrow(/lease_held/);
+				} finally {
+					if (previous === undefined) delete process.env.GJC_HARNESS_SOCKET_DIR;
+					else process.env.GJC_HARNESS_SOCKET_DIR = previous;
+				}
+			});
 		},
 		20_000,
 	);

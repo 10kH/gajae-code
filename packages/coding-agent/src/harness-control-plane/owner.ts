@@ -43,8 +43,10 @@ import {
 	canonicalLeaseSocket,
 	canWriteEvents,
 	classifyLeaseStatus,
+	clearOwnerSocketNote,
 	heartbeat,
 	LeaseError,
+	publishOwnerSocketNote,
 	readLease,
 	releaseLease,
 	type SessionLease,
@@ -243,6 +245,7 @@ export class RuntimeOwner {
 
 	async #startOnce(): Promise<OwnerStartInfo> {
 		const { root, sessionId } = this.#opts;
+		publishOwnerSocketNote(root, sessionId, this.#socketPath);
 		const eventsPath = sessionPaths(root, sessionId).events;
 		const existing = await readEvents(root, sessionId, 0);
 		this.#cursor = existing.reduce((max, e) => Math.max(max, e.cursor), 0);
@@ -1167,6 +1170,7 @@ export class RuntimeOwner {
 			clearInterval(this.#heartbeatTimer);
 			this.#heartbeatTimer = null;
 		}
+		clearOwnerSocketNote(this.#opts.root, this.#opts.sessionId);
 		if (failures.length > 0) throw new AggregateError(failures, "Runtime owner cleanup failed.");
 	}
 
