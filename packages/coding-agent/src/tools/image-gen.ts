@@ -1336,10 +1336,18 @@ export function getOpenAIImageBaseUrlForTest(model: Model, authCredentialType?: 
 	return getOpenAIBaseUrl(model, authCredentialType);
 }
 
+/** Strips a trailing `/codex` or `/codex/responses` so Codex routes are appended exactly once. */
+function getCodexRootUrl(baseUrl: string): string {
+	const normalized = baseUrl.replace(/\/+$/, "");
+	if (normalized.endsWith(URL_PATHS.CODEX_RESPONSES)) {
+		return normalized.slice(0, -URL_PATHS.CODEX_RESPONSES.length);
+	}
+	if (normalized.endsWith("/codex")) return normalized.slice(0, -"/codex".length);
+	return normalized;
+}
+
 function getCodexImagesGenerationsUrl(baseUrl: string): string {
-	const path = URL_PATHS.CODEX_IMAGES_GENERATIONS;
-	const baseWithSlash = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-	return new URL(path.slice(1), baseWithSlash).toString();
+	return `${getCodexRootUrl(baseUrl)}${URL_PATHS.CODEX_IMAGES_GENERATIONS}`;
 }
 
 function getOpenAIResponsesUrl(model: Model, authCredentialType?: "api_key" | "oauth"): string {
@@ -1347,10 +1355,7 @@ function getOpenAIResponsesUrl(model: Model, authCredentialType?: "api_key" | "o
 	if (model.api !== "openai-codex-responses" && model.provider !== "openai-codex") {
 		return `${baseUrl}/responses`;
 	}
-	const baseWithSlash = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-	return new URL(URL_PATHS.RESPONSES.slice(1), baseWithSlash)
-		.toString()
-		.replace(URL_PATHS.RESPONSES, URL_PATHS.CODEX_RESPONSES);
+	return `${getCodexRootUrl(baseUrl)}${URL_PATHS.CODEX_RESPONSES}`;
 }
 
 function buildOpenAIImageHeaders(model: Model, apiKey: string, sessionId: string | undefined): Headers {
