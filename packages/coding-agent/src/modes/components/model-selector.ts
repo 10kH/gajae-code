@@ -595,6 +595,7 @@ export class ModelSelectorComponent extends Container {
 	#authSessionId?: string;
 	#imageRoleFilter: boolean = false;
 	#smartRoutingPanel?: SmartRoutingPanelComponent;
+	#smartRoutingStateUnknown = false;
 	#smartRoutingPreviewBuilder?: (draft: AutoroutingSetup) => RoutingSettingsPreview;
 	#smartRoutingDiscardPreview?: (preview: RoutingSettingsPreview) => void;
 	#isBillingDismissed?: (key: string) => boolean;
@@ -627,6 +628,7 @@ export class ModelSelectorComponent extends Container {
 			configuredDefaultChain?: readonly string[];
 			smartRoutingPreview?: (draft: AutoroutingSetup) => RoutingSettingsPreview;
 			smartRoutingDiscardPreview?: (preview: RoutingSettingsPreview) => void;
+			smartRoutingStateUnknown?: boolean;
 			/** Open the smart-routing panel directly instead of the preset landing. */
 			smartRoutingOnly?: boolean;
 			/** Test seam: synchronous persisted-dismissal check to avoid async render churn. */
@@ -648,6 +650,7 @@ export class ModelSelectorComponent extends Container {
 		this.#authSessionId = options?.sessionId;
 		this.#smartRoutingPreviewBuilder = options?.smartRoutingPreview;
 		this.#smartRoutingDiscardPreview = options?.smartRoutingDiscardPreview;
+		this.#smartRoutingStateUnknown = options?.smartRoutingStateUnknown === true;
 		this.#isBillingDismissed = (options as any)?.isBillingDismissed;
 		this.#markBillingDismissed = (options as any)?.markBillingDismissed;
 		this.#currentModel = _currentModel;
@@ -1959,6 +1962,7 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#smartRoutingIsStale(committedPreview?: RoutingSettingsPreview): boolean {
+		if (this.#smartRoutingStateUnknown) return false;
 		const provenance = this.#settings.get("task.autorouting.provenance");
 		if (!provenance) return false;
 		try {
@@ -1980,6 +1984,12 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#enterSmartRoutingMode(): void {
+		if (this.#smartRoutingStateUnknown) {
+			this.#viewMode = "presets";
+			this.#presetLoginHint = "Smart-routing settings are unknown; reload Settings before continuing.";
+			this.#renderPresetLanding();
+			return;
+		}
 		if (!this.#smartRoutingPreviewBuilder) {
 			if (this.#smartRoutingOnly) {
 				this.#onCancelCallback();
@@ -2048,7 +2058,13 @@ export class ModelSelectorComponent extends Container {
 		);
 	}
 
+	/** The Settings snapshot cannot be trusted after an unresolved durable rollback. */
+	invalidateSmartRoutingState(): void {
+		this.#smartRoutingStateUnknown = true;
+	}
+
 	refreshSmartRoutingState(committedPreview?: RoutingSettingsPreview): void {
+		if (this.#smartRoutingStateUnknown) return;
 		const panel = this.#smartRoutingPanel;
 		if (!panel || this.#viewMode !== "smart-routing") return;
 		// Catalog and provider-order reads are advisory after publication. A failure must
@@ -2108,7 +2124,11 @@ export class ModelSelectorComponent extends Container {
 			const prefix = selected ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
 			if (row.kind === "smartRouting") {
 				const stale = this.#smartRoutingIsStale();
-				const label = stale ? "Smart routing (stale)" : "Smart routing setup";
+				const label = this.#smartRoutingStateUnknown
+					? "Smart routing (unknown)"
+					: stale
+						? "Smart routing (stale)"
+						: "Smart routing setup";
 				this.#listContainer.addChild(new Text(`${prefix}${selected ? theme.fg("accent", label) : label}`, 0, 0));
 				continue;
 			}

@@ -360,7 +360,7 @@ describe("/model smart-routing panel integration", () => {
 	}
 
 	for (const refreshFails of [false, true]) {
-		test(`activation rollback conflict ${refreshFails ? "marks effective state unknown when refresh fails" : "refreshes effective state"}`, async () => {
+		test(`durable activation rollback conflict marks effective state unknown${refreshFails ? " even when refresh would fail" : ""}`, async () => {
 			const temp = TempDir.createSync("@gjc-routing-ui-conflict-");
 			const agentDir = path.join(temp.path(), "agent");
 			const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir });
@@ -388,13 +388,59 @@ describe("/model smart-routing panel integration", () => {
 				}
 				expect(panel.mode).toBe("error");
 				expect(renderText(panel)).toContain("rollback conflict");
-				expect(renderText(panel)).toContain(refreshFails ? "Effective enabled: unknown" : "Effective enabled: yes");
+				expect(renderText(panel)).toContain("Effective enabled: unknown");
+				expect(renderText(panel)).toContain("Effective generated setup: unknown");
 			} finally {
 				await settings.close();
 				temp.removeSync();
 			}
 		});
 	}
+
+	test("cross-instance rollback conflict leaves stale local state unknown in the panel", async () => {
+		const temp = TempDir.createSync("@gjc-routing-ui-cross-conflict-");
+		const agentDir = path.join(temp.path(), "agent");
+		const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir });
+		const other = await Settings.loadForScope({ cwd: temp.path(), agentDir });
+		try {
+			settings.set("task.autorouting.enabled", false);
+			await settings.flushOrThrow();
+			const { controller, panel, selector, ctx } = await openPanel({ settings });
+			ctx.notifyConfigChanged.mockImplementation(async () => {
+				await other.commitAtomicBatchWithCurrent(() => [
+					{ path: "task.autorouting.enabled", op: "set", value: false },
+				]);
+				throw new Error("activation failed");
+			});
+			ctx.showError.mockImplementation(() => {
+				throw new Error("error display failed");
+			});
+			ctx.ui.requestRender.mockImplementation(() => {
+				throw new Error("render failed");
+			});
+			await panel.__testToggle(true);
+			const disk = await Settings.loadReadonly({ cwd: temp.path(), agentDir });
+			try {
+				expect(disk.getGlobal("task.autorouting.enabled")).toBe(false);
+			} finally {
+				await disk.close();
+			}
+			expect(settings.getGlobal("task.autorouting.enabled")).toBe(true);
+			expect(settings.get("task.autorouting.enabled")).toBe(true);
+			expect(panel.mode).toBe("error");
+			expect(renderText(panel)).toContain("rollback conflict");
+			expect(renderText(panel)).toContain("Effective enabled: unknown");
+			expect(renderText(panel)).toContain("Effective generated setup: unknown");
+			await expect(controller.setAutoroutingEnabled(false)).rejects.toThrow("settings are unknown");
+			ctx.ui.requestRender.mockReset();
+			panel.handleInput("\x1b");
+			expect(renderText(selector)).toContain("Smart routing (unknown)");
+		} finally {
+			await settings.close();
+			await other.close();
+			temp.removeSync();
+		}
+	});
 
 	test("failure UI callbacks cannot replace the original mutation error", async () => {
 		const { controller, settings, ctx } = await openPanel();

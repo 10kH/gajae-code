@@ -874,6 +874,12 @@ describe("SDK smart-routing settings", () => {
 			});
 			const error = await routing.applySmartRouting(setup).catch(failure => failure);
 			expect(error).toMatchObject({ durability: "persisted", activation: "failed", rollback: "conflict" });
+			// The original instance retains its published value, not the other writer's.
+			expect(settings.getGlobal("task.autorouting.setup")).toEqual(setup);
+			expect(settings.get("task.autorouting.setup")).toEqual(setup);
+			expect(routing.stateUnknown).toBe(true);
+			expect(() => routing.previewSmartRouting(setup)).toThrow("settings are unknown");
+			await expect(routing.setAutoroutingEnabled(true)).rejects.toThrow("settings are unknown");
 			const disk = await Settings.loadReadonly({ cwd, agentDir });
 			try {
 				expect(disk.getGlobal("task.autorouting.setup")).toEqual(newer);
@@ -883,6 +889,55 @@ describe("SDK smart-routing settings", () => {
 		} finally {
 			await settings.close();
 			await other.close();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("a failed durable restore preserves the activation error and invalidates the Settings instance", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "sdk-routing-restore-failed-"));
+		const agentDir = path.join(root, "agent");
+		const cwd = path.join(root, "project");
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.mkdir(cwd, { recursive: true });
+		await Bun.write(path.join(agentDir, "config.yml"), "{}\n");
+		const settings = await Settings.loadForScope({ cwd, agentDir });
+		try {
+			const commit = settings.commitAtomicBatchWithCurrent.bind(settings);
+			const restoreError = new Error("restore failed");
+			vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockImplementationOnce(async build => {
+				const receipt = await commit(build);
+				return {
+					...receipt,
+					restore: async () => {
+						throw restoreError;
+					},
+				};
+			});
+			const cause = new Error("activation failed");
+			const routing = service(settings, {
+				activate: async () => {
+					throw cause;
+				},
+			});
+			const error = await routing.applySmartRouting(setup).catch(failure => failure);
+			expect(error).toMatchObject({
+				durability: "persisted",
+				activation: "failed",
+				rollback: "failed",
+				cause,
+				rollbackError: restoreError,
+			});
+			expect(routing.stateUnknown).toBe(true);
+			expect(service(settings).stateUnknown).toBe(true);
+			await expect(service(settings).clearGeneratedSetup()).rejects.toThrow("settings are unknown");
+			const disk = await Settings.loadReadonly({ cwd, agentDir });
+			try {
+				expect(disk.getGlobal("task.autorouting.setup")).toEqual(setup);
+			} finally {
+				await disk.close();
+			}
+		} finally {
+			await settings.close();
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});

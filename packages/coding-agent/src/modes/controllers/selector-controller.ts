@@ -1668,7 +1668,11 @@ export class SelectorController {
 									error.rollback === "failed" ||
 									error.rollback === "not-restorable")
 							) {
-								this.#updateSmartRoutingUi(() => modelSelector.refreshSmartRoutingState());
+								if (error.durability === "persisted") {
+									this.#updateSmartRoutingUi(() => modelSelector.invalidateSmartRoutingState());
+								} else {
+									this.#updateSmartRoutingUi(() => modelSelector.refreshSmartRoutingState());
+								}
 							}
 							throw error;
 						}
@@ -1930,6 +1934,7 @@ export class SelectorController {
 					isCurrentModelFastModeActive: () => this.ctx.session.isFastModeActive(),
 					smartRoutingPreview: draft => this.previewSmartRouting(draft),
 					smartRoutingDiscardPreview: preview => this.#smartRouting.discardPreview(preview),
+					smartRoutingStateUnknown: this.#smartRouting.stateUnknown,
 					smartRoutingOnly: options?.smartRoutingOnly,
 				},
 			);

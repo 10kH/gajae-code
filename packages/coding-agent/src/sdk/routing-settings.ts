@@ -25,6 +25,7 @@ export interface RoutingSettingsDependencies {
 	readonly settings: Settings;
 	readonly getCatalog: () => readonly Model<Api>[];
 	readonly getProviderOrder: () => readonly string[];
+	/** The host must serialize scope changes with each routing operation through completion. */
 	readonly isScoped: () => boolean;
 	/** Notify the host after settings publication; this is not a model or lifecycle operation. */
 	readonly activate?: () => Promise<void> | void;
@@ -90,6 +91,9 @@ function rawAutoroutingState(current: Readonly<RawSettings>): RoutingState {
 	};
 }
 
+// A new service over the same stale Settings instance must not regain authority.
+const unknownSettings = new WeakSet<Settings>();
+
 export class RoutingSettingsService {
 	#inFlight = false;
 	readonly #previews = new WeakMap<RoutingSettingsPreview, PreviewAuthority>();
@@ -97,7 +101,12 @@ export class RoutingSettingsService {
 	readonly #discardedPreviews = new WeakSet<RoutingSettingsPreview>();
 	constructor(private readonly dependencies: RoutingSettingsDependencies) {}
 
+	get stateUnknown(): boolean {
+		return unknownSettings.has(this.dependencies.settings);
+	}
+
 	previewSmartRouting(draft: AutoroutingSetup): RoutingSettingsPreview {
+		this.#assertStateKnown();
 		const issues = validateAutoroutingSetup(draft);
 		if (issues.length > 0)
 			throw new Error(issues.map(issue => `${issue.path || "setup"}: ${issue.detail}`).join("; "));
@@ -144,7 +153,16 @@ export class RoutingSettingsService {
 		});
 	}
 
+	#assertStateKnown(): void {
+		if (this.stateUnknown) {
+			throw new Error(
+				"Smart-routing settings are unknown after a failed rollback; reload Settings before continuing.",
+			);
+		}
+	}
+
 	#assertWritable(): void {
+		this.#assertStateKnown();
 		if (this.dependencies.isScoped())
 			throw new Error("Smart-routing settings are read-only in a --models-scoped session.");
 		if (!this.dependencies.settings.canWriteDurableConfig()) {
@@ -231,6 +249,15 @@ export class RoutingSettingsService {
 					} catch (error) {
 						rollback = "failed";
 						rollbackError = error;
+					}
+					// A durable restore that did not succeed may have observed another Settings
+					// writer. This instance is not reloaded, and replacing it here could erase
+					// pending local mutations. Require a new safely loaded Settings instead.
+					if (
+						durability === "persisted" &&
+						(rollback === "conflict" || rollback === "failed" || rollback === "not-restorable")
+					) {
+						unknownSettings.add(this.dependencies.settings);
 					}
 					throw new RoutingSettingsActivationError(durability, rollback, cause, rollbackError);
 				}
