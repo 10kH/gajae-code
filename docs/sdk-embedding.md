@@ -167,6 +167,67 @@ package root. They are trusted embedding compositions, not new managed operation
 These compositions do not install generic-host `auth.login`, relax notification
 binding/secret restrictions on `config.patch`, or certify full TUI parity.
 
+### Settings catalog and layer provenance
+
+`getSettingsCatalog(settings)` is a detached, read-only schema snapshot, not a
+managed operation or a write permission. It enumerates schema paths, types, UI
+metadata, schema choices, defaults, effective scalar values and
+`Settings.getResolutionSnapshot()` provenance. Scalar origins follow
+`global < project < runtime`; `default` means no configured layer. `layers` lists
+permitted present layers, including shadowed ones. An object reported as
+`layered` was constructed using multiple layers; it is not per-leaf provenance.
+`allowedLayers` describes Settings merging, not filesystem authority or proof
+that every consumer uses `Settings.get` rather than a global-only read.
+
+The display boundary deliberately withholds **all free-form strings and compound
+values**, including innocent-looking endpoints, headers and command snippets;
+secret-shaped paths are withheld using the SDK's shared secret-key classifier.
+Only correctly typed booleans, finite numbers and declared enum values are
+returned. Hosts must not infer that withheld means unset. UI metadata is schema
+metadata, not the set of rows actually visible for a terminal or host. Runtime
+choices report `host-required`; unknown application timing reports
+`unclassified`, never an invented live/restart guarantee. Currently the six
+sampling settings carry audited `next-run` application metadata. The remaining
+runtime choices, free-form editing, detailed application classification and full
+F1 catalog/UI parity are **not complete**. Notification-atomic editor ownership
+is retained in metadata, but this query installs no writer.
+
+```ts
+import { getSettingsCatalog } from "@gajae-code/coding-agent/sdk";
+const catalog = getSettingsCatalog(session.settings);
+// catalog.durableStorage is capability, not an individual save/flush receipt.
+```
+
+### Smart-routing intents
+
+`createRoutingSettingsService({ settings, getCatalog, getProviderOrder, isScoped,
+activate? })` is the shared service used by the TUI. It provides
+`previewSmartRouting`, `applySmartRouting`, `refreshSmartRouting`,
+`clearGeneratedSetup` and `setAutoroutingEnabled`. Catalog and provider-order
+callbacks return the embedding session's real model catalog and current priority;
+`isScoped` must report that session's `--models` restriction, not a caller-selected
+permission flag. No managed routing operation is installed by constructing it.
+
+A preview is instance-bound host authority. Retain the exact returned object in
+the trusted host and send only display data to a renderer; copied, foreign,
+modified, consumed or stale-source previews cannot authorize a write. A failed
+attempt requires fresh preview and explicit review, except a hand-edit guard
+permits confirming the same pending preview. Catalog changes are refused rather
+than silently substituting unseen routes. The TUI likewise refreshes display
+preview after failure but never automatically commits it. Keep scoped-session
+mutations read-only and obtain explicit confirmation before replacing hand edits.
+
+Refresh reads the **global** recorded setup, not an effective project/runtime
+setup that would otherwise be promoted into global config. Atomic mutations
+check current durable state; post-publication `activate` is a host notification,
+not model execution or lifecycle admission. Results report `persisted` versus
+`memory` and `notified` versus `not_requested`. An activation failure throws
+`RoutingSettingsActivationError` with the CAS rollback outcome; `conflict` means
+a newer writer prevented restoration, not that the save never happened. Do not
+serialize error causes or rollback diagnostics into generic queries. This service
+does not implement temporary/default profile selection or role/all-target model
+assignment; use their existing session/model APIs with their separate scopes.
+
 ### Required vs optional inputs
 
 Typically you must provide only what you want to control:

@@ -300,6 +300,17 @@ function summarizeSettingsOptions(options: SettingsOptions | null): {
 	};
 }
 
+/** Configuration layers, not a claim about a consumer's live application. */
+export type SettingsLayer = "global" | "project" | "runtime";
+export interface SettingsPathResolution {
+	/** Highest configured scalar layer; objects can be constructed from several layers. */
+	origin: SettingsLayer | "default" | "layered";
+	/** Present, permitted layers in precedence order, including shadowed values. */
+	layers: SettingsLayer[];
+	/** Layers accepted by Settings merging; not filesystem write or execution authority. */
+	allowedLayers: SettingsLayer[];
+}
+
 /** Additional layer setup for {@link Settings.isolated}. */
 export interface IsolatedSettingsOptions {
 	/** Initial runtime overrides. Notification paths are rejected. */
@@ -807,6 +818,48 @@ export class Settings implements NotificationSettingsReader {
 			return (pathScopedValue ?? value) as SettingValue<P>;
 		}
 		return getDefault(path);
+	}
+
+	/**
+	 * Describe Settings.get resolution without exposing configuration values.
+	 * Object origins describe layered construction, not per-leaf provenance.
+	 * This is a read-only snapshot; it is neither a durability receipt nor proof
+	 * that an engine consumer has applied the resulting value.
+	 */
+	getResolutionSnapshot(): Record<SettingPath, SettingsPathResolution> {
+		const project = this.#mergeSettingsLayers({}, this.#project, {});
+		const runtime = this.#mergeSettingsLayers({}, {}, this.#overrides);
+		const result = {} as Record<SettingPath, SettingsPathResolution>;
+		for (const settingPath of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
+			const segments = settingPath.split(".");
+			const layers: SettingsLayer[] = [];
+			for (const [layer, raw] of [
+				["global", this.#global],
+				["project", project],
+				["runtime", runtime],
+			] as const) {
+				if (getByPath(raw, segments) !== undefined) layers.push(layer);
+			}
+			const allowedLayers: SettingsLayer[] = ["global"];
+			const globalOnly = GLOBAL_ONLY_SETTINGS.has(settingPath) || isNotificationSettingsPath(settingPath);
+			if (!globalOnly) {
+				if (
+					!PROJECT_LAYER_DENIED_SETTINGS.has(settingPath) &&
+					!(settingPath.startsWith("auth.") && GLOBAL_ONLY_AUTH_SETTING_KEYS.has(settingPath.slice(5)))
+				) {
+					allowedLayers.push("project");
+				}
+				allowedLayers.push("runtime");
+			}
+			const effective = getByPath(this.#merged, segments);
+			const isObject = effective !== null && typeof effective === "object" && !Array.isArray(effective);
+			result[settingPath] = {
+				origin: layers.length > 1 && isObject ? "layered" : (layers.at(-1) ?? "default"),
+				layers,
+				allowedLayers,
+			};
+		}
+		return result;
 	}
 
 	/**

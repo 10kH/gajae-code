@@ -68,11 +68,12 @@ import { getProviderAuthHealth } from "../../config/provider-auth-health";
 import { compareRankedProviders, type ProviderAuthState } from "../../config/provider-ranking";
 import type { Settings } from "../../config/settings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
+import type { RoutingSettingsPreview } from "../../sdk/routing-settings";
 import { formatModelOnboardingInlineHint } from "../../setup/model-onboarding-guidance";
 import { formatClampedModelSelector, getThinkingLevelMetadata, parseThinkingLevel } from "../../thinking";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
-import type { SmartRoutingIntent, SmartRoutingPreview } from "./smart-routing-panel";
+import type { SmartRoutingIntent } from "./smart-routing-panel";
 import { SmartRoutingPanelComponent } from "./smart-routing-panel";
 
 function makeInvertedBadge(label: string, color: ThemeColor): string {
@@ -590,7 +591,7 @@ export class ModelSelectorComponent extends Container {
 	#authSessionId?: string;
 	#imageRoleFilter: boolean = false;
 	#smartRoutingPanel?: SmartRoutingPanelComponent;
-	#smartRoutingPreviewBuilder?: (draft: AutoroutingSetup) => SmartRoutingPreview;
+	#smartRoutingPreviewBuilder?: (draft: AutoroutingSetup) => RoutingSettingsPreview;
 	#isBillingDismissed?: (key: string) => boolean;
 	#markBillingDismissed?: (key: string) => void;
 	#pendingBillingNoticeKey?: string;
@@ -619,7 +620,7 @@ export class ModelSelectorComponent extends Container {
 			currentThinkingLevel?: ThinkingLevel;
 			activeModelProfile?: string;
 			configuredDefaultChain?: readonly string[];
-			smartRoutingPreview?: (draft: AutoroutingSetup) => SmartRoutingPreview;
+			smartRoutingPreview?: (draft: AutoroutingSetup) => RoutingSettingsPreview;
 			/** Open the smart-routing panel directly instead of the preset landing. */
 			smartRoutingOnly?: boolean;
 			/** Test seam: synchronous persisted-dismissal check to avoid async render churn. */
@@ -1943,7 +1944,7 @@ export class ModelSelectorComponent extends Container {
 		return autoroutingProviderOrderHint(declared, this.#modelRegistry.autoroutingProviderOrder());
 	}
 
-	#smartRoutingPreview(setup: AutoroutingSetup): SmartRoutingPreview {
+	#smartRoutingPreview(setup: AutoroutingSetup): RoutingSettingsPreview {
 		if (!this.#smartRoutingPreviewBuilder) {
 			throw new Error("Smart-routing preview is unavailable in this selector context.");
 		}

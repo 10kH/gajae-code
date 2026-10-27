@@ -7,24 +7,17 @@ import type {
 	AutoroutingTier,
 	TierMap,
 } from "../../config/autorouting-contract";
-import type { AutoroutingSourceIdentity } from "../../config/autorouting-generator";
+import type { RoutingSettingsPreview } from "../../sdk/routing-settings";
 import { theme } from "../theme/theme";
 
 /** Longest rendered panel line before truncation. */
 export const MAX_PANEL_LINE_WIDTH = 200;
 
-export type SmartRoutingPreview = {
-	readonly setup: AutoroutingSetup;
-	readonly tiers: TierMap;
-	readonly provenance: AutoroutingProvenance;
-	readonly sourceIdentity: AutoroutingSourceIdentity;
-};
-
 export type SmartRoutingIntent =
 	| {
 			kind: "apply";
 			draft: AutoroutingSetup;
-			preview: SmartRoutingPreview;
+			preview: RoutingSettingsPreview;
 			confirmHandEdit?: boolean;
 	  }
 	| {
@@ -51,9 +44,9 @@ export interface SmartRoutingPanelOptions {
 	enabled: boolean;
 	readOnly: boolean;
 	stale: boolean;
-	preview: SmartRoutingPreview;
-	generatePreview: (draft: AutoroutingSetup) => SmartRoutingPreview;
-	onSelect: (intent: SmartRoutingIntent) => undefined | Promise<SmartRoutingPreview | undefined>;
+	preview: RoutingSettingsPreview;
+	generatePreview: (draft: AutoroutingSetup) => RoutingSettingsPreview;
+	onSelect: (intent: SmartRoutingIntent) => undefined | Promise<RoutingSettingsPreview | undefined>;
 	onCancel: () => void;
 }
 
@@ -61,7 +54,7 @@ function cloneSetup(setup: AutoroutingSetup): AutoroutingSetup {
 	return structuredClone(setup);
 }
 
-function clonePreview(preview: SmartRoutingPreview): SmartRoutingPreview {
+function clonePreview(preview: RoutingSettingsPreview): RoutingSettingsPreview {
 	return structuredClone(preview);
 }
 
@@ -98,7 +91,7 @@ function formatTier(tier: AutoroutingTier, tiers: TierMap | undefined): string {
 export class SmartRoutingPanelComponent extends Container {
 	readonly #onSelect: SmartRoutingPanelOptions["onSelect"];
 	readonly #onCancel: () => void;
-	readonly #generatePreview: (draft: AutoroutingSetup) => SmartRoutingPreview;
+	readonly #generatePreview: (draft: AutoroutingSetup) => RoutingSettingsPreview;
 	readonly #readOnly: boolean;
 	#draft: AutoroutingSetup;
 
@@ -106,7 +99,8 @@ export class SmartRoutingPanelComponent extends Container {
 	#provenance?: AutoroutingProvenance;
 	#enabled: boolean;
 	#stale: boolean;
-	#preview: SmartRoutingPreview;
+	/** Service-owned preview identity; never clone it when forwarding a mutation intent. */
+	#preview: RoutingSettingsPreview;
 	#mode: SmartRoutingPanelMode = "editing";
 	#confirmation: SmartRoutingConfirmation;
 	/** Intent that triggered the current hand-edit confirmation, replayed verbatim on confirm. */
@@ -131,7 +125,7 @@ export class SmartRoutingPanelComponent extends Container {
 		this.#enabled = options.enabled;
 		this.#providerOrderHint = options.providerOrderHint ? structuredClone(options.providerOrderHint) : undefined;
 		this.#stale = options.stale;
-		this.#preview = clonePreview(options.preview);
+		this.#preview = options.preview;
 		this.#render();
 	}
 
@@ -147,7 +141,8 @@ export class SmartRoutingPanelComponent extends Container {
 		return cloneSetup(this.#draft);
 	}
 
-	getPreviewPayload(): SmartRoutingPreview {
+	/** Detached display data only; apply intents retain the service-issued identity internally. */
+	getPreviewPayload(): RoutingSettingsPreview {
 		return clonePreview(this.#preview);
 	}
 
@@ -177,7 +172,7 @@ export class SmartRoutingPanelComponent extends Container {
 		enabled: boolean;
 		providerOrderHint?: AutoroutingProviderOrderHint;
 		stale: boolean;
-		preview: SmartRoutingPreview;
+		preview: RoutingSettingsPreview;
 	}): void {
 		this.#draft = cloneSetup(options.setup);
 		this.#tiers = options.tiers ? structuredClone(options.tiers) : undefined;
@@ -185,7 +180,7 @@ export class SmartRoutingPanelComponent extends Container {
 		this.#enabled = options.enabled;
 		this.#stale = options.stale;
 		this.#providerOrderHint = options.providerOrderHint ? structuredClone(options.providerOrderHint) : undefined;
-		this.#preview = clonePreview(options.preview);
+		this.#preview = options.preview;
 		this.#providerCursor = Math.min(this.#providerCursor, Math.max(0, this.#draft.providers.length - 1));
 		this.#mode = "editing";
 		this.#confirmation = undefined;
@@ -310,7 +305,7 @@ export class SmartRoutingPanelComponent extends Container {
 
 	#recomputePreview(): void {
 		try {
-			this.#preview = clonePreview(this.#generatePreview(this.#draft));
+			this.#preview = this.#generatePreview(this.#draft);
 			this.#error = "";
 		} catch (error) {
 			this.#error = error instanceof Error ? error.message : String(error);
@@ -329,7 +324,7 @@ export class SmartRoutingPanelComponent extends Container {
 			if (intent.kind === "apply") {
 				const appliedPreview = result ?? this.#generatePreview(intent.draft);
 				this.#draft = cloneSetup(appliedPreview.setup);
-				this.#preview = clonePreview(appliedPreview);
+				this.#preview = appliedPreview;
 			} else if (intent.kind === "toggle") {
 				this.#enabled = intent.enabled;
 			}
@@ -350,6 +345,14 @@ export class SmartRoutingPanelComponent extends Container {
 				this.#mode = "error";
 				this.#error = error instanceof Error ? error.message : String(error);
 				this.#status = "";
+				if (intent.kind === "apply") {
+					try {
+						this.#preview = this.#generatePreview(this.#draft);
+						this.#error += " A fresh preview is shown; review it before applying again.";
+					} catch {
+						this.#error += " Preview generation failed; edit the setup to prepare again.";
+					}
+				}
 			}
 		}
 		this.#render();
@@ -471,7 +474,7 @@ export class SmartRoutingPanelComponent extends Container {
 			return;
 		}
 		if (data === "a" || data === "A") {
-			void this.#emit({ kind: "apply", draft: cloneSetup(this.#draft), preview: clonePreview(this.#preview) });
+			void this.#emit({ kind: "apply", draft: cloneSetup(this.#draft), preview: this.#preview });
 			return;
 		}
 		if (data === "r" || data === "R") {
@@ -488,7 +491,7 @@ export class SmartRoutingPanelComponent extends Container {
 	}
 
 	__testApply(): Promise<void> {
-		return this.#emit({ kind: "apply", draft: cloneSetup(this.#draft), preview: clonePreview(this.#preview) });
+		return this.#emit({ kind: "apply", draft: cloneSetup(this.#draft), preview: this.#preview });
 	}
 
 	/** Test hook mirroring an in-panel provider reorder/edit: mutates the draft and re-previews. */

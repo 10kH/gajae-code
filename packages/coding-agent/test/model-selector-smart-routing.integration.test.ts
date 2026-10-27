@@ -4,16 +4,14 @@ import type { AutoroutingSetup, TierMap } from "@gajae-code/coding-agent/config/
 import { canonicalJsonBytes } from "@gajae-code/coding-agent/config/autorouting-generator";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
-import type {
-	SmartRoutingPanelComponent,
-	SmartRoutingPreview,
-} from "@gajae-code/coding-agent/modes/components/smart-routing-panel";
+import type { SmartRoutingPanelComponent } from "@gajae-code/coding-agent/modes/components/smart-routing-panel";
 import {
 	MAX_PANEL_LINE_WIDTH,
 	SmartRoutingPanelComponent as SmartRoutingPanelClass,
 } from "@gajae-code/coding-agent/modes/components/smart-routing-panel";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import type { RoutingSettingsPreview } from "../src/sdk/routing-settings";
 
 const model = (provider: string, id: string): Model =>
 	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
@@ -229,7 +227,7 @@ describe("/model smart-routing panel integration", () => {
 	test("refresh guards hand-edited tiers and proceeds after explicit confirmation (AC7)", async () => {
 		const { panel, settings } = await openPanel();
 		await panel.__testApply();
-		settings.override("task.autorouting.tiers", { fast: ["anthropic/hand-edited"] });
+		settings.set("task.autorouting.tiers", { fast: ["anthropic/hand-edited"] });
 
 		await panel.__testRefresh();
 		expect(panel.mode).toBe("confirming");
@@ -249,7 +247,7 @@ describe("/model smart-routing panel integration", () => {
 		const editedProviders = [...(recordedSetup?.providers ?? [])].reverse();
 		panel.__testSetProviders(editedProviders);
 		const editedPreview = panel.getPreviewPayload();
-		settings.override("task.autorouting.tiers", { fast: ["anthropic/hand-edited"] });
+		settings.set("task.autorouting.tiers", { fast: ["anthropic/hand-edited"] });
 
 		await panel.__testApply();
 		expect(panel.mode).toBe("confirming");
@@ -259,8 +257,7 @@ describe("/model smart-routing panel integration", () => {
 		expect(panel.mode).toBe("done");
 		// Regression: confirming previously emitted `refresh`, which discarded the edited draft and
 		// re-committed the PREVIOUSLY recorded setup. The edited draft must win.
-		// (`tiers` itself is asserted via the preview payload rather than settings, because the test
-		// harness injects the hand edit through a higher-precedence override layer.)
+		// The generated tiers and declaration are committed together after confirmation.
 		expect((settings.get("task.autorouting.setup") as { providers: string[] }).providers).toEqual(editedProviders);
 		expect(panel.getPreviewPayload().tiers).toEqual(editedPreview.tiers);
 	});
@@ -457,7 +454,7 @@ describe("smart-routing panel hostile render boundary", () => {
 				tiersFingerprint: "t",
 			},
 			sourceIdentity: { catalogFingerprint: "c", mapFingerprint: "m", generatorVersion: 1 },
-		} as unknown as SmartRoutingPreview;
+		} as unknown as RoutingSettingsPreview;
 		return new SmartRoutingPanelClass({
 			setup,
 			tiers,
@@ -521,7 +518,7 @@ describe("smart-routing panel hostile render boundary", () => {
 				tiersFingerprint: "t",
 			},
 			sourceIdentity: { catalogFingerprint: "c", mapFingerprint: "m", generatorVersion: 1 },
-		} as unknown as SmartRoutingPreview;
+		} as unknown as RoutingSettingsPreview;
 		const panel = new SmartRoutingPanelClass({
 			setup: baseSetup,
 			enabled: false,
