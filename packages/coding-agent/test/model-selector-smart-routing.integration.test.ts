@@ -11,7 +11,7 @@ import {
 } from "@gajae-code/coding-agent/modes/components/smart-routing-panel";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
-import type { RoutingSettingsPreview } from "../src/sdk/routing-settings";
+import { RoutingSettingsConfirmationRequiredError, type RoutingSettingsPreview } from "../src/sdk/routing-settings";
 
 const model = (provider: string, id: string): Model =>
 	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
@@ -287,6 +287,86 @@ describe("/model smart-routing panel integration", () => {
 
 		expect(observedPatches).toHaveLength(1);
 		expect(observedPatches[0]).toMatchObject({ path: "task.autorouting.enabled", op: "set", value: true });
+	});
+
+	test("refresh shows the committed global setup alongside its preview when runtime settings differ", async () => {
+		const globalSetup: AutoroutingSetup = { schema: 1, providers: ["anthropic"] };
+		const runtimeSetup: AutoroutingSetup = { schema: 1, providers: ["openai-codex"] };
+		const runtimeTiers = {
+			fast: ["openai-codex/custom-fast"],
+			balanced: ["openai-codex/custom-balanced"],
+			strong: ["openai-codex/custom-strong"],
+		};
+		const settings = Settings.isolated({ "task.autorouting.setup": globalSetup });
+		settings.override("task.autorouting.setup", runtimeSetup);
+		settings.override("task.autorouting.tiers", runtimeTiers);
+		const { panel } = await openPanel({ settings });
+		expect(panel.getDraft()).toEqual(runtimeSetup);
+		await panel.__testRefresh();
+		expect(panel.mode).toBe("done");
+		expect(settings.getGlobal("task.autorouting.setup")).toEqual(globalSetup);
+		expect(panel.getDraft()).toEqual(globalSetup);
+		expect(panel.getPreviewPayload().setup).toEqual(globalSetup);
+		expect(settings.getGlobal("task.autorouting.tiers")).toEqual(panel.getPreviewPayload().tiers);
+		expect(settings.getGlobal("task.autorouting.provenance")).toEqual(panel.getPreviewPayload().provenance);
+		expect(settings.get("task.autorouting.setup")).toEqual(runtimeSetup);
+		expect(settings.get("task.autorouting.tiers")).toEqual(runtimeTiers);
+		expect(renderText(panel)).toContain("Saved preview is global; effective settings currently differ.");
+	});
+
+	test("controller and selector forward the exact refresh guard after keyboard cancellation and retry", async () => {
+		const { controller, panel: initialPanel, selector, settings } = await openPanel();
+		await initialPanel.__testApply();
+		initialPanel.handleInput("\x1b");
+		const globalSetup = settings.getGlobal("task.autorouting.setup");
+		if (!globalSetup) throw new Error("Expected a recorded global setup");
+		const runtimeSetup: AutoroutingSetup = { schema: 1, providers: ["openai-codex"] };
+		settings.override("task.autorouting.setup", runtimeSetup);
+		settings.set("task.autorouting.tiers", { fast: ["anthropic/hand-edited"] });
+		selector.handleInput("\n");
+		await settle();
+		const panel = selector.__testGetSmartRoutingPanel();
+		if (!panel) throw new Error("Expected reopened routing panel");
+		const refresh = controller.refreshSmartRouting.bind(controller);
+		const calls: Promise<RoutingSettingsPreview>[] = [];
+		const spy = vi.spyOn(controller, "refreshSmartRouting").mockImplementation(options => {
+			const call = refresh(options);
+			calls.push(call);
+			return call;
+		});
+		panel.handleInput("r");
+		const guards: RoutingSettingsConfirmationRequiredError[] = [];
+		await calls[0]?.catch(error => {
+			if (error instanceof RoutingSettingsConfirmationRequiredError) guards.push(error);
+		});
+		await settle();
+		const first = guards[0];
+		if (!first) throw new Error("Expected first refresh guard");
+		expect(panel.getDraft()).toEqual(runtimeSetup);
+		expect(panel.getPreviewPayload().setup).toEqual(globalSetup);
+		expect(renderText(panel)).toContain(
+			`Pending refresh uses recorded global providers: ${globalSetup.providers.join(", ")}`,
+		);
+		panel.handleInput("\x1b");
+		panel.handleInput("r");
+		await calls[1]?.catch(error => {
+			if (error instanceof RoutingSettingsConfirmationRequiredError) guards.push(error);
+		});
+		await settle();
+		const second = guards[1];
+		if (!second) throw new Error("Expected second refresh guard");
+		expect(first.preview).not.toBe(second.preview);
+		await expect(refresh({ preview: first.preview, confirmHandEdit: true })).rejects.toThrow("not valid");
+		panel.handleInput("\r");
+		await calls[2];
+		await settle();
+		expect(spy.mock.calls[2]?.[0]?.preview).toBe(second.preview);
+		expect(spy.mock.calls[2]?.[0]?.confirmHandEdit).toBe(true);
+		expect(panel.mode).toBe("done");
+		expect(panel.getDraft()).toEqual(globalSetup);
+		expect(panel.getPreviewPayload().setup).toEqual(globalSetup);
+		expect(settings.get("task.autorouting.setup")).toEqual(runtimeSetup);
+		expect(renderText(panel)).toContain("Saved preview is global; effective settings currently differ.");
 	});
 
 	test("refresh guards hand-edited tiers and proceeds after explicit confirmation (AC7)", async () => {

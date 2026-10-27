@@ -1587,7 +1587,10 @@ export class SelectorController {
 			.preview;
 	}
 
-	async refreshSmartRouting(options?: { confirmHandEdit?: boolean }): Promise<RoutingSettingsPreview> {
+	async refreshSmartRouting(options?: {
+		preview?: RoutingSettingsPreview;
+		confirmHandEdit?: boolean;
+	}): Promise<RoutingSettingsPreview> {
 		return (await this.#runSmartRoutingIntent("Refresh", () => this.#smartRouting.refreshSmartRouting(options)))
 			.preview;
 	}
@@ -1630,6 +1633,7 @@ export class SelectorController {
 							}
 							case "refresh": {
 								const preview = await this.refreshSmartRouting({
+									preview: selection.intent.preview,
 									confirmHandEdit: selection.intent.confirmHandEdit,
 								});
 								modelSelector.refreshSmartRoutingState(preview);
@@ -1901,6 +1905,7 @@ export class SelectorController {
 						this.ctx.session.isFastForSubagentProvider(provider, supportsServiceTier),
 					isCurrentModelFastModeActive: () => this.ctx.session.isFastModeActive(),
 					smartRoutingPreview: draft => this.previewSmartRouting(draft),
+					smartRoutingDiscardPreview: preview => this.#smartRouting.discardPreview(preview),
 					smartRoutingOnly: options?.smartRoutingOnly,
 				},
 			);

@@ -7,7 +7,7 @@ import type {
 	AutoroutingTier,
 	TierMap,
 } from "../../config/autorouting-contract";
-import type { RoutingSettingsPreview } from "../../sdk/routing-settings";
+import { RoutingSettingsConfirmationRequiredError, type RoutingSettingsPreview } from "../../sdk/routing-settings";
 import { theme } from "../theme/theme";
 
 /** Longest rendered panel line before truncation. */
@@ -22,6 +22,7 @@ export type SmartRoutingIntent =
 	  }
 	| {
 			kind: "refresh";
+			preview?: RoutingSettingsPreview;
 			confirmHandEdit?: boolean;
 	  }
 	| {
@@ -46,6 +47,8 @@ export interface SmartRoutingPanelOptions {
 	stale: boolean;
 	preview: RoutingSettingsPreview;
 	generatePreview: (draft: AutoroutingSetup) => RoutingSettingsPreview;
+	discardPreview?: (preview: RoutingSettingsPreview) => void;
+	effectiveDiffersFromSaved?: boolean;
 	onSelect: (intent: SmartRoutingIntent) => undefined | Promise<RoutingSettingsPreview | undefined>;
 	onCancel: () => void;
 }
@@ -91,6 +94,7 @@ function formatTier(tier: AutoroutingTier, tiers: TierMap | undefined): string {
 export class SmartRoutingPanelComponent extends Container {
 	readonly #onSelect: SmartRoutingPanelOptions["onSelect"];
 	readonly #onCancel: () => void;
+	readonly #discardPreview?: (preview: RoutingSettingsPreview) => void;
 	readonly #generatePreview: (draft: AutoroutingSetup) => RoutingSettingsPreview;
 	readonly #readOnly: boolean;
 	#draft: AutoroutingSetup;
@@ -101,6 +105,8 @@ export class SmartRoutingPanelComponent extends Container {
 	#stale: boolean;
 	/** Service-owned preview identity; never clone it when forwarding a mutation intent. */
 	#preview: RoutingSettingsPreview;
+	#previewValid = true;
+	#effectiveDiffersFromSaved = false;
 	#mode: SmartRoutingPanelMode = "editing";
 	#confirmation: SmartRoutingConfirmation;
 	/** Intent that triggered the current hand-edit confirmation, replayed verbatim on confirm. */
@@ -116,6 +122,8 @@ export class SmartRoutingPanelComponent extends Container {
 		super();
 		this.#onSelect = options.onSelect;
 		this.#onCancel = options.onCancel;
+		this.#discardPreview = options.discardPreview;
+		this.#effectiveDiffersFromSaved = options.effectiveDiffersFromSaved === true;
 		this.#generatePreview = options.generatePreview;
 		this.#readOnly = options.readOnly;
 		this.#draft = cloneSetup(options.setup);
@@ -143,7 +151,18 @@ export class SmartRoutingPanelComponent extends Container {
 
 	/** Detached display data only; apply intents retain the service-issued identity internally. */
 	getPreviewPayload(): RoutingSettingsPreview {
-		return clonePreview(this.#preview);
+		return clonePreview(this.#visiblePreview());
+	}
+
+	#visiblePreview(): RoutingSettingsPreview {
+		if (
+			this.#confirmation === "hand-edit" &&
+			this.#pendingIntent?.kind === "refresh" &&
+			this.#pendingIntent.preview
+		) {
+			return this.#pendingIntent.preview;
+		}
+		return this.#preview;
 	}
 
 	getProviderOrder(): readonly string[] {
@@ -173,7 +192,9 @@ export class SmartRoutingPanelComponent extends Container {
 		providerOrderHint?: AutoroutingProviderOrderHint;
 		stale: boolean;
 		preview: RoutingSettingsPreview;
+		effectiveDiffersFromSaved?: boolean;
 	}): void {
+		if (this.#preview !== options.preview) this.#discardPreview?.(this.#preview);
 		this.#draft = cloneSetup(options.setup);
 		this.#tiers = options.tiers ? structuredClone(options.tiers) : undefined;
 		this.#provenance = options.provenance ? structuredClone(options.provenance) : undefined;
@@ -181,6 +202,8 @@ export class SmartRoutingPanelComponent extends Container {
 		this.#stale = options.stale;
 		this.#providerOrderHint = options.providerOrderHint ? structuredClone(options.providerOrderHint) : undefined;
 		this.#preview = options.preview;
+		this.#previewValid = true;
+		this.#effectiveDiffersFromSaved = options.effectiveDiffersFromSaved === true;
 		this.#providerCursor = Math.min(this.#providerCursor, Math.max(0, this.#draft.providers.length - 1));
 		this.#mode = "editing";
 		this.#confirmation = undefined;
@@ -202,6 +225,11 @@ export class SmartRoutingPanelComponent extends Container {
 					0,
 					0,
 				),
+			);
+		}
+		if (this.#effectiveDiffersFromSaved) {
+			this.addChild(
+				new Text(theme.fg("muted", "Saved preview is global; effective settings currently differ."), 0, 0),
 			);
 		}
 		if (this.#stale) {
@@ -272,9 +300,30 @@ export class SmartRoutingPanelComponent extends Container {
 			);
 		}
 		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.fg("muted", "Preview:"), 0, 0));
+		const visiblePreview = this.#visiblePreview();
+		if (this.#confirmation === "hand-edit" && this.#pendingIntent?.kind === "refresh") {
+			this.addChild(
+				new Text(
+					theme.fg(
+						"warning",
+						displaySafe(
+							`Pending refresh uses recorded global providers: ${visiblePreview.setup.providers.join(", ")}`,
+						),
+					),
+					0,
+					0,
+				),
+			);
+		}
+		this.addChild(
+			new Text(
+				theme.fg("muted", this.#previewValid ? "Preview:" : "Preview invalid; regenerate before applying:"),
+				0,
+				0,
+			),
+		);
 		for (const tier of ["fast", "balanced", "strong"] as const) {
-			this.addChild(new Text(`  ${formatTier(tier, this.#preview.tiers)}`, 0, 0));
+			this.addChild(new Text(`  ${formatTier(tier, visiblePreview.tiers)}`, 0, 0));
 		}
 		if (this.#status) this.addChild(new Text(theme.fg("success", displaySafe(this.#status)), 0, 0));
 		if (this.#error) this.addChild(new Text(theme.fg("error", displaySafe(this.#error)), 0, 0));
@@ -304,8 +353,11 @@ export class SmartRoutingPanelComponent extends Container {
 	}
 
 	#recomputePreview(): void {
+		this.#discardPreview?.(this.#preview);
+		this.#previewValid = false;
 		try {
 			this.#preview = this.#generatePreview(this.#draft);
+			this.#previewValid = true;
 			this.#error = "";
 		} catch (error) {
 			this.#error = error instanceof Error ? error.message : String(error);
@@ -314,6 +366,11 @@ export class SmartRoutingPanelComponent extends Container {
 
 	async #emit(intent: SmartRoutingIntent): Promise<void> {
 		if (this.#readOnly || this.#mode === "committing") return;
+		if (intent.kind === "apply" && !this.#previewValid) {
+			this.#error = "Preview unavailable; edit the setup to generate and review a fresh preview.";
+			this.#render();
+			return;
+		}
 		this.#mode = "committing";
 		this.#status = "Committing smart-routing settings…";
 		this.#error = "";
@@ -321,24 +378,30 @@ export class SmartRoutingPanelComponent extends Container {
 		this.#render();
 		try {
 			const result = await this.#onSelect(intent);
-			if (intent.kind === "apply") {
-				const appliedPreview = result ?? this.#generatePreview(intent.draft);
-				this.#draft = cloneSetup(appliedPreview.setup);
-				this.#preview = appliedPreview;
+			if ((intent.kind === "apply" || intent.kind === "refresh") && result) {
+				if (this.#preview !== result) this.#discardPreview?.(this.#preview);
+				this.#draft = cloneSetup(result.setup);
+				this.#preview = result;
+				this.#previewValid = true;
 			} else if (intent.kind === "toggle") {
 				this.#enabled = intent.enabled;
 			}
 			this.#mode = "done";
 			this.#status = intent.kind === "clear" ? "Generated setup cleared." : "Smart-routing settings saved.";
 		} catch (error) {
-			const typed = error as { code?: unknown } | undefined;
-			if (typed?.code === "autorouting-hand-edited") {
+			if (
+				error instanceof RoutingSettingsConfirmationRequiredError &&
+				(intent.kind === "apply" || intent.kind === "refresh")
+			) {
 				this.#mode = "confirming";
 				this.#confirmation = "hand-edit";
 				// Retain the intent that triggered the guard so confirming replays THAT intent. An Apply
 				// carrying an edited draft must not be silently downgraded to a Refresh, which would
 				// discard the frozen preview and commit the previously recorded setup instead (AC6).
-				this.#pendingIntent = intent;
+				this.#pendingIntent =
+					intent.kind === "apply"
+						? { ...intent, preview: error.preview }
+						: { kind: "refresh", preview: error.preview };
 				this.#status = "";
 				this.#error = "";
 			} else {
@@ -346,9 +409,13 @@ export class SmartRoutingPanelComponent extends Container {
 				this.#error = error instanceof Error ? error.message : String(error);
 				this.#status = "";
 				if (intent.kind === "apply" || intent.kind === "refresh") {
+					if (intent.preview) this.#discardPreview?.(intent.preview);
+					this.#discardPreview?.(this.#preview);
+					this.#previewValid = false;
+					this.#mode = "editing";
 					try {
 						this.#preview = this.#generatePreview(this.#draft);
-						this.#mode = "editing";
+						this.#previewValid = true;
 						this.#error += " A fresh preview is shown; review it before applying again.";
 					} catch {
 						this.#error += " Preview generation failed; edit the setup to prepare again.";
@@ -384,11 +451,23 @@ export class SmartRoutingPanelComponent extends Container {
 	handleInput(data: string): void {
 		if (this.#mode === "committing") return;
 		if (this.#mode === "done" || this.#mode === "error") {
-			if (getKeybindings().matches(data, "tui.select.cancel")) this.#onCancel();
+			if (getKeybindings().matches(data, "tui.select.cancel")) {
+				this.#discardPreview?.(this.#preview);
+				this.#onCancel();
+			}
 			return;
 		}
 		if (this.#confirmation) {
 			if (getKeybindings().matches(data, "tui.select.cancel")) {
+				if (
+					this.#confirmation === "hand-edit" &&
+					this.#pendingIntent &&
+					"preview" in this.#pendingIntent &&
+					this.#pendingIntent.preview
+				) {
+					this.#discardPreview?.(this.#pendingIntent.preview);
+					if (this.#pendingIntent.preview === this.#preview) this.#recomputePreview();
+				}
 				this.#confirmation = undefined;
 				this.#pendingIntent = undefined;
 				this.#mode = "editing";
@@ -423,6 +502,7 @@ export class SmartRoutingPanelComponent extends Container {
 			return;
 		}
 		if (getKeybindings().matches(data, "tui.select.cancel")) {
+			this.#discardPreview?.(this.#preview);
 			this.#onCancel();
 			return;
 		}
@@ -498,12 +578,12 @@ export class SmartRoutingPanelComponent extends Container {
 	/** Test hook mirroring an in-panel provider reorder/edit: mutates the draft and re-previews. */
 	__testSetProviders(providers: string[]): void {
 		this.#draft = { ...this.#draft, providers: [...providers] };
-		this.#preview = this.#generatePreview(this.#draft);
+		this.#recomputePreview();
 		this.#providerCursor = 0;
 	}
 
-	__testRefresh(confirmHandEdit = false): Promise<void> {
-		return this.#emit({ kind: "refresh", ...(confirmHandEdit ? { confirmHandEdit: true } : {}) });
+	__testRefresh(): Promise<void> {
+		return this.#emit({ kind: "refresh" });
 	}
 
 	__testToggle(enabled = !this.#enabled): Promise<void> {
@@ -530,6 +610,8 @@ export class SmartRoutingPanelComponent extends Container {
 		this.#pendingIntent = undefined;
 		if (pending?.kind === "apply")
 			return this.#emit({ kind: "apply", draft: pending.draft, preview: pending.preview, confirmHandEdit: true });
-		return this.#emit({ kind: "refresh", confirmHandEdit: true });
+		if (pending?.kind === "refresh" && pending.preview)
+			return this.#emit({ kind: "refresh", preview: pending.preview, confirmHandEdit: true });
+		return Promise.resolve();
 	}
 }

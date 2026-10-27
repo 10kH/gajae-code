@@ -68,6 +68,8 @@ describe("SDK package exports", () => {
 		expect(publicSdk.JobObservation).toBeFunction();
 		expect(root.getSettingsCatalog).toBe(publicSdk.getSettingsCatalog);
 		expect(root.createRoutingSettingsService).toBe(publicSdk.createRoutingSettingsService);
+		expect(publicSdk.RoutingSettingsConfirmationRequiredError).toBeFunction();
+		expect(root.RoutingSettingsConfirmationRequiredError).toBe(publicSdk.RoutingSettingsConfirmationRequiredError);
 		expect(root.ExtensionInteractionService).toBe(publicSdk.ExtensionInteractionService);
 		expect(root.JobObservation).toBe(publicSdk.JobObservation);
 		expect(publicSdk.lifecycle.SessionLifecycleService).toBeFunction();

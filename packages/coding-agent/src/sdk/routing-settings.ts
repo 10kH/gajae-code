@@ -39,6 +39,15 @@ export interface RoutingSettingsPreviewOutcome extends RoutingSettingsOutcome {
 	readonly preview: RoutingSettingsPreview;
 }
 
+export class RoutingSettingsConfirmationRequiredError extends Error {
+	readonly code = "autorouting-hand-edited" as const;
+
+	constructor(readonly preview: RoutingSettingsPreview) {
+		super("Generated autorouting tiers were hand-edited; explicit confirmation is required.");
+		this.name = "RoutingSettingsConfirmationRequiredError";
+	}
+}
+
 export class RoutingSettingsActivationError extends Error {
 	readonly activation = "failed" as const;
 	constructor(
@@ -84,7 +93,6 @@ function rawAutoroutingState(current: Readonly<RawSettings>): RoutingState {
 export class RoutingSettingsService {
 	#inFlight = false;
 	readonly #previews = new WeakMap<RoutingSettingsPreview, PreviewAuthority>();
-	#pendingRefresh: RoutingSettingsPreview | undefined;
 	constructor(private readonly dependencies: RoutingSettingsDependencies) {}
 
 	previewSmartRouting(draft: AutoroutingSetup): RoutingSettingsPreview {
@@ -142,7 +150,11 @@ export class RoutingSettingsService {
 		}
 	}
 
-	#assertNotHandEdited(preview: RoutingSettingsPreview, current: RoutingState): void {
+	#assertNotHandEdited(
+		preview: RoutingSettingsPreview,
+		current: RoutingState,
+		supplied: RoutingSettingsPreview,
+	): void {
 		if (!current.provenance || current.tiers === undefined) return;
 		const state = evaluateAutoroutingProvenanceState(current.provenance, {
 			catalogFingerprint: preview.sourceIdentity.catalogFingerprint,
@@ -150,12 +162,7 @@ export class RoutingSettingsService {
 			tiers: current.tiers,
 		});
 		if (state.handEdited) {
-			throw Object.assign(
-				new Error("Generated autorouting tiers were hand-edited; explicit confirmation is required."),
-				{
-					code: "autorouting-hand-edited",
-				},
-			);
+			throw new RoutingSettingsConfirmationRequiredError(supplied);
 		}
 	}
 
@@ -226,6 +233,10 @@ export class RoutingSettingsService {
 		}
 	}
 
+	discardPreview(preview: RoutingSettingsPreview): void {
+		this.#previews.delete(preview);
+	}
+
 	async applySmartRouting(
 		draft: AutoroutingSetup,
 		options?: { preview?: RoutingSettingsPreview; confirmHandEdit?: boolean },
@@ -269,11 +280,13 @@ export class RoutingSettingsService {
 					}
 				} else {
 					try {
-						this.#assertNotHandEdited(preview, effective);
-						this.#assertNotHandEdited(preview, state);
+						this.#assertNotHandEdited(preview, effective, supplied);
+						this.#assertNotHandEdited(preview, state, supplied);
 					} catch (error) {
-						authority.guard = structuredClone({ global: state, effective });
-						guardRaised = true;
+						if (error instanceof RoutingSettingsConfirmationRequiredError) {
+							authority.guard = structuredClone({ global: state, effective });
+							guardRaised = true;
+						}
 						throw error;
 					}
 				}
@@ -298,12 +311,22 @@ export class RoutingSettingsService {
 		};
 	}
 
-	async refreshSmartRouting(options?: { confirmHandEdit?: boolean }): Promise<RoutingSettingsPreviewOutcome> {
-		// A guarded refresh must reuse its original service-issued preview, not regenerate it.
-		const pending = options?.confirmHandEdit === true ? this.#pendingRefresh : undefined;
-		this.#pendingRefresh = undefined;
+	async refreshSmartRouting(options?: {
+		preview?: RoutingSettingsPreview;
+		confirmHandEdit?: boolean;
+	}): Promise<RoutingSettingsPreviewOutcome> {
 		this.#assertWritable();
-		if (pending) return this.applySmartRouting(pending.setup, { preview: pending, confirmHandEdit: true });
+		if (options?.preview || options?.confirmHandEdit === true) {
+			const preview = options.preview;
+			if (!preview || options.confirmHandEdit !== true) {
+				throw new Error("Refreshing with confirmation requires its guarded preview and explicit confirmation.");
+			}
+			const authority = this.#previews.get(preview);
+			if (!authority?.refresh || !authority.guard) {
+				throw new Error("Smart-routing refresh preview is not valid for this service; refresh again.");
+			}
+			return this.applySmartRouting(preview.setup, { preview, confirmHandEdit: true });
+		}
 		const setup = this.dependencies.settings.getGlobal("task.autorouting.setup");
 		if (setup === undefined || validateAutoroutingSetup(setup).length > 0) {
 			throw new Error("Cannot refresh smart routing without a valid recorded global setup.");
@@ -317,12 +340,7 @@ export class RoutingSettingsService {
 		const authority = this.#previews.get(preview);
 		if (!authority) throw new Error("Smart-routing preview is unavailable.");
 		authority.refresh = { setup: structuredClone(setup), providerOrder };
-		try {
-			return await this.applySmartRouting(preview.setup, { preview });
-		} catch (error) {
-			if (this.#previews.has(preview)) this.#pendingRefresh = preview;
-			throw error;
-		}
+		return this.applySmartRouting(preview.setup, { preview });
 	}
 
 	clearGeneratedSetup(): Promise<RoutingSettingsOutcome> {

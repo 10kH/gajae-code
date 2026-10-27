@@ -1,3 +1,4 @@
+import * as util from "node:util";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import {
 	getMiniMaxThinkingMode,
@@ -595,6 +596,7 @@ export class ModelSelectorComponent extends Container {
 	#imageRoleFilter: boolean = false;
 	#smartRoutingPanel?: SmartRoutingPanelComponent;
 	#smartRoutingPreviewBuilder?: (draft: AutoroutingSetup) => RoutingSettingsPreview;
+	#smartRoutingDiscardPreview?: (preview: RoutingSettingsPreview) => void;
 	#isBillingDismissed?: (key: string) => boolean;
 	#markBillingDismissed?: (key: string) => void;
 	#pendingBillingNoticeKey?: string;
@@ -624,6 +626,7 @@ export class ModelSelectorComponent extends Container {
 			activeModelProfile?: string;
 			configuredDefaultChain?: readonly string[];
 			smartRoutingPreview?: (draft: AutoroutingSetup) => RoutingSettingsPreview;
+			smartRoutingDiscardPreview?: (preview: RoutingSettingsPreview) => void;
 			/** Open the smart-routing panel directly instead of the preset landing. */
 			smartRoutingOnly?: boolean;
 			/** Test seam: synchronous persisted-dismissal check to avoid async render churn. */
@@ -644,6 +647,7 @@ export class ModelSelectorComponent extends Container {
 		this.#temporaryOnly = options?.temporaryOnly ?? false;
 		this.#authSessionId = options?.sessionId;
 		this.#smartRoutingPreviewBuilder = options?.smartRoutingPreview;
+		this.#smartRoutingDiscardPreview = options?.smartRoutingDiscardPreview;
 		this.#isBillingDismissed = (options as any)?.isBillingDismissed;
 		this.#markBillingDismissed = (options as any)?.markBillingDismissed;
 		this.#currentModel = _currentModel;
@@ -2010,6 +2014,7 @@ export class ModelSelectorComponent extends Container {
 			stale: this.#smartRoutingIsStale(),
 			preview,
 			generatePreview: draft => this.#smartRoutingPreview(draft),
+			discardPreview: preview => this.#smartRoutingDiscardPreview?.(preview),
 			onSelect: async intent => {
 				const result = await this.#onSelectCallback({ kind: "smartRouting", intent });
 				return result || undefined;
@@ -2036,16 +2041,22 @@ export class ModelSelectorComponent extends Container {
 	refreshSmartRoutingState(committedPreview?: RoutingSettingsPreview): void {
 		const panel = this.#smartRoutingPanel;
 		if (!panel || this.#viewMode !== "smart-routing") return;
-		const setup = this.#smartRoutingSetup();
+		const setup = committedPreview?.setup ?? this.#smartRoutingSetup();
 		// A post-publication catalog may already differ; only the service result describes this commit.
 		const preview = committedPreview ?? this.#smartRoutingPreview(setup);
+		const effectiveDiffersFromSaved =
+			committedPreview !== undefined &&
+			(!util.isDeepStrictEqual(this.#settings.get("task.autorouting.setup"), committedPreview.setup) ||
+				!util.isDeepStrictEqual(this.#settings.get("task.autorouting.tiers"), committedPreview.tiers) ||
+				!util.isDeepStrictEqual(this.#settings.get("task.autorouting.provenance"), committedPreview.provenance));
 		panel.refreshState({
 			setup,
-			tiers: normalizeTierMap(this.#settings.get("task.autorouting.tiers")),
-			provenance: this.#settings.get("task.autorouting.provenance"),
+			tiers: committedPreview?.tiers ?? normalizeTierMap(this.#settings.get("task.autorouting.tiers")),
+			provenance: committedPreview?.provenance ?? this.#settings.get("task.autorouting.provenance"),
+			effectiveDiffersFromSaved,
 			enabled: this.#settings.get("task.autorouting.enabled") === true,
 			providerOrderHint: this.#providerOrderHintFor(setup.providers),
-			stale: this.#smartRoutingIsStale(committedPreview),
+			stale: committedPreview ? false : this.#smartRoutingIsStale(),
 			preview,
 		});
 		this.#requestRender();

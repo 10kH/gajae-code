@@ -6,7 +6,11 @@ import { KeybindingsManager } from "../src/config/keybindings";
 import { Settings } from "../src/config/settings";
 import { type SmartRoutingIntent, SmartRoutingPanelComponent } from "../src/modes/components/smart-routing-panel";
 import { initTheme } from "../src/modes/theme/theme";
-import { createRoutingSettingsService, type RoutingSettingsPreview } from "../src/sdk/routing-settings";
+import {
+	createRoutingSettingsService,
+	RoutingSettingsConfirmationRequiredError,
+	type RoutingSettingsPreview,
+} from "../src/sdk/routing-settings";
 
 const setup: AutoroutingSetup = { schema: 1, providers: ["anthropic", "openai-codex"] };
 const catalog = [
@@ -45,6 +49,8 @@ describe("smart-routing keyboard confirmation", () => {
 		const settings = Settings.isolated();
 		let currentCatalog = catalog;
 		let order = [...setup.providers];
+		let generationFails = false;
+		const guards: RoutingSettingsPreview[] = [];
 		const routing = createRoutingSettingsService({
 			settings,
 			getCatalog: () => currentCatalog,
@@ -54,19 +60,29 @@ describe("smart-routing keyboard confirmation", () => {
 		const intents: SmartRoutingIntent[] = [];
 		const pending: { callback?: Promise<RoutingSettingsPreview | undefined> } = {};
 		const currentCallback = (): Promise<RoutingSettingsPreview | undefined> | undefined => pending.callback;
+		const initialPreview = routing.previewSmartRouting(setup);
 		const panel = new SmartRoutingPanelComponent({
 			setup,
 			enabled: false,
 			readOnly: false,
 			stale: false,
-			preview: routing.previewSmartRouting(setup),
-			generatePreview: draft => routing.previewSmartRouting(draft),
+			preview: initialPreview,
+			generatePreview: draft => {
+				if (generationFails) throw new Error("generator unavailable");
+				return routing.previewSmartRouting(draft);
+			},
+			discardPreview: preview => routing.discardPreview(preview),
 			onSelect: intent => {
 				intents.push(intent);
 				pending.callback = (async () => {
-					if (intent.kind === "apply") return (await routing.applySmartRouting(intent.draft, intent)).preview;
-					if (intent.kind === "refresh") return (await routing.refreshSmartRouting(intent)).preview;
-					throw new Error("Unexpected intent");
+					try {
+						if (intent.kind === "apply") return (await routing.applySmartRouting(intent.draft, intent)).preview;
+						if (intent.kind === "refresh") return (await routing.refreshSmartRouting(intent)).preview;
+						throw new Error("Unexpected intent");
+					} catch (error) {
+						if (error instanceof RoutingSettingsConfirmationRequiredError) guards.push(error.preview);
+						throw error;
+					}
 				})();
 				return pending.callback;
 			},
@@ -77,6 +93,11 @@ describe("smart-routing keyboard confirmation", () => {
 			routing,
 			panel,
 			intents,
+			guards,
+			initialPreview,
+			setGenerationFails: (value: boolean) => {
+				generationFails = value;
+			},
 			setCatalog: (value: Model[]) => {
 				currentCatalog = value;
 			},
@@ -109,6 +130,64 @@ describe("smart-routing keyboard confirmation", () => {
 		expect(f.intents[1]?.kind).toBe("apply");
 		expect(f.panel.mode).toBe("done");
 		expect(f.settings.getGlobal("task.autorouting.tiers")).toEqual(f.panel.getPreviewPayload().tiers);
+	});
+
+	test("panel cancellation discards the prepared proof, while clear-dialog cancellation does not", async () => {
+		const f = fixture();
+		f.panel.handleInput("c");
+		f.panel.handleInput("\x1b");
+		expect(f.panel.mode).toBe("editing");
+		f.panel.handleInput("\x1b");
+		await expect(f.routing.applySmartRouting(setup, { preview: f.initialPreview })).rejects.toThrow("not valid");
+
+		const other = fixture();
+		other.panel.handleInput("c");
+		other.panel.handleInput("\x1b");
+		await other.input("a");
+		expect(other.panel.mode).toBe("done");
+	});
+
+	test("cancelled refresh proof cannot authorize a later keyboard confirmation", async () => {
+		const f = fixture();
+		await f.routing.applySmartRouting(setup);
+		f.settings.set("task.autorouting.tiers", { fast: ["anthropic/custom"] });
+		await f.input("r");
+		const first = f.guards[0];
+		if (!first) throw new Error("Expected first guard");
+		f.panel.handleInput("\x1b");
+		await f.input("r");
+		const second = f.guards[1];
+		if (!second) throw new Error("Expected second guard");
+		expect(second).not.toBe(first);
+		await expect(f.routing.refreshSmartRouting({ preview: first, confirmHandEdit: true })).rejects.toThrow(
+			"not valid",
+		);
+		await f.input("\r");
+		const confirmed = f.intents[2];
+		expect(confirmed?.kind).toBe("refresh");
+		if (confirmed?.kind !== "refresh") throw new Error("Expected refresh confirmation");
+		expect(confirmed.preview).toBe(second);
+		expect(confirmed.confirmHandEdit).toBe(true);
+		expect(f.panel.mode).toBe("done");
+	});
+
+	test("failed regeneration keeps keyboard editing and blocks the invalid proof until a reviewed preview exists", async () => {
+		const f = fixture();
+		f.setCatalog(catalog.slice(0, 1));
+		f.setGenerationFails(true);
+		await f.input("a");
+		expect(f.panel.mode).toBe("editing");
+		expect(f.panel.render(120).join("\n")).toContain("Preview generation failed");
+		f.panel.handleInput("a");
+		expect(f.intents).toHaveLength(1);
+		f.setGenerationFails(false);
+		f.panel.handleInput("\x1b[B");
+		expect(f.panel.getDraft().providers).toEqual([...setup.providers].reverse());
+		expect(f.intents).toHaveLength(1);
+		await f.input("a");
+		expect(f.intents).toHaveLength(2);
+		expect(f.panel.mode).toBe("done");
+		expect(f.settings.getGlobal("task.autorouting.setup")).toEqual(f.panel.getDraft());
 	});
 
 	for (const drift of ["catalog", "order"] as const) {

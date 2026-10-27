@@ -102,10 +102,15 @@ ancestor/descendant path mixtures (for example `modelRoles` together with
 Write one parent value or disjoint leaf paths instead. Repeated writes to the
 same exact path retain ordered last-write semantics.
 `commitAtomicBatchWithCurrent` also refuses newer local staged mutations that
-arrive while it waits, and refuses local changes during an asynchronous builder;
-prepare the operation again after that refusal. Synchronous memory-only builders
-publish without yielding between their check and mutation. Earlier queued atomic
-batches still serialize normally and supply the next builder's current input.
+arrive while it waits, and fences nonempty batches against local or runtime-override
+intent during an asynchronous builder, including same-value and ABA overrides.
+Prepare again after refusal; builders returning patches must not perform irreversible
+external work before that commit. Empty batches can serve as lock-only transactions
+for adjacent durable work (such as profile deletion) and do not receive a post-action
+stale-patch rejection. Runtime intent does not take ownership of durable receipt
+paths. Synchronous memory-only builders publish without yielding between their check
+and mutation. Earlier queued atomic batches still serialize normally and supply the
+next builder's current input.
 
 Ordinary saves also publish effective changes adopted from another scoped owner's
 on-disk edits. Overlapping writes through the shared in-process YAML writer fence
@@ -220,14 +225,23 @@ modified, consumed or stale-source previews cannot authorize a write. A failed
 attempt requires fresh preview and explicit review, except a hand-edit guard
 permits confirming the same pending preview. That confirmation is bound to the
 exact guarded global and effective state; intervening edits require new review.
-A guarded refresh retains its original preview and provider order through
-confirmation, so catalog or order drift cannot silently change its payload. Catalog changes are refused rather
-than silently substituting unseen routes. The TUI likewise refreshes display
+A `RoutingSettingsConfirmationRequiredError` carries that exact authority as
+`error.preview`; keep it inside the trusted host. Confirm refresh with
+`refreshSmartRouting({ preview: error.preview, confirmHandEdit: true })` or apply
+with `applySmartRouting(draft, { preview: error.preview, confirmHandEdit: true })`.
+A boolean alone cannot confirm a refresh. Separate callers retain separate proofs;
+`discardPreview(preview)` idempotently invalidates only that proof on cancellation.
+It does not undo an already admitted commit. A guarded refresh retains its original
+preview and provider order, so catalog or order drift cannot silently change its
+payload. Catalog changes are refused rather than silently substituting unseen routes. The TUI likewise refreshes display
 preview after failure but never automatically commits it. Keep scoped-session
 mutations read-only and obtain explicit confirmation before replacing hand edits.
 
 Refresh reads the **global** recorded setup, not an effective project/runtime
-setup that would otherwise be promoted into global config. Atomic mutations
+setup that would otherwise be promoted into global config. Display a pending
+refresh's actual global target before confirmation. Pair the returned committed
+setup and preview after saving, and distinguish them from any still-effective
+higher-priority overlay; saving globally does not remove that overlay. Atomic mutations
 check current durable state; post-publication `activate` is a host notification,
 not model execution or lifecycle admission. Results report `persisted` versus
 `memory` and `notified` versus `not_requested`. An activation failure throws
