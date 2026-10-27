@@ -118,8 +118,9 @@ and mutation. Earlier queued atomic batches still serialize normally and supply 
 next builder's current input. Internal YAML transaction callbacks must await every
 admitted mutation: a detached mutation that fails before the callback returns may
 not be reflected in the transaction result. Nested YAML operations refuse a busy
-file while holding another file's queue; inherited async callbacks retain this
-conservative restriction until their originating operation finishes.
+file while holding another file's queue, and Settings flushes refuse to wait for
+another active YAML owner while holding a queue. Inherited async callbacks retain
+these conservative restrictions until their originating operation finishes.
 
 Ordinary saves also publish effective changes adopted from another scoped owner's
 on-disk edits. Overlapping writes through the shared in-process YAML writer fence
@@ -152,8 +153,9 @@ package root. They are trusted embedding compositions, not new managed operation
   reportRuntimeError, onShutdown })` helper. The latter initializes extension and
   function-hook context and emits `session_start`; it is not a repeated UI setter.
   `subscribe()`/`snapshot()` expose bounded pending requests. Payload size is
-  validated against the detached data retained by the service; replies require the
-  matching session, connection and request IDs. Reconnect rotates responder
+  validated against the detached data retained by the service; request options are
+  snapshotted before admission. Replies require the matching session, connection and
+  request IDs. Reconnect rotates responder
   authority while preserving pending requests. The host **must call
   `service.dispose()` before awaiting `session.dispose()`**, and before switching
   session identity. This settles pending requests and immediately refuses new UI
@@ -187,8 +189,12 @@ package root. They are trusted embedding compositions, not new managed operation
   retained object. A Telegram draft whose preflight reports a foreign or unknown
   daemon cannot be activated; it may be saved inactive or discarded. Active commit
   rechecks identity before writing, but does not lock out external daemon changes.
-  Completed restore outcomes separately report observer and runtime failures. Discard
-  prepared configuration on cancellation; prepare a fresh draft after a consumed
+  Completed restore outcomes separately report observer and runtime failures. After
+  a blocked reconnect, a failed runtime fence does not guarantee a durable inactive
+  marker; a restore-time marker conflict may not protect the restored identity or
+  notify observers of a retained marker. Treat these cases as degraded. Owner IDs
+  originate in daemon state and cannot be assumed free of unknown foreign secrets.
+  Discard prepared configuration on cancellation; prepare a fresh draft after a consumed
   commit attempt. Forged, copied, foreign, discarded or replayed provider drafts return `invalid_draft` without
   saving bindings. Secret inputs use the one-way `NotificationSetupSecretValue`
   contract; do not serialize credentials into renderer state or generic queries.
@@ -273,8 +279,9 @@ not model execution or lifecycle admission. Results report `persisted` versus
 a newer writer prevented restoration, not that the save never happened. After an
 unresolved durable rollback, `stateUnknown` is true and that Settings instance
 cannot issue routing previews or mutations; create a freshly loaded Settings owner
-before continuing, without discarding pending local changes. Do not serialize error
-causes or rollback diagnostics into generic queries. This service
+before continuing, without discarding pending local changes. Open selectors reflect
+shared invalidation on their next render or input. Do not serialize error causes or
+rollback diagnostics into generic queries. This service
 does not implement temporary/default profile selection or role/all-target model
 assignment; use their existing session/model APIs with their separate scopes.
 
