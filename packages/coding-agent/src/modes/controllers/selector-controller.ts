@@ -64,6 +64,7 @@ import { configureSttFromSettings } from "../../runtime/stt-settings-setup";
 import { createNotificationsEditorOperations } from "../../sdk/notification-setup";
 import {
 	createRoutingSettingsService,
+	RoutingSettingsActivationError,
 	type RoutingSettingsOutcome,
 	type RoutingSettingsPreview,
 	type RoutingSettingsService,
@@ -1565,17 +1566,28 @@ export class SelectorController {
 		operation: () => Promise<T>,
 	): Promise<T> {
 		this.ctx.showStatus(`${label} smart-routing settings…`);
+		let result: T;
 		try {
-			const result = await operation();
+			result = await operation();
+		} catch (error) {
+			this.#updateSmartRoutingUi(() => this.ctx.showError(error instanceof Error ? error.message : String(error)));
+			this.#updateSmartRoutingUi(() => this.ctx.ui.requestRender());
+			throw error;
+		}
+		this.#updateSmartRoutingUi(() =>
 			this.ctx.showStatus(
 				`${label} smart-routing settings ${result.durability === "persisted" ? "saved" : "updated in memory"}.`,
-			);
-			this.ctx.ui.requestRender();
-			return result;
-		} catch (error) {
-			this.ctx.showError(error instanceof Error ? error.message : String(error));
-			this.ctx.ui.requestRender();
-			throw error;
+			),
+		);
+		this.#updateSmartRoutingUi(() => this.ctx.ui.requestRender());
+		return result;
+	}
+
+	#updateSmartRoutingUi(update: () => void): void {
+		try {
+			update();
+		} catch {
+			logger.warn("Smart-routing UI update failed", { classification: "smart-routing-ui-update-failed" });
 		}
 	}
 
@@ -1622,32 +1634,44 @@ export class SelectorController {
 				this.ctx.session.scopedModels,
 				async selection => {
 					if (selection.kind === "smartRouting") {
-						switch (selection.intent.kind) {
-							case "apply": {
-								const preview = await this.applySmartRouting(selection.intent.draft, {
-									preview: selection.intent.preview,
-									confirmHandEdit: selection.intent.confirmHandEdit,
-								});
-								modelSelector.refreshSmartRoutingState(preview);
-								return preview;
+						try {
+							switch (selection.intent.kind) {
+								case "apply": {
+									const preview = await this.applySmartRouting(selection.intent.draft, {
+										preview: selection.intent.preview,
+										confirmHandEdit: selection.intent.confirmHandEdit,
+									});
+									this.#updateSmartRoutingUi(() => modelSelector.refreshSmartRoutingState(preview));
+									return preview;
+								}
+								case "refresh": {
+									const preview = await this.refreshSmartRouting({
+										preview: selection.intent.preview,
+										confirmHandEdit: selection.intent.confirmHandEdit,
+									});
+									this.#updateSmartRoutingUi(() => modelSelector.refreshSmartRoutingState(preview));
+									return preview;
+								}
+								case "clear":
+									await this.clearGeneratedSetup();
+									break;
+								case "toggle":
+									await this.setAutoroutingEnabled(selection.intent.enabled);
+									break;
 							}
-							case "refresh": {
-								const preview = await this.refreshSmartRouting({
-									preview: selection.intent.preview,
-									confirmHandEdit: selection.intent.confirmHandEdit,
-								});
-								modelSelector.refreshSmartRoutingState(preview);
-								return preview;
+							this.#updateSmartRoutingUi(() => modelSelector.refreshSmartRoutingState());
+							return;
+						} catch (error) {
+							if (
+								error instanceof RoutingSettingsActivationError &&
+								(error.rollback === "conflict" ||
+									error.rollback === "failed" ||
+									error.rollback === "not-restorable")
+							) {
+								this.#updateSmartRoutingUi(() => modelSelector.refreshSmartRoutingState());
 							}
-							case "clear":
-								await this.clearGeneratedSetup();
-								break;
-							case "toggle":
-								await this.setAutoroutingEnabled(selection.intent.enabled);
-								break;
+							throw error;
 						}
-						modelSelector.refreshSmartRoutingState();
-						return;
 					}
 					const isTrackedSingleAssignment =
 						selection.kind === "assignment" && selection.role !== null && selection.roles === undefined;

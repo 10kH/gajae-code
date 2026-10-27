@@ -7,7 +7,11 @@ import type {
 	AutoroutingTier,
 	TierMap,
 } from "../../config/autorouting-contract";
-import { RoutingSettingsConfirmationRequiredError, type RoutingSettingsPreview } from "../../sdk/routing-settings";
+import {
+	RoutingSettingsActivationError,
+	RoutingSettingsConfirmationRequiredError,
+	type RoutingSettingsPreview,
+} from "../../sdk/routing-settings";
 import { theme } from "../theme/theme";
 
 /** Longest rendered panel line before truncation. */
@@ -199,7 +203,6 @@ export class SmartRoutingPanelComponent extends Container {
 		preview?: RoutingSettingsPreview;
 		effectiveDiffersFromSaved?: boolean;
 	}): void {
-		this.#stateRevision++;
 		if (this.#preview !== options.preview) this.#discardPreview?.(this.#preview);
 		this.#draft = cloneSetup(options.setup);
 		this.#tiers = options.tiers ? structuredClone(options.tiers) : undefined;
@@ -217,6 +220,7 @@ export class SmartRoutingPanelComponent extends Container {
 		this.#status = "";
 		this.#error = "";
 		this.#render();
+		this.#stateRevision++;
 	}
 
 	#render(): void {
@@ -236,7 +240,7 @@ export class SmartRoutingPanelComponent extends Container {
 		}
 		if (this.#effectiveDiffersFromSaved) {
 			this.addChild(
-				new Text(theme.fg("muted", "Saved preview is global; effective settings currently differ."), 0, 0),
+				new Text(theme.fg("muted", "Committed preview is global; effective settings currently differ."), 0, 0),
 			);
 		}
 		if (this.#stale) {
@@ -439,9 +443,20 @@ export class SmartRoutingPanelComponent extends Container {
 				intent.kind === "clear"
 					? "Global generated setup cleared."
 					: intent.kind === "toggle"
-						? `Global enabled saved: ${intent.enabled ? "yes" : "no"}.`
-						: "Global smart-routing settings saved.";
+						? `Global enabled updated: ${intent.enabled ? "yes" : "no"}.`
+						: "Global smart-routing settings updated.";
 		} catch (error) {
+			if (
+				error instanceof RoutingSettingsActivationError &&
+				(error.rollback === "conflict" || error.rollback === "failed" || error.rollback === "not-restorable") &&
+				this.#stateRevision === stateRevision
+			) {
+				this.#enabled = undefined;
+				this.#effectiveGeneratedSetup = undefined;
+				this.#provenance = undefined;
+				this.#stale = false;
+				this.#effectiveDiffersFromSaved = false;
+			}
 			if (
 				error instanceof RoutingSettingsConfirmationRequiredError &&
 				(intent.kind === "apply" || intent.kind === "refresh")

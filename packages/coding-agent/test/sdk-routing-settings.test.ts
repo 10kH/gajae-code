@@ -567,6 +567,50 @@ describe("SDK smart-routing settings", () => {
 		}
 	});
 
+	test("queued apply snapshots confirmation before the caller mutates its options", async () => {
+		const temp = TempDir.createSync("@gjc-routing-confirm-queue-");
+		const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") });
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		try {
+			const routing = service(settings);
+			await routing.applySmartRouting(setup);
+			const edited = { fast: ["anthropic/custom"] };
+			settings.set("task.autorouting.tiers", edited);
+			await settings.flushOrThrow();
+			const preview = routing.previewSmartRouting(setup);
+			const guard = await confirmationRequired(routing.applySmartRouting(setup, { preview }));
+			const unrelated = routing.previewSmartRouting(setup);
+			const configPath = settings.getGlobalConfigPath();
+			if (!configPath) throw new Error("Expected disk settings");
+			const diskBefore = await Bun.file(configPath).text();
+			const blocker = enqueueAtomicYamlOperation(configPath, () => {
+				entered.resolve();
+				return release.promise;
+			});
+			await entered.promise;
+			const options = { preview: guard.preview, confirmHandEdit: false };
+			const pending = confirmationRequired(routing.applySmartRouting(setup, options));
+			options.confirmHandEdit = true;
+			options.preview = unrelated;
+			release.resolve();
+			await blocker;
+			const repeated = await pending;
+			expect(repeated.preview).toBe(preview);
+			expect(settings.getGlobal("task.autorouting.tiers")).toEqual(edited);
+			expect(await Bun.file(configPath).text()).toBe(diskBefore);
+			await routing.applySmartRouting(setup, { preview, confirmHandEdit: true });
+			expect(settings.getGlobal("task.autorouting.tiers")).toEqual(preview.tiers);
+			await expect(routing.applySmartRouting(setup, { preview: unrelated })).rejects.toThrow(
+				"changed since the preview",
+			);
+		} finally {
+			release.resolve();
+			await settings.close();
+			temp.removeSync();
+		}
+	});
+
 	test("discarding an admitted queued preview does not undo its successful commit", async () => {
 		const temp = TempDir.createSync("@gjc-routing-discard-commit-");
 		const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") });
@@ -627,6 +671,76 @@ describe("SDK smart-routing settings", () => {
 			temp.removeSync();
 		}
 	});
+
+	for (const operation of ["apply", "refresh", "clear", "toggle"] as const) {
+		test(`queued disk ${operation} refuses a newly scoped session without publishing`, async () => {
+			const temp = TempDir.createSync("@gjc-routing-scoped-queue-");
+			const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") });
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			let scoped = false;
+			const activate = vi.fn(async () => {});
+			const routing = createRoutingSettingsService({
+				settings,
+				getCatalog: () => catalog,
+				getProviderOrder: () => setup.providers,
+				isScoped: () => scoped,
+				activate,
+			});
+			try {
+				await routing.applySmartRouting(setup);
+				activate.mockClear();
+				const preview = routing.previewSmartRouting(setup);
+				const independent = routing.previewSmartRouting(setup);
+				const before = structuredClone({
+					setup: settings.getGlobal("task.autorouting.setup"),
+					tiers: settings.getGlobal("task.autorouting.tiers"),
+					provenance: settings.getGlobal("task.autorouting.provenance"),
+					enabled: settings.getGlobal("task.autorouting.enabled"),
+				});
+				const configPath = settings.getGlobalConfigPath();
+				if (!configPath) throw new Error("Expected disk settings");
+				const diskBefore = await Bun.file(configPath).text();
+				const blocker = enqueueAtomicYamlOperation(configPath, () => {
+					entered.resolve();
+					return release.promise;
+				});
+				await entered.promise;
+				const pending =
+					operation === "apply"
+						? routing.applySmartRouting(setup, { preview })
+						: operation === "refresh"
+							? routing.refreshSmartRouting()
+							: operation === "clear"
+								? routing.clearGeneratedSetup()
+								: routing.setAutoroutingEnabled(true);
+				scoped = true;
+				release.resolve();
+				await blocker;
+				await expect(pending).rejects.toThrow("--models-scoped");
+				expect(activate).not.toHaveBeenCalled();
+				expect({
+					setup: settings.getGlobal("task.autorouting.setup"),
+					tiers: settings.getGlobal("task.autorouting.tiers"),
+					provenance: settings.getGlobal("task.autorouting.provenance"),
+					enabled: settings.getGlobal("task.autorouting.enabled"),
+				}).toEqual(before);
+				expect(await Bun.file(configPath).text()).toBe(diskBefore);
+				scoped = false;
+				if (operation === "apply") {
+					await expect(routing.applySmartRouting(setup, { preview })).rejects.toThrow(
+						"not valid for this service",
+					);
+				}
+				const result = await routing.applySmartRouting(setup, { preview: independent });
+				expect(result.preview.tiers).toEqual(independent.tiers);
+			} finally {
+				release.resolve();
+				await settings.close();
+				temp.removeSync();
+			}
+		});
+	}
 
 	test("scoped sessions allow preview but reject all mutations", async () => {
 		const settings = Settings.isolated();

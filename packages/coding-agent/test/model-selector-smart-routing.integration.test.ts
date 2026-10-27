@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, test, vi } from "bun:test";
+import * as path from "node:path";
 import type { Model } from "@gajae-code/ai";
 import type { AutoroutingSetup, TierMap } from "@gajae-code/coding-agent/config/autorouting-contract";
 import { canonicalJsonBytes } from "@gajae-code/coding-agent/config/autorouting-generator";
@@ -11,7 +12,12 @@ import {
 } from "@gajae-code/coding-agent/modes/components/smart-routing-panel";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
-import { RoutingSettingsConfirmationRequiredError, type RoutingSettingsPreview } from "../src/sdk/routing-settings";
+import { TempDir } from "@gajae-code/utils";
+import {
+	createRoutingSettingsService,
+	RoutingSettingsConfirmationRequiredError,
+	type RoutingSettingsPreview,
+} from "../src/sdk/routing-settings";
 
 const model = (provider: string, id: string): Model =>
 	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
@@ -209,6 +215,14 @@ describe("/model smart-routing panel integration", () => {
 		expect(ctx.showStatus).toHaveBeenCalled();
 	});
 
+	test("memory-only panel updates do not claim durable persistence", async () => {
+		const { panel, ctx } = await openPanel();
+		await panel.__testApply();
+		expect(renderText(panel)).toContain("Global smart-routing settings updated.");
+		expect(renderText(panel)).not.toContain("settings saved");
+		expect(ctx.showStatus).toHaveBeenCalledWith("Apply smart-routing settings updated in memory.");
+	});
+
 	for (const operation of ["apply", "refresh"] as const) {
 		test(`${operation} displays the published preview when activation switches the catalog`, async () => {
 			const { controller, panel, settings, ctx, notifyCatalogChanged } = await openPanel();
@@ -234,7 +248,7 @@ describe("/model smart-routing panel integration", () => {
 			expect(settings.get("task.autorouting.provenance")).toEqual(committed.provenance);
 			expect(panel.getPreviewPayload()).toEqual(committed);
 			expect(renderText(panel)).toContain("openai-codex/gpt-5.6-terra");
-			expect(renderText(panel)).toContain("Global smart-routing settings saved.");
+			expect(renderText(panel)).toContain("Global smart-routing settings updated.");
 
 			// A separately requested preview is a new candidate, not the saved result.
 			const candidate = controller.previewSmartRouting(committed.setup);
@@ -269,10 +283,131 @@ describe("/model smart-routing panel integration", () => {
 			expect(settings.get("task.autorouting.tiers")).toEqual(committed.tiers);
 			expect(settings.get("task.autorouting.provenance")).toEqual(committed.provenance);
 			expect(ctx.showError).not.toHaveBeenCalled();
-			expect(renderText(panel)).toContain("Global smart-routing settings saved.");
+			expect(renderText(panel)).toContain("Global smart-routing settings updated.");
 			expect(renderText(panel)).not.toContain("catalog unavailable after publication");
 		});
 	}
+
+	for (const operation of ["apply", "refresh", "clear", "toggle"] as const) {
+		for (const failure of ["status", "render", "refresh"] as const) {
+			test(`${operation} retains its disk commit when post-publication ${failure} throws`, async () => {
+				const temp = TempDir.createSync("@gjc-routing-ui-commit-");
+				const agentDir = path.join(temp.path(), "agent");
+				const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir });
+				try {
+					const routing = createRoutingSettingsService({
+						settings,
+						getCatalog: () => catalog,
+						getProviderOrder: () => ["anthropic", "openai-codex"],
+						isScoped: () => false,
+					});
+					if (operation === "refresh" || operation === "clear") {
+						await routing.applySmartRouting({ schema: 1, providers: ["anthropic", "openai-codex"] });
+					}
+					const { panel, selector, ctx } = await openPanel({ settings });
+					let activated = false;
+					ctx.notifyConfigChanged.mockImplementation(async () => {
+						activated = true;
+					});
+					if (failure === "status")
+						ctx.showStatus.mockImplementation(() => {
+							if (activated) throw new Error("private status failure");
+						});
+					if (failure === "render")
+						ctx.ui.requestRender.mockImplementation(() => {
+							if (activated) throw new Error("private render failure");
+						});
+					if (failure === "refresh")
+						vi.spyOn(selector, "refreshSmartRoutingState").mockImplementation(() => {
+							throw new Error("private refresh failure");
+						});
+					if (operation === "apply") await panel.__testApply();
+					else if (operation === "refresh") await panel.__testRefresh();
+					else if (operation === "clear") await panel.__testClear();
+					else await panel.__testToggle(true);
+					expect(activated).toBe(true);
+					expect(panel.mode).toBe("done");
+					expect(ctx.showError).not.toHaveBeenCalled();
+					expect(renderText(panel)).not.toContain("private");
+					const disk = await Settings.loadReadonly({ cwd: temp.path(), agentDir });
+					try {
+						for (const key of [
+							"task.autorouting.setup",
+							"task.autorouting.tiers",
+							"task.autorouting.provenance",
+							"task.autorouting.enabled",
+						] as const) {
+							expect(disk.getGlobal(key)).toEqual(settings.getGlobal(key));
+						}
+						if (operation === "apply" || operation === "refresh") {
+							expect(settings.getGlobal("task.autorouting.setup")).toEqual(panel.getPreviewPayload().setup);
+							expect(settings.getGlobal("task.autorouting.tiers")).toEqual(panel.getPreviewPayload().tiers);
+							expect(settings.getGlobal("task.autorouting.provenance")).toEqual(
+								panel.getPreviewPayload().provenance,
+							);
+						} else if (operation === "clear")
+							expect(settings.getGlobal("task.autorouting.setup")).toBeUndefined();
+						else expect(settings.getGlobal("task.autorouting.enabled")).toBe(true);
+					} finally {
+						await disk.close();
+					}
+				} finally {
+					await settings.close();
+					temp.removeSync();
+				}
+			});
+		}
+	}
+
+	for (const refreshFails of [false, true]) {
+		test(`activation rollback conflict ${refreshFails ? "marks effective state unknown when refresh fails" : "refreshes effective state"}`, async () => {
+			const temp = TempDir.createSync("@gjc-routing-ui-conflict-");
+			const agentDir = path.join(temp.path(), "agent");
+			const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir });
+			try {
+				settings.set("task.autorouting.enabled", false);
+				await settings.flushOrThrow();
+				const { panel, selector, ctx } = await openPanel({ settings });
+				ctx.notifyConfigChanged.mockImplementation(async () => {
+					settings.set("task.autorouting.enabled", false);
+					settings.override("task.autorouting.enabled", true);
+					await settings.flushOrThrow();
+					throw new Error("activation failed");
+				});
+				if (refreshFails)
+					vi.spyOn(selector, "refreshSmartRoutingState").mockImplementation(() => {
+						throw new Error("refresh failed");
+					});
+				await panel.__testToggle(true);
+				expect(settings.getGlobal("task.autorouting.enabled")).toBe(false);
+				const disk = await Settings.loadReadonly({ cwd: temp.path(), agentDir });
+				try {
+					expect(disk.getGlobal("task.autorouting.enabled")).toBe(false);
+				} finally {
+					await disk.close();
+				}
+				expect(panel.mode).toBe("error");
+				expect(renderText(panel)).toContain("rollback conflict");
+				expect(renderText(panel)).toContain(refreshFails ? "Effective enabled: unknown" : "Effective enabled: yes");
+			} finally {
+				await settings.close();
+				temp.removeSync();
+			}
+		});
+	}
+
+	test("failure UI callbacks cannot replace the original mutation error", async () => {
+		const { controller, settings, ctx } = await openPanel();
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValueOnce(new Error("original write failed"));
+		ctx.showError.mockImplementation(() => {
+			throw new Error("error display failed");
+		});
+		ctx.ui.requestRender.mockImplementation(() => {
+			throw new Error("error render failed");
+		});
+		await expect(controller.setAutoroutingEnabled(true)).rejects.toThrow("original write failed");
+		expect(settings.getGlobal("task.autorouting.enabled")).not.toBe(true);
+	});
 
 	test("toggle writes only task.autorouting.enabled (AC8)", async () => {
 		const { panel, settings } = await openPanel();
@@ -287,7 +422,7 @@ describe("/model smart-routing panel integration", () => {
 
 		expect(observedPatches).toHaveLength(1);
 		expect(observedPatches[0]).toMatchObject({ path: "task.autorouting.enabled", op: "set", value: true });
-		expect(renderText(panel)).toContain("Global enabled saved: yes.");
+		expect(renderText(panel)).toContain("Global enabled updated: yes.");
 		expect(renderText(panel)).toContain("Effective enabled: yes");
 	});
 
@@ -298,7 +433,7 @@ describe("/model smart-routing panel integration", () => {
 		await panel.__testToggle(true);
 		expect(settings.getGlobal("task.autorouting.enabled")).toBe(true);
 		expect(settings.get("task.autorouting.enabled")).toBe(false);
-		expect(renderText(panel)).toContain("Global enabled saved: yes.");
+		expect(renderText(panel)).toContain("Global enabled updated: yes.");
 		expect(renderText(panel)).toContain("Effective enabled: no");
 	});
 
@@ -365,7 +500,7 @@ describe("/model smart-routing panel integration", () => {
 				expect(panel.mode).toBe("done");
 				expect(ctx.showError).not.toHaveBeenCalled();
 				expect(renderText(panel)).toContain(
-					operation === "toggle" ? "Global enabled saved: yes." : "Global generated setup cleared.",
+					operation === "toggle" ? "Global enabled updated: yes." : "Global generated setup cleared.",
 				);
 				expect(renderText(panel)).toContain("Preview invalid; regenerate before applying:");
 				if (operation === "toggle") expect(settings.getGlobal("task.autorouting.enabled")).toBe(true);
@@ -396,7 +531,7 @@ describe("/model smart-routing panel integration", () => {
 		expect(settings.getGlobal("task.autorouting.provenance")).toEqual(panel.getPreviewPayload().provenance);
 		expect(settings.get("task.autorouting.setup")).toEqual(runtimeSetup);
 		expect(settings.get("task.autorouting.tiers")).toEqual(runtimeTiers);
-		expect(renderText(panel)).toContain("Saved preview is global; effective settings currently differ.");
+		expect(renderText(panel)).toContain("Committed preview is global; effective settings currently differ.");
 	});
 
 	test("controller and selector forward the exact refresh guard after keyboard cancellation and retry", async () => {
@@ -462,7 +597,7 @@ describe("/model smart-routing panel integration", () => {
 		expect(panel.getPreviewPayload().setup).toEqual(globalSetup);
 		expect(settings.getGlobal("task.autorouting.setup")).toEqual(globalSetup);
 		expect(settings.get("task.autorouting.setup")).toEqual(runtimeSetup);
-		expect(renderText(panel)).toContain("Saved preview is global; effective settings currently differ.");
+		expect(renderText(panel)).toContain("Committed preview is global; effective settings currently differ.");
 	});
 
 	test("refresh guards hand-edited tiers and proceeds after explicit confirmation (AC7)", async () => {
@@ -715,7 +850,7 @@ describe("smart-routing panel hostile render boundary", () => {
 		const toggle = hostilePanel();
 		await toggle.__testToggle(false);
 		const toggleText = renderText(toggle);
-		expect(toggleText).toContain("Global enabled saved: no.");
+		expect(toggleText).toContain("Global enabled updated: no.");
 		expect(toggleText).toContain("Effective enabled: unknown");
 		const clear = hostilePanel();
 		clear.handleInput("c");

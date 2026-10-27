@@ -211,7 +211,14 @@ export class RoutingSettingsService {
 		this.#inFlight = true;
 		try {
 			this.#assertWritable();
-			const receipt: SettingsAtomicReceipt = await this.dependencies.settings.commitAtomicBatchWithCurrent(build);
+			const receipt: SettingsAtomicReceipt = await this.dependencies.settings.commitAtomicBatchWithCurrent(
+				current => {
+					this.#assertWritable();
+					const patches = build(current);
+					this.#assertWritable();
+					return patches;
+				},
+			);
 			const durability = receipt.revisions.length > 0 ? "persisted" : "memory";
 			if (this.dependencies.activate) {
 				try {
@@ -244,6 +251,7 @@ export class RoutingSettingsService {
 		draft: AutoroutingSetup,
 		options?: { preview?: RoutingSettingsPreview; confirmHandEdit?: boolean },
 	): Promise<RoutingSettingsPreviewOutcome> {
+		const confirmed = options?.confirmHandEdit === true;
 		const supplied = options?.preview ?? this.previewSmartRouting(draft);
 		const authority = this.#previews.get(supplied);
 		if (!authority) throw new Error("Smart-routing preview is not valid for this service; preview again.");
@@ -273,7 +281,7 @@ export class RoutingSettingsService {
 						throw new Error("Smart-routing provider order changed; refresh again before applying.");
 					}
 				}
-				const guard = options?.confirmHandEdit === true ? authority.guard : undefined;
+				const guard = confirmed ? authority.guard : undefined;
 				if (guard) {
 					if (
 						!util.isDeepStrictEqual(state, guard.global) ||
