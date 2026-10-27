@@ -1546,7 +1546,8 @@ export class Settings implements NotificationSettingsReader {
 	 * Build a batch from current YAML under the shared queue/lock. New local or
 	 * runtime intent invalidates nonempty batches prepared asynchronously. Such
 	 * builders must not perform irreversible external work before publication.
-	 * Empty batches may serialize adjacent durable actions without a Settings write.
+	 * Empty batches may hold the durable writer queue for an adjacent action, but
+	 * cannot prevent synchronous setters or runtime overrides during that action.
 	 * Synchronous memory builders publish without yielding to another setter.
 	 */
 	async commitAtomicBatchWithCurrent(
@@ -1596,8 +1597,9 @@ export class Settings implements NotificationSettingsReader {
 				const runtimeBefore = structuredClone(this.#overrides);
 				const patches = await buildPatches(structuredClone(current));
 				// Empty batches also serve as lock-only transactions for adjacent
-				// durable work (for example profile deletion). They cannot overtake
-				// any Settings patch; do not report failure after their side effect.
+				// durable work (for example profile deletion). The writer queue does
+				// not block synchronous setters, and cannot undo the side effect;
+				// do not report a stale-patch failure after it has completed.
 				if (
 					patches.length > 0 &&
 					(this.#nextRevision !== builderRevision ||
