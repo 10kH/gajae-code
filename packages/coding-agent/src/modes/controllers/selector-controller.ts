@@ -1620,15 +1620,21 @@ export class SelectorController {
 				async selection => {
 					if (selection.kind === "smartRouting") {
 						switch (selection.intent.kind) {
-							case "apply":
-								await this.applySmartRouting(selection.intent.draft, {
+							case "apply": {
+								const preview = await this.applySmartRouting(selection.intent.draft, {
 									preview: selection.intent.preview,
 									confirmHandEdit: selection.intent.confirmHandEdit,
 								});
-								break;
-							case "refresh":
-								await this.refreshSmartRouting({ confirmHandEdit: selection.intent.confirmHandEdit });
-								break;
+								modelSelector.refreshSmartRoutingState(preview);
+								return preview;
+							}
+							case "refresh": {
+								const preview = await this.refreshSmartRouting({
+									confirmHandEdit: selection.intent.confirmHandEdit,
+								});
+								modelSelector.refreshSmartRoutingState(preview);
+								return preview;
+							}
 							case "clear":
 								await this.clearGeneratedSetup();
 								break;

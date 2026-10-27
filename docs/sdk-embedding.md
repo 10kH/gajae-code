@@ -101,6 +101,11 @@ ancestor/descendant path mixtures (for example `modelRoles` together with
 `modelRoles.default`) before applying any patch: their restore scopes overlap.
 Write one parent value or disjoint leaf paths instead. Repeated writes to the
 same exact path retain ordered last-write semantics.
+`commitAtomicBatchWithCurrent` also refuses newer local staged mutations that
+arrive while it waits, and refuses local changes during an asynchronous builder;
+prepare the operation again after that refusal. Synchronous memory-only builders
+publish without yielding between their check and mutation. Earlier queued atomic
+batches still serialize normally and supply the next builder's current input.
 
 Ordinary saves also publish effective changes adopted from another scoped owner's
 on-disk edits. Overlapping writes through the shared in-process YAML writer fence
@@ -173,8 +178,9 @@ binding/secret restrictions on `config.patch`, or certify full TUI parity.
 managed operation or a write permission. It enumerates schema paths, types, UI
 metadata, schema choices, defaults, effective scalar values and
 `Settings.getResolutionSnapshot()` provenance. Scalar origins follow
-`global < project < runtime`; `default` means no configured layer. `layers` lists
-permitted present layers, including shadowed ones. An object reported as
+`global < project < runtime`; `default` means the merged leaf is absent and the
+schema fallback is used, including when a higher layer replaces its ancestor.
+`layers` lists permitted present leaves, including shadowed lower values. An object reported as
 `layered` was constructed using multiple layers; it is not per-leaf provenance.
 `allowedLayers` describes Settings merging, not filesystem authority or proof
 that every consumer uses `Settings.get` rather than a global-only read.
@@ -212,7 +218,10 @@ A preview is instance-bound host authority. Retain the exact returned object in
 the trusted host and send only display data to a renderer; copied, foreign,
 modified, consumed or stale-source previews cannot authorize a write. A failed
 attempt requires fresh preview and explicit review, except a hand-edit guard
-permits confirming the same pending preview. Catalog changes are refused rather
+permits confirming the same pending preview. That confirmation is bound to the
+exact guarded global and effective state; intervening edits require new review.
+A guarded refresh retains its original preview and provider order through
+confirmation, so catalog or order drift cannot silently change its payload. Catalog changes are refused rather
 than silently substituting unseen routes. The TUI likewise refreshes display
 preview after failure but never automatically commits it. Keep scoped-session
 mutations read-only and obtain explicit confirmation before replacing hand edits.

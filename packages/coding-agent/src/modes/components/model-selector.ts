@@ -335,7 +335,10 @@ interface PendingThinkingChoice {
 	levels: ThinkingLevel[];
 }
 
-type RoleSelectCallback = (selection: ModelSelectorSelection) => void | Promise<void>;
+type RoleSelectCallback =
+	| ((selection: ModelSelectorSelection) => void)
+	| ((selection: ModelSelectorSelection) => Promise<void>)
+	| ((selection: ModelSelectorSelection) => Promise<RoutingSettingsPreview | undefined>);
 type CancelCallback = () => void;
 
 interface ProviderTabState {
@@ -1951,11 +1954,11 @@ export class ModelSelectorComponent extends Container {
 		return this.#smartRoutingPreviewBuilder(setup);
 	}
 
-	#smartRoutingIsStale(): boolean {
+	#smartRoutingIsStale(committedPreview?: RoutingSettingsPreview): boolean {
 		const provenance = this.#settings.get("task.autorouting.provenance");
 		if (!provenance || validateAutoroutingSetup(this.#smartRoutingSetup()).length > 0) return false;
 		try {
-			const preview = this.#smartRoutingPreview(this.#smartRoutingSetup());
+			const preview = committedPreview ?? this.#smartRoutingPreview(this.#smartRoutingSetup());
 			const state = evaluateAutoroutingProvenanceState(provenance, {
 				catalogFingerprint: preview.sourceIdentity.catalogFingerprint,
 				mapFingerprint: preview.sourceIdentity.mapFingerprint,
@@ -2008,8 +2011,8 @@ export class ModelSelectorComponent extends Container {
 			preview,
 			generatePreview: draft => this.#smartRoutingPreview(draft),
 			onSelect: async intent => {
-				await this.#onSelectCallback({ kind: "smartRouting", intent });
-				return intent.kind === "apply" ? this.#smartRoutingPreview(intent.draft) : undefined;
+				const result = await this.#onSelectCallback({ kind: "smartRouting", intent });
+				return result || undefined;
 			},
 			onCancel: () => (this.#smartRoutingOnly ? this.#onCancelCallback() : this.#switchToPresetMode()),
 		});
@@ -2030,18 +2033,19 @@ export class ModelSelectorComponent extends Container {
 		this.#requestRender();
 	}
 
-	refreshSmartRoutingState(): void {
+	refreshSmartRoutingState(committedPreview?: RoutingSettingsPreview): void {
 		const panel = this.#smartRoutingPanel;
 		if (!panel || this.#viewMode !== "smart-routing") return;
 		const setup = this.#smartRoutingSetup();
-		const preview = this.#smartRoutingPreview(setup);
+		// A post-publication catalog may already differ; only the service result describes this commit.
+		const preview = committedPreview ?? this.#smartRoutingPreview(setup);
 		panel.refreshState({
 			setup,
 			tiers: normalizeTierMap(this.#settings.get("task.autorouting.tiers")),
 			provenance: this.#settings.get("task.autorouting.provenance"),
 			enabled: this.#settings.get("task.autorouting.enabled") === true,
 			providerOrderHint: this.#providerOrderHintFor(setup.providers),
-			stale: this.#smartRoutingIsStale(),
+			stale: this.#smartRoutingIsStale(committedPreview),
 			preview,
 		});
 		this.#requestRender();

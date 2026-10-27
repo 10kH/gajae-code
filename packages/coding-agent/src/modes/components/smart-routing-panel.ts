@@ -345,9 +345,10 @@ export class SmartRoutingPanelComponent extends Container {
 				this.#mode = "error";
 				this.#error = error instanceof Error ? error.message : String(error);
 				this.#status = "";
-				if (intent.kind === "apply") {
+				if (intent.kind === "apply" || intent.kind === "refresh") {
 					try {
 						this.#preview = this.#generatePreview(this.#draft);
+						this.#mode = "editing";
 						this.#error += " A fresh preview is shown; review it before applying again.";
 					} catch {
 						this.#error += " Preview generation failed; edit the setup to prepare again.";

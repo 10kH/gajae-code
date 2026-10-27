@@ -3,6 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Model } from "@gajae-code/ai/core";
+import { TempDir } from "@gajae-code/utils";
+import { enqueueAtomicYamlOperation } from "../src/config/atomic-yaml-patch";
 import type { AutoroutingSetup } from "../src/config/autorouting-contract";
 import { Settings } from "../src/config/settings";
 import { createRoutingSettingsService, RoutingSettingsActivationError } from "../src/sdk/routing-settings";
@@ -166,6 +168,128 @@ describe("SDK smart-routing settings", () => {
 		expect(settings.getGlobal("task.autorouting.tiers")).toEqual(preview.tiers);
 	});
 
+	for (const operation of ["apply", "refresh"] as const) {
+		for (const changed of [false, true]) {
+			test(`${operation} confirmation ${changed ? "rejects a subsequent hand edit" : "accepts the exact guarded state"}`, async () => {
+				const settings = Settings.isolated();
+				const routing = service(settings);
+				await routing.applySmartRouting(setup);
+				const preview = routing.previewSmartRouting(setup);
+				const first = { fast: ["anthropic/edit-a"] };
+				const second = { fast: ["anthropic/edit-b"] };
+				settings.set("task.autorouting.tiers", first);
+				const attempt = (confirmHandEdit: boolean) =>
+					operation === "apply"
+						? routing.applySmartRouting(setup, { preview, confirmHandEdit })
+						: routing.refreshSmartRouting({ confirmHandEdit });
+				await expect(attempt(false)).rejects.toMatchObject({ code: "autorouting-hand-edited" });
+				if (changed) settings.set("task.autorouting.tiers", second);
+				if (changed) {
+					await expect(attempt(true)).rejects.toThrow("hand-edited settings changed");
+					expect(settings.getGlobal("task.autorouting.tiers")).toEqual(second);
+				} else {
+					const result = await attempt(true);
+					expect(settings.getGlobal("task.autorouting.tiers")).toEqual(result.preview.tiers);
+				}
+			});
+		}
+	}
+
+	for (const operation of ["apply", "refresh"] as const) {
+		test(`${operation} compares the guarded state inside the writer`, async () => {
+			const settings = Settings.isolated();
+			const routing = service(settings);
+			await routing.applySmartRouting(setup);
+			const preview = routing.previewSmartRouting(setup);
+			settings.set("task.autorouting.tiers", { fast: ["anthropic/edit-a"] });
+			const attempt = (confirmHandEdit: boolean) =>
+				operation === "apply"
+					? routing.applySmartRouting(setup, { preview, confirmHandEdit })
+					: routing.refreshSmartRouting({ confirmHandEdit });
+			await expect(attempt(false)).rejects.toMatchObject({ code: "autorouting-hand-edited" });
+			const newer = { fast: ["anthropic/edit-b"] };
+			const commit = settings.commitAtomicBatchWithCurrent.bind(settings);
+			vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockImplementationOnce(async build => {
+				settings.set("task.autorouting.tiers", newer);
+				return commit(build);
+			});
+			await expect(attempt(true)).rejects.toThrow("hand-edited settings changed");
+			expect(settings.getGlobal("task.autorouting.tiers")).toEqual(newer);
+		});
+	}
+
+	test("confirmation also binds the effective overlay that triggered the guard", async () => {
+		const settings = Settings.isolated();
+		const routing = service(settings);
+		await routing.applySmartRouting(setup);
+		const global = settings.getGlobal("task.autorouting.tiers");
+		const preview = routing.previewSmartRouting(setup);
+		settings.override("task.autorouting.tiers", { fast: ["anthropic/edit-a"] });
+		await expect(routing.applySmartRouting(setup, { preview })).rejects.toMatchObject({
+			code: "autorouting-hand-edited",
+		});
+		settings.override("task.autorouting.tiers", { fast: ["anthropic/edit-b"] });
+		const effective = structuredClone(settings.get("task.autorouting.tiers"));
+		await expect(routing.applySmartRouting(setup, { preview, confirmHandEdit: true })).rejects.toThrow(
+			"hand-edited settings changed",
+		);
+		expect(settings.getGlobal("task.autorouting.tiers")).toEqual(global);
+		expect(settings.get("task.autorouting.tiers")).toEqual(effective);
+		expect(settings.get("task.autorouting.tiers").fast).toEqual(["anthropic/edit-b"]);
+	});
+
+	for (const drift of ["catalog", "order"] as const) {
+		test(`refresh confirmation refuses ${drift} drift and consumes its pending authority`, async () => {
+			const settings = Settings.isolated();
+			let currentCatalog = catalog;
+			let order = ["anthropic", "openai-codex"];
+			const routing = createRoutingSettingsService({
+				settings,
+				getCatalog: () => currentCatalog,
+				getProviderOrder: () => order,
+				isScoped: () => false,
+			});
+			await routing.applySmartRouting(setup);
+			const edited = { fast: ["anthropic/edit"] };
+			settings.set("task.autorouting.tiers", edited);
+			const originalSetup = settings.getGlobal("task.autorouting.setup");
+			const originalProvenance = settings.getGlobal("task.autorouting.provenance");
+			await expect(routing.refreshSmartRouting()).rejects.toMatchObject({ code: "autorouting-hand-edited" });
+			if (drift === "catalog") currentCatalog = catalog.slice(0, 1);
+			else order = [...order].reverse();
+			await expect(routing.refreshSmartRouting({ confirmHandEdit: true })).rejects.toThrow(
+				drift === "catalog" ? "preview source changed" : "provider order changed",
+			);
+			expect(settings.getGlobal("task.autorouting.tiers")).toEqual(edited);
+			expect(settings.getGlobal("task.autorouting.setup")).toEqual(originalSetup);
+			expect(settings.getGlobal("task.autorouting.provenance")).toEqual(originalProvenance);
+			currentCatalog = catalog;
+			order = ["anthropic", "openai-codex"];
+			await expect(routing.refreshSmartRouting({ confirmHandEdit: true })).rejects.toMatchObject({
+				code: "autorouting-hand-edited",
+			});
+		});
+	}
+
+	test("confirmation without a guard cannot bypass a stale preview", async () => {
+		const settings = Settings.isolated();
+		const first = service(settings);
+		await first.applySmartRouting(setup);
+		const stale = first.previewSmartRouting(setup);
+		const second = createRoutingSettingsService({
+			settings,
+			getCatalog: () => catalog.slice(0, 1),
+			getProviderOrder: () => ["anthropic", "openai-codex"],
+			isScoped: () => false,
+		});
+		await second.applySmartRouting(setup);
+		const current = settings.getGlobal("task.autorouting.tiers");
+		await expect(first.applySmartRouting(setup, { preview: stale, confirmHandEdit: true })).rejects.toThrow(
+			"changed since the preview",
+		);
+		expect(settings.getGlobal("task.autorouting.tiers")).toEqual(current);
+	});
+
 	test("a changed global declaration rejects a stale preview under the atomic writer", async () => {
 		const settings = Settings.isolated();
 		const routing = service(settings);
@@ -190,6 +314,67 @@ describe("SDK smart-routing settings", () => {
 		});
 		await second.applySmartRouting(setup);
 		await expect(first.applySmartRouting(setup, { preview: stale })).rejects.toThrow("changed since the preview");
+	});
+
+	test("memory Apply publishes before a later setter instead of overwriting it", async () => {
+		const settings = Settings.isolated();
+		const routing = service(settings);
+		const preview = routing.previewSmartRouting(setup);
+		const pending = routing.applySmartRouting(setup, { preview });
+		expect(settings.getGlobal("task.autorouting.tiers")).toEqual(preview.tiers);
+		const newer = { schema: 1 as const, providers: ["newer-owner"] };
+		settings.set("task.autorouting.setup", newer);
+		await pending;
+		expect(settings.getGlobal("task.autorouting.setup")).toEqual(newer);
+	});
+
+	test("catalog drift after synchronous memory publication cannot substitute the committed payload", async () => {
+		const settings = Settings.isolated();
+		let currentCatalog = catalog;
+		const routing = createRoutingSettingsService({
+			settings,
+			getCatalog: () => currentCatalog,
+			getProviderOrder: () => setup.providers,
+			isScoped: () => false,
+		});
+		const preview = routing.previewSmartRouting(setup);
+		const pending = routing.applySmartRouting(setup, { preview });
+		expect(settings.getGlobal("task.autorouting.provenance")).toEqual(preview.provenance);
+		currentCatalog = catalog.slice(0, 1);
+		const result = await pending;
+		expect(result.preview).toEqual(preview);
+		expect(settings.getGlobal("task.autorouting.tiers")).toEqual(preview.tiers);
+	});
+
+	test("a queued disk Apply cannot consume a newer local setup patch", async () => {
+		const temp = TempDir.createSync("@gjc-routing-current-");
+		const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") });
+		const release = Promise.withResolvers<void>();
+		try {
+			const configPath = settings.getGlobalConfigPath();
+			if (!configPath) throw new Error("Expected disk settings");
+			const blocker = enqueueAtomicYamlOperation(configPath, () => release.promise);
+			const routing = service(settings);
+			const preview = routing.previewSmartRouting(setup);
+			const pending = routing.applySmartRouting(setup, { preview });
+			const newer = { schema: 1 as const, providers: ["anthropic"] };
+			settings.set("task.autorouting.setup", newer);
+			release.resolve();
+			await blocker;
+			await expect(pending).rejects.toThrow("changed");
+			await settings.flushOrThrow();
+			expect(settings.getGlobal("task.autorouting.setup")).toEqual(newer);
+			const disk = await Settings.loadReadonly({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") });
+			try {
+				expect(disk.getGlobal("task.autorouting.setup")).toEqual(newer);
+			} finally {
+				await disk.close();
+			}
+		} finally {
+			release.resolve();
+			await settings.close();
+			temp.removeSync();
+		}
 	});
 
 	test("scoped sessions allow preview but reject all mutations", async () => {

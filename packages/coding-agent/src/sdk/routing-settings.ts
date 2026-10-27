@@ -63,6 +63,9 @@ type RoutingBaseline = {
 type PreviewAuthority = {
 	readonly preview: RoutingSettingsPreview;
 	readonly baseline: RoutingBaseline;
+	// Confirmation authorizes only the exact states observed inside the writer.
+	guard?: { global: RoutingState; effective: RoutingState };
+	refresh?: { setup: AutoroutingSetup; providerOrder: readonly string[] };
 };
 
 function rawAutoroutingState(current: Readonly<RawSettings>): RoutingState {
@@ -81,6 +84,7 @@ function rawAutoroutingState(current: Readonly<RawSettings>): RoutingState {
 export class RoutingSettingsService {
 	#inFlight = false;
 	readonly #previews = new WeakMap<RoutingSettingsPreview, PreviewAuthority>();
+	#pendingRefresh: RoutingSettingsPreview | undefined;
 	constructor(private readonly dependencies: RoutingSettingsDependencies) {}
 
 	previewSmartRouting(draft: AutoroutingSetup): RoutingSettingsPreview {
@@ -138,8 +142,8 @@ export class RoutingSettingsService {
 		}
 	}
 
-	#assertNotHandEdited(preview: RoutingSettingsPreview, confirmed: boolean, current: RoutingState): void {
-		if (confirmed || !current.provenance || current.tiers === undefined) return;
+	#assertNotHandEdited(preview: RoutingSettingsPreview, current: RoutingState): void {
+		if (!current.provenance || current.tiers === undefined) return;
 		const state = evaluateAutoroutingProvenanceState(current.provenance, {
 			catalogFingerprint: preview.sourceIdentity.catalogFingerprint,
 			mapFingerprint: preview.sourceIdentity.mapFingerprint,
@@ -167,7 +171,9 @@ export class RoutingSettingsService {
 		const changed =
 			!util.isDeepStrictEqual(current.tiers, baseline.tiers) ||
 			!util.isDeepStrictEqual(current.provenance, baseline.provenance);
-		const handEdited =
+		const confirmedHandEdit =
+			confirmed &&
+			util.isDeepStrictEqual(current.provenance, baseline.provenance) &&
 			current.provenance !== undefined &&
 			current.tiers !== undefined &&
 			evaluateAutoroutingProvenanceState(current.provenance, {
@@ -175,14 +181,18 @@ export class RoutingSettingsService {
 				mapFingerprint: preview.sourceIdentity.mapFingerprint,
 				tiers: current.tiers,
 			}).handEdited;
-		if (changed && !(confirmed && handEdited && util.isDeepStrictEqual(current.provenance, baseline.provenance))) {
+		if (changed && !confirmedHandEdit) {
 			throw new Error("Smart-routing generated settings changed since the preview; preview again before applying.");
 		}
 	}
 
 	#effectiveState(): RoutingState {
 		const settings = this.dependencies.settings;
-		return { provenance: settings.get("task.autorouting.provenance"), tiers: settings.get("task.autorouting.tiers") };
+		return {
+			setup: settings.get("task.autorouting.setup"),
+			provenance: settings.get("task.autorouting.provenance"),
+			tiers: settings.get("task.autorouting.tiers"),
+		};
 	}
 
 	async #commit(
@@ -220,7 +230,6 @@ export class RoutingSettingsService {
 		draft: AutoroutingSetup,
 		options?: { preview?: RoutingSettingsPreview; confirmHandEdit?: boolean },
 	): Promise<RoutingSettingsPreviewOutcome> {
-		this.#assertWritable();
 		const supplied = options?.preview ?? this.previewSmartRouting(draft);
 		const authority = this.#previews.get(supplied);
 		if (!authority) throw new Error("Smart-routing preview is not valid for this service; preview again.");
@@ -234,14 +243,41 @@ export class RoutingSettingsService {
 		const preview = authority.preview;
 		this.#previews.delete(supplied);
 		let outcome: RoutingSettingsOutcome;
+		let guardRaised = false;
 		try {
+			this.#assertWritable();
 			this.#assertSourceCurrent(preview);
-			this.#assertNotHandEdited(preview, options?.confirmHandEdit === true, this.#effectiveState());
 			outcome = await this.#commit(current => {
 				const state = rawAutoroutingState(current);
+				const effective = this.#effectiveState();
 				this.#assertSourceCurrent(preview);
-				this.#assertNotHandEdited(preview, options?.confirmHandEdit === true, state);
-				this.#assertFresh(preview, authority.baseline, state, options?.confirmHandEdit === true);
+				if (authority.refresh) {
+					if (!util.isDeepStrictEqual(state.setup, authority.refresh.setup)) {
+						throw new Error("Smart-routing setup changed while refresh was preparing; refresh again.");
+					}
+					if (!util.isDeepStrictEqual(authority.refresh.providerOrder, this.dependencies.getProviderOrder())) {
+						throw new Error("Smart-routing provider order changed; refresh again before applying.");
+					}
+				}
+				const guard = options?.confirmHandEdit === true ? authority.guard : undefined;
+				if (guard) {
+					if (
+						!util.isDeepStrictEqual(state, guard.global) ||
+						!util.isDeepStrictEqual(effective, guard.effective)
+					) {
+						throw new Error("Smart-routing hand-edited settings changed; preview again before applying.");
+					}
+				} else {
+					try {
+						this.#assertNotHandEdited(preview, effective);
+						this.#assertNotHandEdited(preview, state);
+					} catch (error) {
+						authority.guard = structuredClone({ global: state, effective });
+						guardRaised = true;
+						throw error;
+					}
+				}
+				this.#assertFresh(preview, authority.baseline, state, guard !== undefined);
 				return buildAutoroutingSettingsBatch({
 					tiers: preview.tiers,
 					setup: preview.setup,
@@ -249,9 +285,7 @@ export class RoutingSettingsService {
 				});
 			});
 		} catch (error) {
-			if (error && typeof error === "object" && "code" in error && error.code === "autorouting-hand-edited") {
-				this.#previews.set(supplied, authority);
-			}
+			if (guardRaised) this.#previews.set(supplied, authority);
 			throw error;
 		}
 		return {
@@ -265,46 +299,30 @@ export class RoutingSettingsService {
 	}
 
 	async refreshSmartRouting(options?: { confirmHandEdit?: boolean }): Promise<RoutingSettingsPreviewOutcome> {
+		// A guarded refresh must reuse its original service-issued preview, not regenerate it.
+		const pending = options?.confirmHandEdit === true ? this.#pendingRefresh : undefined;
+		this.#pendingRefresh = undefined;
 		this.#assertWritable();
+		if (pending) return this.applySmartRouting(pending.setup, { preview: pending, confirmHandEdit: true });
 		const setup = this.dependencies.settings.getGlobal("task.autorouting.setup");
 		if (setup === undefined || validateAutoroutingSetup(setup).length > 0) {
 			throw new Error("Cannot refresh smart routing without a valid recorded global setup.");
 		}
 		const declared = new Set(setup.providers.map(provider => provider.trim().toLowerCase()));
-		const providers = this.dependencies
-			.getProviderOrder()
-			.filter(provider => declared.has(provider.trim().toLowerCase()));
+		const providerOrder = [...this.dependencies.getProviderOrder()];
+		const providers = providerOrder.filter(provider => declared.has(provider.trim().toLowerCase()));
 		if (providers.length === 0)
 			throw new Error("No declared providers remain in the catalog; smart routing was not updated.");
 		const preview = this.previewSmartRouting({ ...structuredClone(setup), providers });
 		const authority = this.#previews.get(preview);
 		if (!authority) throw new Error("Smart-routing preview is unavailable.");
-		this.#previews.delete(preview);
-		this.#assertNotHandEdited(preview, options?.confirmHandEdit === true, this.#effectiveState());
-		const outcome = await this.#commit(current => {
-			const state = rawAutoroutingState(current);
-			if (!util.isDeepStrictEqual(state.setup, setup)) {
-				throw new Error(
-					"Smart-routing setup changed while refresh was preparing; refresh again to use current settings.",
-				);
-			}
-			this.#assertSourceCurrent(preview);
-			this.#assertNotHandEdited(preview, options?.confirmHandEdit === true, state);
-			this.#assertFresh(preview, authority.baseline, state, options?.confirmHandEdit === true);
-			return buildAutoroutingSettingsBatch({
-				tiers: preview.tiers,
-				setup: preview.setup,
-				provenance: preview.provenance,
-			});
-		});
-		return {
-			...outcome,
-			preview: this.#registerPreview(preview, {
-				setup: preview.setup,
-				tiers: preview.tiers,
-				provenance: preview.provenance,
-			}),
-		};
+		authority.refresh = { setup: structuredClone(setup), providerOrder };
+		try {
+			return await this.applySmartRouting(preview.setup, { preview });
+		} catch (error) {
+			if (this.#previews.has(preview)) this.#pendingRefresh = preview;
+			throw error;
+		}
 	}
 
 	clearGeneratedSetup(): Promise<RoutingSettingsOutcome> {

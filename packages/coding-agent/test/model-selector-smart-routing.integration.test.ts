@@ -209,6 +209,71 @@ describe("/model smart-routing panel integration", () => {
 		expect(ctx.showStatus).toHaveBeenCalled();
 	});
 
+	for (const operation of ["apply", "refresh"] as const) {
+		test(`${operation} displays the published preview when activation switches the catalog`, async () => {
+			const { controller, panel, settings, ctx, notifyCatalogChanged } = await openPanel();
+			if (operation === "refresh") await panel.__testApply();
+			const committed = panel.getPreviewPayload();
+			const registry = ctx.session.modelRegistry;
+			const getAll = vi.spyOn(registry, "getAll");
+			ctx.notifyConfigChanged.mockImplementation(async () => {
+				// Activation happens after atomic publication, not while preparing the preview.
+				expect(settings.get("task.autorouting.tiers")).toEqual(committed.tiers);
+				expect(settings.get("task.autorouting.provenance")).toEqual(committed.provenance);
+				getAll.mockImplementation(() => catalog.filter(item => item.provider !== "openai-codex"));
+				notifyCatalogChanged();
+			});
+
+			if (operation === "apply") await panel.__testApply();
+			else await panel.__testRefresh();
+
+			expect(panel.mode).toBe("done");
+			expect(ctx.showError).not.toHaveBeenCalled();
+			expect(settings.get("task.autorouting.setup")).toEqual(committed.setup);
+			expect(settings.get("task.autorouting.tiers")).toEqual(committed.tiers);
+			expect(settings.get("task.autorouting.provenance")).toEqual(committed.provenance);
+			expect(panel.getPreviewPayload()).toEqual(committed);
+			expect(renderText(panel)).toContain("openai-codex/gpt-5.6-terra");
+			expect(renderText(panel)).toContain("Smart-routing settings saved.");
+
+			// A separately requested preview is a new candidate, not the saved result.
+			const candidate = controller.previewSmartRouting(committed.setup);
+			expect(candidate.tiers).not.toEqual(committed.tiers);
+			expect(candidate.provenance.source.catalogFingerprint).not.toBe(
+				committed.provenance.source.catalogFingerprint,
+			);
+			expect(panel.getPreviewPayload()).toEqual(committed);
+		});
+
+		test(`${operation} remains successful when the catalog becomes unreadable after publication`, async () => {
+			const { panel, settings, ctx, notifyCatalogChanged } = await openPanel();
+			if (operation === "refresh") await panel.__testApply();
+			const committed = panel.getPreviewPayload();
+			const getAll = vi.spyOn(ctx.session.modelRegistry, "getAll");
+			let postPublicationReads = 0;
+			ctx.notifyConfigChanged.mockImplementation(async () => {
+				expect(settings.get("task.autorouting.tiers")).toEqual(committed.tiers);
+				getAll.mockImplementation(() => {
+					postPublicationReads++;
+					throw new Error("catalog unavailable after publication");
+				});
+				notifyCatalogChanged();
+			});
+
+			if (operation === "apply") await panel.__testApply();
+			else await panel.__testRefresh();
+
+			expect(panel.mode).toBe("done");
+			expect(postPublicationReads).toBe(0);
+			expect(panel.getPreviewPayload()).toEqual(committed);
+			expect(settings.get("task.autorouting.tiers")).toEqual(committed.tiers);
+			expect(settings.get("task.autorouting.provenance")).toEqual(committed.provenance);
+			expect(ctx.showError).not.toHaveBeenCalled();
+			expect(renderText(panel)).toContain("Smart-routing settings saved.");
+			expect(renderText(panel)).not.toContain("catalog unavailable after publication");
+		});
+	}
+
 	test("toggle writes only task.autorouting.enabled (AC8)", async () => {
 		const { panel, settings } = await openPanel();
 		const observedPatches: unknown[] = [];

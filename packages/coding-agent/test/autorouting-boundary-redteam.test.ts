@@ -1343,7 +1343,7 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 		});
 		useCatalogB = true;
 		await panel.__testApply();
-		expect(panel.mode).toBe("error");
+		expect(panel.mode).toBe("editing");
 		expect(applied).toBeUndefined();
 		expect(context.settings.getGlobal("task.autorouting.tiers")).toBeUndefined();
 		expect(panel.getPreviewPayload().sourceIdentity).not.toEqual(initialPreview.sourceIdentity);
@@ -1895,7 +1895,7 @@ describe("autorouting boundary red-team generation 3 delta re-attacks", () => {
 		});
 		voidUseB = true;
 		await voidPanel.__testApply();
-		expect(voidPanel.mode).toBe("error");
+		expect(voidPanel.mode).toBe("editing");
 		expect(voidContext.settings.getGlobal("task.autorouting.tiers")).toBeUndefined();
 		await voidPanel.__testApply();
 		const voidApplied = {
@@ -1921,7 +1921,7 @@ describe("autorouting boundary red-team generation 3 delta re-attacks", () => {
 		});
 		productionUseB = true;
 		await productionPanel.__testApply();
-		expect(productionPanel.mode).toBe("error");
+		expect(productionPanel.mode).toBe("editing");
 		expect(productionContext.settings.getGlobal("task.autorouting.tiers")).toBeUndefined();
 		await productionPanel.__testApply();
 		const productionApplied = {
@@ -1988,7 +1988,7 @@ describe("autorouting boundary red-team generation 3 delta re-attacks", () => {
 			productionApplied.mode === "done" &&
 			bytes(productionApplied.preview.tiers) === bytes(productionApplied.tiers) &&
 			productionApplied.preview.tiers.balanced === undefined &&
-			observed.failure.mode === "error" &&
+			observed.failure.mode === "editing" &&
 			bytes(observed.failure.preview) === bytes(failureInitial) &&
 			bytes(observed.failure.tiers) === bytes({}) &&
 			observed.rapid.rapidCalls === 1 &&
