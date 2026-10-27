@@ -1249,12 +1249,14 @@ function createOpenAIInlineImage(data: string): InlineImageData {
 	const mimeType = parseImageMetadata(bytes)?.mimeType ?? OPENAI_IMAGE_MIME_TYPE;
 	return { data, mimeType };
 }
-function isCodexImageOnlyModel(model: Model): boolean {
+/**
+ * Selects the standalone `/codex/images/generations` route by affirmative model identity only.
+ * Output modalities do not prove Images API support: other image-only Codex models keep using
+ * the hosted `image_generation` tool on `/codex/responses`, including edits.
+ */
+function isCodexImagesApiModel(model: Model): boolean {
 	if (model.api !== "openai-codex-responses" && model.provider !== "openai-codex") return false;
-	const modelId = model.id.toLowerCase();
-	if (modelId.startsWith("gpt-image-")) return true;
-	const output = model.output ?? [];
-	return output.includes("image") && !output.includes("text");
+	return model.id.toLowerCase().startsWith("gpt-image-");
 }
 function buildCodexImagesRequest(model: Model, promptText: string, params: ImageGenParams): CodexImagesRequest {
 	const size = resolveOpenAIImageSize(params.aspect_ratio, params.image_size);
@@ -1336,18 +1338,32 @@ export function getOpenAIImageBaseUrlForTest(model: Model, authCredentialType?: 
 	return getOpenAIBaseUrl(model, authCredentialType);
 }
 
-/** Strips a trailing `/codex` or `/codex/responses` so Codex routes are appended exactly once. */
-function getCodexRootUrl(baseUrl: string): string {
-	const normalized = baseUrl.replace(/\/+$/, "");
-	if (normalized.endsWith(URL_PATHS.CODEX_RESPONSES)) {
-		return normalized.slice(0, -URL_PATHS.CODEX_RESPONSES.length);
+/**
+ * Builds a Codex route URL from a configured base URL. Normalization runs on the parsed pathname
+ * only: a trailing `/codex` or `/codex/responses` path segment is stripped before `route` is
+ * appended, so the route appears exactly once. The query string is preserved; a fragment is
+ * dropped because it is never sent to the server and must not end up inside the path.
+ */
+function getCodexRouteUrl(baseUrl: string, route: string): string {
+	let url: URL;
+	try {
+		url = new URL(baseUrl);
+	} catch {
+		throw new Error(`Invalid OpenAI Codex base URL: ${baseUrl}`);
 	}
-	if (normalized.endsWith("/codex")) return normalized.slice(0, -"/codex".length);
-	return normalized;
+	let pathname = url.pathname.replace(/\/+$/, "");
+	if (pathname.endsWith(URL_PATHS.CODEX_RESPONSES)) {
+		pathname = pathname.slice(0, -URL_PATHS.CODEX_RESPONSES.length);
+	} else if (pathname.endsWith("/codex")) {
+		pathname = pathname.slice(0, -"/codex".length);
+	}
+	url.pathname = `${pathname}${route}`;
+	url.hash = "";
+	return url.toString();
 }
 
 function getCodexImagesGenerationsUrl(baseUrl: string): string {
-	return `${getCodexRootUrl(baseUrl)}${URL_PATHS.CODEX_IMAGES_GENERATIONS}`;
+	return getCodexRouteUrl(baseUrl, URL_PATHS.CODEX_IMAGES_GENERATIONS);
 }
 
 function getOpenAIResponsesUrl(model: Model, authCredentialType?: "api_key" | "oauth"): string {
@@ -1355,7 +1371,7 @@ function getOpenAIResponsesUrl(model: Model, authCredentialType?: "api_key" | "o
 	if (model.api !== "openai-codex-responses" && model.provider !== "openai-codex") {
 		return `${baseUrl}/responses`;
 	}
-	return `${getCodexRootUrl(baseUrl)}${URL_PATHS.CODEX_RESPONSES}`;
+	return getCodexRouteUrl(baseUrl, URL_PATHS.CODEX_RESPONSES);
 }
 
 function buildOpenAIImageHeaders(model: Model, apiKey: string, sessionId: string | undefined): Headers {
@@ -1443,7 +1459,7 @@ async function generateOpenAIHostedImage(
 	options?: { authCredentialType?: "api_key" | "oauth" },
 ): Promise<OpenAIHostedImageResult> {
 	const promptText = assemblePrompt(params);
-	const imageOnly = isCodexImageOnlyModel(model);
+	const imageOnly = isCodexImagesApiModel(model);
 	if (imageOnly && inputImages.length > 0) {
 		throw new Error("Codex image edits are not supported on this route.");
 	}
