@@ -1752,8 +1752,9 @@ export function renderCustomizeDoctorText(report: CustomizeDoctorReport): string
 					lines.push(`      network destinations: ${hook.networkDestinations.map(doctorDisplay).join(",")}`);
 				if (hook.filesystemRoots.length > 0)
 					lines.push(`      filesystem roots: ${hook.filesystemRoots.map(doctorDisplay).join(",")}`);
-				if (hook.capabilityHash) lines.push(`      capability hash: ${hook.capabilityHash}`);
-				if (hook.implementationHash) lines.push(`      implementation hash: ${hook.implementationHash}`);
+				if (hook.capabilityHash) lines.push(`      capability hash: ${doctorDisplay(hook.capabilityHash)}`);
+				if (hook.implementationHash)
+					lines.push(`      implementation hash: ${doctorDisplay(hook.implementationHash)}`);
 				if (hook.quarantineCode) lines.push(`      quarantine code: ${doctorDisplay(hook.quarantineCode)}`);
 				lines.push(`      remediation: ${doctorDisplay(hook.remediation)}`);
 			}

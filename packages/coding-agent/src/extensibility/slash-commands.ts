@@ -197,7 +197,8 @@ const COMMAND_DESCRIPTION_PREVIEW = 60;
 
 /** A command name is shown as typed. Names that display sanitization would change are not loaded. */
 export function isDisplaySafeCommandName(name: string): boolean {
-	return name.length > 0 && sanitizeDisplayLine(name) === name;
+	// SelectList replaces HT. sanitizeDisplayLine keeps it, so a tabbed name would paint as a different string.
+	return name.length > 0 && !name.includes("\t") && sanitizeDisplayLine(name) === name;
 }
 
 /**

@@ -269,6 +269,45 @@ describe.serial("slash command display", () => {
 		});
 	});
 
+	it("drops an OpenCode command name that contains an escaped tab and keeps a spaced name", async () => {
+		const cwd = await makeRepo();
+		await writeCommand(
+			cwd,
+			path.join(".opencode", "commands", "tabbed.md"),
+			["---", 'name: "sync\\tteam"', "---", "tab-name-marker", ""].join("\n"),
+		);
+		await writeCommand(
+			cwd,
+			path.join(".opencode", "commands", "spaced.md"),
+			["---", 'name: "sync team"', "---", "tab-neighbor-marker", ""].join("\n"),
+		);
+
+		const commands = await loadSlashCommands({ cwd });
+		expect(commands.some(command => command.name.includes("\t"))).toBe(false);
+		expect(commands.some(command => command.content.includes("tab-name-marker"))).toBe(false);
+		expect(commands.find(command => command.content.includes("tab-neighbor-marker"))).toMatchObject({
+			name: "sync team",
+		});
+	});
+
+	it.skipIf(process.platform === "win32")("drops a command file whose name contains a tab", async () => {
+		const cwd = await makeRepo();
+		await writeCommand(cwd, path.join(".gjc", "commands", "sync\tteam.md"), "---\n---\ntab-file-marker\n");
+		await writeCommand(
+			cwd,
+			path.join(".gjc", "commands", "sync team.md"),
+			"---\ndescription: Sync the team.\n---\ntab-file-neighbor\n",
+		);
+
+		const commands = await loadSlashCommands({ cwd });
+		expect(commands.some(command => command.name.includes("\t"))).toBe(false);
+		expect(commands.some(command => command.content.includes("tab-file-marker"))).toBe(false);
+		expect(commands.find(command => command.content.includes("tab-file-neighbor"))).toMatchObject({
+			name: "sync team",
+			description: "Sync the team.",
+		});
+	});
+
 	it("property: slash command names reject terminal controls", async () => {
 		const mod = await import("../src/extensibility/slash-commands");
 		const acceptName = mod.isDisplaySafeCommandName;
@@ -294,6 +333,7 @@ describe.serial("slash command display", () => {
 			"\u009b",
 			"\r",
 			"\n",
+			"\t",
 			"\u202e",
 			"\u200e",
 			"\u200f",
@@ -436,4 +476,83 @@ describe.serial("slash command display", () => {
 			expect(text).toContain("  status-ok  [loaded]");
 		},
 	);
+
+	it("keeps quarantined hook hashes in the report and strips them from doctor text", async () => {
+		const cwd = await makeRepo();
+		const pluginRoot = path.join(cwd, ".gjc", "gjc-plugins", "hash-bundle");
+		const hostile = "\u001b]0;spoofed-title\u0007";
+		const plainHash = "ab".repeat(32);
+		const hook = (id: string, hash: string) => ({
+			extensionId: id,
+			name: id,
+			event: "tool_call",
+			target: "read",
+			phase: "before",
+			relativePath: "hooks/read.ts",
+			sha256: "0".repeat(64),
+			implementationHash: hash,
+			capabilityHash: hash,
+			capabilities: [],
+			networkDestinations: [],
+			filesystemRoots: [],
+			functionHook: false,
+		});
+		const registry = {
+			version: 1,
+			scope: "project",
+			plugins: [
+				{
+					name: "hash-bundle",
+					version: "1.0.0",
+					scope: "project",
+					enabled: true,
+					pluginRoot,
+					manifestPath: path.join(pluginRoot, "gajae-plugin.json"),
+					manifestHash: "",
+					source: { kind: "path", uri: pluginRoot, resolvedAt: "2026-01-01T00:00:00.000Z" },
+					installedAt: "2026-01-01T00:00:00.000Z",
+					updatedAt: "2026-01-01T00:00:00.000Z",
+					copiedFiles: [{ relativePath: "tools/fixture.ts", sha256: "0".repeat(64), bytes: 1 }],
+					surfaces: {
+						subskills: [],
+						tools: [
+							{
+								extensionId: "tool:fixture-tool",
+								name: "fixture-tool",
+								relativePath: "tools/fixture.ts",
+								sha256: "0".repeat(64),
+							},
+						],
+						hooks: [
+							hook("hook:tool_call:before:read:hostile", hostile),
+							hook("hook:tool_call:before:read:plain", plainHash),
+						],
+						mcps: [],
+						systemAppendices: [],
+						agentAppendices: [],
+					},
+					disabledSurfaceIds: [],
+				},
+			],
+		};
+		await writeCommand(cwd, path.join(".gjc", "gjc-plugins", "registry.json"), `${JSON.stringify(registry)}\n`);
+
+		const report = await runCustomizeDoctor(cwd, Settings.isolated({}));
+		const bundle = report.surfaces
+			.find(surface => surface.kind === "plugin-bundle")
+			?.items.find(item => item.name === "hash-bundle");
+		const hostileHook = bundle?.functionHooks?.find(item => item.extensionId.endsWith("hostile"));
+		const plainHook = bundle?.functionHooks?.find(item => item.extensionId.endsWith("plain"));
+		expect(bundle?.status).toBe("quarantined");
+		expect(hostileHook?.capabilityHash).toBe(hostile);
+		expect(hostileHook?.implementationHash).toBe(hostile);
+		expect(plainHook?.capabilityHash).toBe(plainHash);
+		expect(plainHook?.implementationHash).toBe(plainHash);
+
+		const text = renderCustomizeDoctorText(report);
+		expect(text.includes("\u001b")).toBe(false);
+		expect(text.includes("\u0007")).toBe(false);
+		expect(text.includes("spoofed-title")).toBe(false);
+		expect(text).toContain(plainHash);
+	});
 });
