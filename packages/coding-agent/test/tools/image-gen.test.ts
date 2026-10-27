@@ -15,6 +15,7 @@ import type { CustomToolContext } from "@gajae-code/coding-agent/extensibility/c
 import type { ReadonlySessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import {
 	getImageGenToolsWithRegistry,
+	type ImageGenParams,
 	imageGenTool,
 	UnsupportedImageProviderError,
 } from "@gajae-code/coding-agent/tools/image-gen";
@@ -269,64 +270,9 @@ describe("imageGenTool", () => {
 		releaseSpy.mockRestore();
 		archSpy.mockRestore();
 	});
-	it("posts Codex image-only models to the generations route", async () => {
+	function setupCodexImageGen(id: string, output: Model["output"], baseUrl: string, respond: () => Response) {
 		delete Bun.env.OPENAI_BASE_URL;
-		let requestUrl: string | undefined;
-		let requestBody: unknown;
-		const imageModel = {
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			id: "gpt-image-2",
-			name: "GPT Image 2",
-			baseUrl: "",
-			output: ["image"],
-		} as Model;
-		const jwtPayload = Buffer.from(
-			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "codex-account-1" } }),
-		).toString("base64url");
-		const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-			requestUrl = input.toString();
-			requestBody = JSON.parse(String(init?.body));
-			return new Response(
-				JSON.stringify({
-					data: [{ b64_json: Buffer.from("fake-webp").toString("base64"), revised_prompt: "A circle." }],
-				}),
-				{ status: 200, headers: { "content-type": "application/json" } },
-			);
-		}) as unknown as typeof fetch;
-		fetchMock.preconnect = originalFetch.preconnect;
-		global.fetch = fetchMock;
-		const ctx: CustomToolContext = {
-			sessionManager: {
-				getCwd: () => "/tmp",
-				getSessionId: () => "test-session",
-			} as unknown as ReadonlySessionManager,
-			modelRegistry: makeMockRegistry(
-				{ getApiKey: async () => `header.${jwtPayload}.signature`, getApiKeyForProvider: async () => undefined },
-				[imageModel],
-			),
-			model: imageModel,
-			settings: makeMockSettings("openai-codex/gpt-image-2"),
-			isIdle: () => true,
-			hasQueuedMessages: () => false,
-			abort: () => {},
-		};
-		const result = await imageGenTool.execute("call-image", { subject: "a circle" }, undefined, ctx);
-		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
-		expect(requestUrl).toBe("https://chatgpt.com/backend-api/codex/images/generations");
-		expect(requestBody).toMatchObject({ model: "gpt-image-2", n: 1, quality: "auto", output_format: "webp" });
-		expect(requestBody).not.toHaveProperty("tools");
-		expect(requestBody).not.toHaveProperty("input");
-	});
-	async function codexRequestFor(
-		id: string,
-		output: Model["output"],
-		baseUrl: string,
-		input?: { data: string; mime_type: string }[],
-	): Promise<{ requestUrl?: string; requestBody?: unknown }> {
-		delete Bun.env.OPENAI_BASE_URL;
-		let requestUrl: string | undefined;
-		let requestBody: unknown;
+		const captured: { fetchCalls: number; requestUrl?: string; requestBody?: unknown } = { fetchCalls: 0 };
 		const model = {
 			api: "openai-codex-responses",
 			provider: "openai-codex",
@@ -339,9 +285,10 @@ describe("imageGenTool", () => {
 			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "codex-account-1" } }),
 		).toString("base64url");
 		const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-			requestUrl = input.toString();
-			requestBody = JSON.parse(String(init?.body));
-			return new Response("bad gateway", { status: 502 });
+			captured.fetchCalls++;
+			captured.requestUrl = input.toString();
+			captured.requestBody = JSON.parse(String(init?.body));
+			return respond();
 		}) as unknown as typeof fetch;
 		fetchMock.preconnect = originalFetch.preconnect;
 		global.fetch = fetchMock;
@@ -360,10 +307,48 @@ describe("imageGenTool", () => {
 			hasQueuedMessages: () => false,
 			abort: () => {},
 		};
-		await expect(
-			imageGenTool.execute("call-base-url", { subject: "a circle", ...(input ? { input } : {}) }, undefined, ctx),
-		).rejects.toThrow("OpenAI image request failed (502)");
-		return { requestUrl, requestBody };
+		return {
+			captured,
+			run: (params: ImageGenParams) => imageGenTool.execute("call-codex", params, undefined, ctx),
+		};
+	}
+	it("posts Codex image-only models to the generations route", async () => {
+		const { captured, run } = setupCodexImageGen(
+			"gpt-image-2",
+			["image"],
+			"",
+			() =>
+				new Response(
+					JSON.stringify({
+						data: [{ b64_json: Buffer.from("fake-webp").toString("base64"), revised_prompt: "A circle." }],
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				),
+		);
+		const result = await run({ subject: "a circle" });
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+		const { requestUrl, requestBody } = captured;
+		expect(requestUrl).toBe("https://chatgpt.com/backend-api/codex/images/generations");
+		expect(requestBody).toMatchObject({ model: "gpt-image-2", n: 1, quality: "auto", output_format: "webp" });
+		expect(requestBody).not.toHaveProperty("tools");
+		expect(requestBody).not.toHaveProperty("input");
+	});
+	async function codexRequestFor(
+		id: string,
+		output: Model["output"],
+		baseUrl: string,
+		input?: { data: string; mime_type: string }[],
+	): Promise<{ requestUrl?: string; requestBody?: unknown }> {
+		const { captured, run } = setupCodexImageGen(
+			id,
+			output,
+			baseUrl,
+			() => new Response("bad gateway", { status: 502 }),
+		);
+		await expect(run({ subject: "a circle", ...(input ? { input } : {}) })).rejects.toThrow(
+			"OpenAI image request failed (502)",
+		);
+		return captured;
 	}
 	describe.each([
 		["/codex", "https://chatgpt.com/backend-api/codex"],
@@ -419,52 +404,14 @@ describe("imageGenTool", () => {
 		expect(requestBody).toHaveProperty("input");
 	});
 	it("rejects image edits for Codex image-only models before fetch", async () => {
-		let fetchCalled = false;
-		const imageModel = {
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			id: "gpt-image-2",
-			name: "GPT Image 2",
-			baseUrl: "",
-			output: ["image"],
-		} as Model;
-		const jwtPayload = Buffer.from(
-			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "codex-account-1" } }),
-		).toString("base64url");
-		const fetchMock: typeof fetch = (async () => {
-			fetchCalled = true;
-			return new Response();
-		}) as unknown as typeof fetch;
-		fetchMock.preconnect = originalFetch.preconnect;
-		global.fetch = fetchMock;
-		const ctx: CustomToolContext = {
-			sessionManager: {
-				getCwd: () => "/tmp",
-				getSessionId: () => "test-session",
-			} as unknown as ReadonlySessionManager,
-			modelRegistry: makeMockRegistry(
-				{ getApiKey: async () => `header.${jwtPayload}.signature`, getApiKeyForProvider: async () => undefined },
-				[imageModel],
-			),
-			model: imageModel,
-			settings: makeMockSettings("openai-codex/gpt-image-2"),
-			isIdle: () => true,
-			hasQueuedMessages: () => false,
-			abort: () => {},
-		};
-
+		const { captured, run } = setupCodexImageGen("gpt-image-2", ["image"], "", () => new Response());
 		await expect(
-			imageGenTool.execute(
-				"call-image-edit",
-				{
-					subject: "edit this image",
-					input: [{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" }],
-				},
-				undefined,
-				ctx,
-			),
+			run({
+				subject: "edit this image",
+				input: [{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" }],
+			}),
 		).rejects.toThrow("Codex image edits are not supported on this route.");
-		expect(fetchCalled).toBe(false);
+		expect(captured.fetchCalls).toBe(0);
 	});
 
 	it("e2e writes OpenAI Responses image_generation WebP output to a temp file", async () => {

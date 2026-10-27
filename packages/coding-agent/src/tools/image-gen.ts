@@ -414,7 +414,6 @@ interface OpenAIImageGenerationCall {
 }
 interface CodexImagesResponse {
 	data?: Array<{ b64_json?: string; revised_prompt?: string }>;
-	error?: { message?: string };
 }
 
 interface OpenAIOutputText {
@@ -1362,10 +1361,6 @@ function getCodexRouteUrl(baseUrl: string, route: string): string {
 	return url.toString();
 }
 
-function getCodexImagesGenerationsUrl(baseUrl: string): string {
-	return getCodexRouteUrl(baseUrl, URL_PATHS.CODEX_IMAGES_GENERATIONS);
-}
-
 function getOpenAIResponsesUrl(model: Model, authCredentialType?: "api_key" | "oauth"): string {
 	const baseUrl = getOpenAIBaseUrl(model, authCredentialType);
 	if (model.api !== "openai-codex-responses" && model.provider !== "openai-codex") {
@@ -1459,17 +1454,17 @@ async function generateOpenAIHostedImage(
 	options?: { authCredentialType?: "api_key" | "oauth" },
 ): Promise<OpenAIHostedImageResult> {
 	const promptText = assemblePrompt(params);
-	const imageOnly = isCodexImagesApiModel(model);
-	if (imageOnly && inputImages.length > 0) {
+	const useImagesApi = isCodexImagesApiModel(model);
+	if (useImagesApi && inputImages.length > 0) {
 		throw new Error("Codex image edits are not supported on this route.");
 	}
-	const stream = !imageOnly && (model.api === "openai-codex-responses" || model.provider === "openai-codex");
-	const requestBody = imageOnly
+	const stream = !useImagesApi && (model.api === "openai-codex-responses" || model.provider === "openai-codex");
+	const requestBody = useImagesApi
 		? buildCodexImagesRequest(model, promptText, params)
 		: buildOpenAIHostedImageRequest(model, promptText, params, inputImages, stream);
 	const response = await fetchImageProvider(
-		imageOnly
-			? getCodexImagesGenerationsUrl(getOpenAIBaseUrl(model, options?.authCredentialType))
+		useImagesApi
+			? getCodexRouteUrl(getOpenAIBaseUrl(model, options?.authCredentialType), URL_PATHS.CODEX_IMAGES_GENERATIONS)
 			: getOpenAIResponsesUrl(model, options?.authCredentialType),
 		{
 			method: "POST",
@@ -1485,7 +1480,7 @@ async function generateOpenAIHostedImage(
 			`OpenAI image request failed (${response.status}): ${getOpenAIResponseErrorMessage(errorText, apiKey)}`,
 		);
 	}
-	if (imageOnly) {
+	if (useImagesApi) {
 		const rawText = await readProviderResponseText(response, apiKey, signal);
 		const data = parseProviderJson<CodexImagesResponse>(rawText, apiKey);
 		return redactOpenAIHostedImageResult(collectCodexImagesResult(data), apiKey);
