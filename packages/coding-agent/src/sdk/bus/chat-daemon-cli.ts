@@ -26,6 +26,7 @@ import {
 	notificationConfigFromFile,
 	resolveNotificationProvider,
 } from "./config";
+import { requireDaemonInternalOwnerId } from "./daemon-internal-cli-args";
 import { doctorDaemonIdentityMatches, doctorDaemonOccupancySettled } from "./doctor-daemon-restart";
 
 export interface ChatDaemonRuntimeHandle {
@@ -191,8 +192,7 @@ export async function runChatDaemonInternal(
 ): Promise<void> {
 	const agentDir =
 		argValue(argv, "--agent-dir") ?? process.env.GJC_CODING_AGENT_DIR ?? path.join(process.cwd(), ".gjc", "agent");
-	const ownerId = argValue(argv, "--owner-id");
-	if (!ownerId) throw new Error("missing --owner-id");
+	const ownerId = requireDaemonInternalOwnerId(argv);
 	const pid = ownerPid(ownerId);
 	if (pid !== undefined && !(deps.pidAlive ?? defaultPidAlive)(pid)) return;
 	const daemonPid = deps.processPid ?? process.pid;
