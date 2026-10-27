@@ -77,6 +77,7 @@ export function classifyOwnerSocketLexical(candidate: string, canonical: string)
 }
 
 function lexicalOwnerSocketKey(socketPath: string): string | null {
+	if (typeof socketPath !== "string") return null;
 	if (socketPath.length === 0 || socketPath.trim() !== socketPath || socketPath.includes("\0")) return null;
 	const resolved = path.resolve(socketPath);
 	if (!path.isAbsolute(resolved)) return null;
@@ -105,7 +106,9 @@ function ownerSocketPathsMatch(candidate: string, canonical: string): boolean {
 
 /**
  * Path the CLI may dial for this lease endpoint.
- * Returns the private socket, never the lease string, and only when that inode is a real socket.
+ * Returns the private socket, never the lease string.
+ * A missing file still returns that path so a manual owner stays addressable before listen.
+ * A symlink or a non-socket does not.
  */
 export function canonicalLeaseSocket(root: string, sessionId: string, endpointPath: string): string | null {
 	let canonical: string;

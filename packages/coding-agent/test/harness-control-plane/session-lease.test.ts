@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/p
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { FileLockAcquireError, FileLockTestHooks, withFileLock } from "../../src/config/file-lock";
+import { resolveOwner } from "../../src/harness-control-plane/owner";
 import {
 	acquireLease,
 	canWriteEvents,
@@ -326,6 +327,66 @@ describe("SessionLease", () => {
 
 		expect(await readFile(unownedSocket, "utf8")).toBe("sock");
 		await expect(readFile(paths.controlSock, "utf8")).rejects.toThrow();
+	});
+
+	it("takes over a dead lease whose unix endpoint path is not a string", async () => {
+		const badPaths: unknown[] = [null, 1, { nested: true }];
+		const missing = {
+			ownerId: "owner-a",
+			sessionId: SID,
+			pid: 1,
+			leaseTokenHash: "ab".repeat(32),
+			endpoint: { kind: "unix-socket" },
+			eventsPath: "e",
+			heartbeatAt: new Date().toISOString(),
+			expiresAt: new Date(Date.now() + 60_000).toISOString(),
+			leaseEpoch: 1,
+			writer: { ownerId: "owner-a", leaseEpoch: 1 },
+		};
+		await mkdir(path.dirname(sessionPaths(root, SID).lease), { recursive: true });
+		for (const endpointPath of badPaths) {
+			const lease = { ...missing, endpoint: { kind: "unix-socket", path: endpointPath } };
+			await writeFile(sessionPaths(root, SID).lease, `${JSON.stringify(lease)}\n`, "utf8");
+			const taken = await acquireLease(root, SID, {
+				ownerId: "owner-b",
+				pid: 2,
+				eventsPath: "e",
+				endpoint: { kind: "unix-socket", path: controlSocketPath(root, SID) },
+				ttlMs: 10_000,
+				probe: deadProbe,
+			});
+			expect(taken.lease.ownerId).toBe("owner-b");
+			expect(taken.lease.leaseEpoch).toBe(2);
+		}
+		await writeFile(sessionPaths(root, SID).lease, `${JSON.stringify(missing)}\n`, "utf8");
+		const taken = await acquireLease(root, SID, {
+			ownerId: "owner-b",
+			pid: 2,
+			eventsPath: "e",
+			endpoint: { kind: "unix-socket", path: controlSocketPath(root, SID) },
+			ttlMs: 10_000,
+			probe: deadProbe,
+		});
+		expect(taken.lease.ownerId).toBe("owner-b");
+		expect(taken.lease.leaseEpoch).toBe(2);
+	});
+
+	it("does not route a live lease whose unix endpoint path is not a string", async () => {
+		const lease = {
+			ownerId: "owner-a",
+			sessionId: SID,
+			pid: process.pid,
+			leaseTokenHash: "ab".repeat(32),
+			endpoint: { kind: "unix-socket", path: null },
+			eventsPath: "e",
+			heartbeatAt: new Date().toISOString(),
+			expiresAt: new Date(Date.now() + 60_000).toISOString(),
+			leaseEpoch: 1,
+			writer: { ownerId: "owner-a", leaseEpoch: 1 },
+		};
+		await mkdir(path.dirname(sessionPaths(root, SID).lease), { recursive: true });
+		await writeFile(sessionPaths(root, SID).lease, `${JSON.stringify(lease)}\n`, "utf8");
+		expect((await resolveOwner(root, SID)).socketPath).toBeNull();
 	});
 
 	it("takes over a live lease whose unix endpoint is outside the private socket", async () => {
