@@ -43,6 +43,155 @@ describe("current-value atomic batch local ownership", () => {
 		}
 	});
 	for (const durable of [false, true]) {
+		for (const builder of [false, true]) {
+			it(`validates hostile arrays without losing ownership in ${durable ? "durable" : "memory"} ${builder ? "async builder" : "batch"}`, async () => {
+				const temp = TempDir.createSync("@gjc-hostile-patches-");
+				const settings = durable
+					? await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") })
+					: Settings.isolated();
+				try {
+					await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.2 }]);
+					const receipt = await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.4 }]);
+					const changes: string[] = [];
+					settings.onChanged(path => changes.push(path));
+					const configPath = settings.getGlobalConfigPath();
+					const before = configPath ? await Bun.file(configPath).text() : undefined;
+					let dispatches = 0;
+					const hostile = (items: SettingsAtomicPatch[]) => {
+						Object.defineProperty(items, "map", {
+							value: () => {
+								dispatches++;
+								return [{ path: "unknown.secret", op: "set", value: true }];
+							},
+						});
+						Object.defineProperty(items, Symbol.iterator, {
+							value: () => {
+								dispatches++;
+								throw new Error("iterator called");
+							},
+						});
+						Object.defineProperty(items, "constructor", {
+							get: () => {
+								dispatches++;
+								throw new Error("species accessed");
+							},
+						});
+						return items;
+					};
+					const commit = (items: SettingsAtomicPatch[]) =>
+						builder
+							? settings.commitAtomicBatchWithCurrent(async () => items)
+							: settings.commitAtomicBatch(items);
+					const badPath = { path: "unknown.secret", op: "set", value: true } as unknown as SettingsAtomicPatch;
+					await expect(commit(hostile([{ path: "temperature", op: "set", value: 0.9 }, badPath]))).rejects.toThrow(
+						"Unknown setting path",
+					);
+					const sparse = new Array<SettingsAtomicPatch>(2);
+					sparse[0] = { path: "temperature", op: "set", value: 0.9 };
+					await expect(commit(hostile(sparse))).rejects.toThrow();
+					await expect(commit({ length: 0 } as unknown as SettingsAtomicPatch[])).rejects.toThrow(
+						"must be an array",
+					);
+					await expect(
+						commit(
+							hostile([
+								{
+									get op(): never {
+										throw new Error("secret operation");
+									},
+									path: "temperature",
+								},
+							]),
+						),
+					).rejects.toThrow("Could not read settings atomic patch");
+					await expect(
+						commit(
+							hostile([
+								{
+									path: "temperature",
+									op: "set",
+									get value(): never {
+										throw new Error("secret value");
+									},
+								},
+							]),
+						),
+					).rejects.toThrow("Could not read or clone settings atomic patch value");
+					await expect(
+						commit(
+							hostile([
+								{
+									get path(): never {
+										throw new Error("secret getter data");
+									},
+									op: "unset",
+								},
+							]),
+						),
+					).rejects.toThrow("Could not read settings atomic patch");
+					try {
+						await commit(
+							hostile([
+								{
+									get path(): never {
+										throw new Error("secret getter data");
+									},
+									op: "unset",
+								},
+							]),
+						);
+						throw new Error("Expected rejection");
+					} catch (error) {
+						expect(String(error)).not.toContain("secret getter data");
+					}
+					expect(dispatches).toBe(0);
+					expect(settings.getGlobal("temperature")).toBe(0.4);
+					expect(changes).toEqual([]);
+					if (configPath && before !== undefined) expect(await Bun.file(configPath).text()).toBe(before);
+					expect((await receipt.restore()).status).toBe("restored");
+					expect(settings.getGlobal("temperature")).toBe(0.2);
+
+					let pathReads = 0;
+					let opReads = 0;
+					let valueReads = 0;
+					const changing = {
+						get path(): "temperature" {
+							return (++pathReads === 1 ? "temperature" : "unknown.secret") as "temperature";
+						},
+						get op(): "set" {
+							return (++opReads === 1 ? "set" : "unset") as "set";
+						},
+						get value() {
+							valueReads++;
+							return 0.7;
+						},
+					};
+					const accepted = await commit(hostile([changing, { path: "temperature", op: "set", value: 0.8 }]));
+					expect([pathReads, opReads, valueReads, dispatches]).toEqual([1, 1, 1, 0]);
+					expect(settings.getGlobal("temperature")).toBe(0.8);
+					expect((await accepted.restore()).status).toBe("restored");
+					expect(settings.getGlobal("temperature")).toBe(0.2);
+					expect(changes).toEqual(["temperature", "temperature", "temperature"]);
+
+					const reentrant = {
+						get path() {
+							settings.set("temperature", 0.6);
+							return "temperature" as const;
+						},
+						op: "set" as const,
+						value: 0.1,
+					};
+					await expect(commit(hostile([reentrant]))).rejects.toThrow("changed");
+					expect(settings.getGlobal("temperature")).toBe(0.6);
+					await settings.flush();
+					if (configPath)
+						expect(YAML.parse(await Bun.file(configPath).text())).toMatchObject({ temperature: 0.6 });
+				} finally {
+					await settings.close();
+					temp.removeSync();
+				}
+			});
+		}
 		it(`returns a separately owned reversible receipt in ${durable ? "durable" : "memory"}`, async () => {
 			const temp = TempDir.createSync("@gjc-inverse-receipt-");
 			const settings = durable
