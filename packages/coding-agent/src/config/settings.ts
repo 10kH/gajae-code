@@ -829,16 +829,28 @@ export class Settings implements NotificationSettingsReader {
 	getResolutionSnapshot(): Record<SettingPath, SettingsPathResolution> {
 		const project = this.#mergeSettingsLayers({}, this.#project, {});
 		const runtime = this.#mergeSettingsLayers({}, {}, this.#overrides);
+		const stages = [
+			["global", this.#global, this.#global],
+			["project", project, this.#mergeSettingsLayers(this.#global, this.#project, {})],
+			["runtime", runtime, this.#merged],
+		] as const;
 		const result = {} as Record<SettingPath, SettingsPathResolution>;
 		for (const settingPath of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
 			const segments = settingPath.split(".");
 			const layers: SettingsLayer[] = [];
-			for (const [layer, raw] of [
-				["global", this.#global],
-				["project", project],
-				["runtime", runtime],
-			] as const) {
-				if (getByPath(raw, segments) !== undefined) layers.push(layer);
+			let origin: SettingsPathResolution["origin"] = "default";
+			let previous: unknown;
+			for (const [layer, raw, merged] of stages) {
+				const declared = getByPath(raw, segments);
+				const effective = getByPath(merged, segments);
+				if (declared !== undefined) layers.push(layer);
+				if (effective === undefined) {
+					// A higher scalar/null/array ancestor can erase a lower leaf.
+					origin = "default";
+				} else if (declared !== undefined) {
+					origin = rawSettingsRecord(previous) && rawSettingsRecord(declared) ? "layered" : layer;
+				}
+				previous = effective;
 			}
 			const allowedLayers: SettingsLayer[] = ["global"];
 			const globalOnly = GLOBAL_ONLY_SETTINGS.has(settingPath) || isNotificationSettingsPath(settingPath);
@@ -851,10 +863,8 @@ export class Settings implements NotificationSettingsReader {
 				}
 				allowedLayers.push("runtime");
 			}
-			const effective = getByPath(this.#merged, segments);
-			const isObject = effective !== null && typeof effective === "object" && !Array.isArray(effective);
 			result[settingPath] = {
-				origin: layers.length > 1 && isObject ? "layered" : (layers.at(-1) ?? "default"),
+				origin,
 				layers,
 				allowedLayers,
 			};
@@ -1530,15 +1540,28 @@ export class Settings implements NotificationSettingsReader {
 		}
 	}
 
-	/** Build a durable batch from the current on-disk YAML under the shared queue and file lock. */
+	/**
+	 * Build a batch from current YAML under the shared queue/lock. A newer local
+	 * mutation while queued or awaiting an async builder invalidates this attempt.
+	 * Synchronous memory builders publish without yielding to another setter.
+	 */
 	async commitAtomicBatchWithCurrent(
 		buildPatches: (
 			current: Readonly<RawSettings>,
 		) => Promise<readonly SettingsAtomicPatch[]> | readonly SettingsAtomicPatch[],
 	): Promise<CasReceipt> {
 		this.#assertDurableConfigWritable();
+		const admissionRevision = this.#nextRevision;
+		const admissionGeneration = this.#nextGeneration;
+		const changedWhilePreparing = () =>
+			new Error("Settings changed while the atomic batch was preparing; build it again.");
 		if (!this.#persist || !this.#configPath) {
-			const patches = await buildPatches(structuredClone(this.#global));
+			const before = structuredClone(this.#global);
+			const built = buildPatches(structuredClone(before));
+			const patches = Array.isArray(built) ? built : await built;
+			if (this.#nextRevision !== admissionRevision || !util.isDeepStrictEqual(before, this.#global)) {
+				throw changedWhilePreparing();
+			}
 			return this.commitAtomicBatch(patches);
 		}
 
@@ -1548,7 +1571,15 @@ export class Settings implements NotificationSettingsReader {
 		const commit = applyAtomicYamlPatchesWithCurrent(
 			this.#configPath,
 			async current => {
+				// Use the existing ordinary-patch generation, even if an earlier save
+				// has already flushed a later setter and retired its staged patch.
+				// Earlier queued atomic batches alone do not advance this generation.
+				if (this.#nextGeneration !== admissionGeneration) {
+					throw changedWhilePreparing();
+				}
+				const builderRevision = this.#nextRevision;
 				const patches = await buildPatches(structuredClone(current));
+				if (this.#nextRevision !== builderRevision) throw changedWhilePreparing();
 				assertNonOverlappingAtomicYamlPatches(patches);
 				const durablePatches: AtomicYamlPatch[] = patches.map(patch => {
 					if (!isAtomicSettingsPath(patch.path)) {

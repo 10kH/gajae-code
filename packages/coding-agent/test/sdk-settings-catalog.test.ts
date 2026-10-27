@@ -48,6 +48,42 @@ describe("portable settings catalog", () => {
 		expect(getSettingsCatalog(settings).durableStorage).toBe(true);
 	});
 
+	for (const shadow of [null, [], 17]) {
+		it(`tracks ancestor replacement by ${JSON.stringify(shadow)} through the real merge`, async () => {
+			const temp = TempDir.createSync("@gjc-catalog-ancestor-");
+			temps.push(temp);
+			const cwd = path.join(temp.path(), "project");
+			const agentDir = path.join(temp.path(), "agent");
+			await Bun.write(
+				path.join(agentDir, "config.yml"),
+				JSON.stringify({
+					lsp: { enabled: false },
+					statusLine: { segmentOptions: { global: { value: true } } },
+				}),
+			);
+			await Bun.write(
+				path.join(getProjectAgentDir(cwd), "config.yml"),
+				JSON.stringify({ lsp: shadow, statusLine: shadow }),
+			);
+			const settings = await Settings.loadForScope({ cwd, agentDir });
+			try {
+				expect(settings.get("lsp.enabled")).toBe(true);
+				expect(item(getSettingsCatalog(settings), "lsp.enabled")).toMatchObject({
+					effectiveValue: { status: "available", value: true },
+					resolution: { origin: "default", layers: ["global"] },
+				});
+				settings.override("statusLine.segmentOptions", { runtime: { value: true } });
+				expect(settings.get("statusLine.segmentOptions")).toEqual({ runtime: { value: true } });
+				expect(item(getSettingsCatalog(settings), "statusLine.segmentOptions").resolution).toMatchObject({
+					origin: "runtime",
+					layers: ["global", "runtime"],
+				});
+			} finally {
+				await settings.close();
+			}
+		});
+	}
+
 	it("withholds free-form strings, structured values and suspicious paths instead of key-only redaction", () => {
 		const secret = "catalog-must-not-leak-credential";
 		const settings = Settings.isolated({
