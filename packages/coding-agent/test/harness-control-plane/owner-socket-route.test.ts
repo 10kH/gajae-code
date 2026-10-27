@@ -32,12 +32,18 @@ function symlinkSupported(): boolean {
 
 const canSymlink = symlinkSupported();
 
-function privateVarAlias(canonical: string): string | null {
+function privatePrefixAlias(canonical: string): string | null {
 	if (process.platform !== "darwin") return null;
-	if (canonical.startsWith("/private/var/")) return `/var/${canonical.slice("/private/var/".length)}`;
-	if (canonical.startsWith("/var/")) return `/private${canonical}`;
+	if (canonical.startsWith("/private/")) {
+		const rest = canonical.slice("/private".length);
+		if (rest.startsWith("/var/") || rest.startsWith("/tmp/")) return rest;
+		return null;
+	}
+	if (canonical.startsWith("/var/") || canonical.startsWith("/tmp/")) return `/private${canonical}`;
 	return null;
 }
+
+const privatePrefixAliasAvailable = privatePrefixAlias(path.join(tmpdir(), "c.sock")) !== null;
 
 let root: string;
 let cliEnv: HarnessCliEnv;
@@ -238,11 +244,11 @@ describe("harness owner socket routing", () => {
 		20_000,
 	);
 
-	it.skipIf(process.platform !== "darwin")(
+	it.skipIf(process.platform !== "darwin" || !privatePrefixAliasAvailable)(
 		"allows the private-var alias of the private socket to receive observe",
 		async () => {
 			const canonical = controlSocketPath(root, SID);
-			const alias = privateVarAlias(canonical);
+			const alias = privatePrefixAlias(canonical);
 			expect(alias).toBeTruthy();
 			expect(alias).not.toBe(canonical);
 			const server = await listen(canonical, ALLOWED);
