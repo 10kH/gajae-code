@@ -269,6 +269,17 @@ describe.serial("slash command display", () => {
 		});
 	});
 
+	it("keeps a spaced OpenCode command name", async () => {
+		const cwd = await makeRepo();
+		await writeCommand(
+			cwd,
+			path.join(".opencode", "commands", "spaced.md"),
+			["---", 'name: "sync team"', "---", "space-only-marker", ""].join("\n"),
+		);
+		const command = (await loadSlashCommands({ cwd })).find(item => item.content.includes("space-only-marker"));
+		expect(command).toMatchObject({ name: "sync team" });
+	});
+
 	it("drops an OpenCode command name that contains an escaped tab and keeps a spaced name", async () => {
 		const cwd = await makeRepo();
 		await writeCommand(
@@ -476,6 +487,72 @@ describe.serial("slash command display", () => {
 			expect(text).toContain("  status-ok  [loaded]");
 		},
 	);
+
+	it("prints a plain quarantined hook hash", async () => {
+		const cwd = await makeRepo();
+		const pluginRoot = path.join(cwd, ".gjc", "gjc-plugins", "plain-hash-bundle");
+		const plainHash = "cd".repeat(32);
+		const registry = {
+			version: 1,
+			scope: "project",
+			plugins: [
+				{
+					name: "plain-hash-bundle",
+					version: "1.0.0",
+					scope: "project",
+					enabled: true,
+					pluginRoot,
+					manifestPath: path.join(pluginRoot, "gajae-plugin.json"),
+					manifestHash: "",
+					source: { kind: "path", uri: pluginRoot, resolvedAt: "2026-01-01T00:00:00.000Z" },
+					installedAt: "2026-01-01T00:00:00.000Z",
+					updatedAt: "2026-01-01T00:00:00.000Z",
+					copiedFiles: [{ relativePath: "tools/fixture.ts", sha256: "0".repeat(64), bytes: 1 }],
+					surfaces: {
+						subskills: [],
+						tools: [
+							{
+								extensionId: "tool:fixture-tool",
+								name: "fixture-tool",
+								relativePath: "tools/fixture.ts",
+								sha256: "0".repeat(64),
+							},
+						],
+						hooks: [
+							{
+								extensionId: "hook:tool_call:before:read:plain",
+								name: "plain",
+								event: "tool_call",
+								target: "read",
+								phase: "before",
+								relativePath: "hooks/read.ts",
+								sha256: plainHash,
+								implementationHash: plainHash,
+								capabilityHash: plainHash,
+								capabilities: [],
+								networkDestinations: [],
+								filesystemRoots: [],
+								functionHook: false,
+							},
+						],
+						mcps: [],
+						systemAppendices: [],
+						agentAppendices: [],
+					},
+					disabledSurfaceIds: [],
+				},
+			],
+		};
+		await writeCommand(cwd, path.join(".gjc", "gjc-plugins", "registry.json"), `${JSON.stringify(registry)}\n`);
+		const report = await runCustomizeDoctor(cwd, Settings.isolated({}));
+		const hook = report.surfaces
+			.find(surface => surface.kind === "plugin-bundle")
+			?.items.find(item => item.name === "plain-hash-bundle")
+			?.functionHooks?.find(item => item.extensionId.endsWith("plain"));
+		expect(hook?.capabilityHash).toBe(plainHash);
+		expect(hook?.implementationHash).toBe(plainHash);
+		expect(renderCustomizeDoctorText(report)).toContain(plainHash);
+	});
 
 	it("keeps quarantined hook hashes in the report and strips them from doctor text", async () => {
 		const cwd = await makeRepo();
