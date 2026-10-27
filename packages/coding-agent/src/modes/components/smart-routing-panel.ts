@@ -116,7 +116,8 @@ export class SmartRoutingPanelComponent extends Container {
 	/** Service-owned preview identity; never clone it when forwarding a mutation intent. */
 	#preview: RoutingSettingsPreview;
 	#previewValid = true;
-	#effectiveDiffersFromSaved = false;
+	#committedPreviewUnknown = false;
+	#effectiveDiffersFromSaved: boolean | undefined = false;
 	#mode: SmartRoutingPanelMode = "editing";
 	#confirmation: SmartRoutingConfirmation;
 	/** Intent that triggered the current hand-edit confirmation, replayed verbatim on confirm. */
@@ -202,13 +203,22 @@ export class SmartRoutingPanelComponent extends Container {
 		this.#provenance = undefined;
 		this.#stale = false;
 		this.#providerOrderHint = undefined;
-		this.#effectiveDiffersFromSaved = false;
+		this.#effectiveDiffersFromSaved = undefined;
 		this.#status = "";
 	}
 
 	#observeSharedInvalidation(): boolean {
 		if (!this.#sharedStateInvalidated && this.#isStateUnknown?.()) {
 			this.#sharedStateInvalidated = true;
+			if (this.#pendingIntent && "preview" in this.#pendingIntent) {
+				const pendingPreview = this.#pendingIntent.preview;
+				if (pendingPreview && pendingPreview !== this.#preview) this.#discardPreview?.(pendingPreview);
+			}
+			this.#pendingIntent = undefined;
+			this.#confirmation = undefined;
+			if (this.#mode === "confirming") this.#mode = "editing";
+			this.#allowlistEditing = false;
+			this.#allowlistBuffer = "";
 			this.markEffectiveStateUnknown();
 			this.#render();
 		}
@@ -242,6 +252,7 @@ export class SmartRoutingPanelComponent extends Container {
 		this.#providerOrderHint = options.providerOrderHint ? structuredClone(options.providerOrderHint) : undefined;
 		if (options.preview) this.#preview = options.preview;
 		this.#previewValid = options.preview !== undefined;
+		this.#committedPreviewUnknown = false;
 		this.#effectiveDiffersFromSaved = options.effectiveDiffersFromSaved === true;
 		this.#providerCursor = Math.min(this.#providerCursor, Math.max(0, this.#draft.providers.length - 1));
 		this.#mode = "editing";
@@ -267,7 +278,14 @@ export class SmartRoutingPanelComponent extends Container {
 				),
 			);
 		}
-		if (this.#effectiveDiffersFromSaved) {
+		if (this.#sharedStateInvalidated) {
+			this.addChild(
+				new Text(theme.fg("warning", "Routing settings are unknown; reload Settings before continuing."), 0, 0),
+			);
+		}
+		if (this.#effectiveDiffersFromSaved === undefined) {
+			this.addChild(new Text(theme.fg("muted", "Effective settings comparison to global: unknown."), 0, 0));
+		} else if (this.#effectiveDiffersFromSaved) {
 			this.addChild(
 				new Text(theme.fg("muted", "Committed preview is global; effective settings currently differ."), 0, 0),
 			);
@@ -329,7 +347,12 @@ export class SmartRoutingPanelComponent extends Container {
 				0,
 			),
 		);
-		this.addChild(new Text(theme.fg("muted", "Providers (↑/↓ reorder; x removes; m edits allowlist):"), 0, 0));
+		const providersLabel = this.#sharedStateInvalidated
+			? "Providers:"
+			: this.#committedPreviewUnknown
+				? "Draft providers:"
+				: "Providers (↑/↓ reorder; x removes; m edits allowlist):";
+		this.addChild(new Text(theme.fg("muted", providersLabel), 0, 0));
 		for (let index = 0; index < this.#draft.providers.length; index++) {
 			const provider = this.#draft.providers[index] ?? "";
 			const prefix = index === this.#providerCursor ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
@@ -393,7 +416,14 @@ export class SmartRoutingPanelComponent extends Container {
 		}
 		this.addChild(
 			new Text(
-				theme.fg("muted", visiblePreviewValid ? "Preview:" : "Preview invalid; regenerate before applying:"),
+				theme.fg(
+					"muted",
+					visiblePreviewValid
+						? "Preview:"
+						: this.#committedPreviewUnknown
+							? "Committed preview: unknown."
+							: "Preview invalid; regenerate before applying:",
+				),
 				0,
 				0,
 			),
@@ -434,6 +464,7 @@ export class SmartRoutingPanelComponent extends Container {
 	}
 
 	#recomputePreview(): void {
+		this.#committedPreviewUnknown = false;
 		this.#discardPreview?.(this.#preview);
 		this.#previewValid = false;
 		try {
@@ -465,6 +496,10 @@ export class SmartRoutingPanelComponent extends Container {
 				this.#draft = cloneSetup(result.setup);
 				this.#preview = result;
 				this.#previewValid = true;
+				this.#committedPreviewUnknown = false;
+			} else if ((intent.kind === "apply" || intent.kind === "refresh") && !result) {
+				this.#previewValid = false;
+				this.#committedPreviewUnknown = true;
 			}
 			if (this.#stateRevision === stateRevision) {
 				// A callback-only host cannot establish effective state after any write.
@@ -487,7 +522,7 @@ export class SmartRoutingPanelComponent extends Container {
 				this.#effectiveGeneratedSetup = undefined;
 				this.#provenance = undefined;
 				this.#stale = false;
-				this.#effectiveDiffersFromSaved = false;
+				this.#effectiveDiffersFromSaved = undefined;
 			}
 			if (
 				error instanceof RoutingSettingsConfirmationRequiredError &&

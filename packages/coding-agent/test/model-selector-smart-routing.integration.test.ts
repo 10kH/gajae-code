@@ -5,7 +5,10 @@ import type { AutoroutingSetup, TierMap } from "@gajae-code/coding-agent/config/
 import { canonicalJsonBytes } from "@gajae-code/coding-agent/config/autorouting-generator";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
-import type { SmartRoutingPanelComponent } from "@gajae-code/coding-agent/modes/components/smart-routing-panel";
+import type {
+	SmartRoutingIntent,
+	SmartRoutingPanelComponent,
+} from "@gajae-code/coding-agent/modes/components/smart-routing-panel";
 import {
 	MAX_PANEL_LINE_WIDTH,
 	SmartRoutingPanelComponent as SmartRoutingPanelClass,
@@ -332,6 +335,7 @@ describe("/model smart-routing panel integration", () => {
 					if (failure === "refresh") {
 						expect(renderText(panel)).toContain("Effective enabled: unknown");
 						expect(renderText(panel)).toContain("Effective generated setup: unknown");
+						expect(renderText(panel)).toContain("Effective settings comparison to global: unknown.");
 						expect(renderText(panel)).not.toContain("Provenance recorded");
 						expect(renderText(panel)).not.toContain("effective settings currently differ");
 					}
@@ -429,6 +433,13 @@ describe("/model smart-routing panel integration", () => {
 			await settings.flushOrThrow();
 			const { panel, selector, controller, ctx } = await openPanel({ settings });
 			const scoped = await openPanel({ settings, scopedModels: [{ model: catalog[0] }] });
+			const confirming = await openPanel({ settings });
+			panel.handleInput("m");
+			panel.handleInput("z");
+			const draft = panel.getDraft();
+			confirming.panel.handleInput("c");
+			expect(confirming.panel.confirmation).toBe("clear");
+			expect(renderText(confirming.panel)).toContain("Enter confirms");
 			expect(renderText(panel)).toContain("Effective enabled: no");
 			expect(renderText(scoped.panel)).toContain("Read-only");
 			const routing = createRoutingSettingsService({
@@ -448,12 +459,34 @@ describe("/model smart-routing panel integration", () => {
 			expect(error).toMatchObject({ durability: "persisted", rollback: "conflict" });
 			// No listener requests a frame; the next render or input observes the shared state.
 			expect(ctx.ui.requestRender.mock.calls.length).toBe(renders);
+			// Render observes invalidation during editing; input observes it during confirmation.
+			const editingText = renderText(panel);
+			confirming.panel.handleInput("\r");
+			expect(panel.getDraft()).toEqual(draft);
+			expect(editingText).toContain("reload Settings before continuing");
+			expect(editingText).not.toContain("then Enter");
+			expect(editingText).not.toContain("↑/↓ reorder");
+			expect(confirming.panel.confirmation).toBeUndefined();
+			expect(renderText(confirming.panel)).toContain("reload Settings before continuing");
+			expect(renderText(confirming.panel)).not.toContain("Enter confirms");
+			expect(renderText(confirming.panel)).toContain("Esc: cancel");
+			panel.handleInput("\r");
+			panel.handleInput("a");
+			confirming.panel.handleInput("a");
+			expect(panel.getDraft()).toEqual(draft);
+			expect(ctx.notifyConfigChanged).not.toHaveBeenCalled();
+			expect(confirming.ctx.notifyConfigChanged).not.toHaveBeenCalled();
 			await panel.__testToggle(false);
 			await scoped.panel.__testToggle(false);
 			expect(panel.mode).not.toBe("done");
 			expect(scoped.panel.mode).not.toBe("done");
 			expect(renderText(scoped.panel)).toContain("Effective enabled: unknown");
 			expect(renderText(scoped.panel)).toContain("Effective generated setup: unknown");
+			expect(renderText(scoped.panel)).toContain("reload Settings before continuing");
+			expect(renderText(confirming.panel)).toContain("Effective enabled: unknown");
+			expect(renderText(confirming.panel)).toContain("Effective generated setup: unknown");
+			confirming.panel.handleInput("\x1b");
+			expect(confirming.selector.__testViewMode()).not.toBe("smart-routing");
 			expect(renderText(panel)).toContain("Effective enabled: unknown");
 			expect(renderText(panel)).toContain("Effective generated setup: unknown");
 			expect(renderText(panel)).not.toContain("Effective enabled: yes");
@@ -938,7 +971,13 @@ describe("smart-routing panel hostile render boundary", () => {
 
 	const HOSTILE = "\x1b]0;pwned\x07\x1b[2Jbad\x07\tname\nINJECTED-PANEL-ROW\r\nINJECTED-CRLF-ROW";
 
-	function hostilePanel(): SmartRoutingPanelComponent {
+	function hostilePanel(
+		options: {
+			isStateUnknown?: () => boolean;
+			onSelect?: (intent: SmartRoutingIntent) => undefined | Promise<RoutingSettingsPreview | undefined>;
+			discardPreview?: (preview: RoutingSettingsPreview) => void;
+		} = {},
+	): SmartRoutingPanelComponent {
 		const setup: AutoroutingSetup = {
 			schema: 1,
 			providers: [HOSTILE, "anthropic"],
@@ -968,7 +1007,9 @@ describe("smart-routing panel hostile render boundary", () => {
 			stale: false,
 			preview,
 			generatePreview: () => preview,
-			onSelect: () => undefined,
+			onSelect: options.onSelect ?? (() => undefined),
+			isStateUnknown: options.isStateUnknown,
+			discardPreview: options.discardPreview,
 			onCancel: () => undefined,
 		});
 	}
@@ -985,6 +1026,44 @@ describe("smart-routing panel hostile render boundary", () => {
 		expect(renderText(clear)).toContain("Global generated setup cleared.");
 		expect(renderText(clear)).toContain("Effective generated setup: unknown");
 	});
+
+	test("shared invalidation discards a pending hand-edit confirmation before input", async () => {
+		let unknown = false;
+		const pending = hostilePanel().getPreviewPayload();
+		const onSelect = vi.fn(async () => {
+			throw new RoutingSettingsConfirmationRequiredError(pending);
+		});
+		const discardPreview = vi.fn();
+		const panel = hostilePanel({ isStateUnknown: () => unknown, onSelect, discardPreview });
+		await panel.__testRefresh();
+		expect(panel.confirmation).toBe("hand-edit");
+		expect(renderText(panel)).toContain("Enter confirms");
+		unknown = true;
+		panel.handleInput("\r");
+		expect(panel.confirmation).toBeUndefined();
+		expect(onSelect).toHaveBeenCalledTimes(1);
+		expect(discardPreview).toHaveBeenCalledWith(pending);
+		const text = renderText(panel);
+		expect(text).toContain("reload Settings before continuing");
+		expect(text).toContain("Effective enabled: unknown");
+		expect(text).not.toContain("Enter confirms");
+		expect(text).not.toContain("Pending refresh uses");
+	});
+
+	for (const operation of ["apply", "refresh"] as const) {
+		test(`callback-only ${operation} does not present an unverified committed preview`, async () => {
+			const panel = hostilePanel();
+			if (operation === "apply") await panel.__testApply();
+			else await panel.__testRefresh();
+			const text = renderText(panel);
+			expect(panel.mode).toBe("done");
+			expect(text).toContain("Global smart-routing settings updated.");
+			expect(text).toContain("Committed preview: unknown.");
+			expect(text).toContain("Draft providers:");
+			expect(text).toContain("Effective settings comparison to global: unknown.");
+			expect(text).not.toContain("fast-model");
+		});
+	}
 
 	test("strips control sequences from provider, allowlist, preset, and tier rows", () => {
 		const rendered = rawRender(hostilePanel());
