@@ -8,6 +8,75 @@ import { Settings, type SettingsAtomicPatch } from "../src/config/settings";
 const patch: SettingsAtomicPatch[] = [{ path: "temperature", op: "set", value: 0.4 }];
 
 describe("current-value atomic batch local ownership", () => {
+	for (const durable of [false, true]) {
+		it(`rejects unsafe role paths without partial mutation in ${durable ? "durable" : "memory"} batches`, async () => {
+			const temp = TempDir.createSync("@gjc-safe-roles-");
+			const settings = durable
+				? await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") })
+				: Settings.isolated({ temperature: 0.2 });
+			const marker = "gjcAtomicPathMarker";
+			const original = Object.getOwnPropertyDescriptor(Object.prototype, marker);
+			try {
+				await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.2 }]);
+				const configPath = settings.getGlobalConfigPath();
+				const before = configPath ? await Bun.file(configPath).text() : undefined;
+				for (const segment of ["__proto__", "constructor", "prototype"]) {
+					for (const op of ["set", "unset"] as const) {
+						for (const rolePath of [
+							`modelRoles.${segment}.${marker}`,
+							`modelRoles.custom.${segment}.${marker}`,
+						] as const) {
+							const unsafe: SettingsAtomicPatch =
+								op === "set" ? { path: rolePath, op, value: true } : { path: rolePath, op };
+							const patches: SettingsAtomicPatch[] = [{ path: "temperature", op: "set", value: 0.8 }, unsafe];
+							await expect(settings.commitAtomicBatch(patches)).rejects.toThrow("Unknown setting path");
+							await expect(settings.commitAtomicBatchWithCurrent(() => patches)).rejects.toThrow(
+								"Unknown setting path",
+							);
+							expect(settings.getGlobal("temperature")).toBe(0.2);
+							if (configPath && before !== undefined) expect(await Bun.file(configPath).text()).toBe(before);
+							expect(Object.getOwnPropertyDescriptor(Object.prototype, marker)).toEqual(original);
+						}
+					}
+				}
+			} finally {
+				if (original) Object.defineProperty(Object.prototype, marker, original);
+				else delete (Object.prototype as Record<string, unknown>)[marker];
+				await settings.close();
+				temp.removeSync();
+			}
+		});
+
+		it(`restores a custom role exact path in ${durable ? "durable" : "memory"}`, async () => {
+			const temp = TempDir.createSync("@gjc-role-restore-");
+			const settings = durable
+				? await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") })
+				: Settings.isolated();
+			try {
+				await settings.commitAtomicBatch([
+					{ path: "modelRoles.custom.primary", op: "set", value: "first" },
+					{ path: "modelRoles.custom.other", op: "set", value: "keep" },
+				]);
+				const receipt = await settings.commitAtomicBatch([
+					{ path: "modelRoles.custom.primary", op: "set", value: "second" },
+				]);
+				const role = async () => {
+					let roles: unknown;
+					await settings.commitAtomicBatchWithCurrent(current => {
+						roles = current.modelRoles;
+						return [];
+					});
+					return roles;
+				};
+				expect(await role()).toMatchObject({ custom: { primary: "second", other: "keep" } });
+				expect((await receipt.restore()).status).toBe("restored");
+				expect(await role()).toMatchObject({ custom: { primary: "first", other: "keep" } });
+			} finally {
+				await settings.close();
+				temp.removeSync();
+			}
+		});
+	}
 	it("publishes synchronous memory builders before a later setter can be overtaken", async () => {
 		const settings = Settings.isolated({ temperature: 0.2 });
 		const pending = settings.commitAtomicBatchWithCurrent(() => patch);
