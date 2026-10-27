@@ -135,6 +135,42 @@ describe("surrounded untrusted fence on a tail cut", () => {
 		expect(text.split("\n").length).toBeLessThanOrEqual(6);
 	});
 
+	test("a long trusted suffix keeps the unfenced plain tail when bytes cannot hold the tags", async () => {
+		const suffix = `\n${"s".repeat(1000)}`;
+		const full = `${"P".repeat(2000)}\n${wrapUntrustedContent(`${"x\n".repeat(600)}Z`)}${suffix}`;
+		const text = await tailCut(full, 20);
+		const plain = truncateTail(full, { maxBytes: MAX_BYTES, maxLines: 20 }).content.trimEnd();
+		expect(text.split("\n").length).toBeLessThan(20);
+		expect(text.includes(OPEN)).toBe(false);
+		expect(text.startsWith("Z")).toBe(true);
+		expect(text).toContain("Z");
+		expect(text.endsWith("s")).toBe(true);
+		expect(text).toBe(plain);
+		expect(Buffer.byteLength(text, "utf-8")).toBeLessThanOrEqual(MAX_BYTES);
+	});
+
+	test("property: sufficient lines and a short byte budget keep the unfenced plain tail, fc.asyncProperty seed 66928, numRuns 64", async () => {
+		await fc.assert(
+			fc.asyncProperty(
+				fc.integer({ min: 8, max: 40 }),
+				fc.integer({ min: 1000, max: 1800 }),
+				async (maxLines, suffixLen) => {
+					const suffix = `\n${"s".repeat(suffixLen)}`;
+					const full = `${"P".repeat(2000)}\n${wrapUntrustedContent(`${"x\n".repeat(600)}Z`)}${suffix}`;
+					const text = await tailCut(full, maxLines);
+					const plain = truncateTail(full, { maxBytes: MAX_BYTES, maxLines }).content.trimEnd();
+					expect(text.includes(OPEN)).toBe(false);
+					expect(text.includes("P".repeat(2000))).toBe(false);
+					expect(text).toBe(plain);
+					expect(Buffer.byteLength(text, "utf-8")).toBeLessThanOrEqual(MAX_BYTES);
+					expect(text.split("\n").length).toBeLessThanOrEqual(maxLines);
+					if (plain.includes("Z")) expect(text.includes("Z")).toBe(true);
+				},
+			),
+			{ seed: 66928, numRuns: 64 },
+		);
+	});
+
 	test("property: surrounded tail retains the end marker, fc.asyncProperty seed 66927, numRuns 64", async () => {
 		await fc.assert(
 			fc.asyncProperty(

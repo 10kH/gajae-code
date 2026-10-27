@@ -835,10 +835,10 @@ function splitFenceAt(text: string, cut: number): { bodyStart: number; bodyEnd: 
 }
 
 /**
- * Put the opener back on the body the plain tail cut already kept, when the
- * line budget has room for the tags, the trusted suffix, and one body line.
- * Lines before the cut stay dropped. A budget that cannot hold that returns
- * the plain tail instead of an empty fence.
+ * Put the opener back when the line budget and the byte budget both have
+ * room for the tags, the trusted suffix, and one body line. Lines before
+ * the cut stay dropped. If either budget is short, the unfenced plain tail
+ * is returned instead of an empty fence.
  */
 function repairSplitFenceTail(
 	fullText: string,
