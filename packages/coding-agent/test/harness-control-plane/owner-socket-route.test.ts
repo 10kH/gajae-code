@@ -17,13 +17,13 @@ const FORGED = "forged-owner-marker";
 const ALLOWED = "canonical-owner-marker";
 
 function symlinkSupported(): boolean {
-	if (process.platform === "win32") return false;
+	if (process.platform === "win32") return false; // skipIf win32
 	const dir = fsSync.mkdtempSync(path.join(tmpdir(), "sy"));
 	try {
 		fsSync.symlinkSync(path.join(dir, "t"), path.join(dir, "l"));
 		return true;
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "EPERM") return false;
+		if ((error as NodeJS.ErrnoException).code === "EPERM") return false; // skipIf EPERM
 		throw error;
 	} finally {
 		fsSync.rmSync(dir, { recursive: true, force: true });
