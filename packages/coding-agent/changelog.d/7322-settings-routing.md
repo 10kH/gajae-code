@@ -5,7 +5,7 @@
 
 ### Fixed
 
-- Reject prototype-traversal segments in atomic settings and YAML paths before applying any batch, and avoid inherited-property traversal.
+- Reject prototype-traversal segments and malformed operations before applying atomic settings or YAML batches, stage in-memory updates before publication, and avoid inherited-property traversal when clearing overrides.
 - Refuse modified or raced smart-routing previews instead of silently applying unseen generated routes. Keep preview authority inside the host while returning detached display snapshots.
 - Forward the actual committed preview through the controller, model selector and panel instead of regenerating unpublished routes after a catalog change or reporting post-save preview failures as failed commits.
 - Preserve newer routing writers during post-save notification failure by restoring only through the atomic receipt's CAS ownership check.
