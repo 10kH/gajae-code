@@ -1,3 +1,3 @@
 ### Fixed
 
-- File lists strip terminal control sequences from entry names before coloring, so a find result cannot write OSC, CSI, or DCS to the operator terminal.
+- `renderFileList` strips terminal controls from each entry name and its meta text before theme styling. Other find lines are unchanged.
