@@ -491,7 +491,17 @@ export class SmartRoutingPanelComponent extends Container {
 		const stateRevision = this.#stateRevision;
 		try {
 			const result = await this.#onSelect(intent);
-			if ((intent.kind === "apply" || intent.kind === "refresh") && result) {
+			const invalidated = this.#observeSharedInvalidation();
+			if (invalidated) {
+				if (result) this.#discardPreview?.(result);
+				if ((intent.kind === "apply" || intent.kind === "refresh") && intent.preview && intent.preview !== result) {
+					this.#discardPreview?.(intent.preview);
+				}
+				if (intent.kind === "apply" || intent.kind === "refresh") {
+					this.#previewValid = false;
+					this.#committedPreviewUnknown = true;
+				}
+			} else if ((intent.kind === "apply" || intent.kind === "refresh") && result) {
 				if (this.#preview !== result) this.#discardPreview?.(this.#preview);
 				this.#draft = cloneSetup(result.setup);
 				this.#preview = result;
@@ -501,7 +511,7 @@ export class SmartRoutingPanelComponent extends Container {
 				this.#previewValid = false;
 				this.#committedPreviewUnknown = true;
 			}
-			if (this.#stateRevision === stateRevision) {
+			if (invalidated || this.#stateRevision === stateRevision) {
 				// A callback-only host cannot establish effective state after any write.
 				this.markEffectiveStateUnknown();
 			}
@@ -513,6 +523,26 @@ export class SmartRoutingPanelComponent extends Container {
 						? `Global enabled updated: ${intent.enabled ? "yes" : "no"}.`
 						: "Global smart-routing settings updated.";
 		} catch (error) {
+			if (this.#observeSharedInvalidation()) {
+				if (error instanceof RoutingSettingsConfirmationRequiredError) this.#discardPreview?.(error.preview);
+				if ((intent.kind === "apply" || intent.kind === "refresh") && intent.preview) {
+					if (!(error instanceof RoutingSettingsConfirmationRequiredError) || intent.preview !== error.preview) {
+						this.#discardPreview?.(intent.preview);
+					}
+				}
+				this.#previewValid = false;
+				this.markEffectiveStateUnknown();
+				this.#mode = "error";
+				this.#status = "";
+				this.#error =
+					error instanceof RoutingSettingsConfirmationRequiredError
+						? ""
+						: error instanceof Error
+							? error.message
+							: String(error);
+				this.#render();
+				return;
+			}
 			if (
 				error instanceof RoutingSettingsActivationError &&
 				(error.rollback === "conflict" || error.rollback === "failed" || error.rollback === "not-restorable") &&

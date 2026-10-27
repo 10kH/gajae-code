@@ -976,6 +976,7 @@ describe("smart-routing panel hostile render boundary", () => {
 			isStateUnknown?: () => boolean;
 			onSelect?: (intent: SmartRoutingIntent) => undefined | Promise<RoutingSettingsPreview | undefined>;
 			discardPreview?: (preview: RoutingSettingsPreview) => void;
+			onCancel?: () => void;
 		} = {},
 	): SmartRoutingPanelComponent {
 		const setup: AutoroutingSetup = {
@@ -1010,7 +1011,7 @@ describe("smart-routing panel hostile render boundary", () => {
 			onSelect: options.onSelect ?? (() => undefined),
 			isStateUnknown: options.isStateUnknown,
 			discardPreview: options.discardPreview,
-			onCancel: () => undefined,
+			onCancel: options.onCancel ?? (() => undefined),
 		});
 	}
 
@@ -1048,6 +1049,78 @@ describe("smart-routing panel hostile render boundary", () => {
 		expect(text).toContain("Effective enabled: unknown");
 		expect(text).not.toContain("Enter confirms");
 		expect(text).not.toContain("Pending refresh uses");
+	});
+
+	test("late confirmation after observed invalidation discards its preview authority", async () => {
+		const settings = Settings.isolated();
+		const routing = createRoutingSettingsService({
+			settings,
+			getCatalog: () => catalog,
+			getProviderOrder: () => ["anthropic", "openai-codex"],
+			isScoped: () => false,
+		});
+		const setup: AutoroutingSetup = { schema: 1, providers: ["anthropic"] };
+		const pending = routing.previewSmartRouting(setup);
+		const writes = vi.spyOn(settings, "commitAtomicBatchWithCurrent");
+		const gate = Promise.withResolvers<void>();
+		let unknown = false;
+		const onSelect = vi.fn(async () => {
+			await gate.promise;
+			throw new RoutingSettingsConfirmationRequiredError(pending);
+		});
+		const discardPreview = vi.fn((preview: RoutingSettingsPreview) => routing.discardPreview(preview));
+		const onCancel = vi.fn();
+		const panel = hostilePanel({ isStateUnknown: () => unknown, onSelect, discardPreview, onCancel });
+		const operation = panel.__testRefresh();
+		expect(panel.mode).toBe("committing");
+		unknown = true;
+		expect(renderText(panel)).toContain("reload Settings before continuing");
+		gate.resolve();
+		await operation;
+		expect(panel.confirmation).toBeUndefined();
+		const text = renderText(panel);
+		expect(text).toContain("reload Settings before continuing");
+		expect(text).toContain("Esc: cancel");
+		expect(text).not.toContain("Enter confirms");
+		expect(text).not.toContain("Pending refresh uses");
+		panel.handleInput("\r");
+		panel.handleInput("a");
+		expect(onSelect).toHaveBeenCalledTimes(1);
+		expect(discardPreview).toHaveBeenCalledWith(pending);
+		await expect(routing.applySmartRouting(setup, { preview: pending, confirmHandEdit: true })).rejects.toThrow(
+			"preview is not valid",
+		);
+		expect(writes).not.toHaveBeenCalled();
+		panel.handleInput("\x1b");
+		expect(onCancel).toHaveBeenCalledTimes(1);
+		writes.mockRestore();
+	});
+
+	test("late committed result remains truthful after invalidation and loses preview authority", async () => {
+		let unknown = false;
+		const result = hostilePanel().getPreviewPayload();
+		const gate = Promise.withResolvers<void>();
+		const discardPreview = vi.fn();
+		const panel = hostilePanel({
+			isStateUnknown: () => unknown,
+			onSelect: async () => {
+				await gate.promise;
+				return result;
+			},
+			discardPreview,
+		});
+		const operation = panel.__testRefresh();
+		unknown = true;
+		renderText(panel);
+		gate.resolve();
+		await operation;
+		const text = renderText(panel);
+		expect(panel.mode).toBe("done");
+		expect(text).toContain("Global smart-routing settings updated.");
+		expect(text).toContain("reload Settings before continuing");
+		expect(text).toContain("Effective enabled: unknown");
+		expect(text).toContain("Committed preview: unknown.");
+		expect(discardPreview).toHaveBeenCalledWith(result);
 	});
 
 	for (const operation of ["apply", "refresh"] as const) {
