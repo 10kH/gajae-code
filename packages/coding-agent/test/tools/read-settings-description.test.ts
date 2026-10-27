@@ -145,6 +145,15 @@ describe("read tool description project settings", () => {
 		expect(pathDefault("local-bare-stream", settings)).toBe("last");
 	});
 
+	it("normalizes a huge finite budget without making the byte window finite", async () => {
+		const { configuredReadBudget } = await import("../../src/tools/read-internals");
+		for (const value of [1e308, "1e308"]) {
+			const kib = configuredReadBudget(value, "read.receiptBudgetBytes");
+			expect(Number.isFinite(kib)).toBe(true);
+			expect(Number.isFinite(kib * 1024)).toBe(false);
+		}
+	});
+
 	it("property: configured read truncation and budgets, fc.property seed 684452, numRuns 64", async () => {
 		const { configuredReadBudget, configuredReadTruncation } = await import("../../src/tools/read-internals");
 		const members = getEnumValues("read.truncation") ?? [];
