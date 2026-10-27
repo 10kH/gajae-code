@@ -6,6 +6,7 @@ import {
 	applyAtomicYamlPatches,
 	applyAtomicYamlPatchesWithCurrent,
 	enqueueAtomicYamlOperation,
+	withAtomicYamlConfigTransaction,
 } from "../src/config/atomic-yaml-patch";
 import { Settings, type SettingsAtomicPatch } from "../src/config/settings";
 
@@ -13,6 +14,95 @@ const patch: SettingsAtomicPatch[] = [{ path: "temperature", op: "set", value: 0
 
 describe("current-value atomic batch local ownership", () => {
 	for (const method of ["flush", "flushOrThrow"] as const) {
+		it(`rejects cross-file ${method} cycles and preserves deferred saves and independent FIFO writers`, async () => {
+			const temp = TempDir.createSync("@gjc-cross-settings-");
+			const first = await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "first") });
+			const second = await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "second") });
+			const firstPath = first.getGlobalConfigPath()!;
+			const secondPath = second.getGlobalConfigPath()!;
+			const bothEntered = Promise.withResolvers<void>();
+			const bothAttempted = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			let entered = 0;
+			let attempted = 0;
+			const unhandled: unknown[] = [];
+			const onUnhandled = (error: unknown) => unhandled.push(error);
+			process.on("unhandledRejection", onUnhandled);
+			const bounded = async <T>(promise: Promise<T>): Promise<T> => {
+				const timeout = Promise.withResolvers<never>();
+				const timer = setTimeout(() => timeout.reject(new Error("operation timed out")), 1000);
+				try {
+					return await Promise.race([promise, timeout.promise]);
+				} finally {
+					clearTimeout(timer);
+				}
+			};
+			try {
+				const run = (own: string, other: Settings, value: number) =>
+					withAtomicYamlConfigTransaction(own, async () => {
+						if (++entered === 2) bothEntered.resolve();
+						await bounded(bothEntered.promise);
+						other.set("temperature", value);
+						await expect(bounded(other[method]())).rejects.toThrow(
+							"Cannot flush Settings for busy atomic YAML file",
+						);
+						if (++attempted === 2) bothAttempted.resolve();
+						await bounded(release.promise);
+					});
+				const roots = Promise.all([run(firstPath, second, 0.6), run(secondPath, first, 0.7)]);
+				void roots.catch(() => undefined);
+				await bounded(bothAttempted.promise);
+				const observed: unknown[] = [];
+				const later = [firstPath, secondPath].map(file =>
+					applyAtomicYamlPatchesWithCurrent(file, current => {
+						observed.push(current.temperature);
+						return [{ path: "topP", op: "set", value: 0.8 }];
+					}),
+				);
+				// Independent flushes are allowed to wait for the owners and release
+				// the already-reserved saves ahead of the later writers.
+				const flushes = [first.flushOrThrow(), second.flushOrThrow()];
+				const progress = Promise.all([roots, ...later, ...flushes]);
+				release.resolve();
+				await bounded(progress);
+				expect(observed.sort()).toEqual([0.6, 0.7]);
+				expect(YAML.parse(await Bun.file(firstPath).text())).toMatchObject({ temperature: 0.7, topP: 0.8 });
+				expect(YAML.parse(await Bun.file(secondPath).text())).toMatchObject({ temperature: 0.6, topP: 0.8 });
+				const immediate = Promise.withResolvers<void>();
+				setImmediate(immediate.resolve);
+				await immediate.promise;
+				expect(unhandled).toEqual([]);
+			} finally {
+				release.resolve();
+				process.off("unhandledRejection", onUnhandled);
+				await Promise.all([first.close(), second.close()]);
+				temp.removeSync();
+			}
+		});
+
+		it(`allows ${method} of an idle different file after reserving its deferred save`, async () => {
+			const temp = TempDir.createSync("@gjc-idle-cross-settings-");
+			const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") });
+			const configPath = settings.getGlobalConfigPath()!;
+			const ownPath = path.join(temp.path(), "other.yml");
+			const timeout = Promise.withResolvers<never>();
+			const timer = setTimeout(() => timeout.reject(new Error("operation timed out")), 1000);
+			try {
+				await Promise.race([
+					withAtomicYamlConfigTransaction(ownPath, async () => {
+						settings.set("temperature", 0.6);
+						await settings[method]();
+					}),
+					timeout.promise,
+				]);
+				expect(YAML.parse(await Bun.file(configPath).text())).toMatchObject({ temperature: 0.6 });
+			} finally {
+				clearTimeout(timer);
+				await settings.close();
+				temp.removeSync();
+			}
+		});
+
 		it(`rejects reentrant ${method} without losing the deferred save or its FIFO position`, async () => {
 			const temp = TempDir.createSync("@gjc-deferred-settings-");
 			const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") });
