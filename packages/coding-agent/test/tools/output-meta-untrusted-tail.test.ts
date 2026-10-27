@@ -120,7 +120,7 @@ describe("surrounded untrusted fence on a tail cut", () => {
 		expect(text.includes("HEAD")).toBe(false);
 	});
 
-	test("a later fenced section keeps its own opener when the tail starts inside it", async () => {
+	test("a later fenced section restores its own opener when the tail starts inside it", async () => {
 		const full = [
 			"header",
 			wrapUntrustedContent(`OLD\n${"a\n".repeat(400)}FIRST`),
