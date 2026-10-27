@@ -2,12 +2,87 @@ import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { TempDir } from "@gajae-code/utils";
 import { YAML } from "bun";
-import { enqueueAtomicYamlOperation } from "../src/config/atomic-yaml-patch";
+import {
+	applyAtomicYamlPatches,
+	applyAtomicYamlPatchesWithCurrent,
+	enqueueAtomicYamlOperation,
+} from "../src/config/atomic-yaml-patch";
 import { Settings, type SettingsAtomicPatch } from "../src/config/settings";
 
 const patch: SettingsAtomicPatch[] = [{ path: "temperature", op: "set", value: 0.4 }];
 
 describe("current-value atomic batch local ownership", () => {
+	for (const method of ["flush", "flushOrThrow"] as const) {
+		it(`rejects reentrant ${method} without losing the deferred save or its FIFO position`, async () => {
+			const temp = TempDir.createSync("@gjc-deferred-settings-");
+			const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") });
+			const configPath = settings.getGlobalConfigPath()!;
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const unhandled: unknown[] = [];
+			const onUnhandled = (error: unknown) => unhandled.push(error);
+			process.on("unhandledRejection", onUnhandled);
+			const bounded = async <T>(promise: Promise<T>): Promise<T> => {
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				try {
+					return await Promise.race([
+						promise,
+						new Promise<never>((_, reject) => {
+							timer = setTimeout(() => reject(new Error("operation timed out")), 1000);
+						}),
+					]);
+				} finally {
+					clearTimeout(timer);
+				}
+			};
+			try {
+				const commit = settings.commitAtomicBatchWithCurrent(async () => {
+					settings.set("temperature", 0.6);
+					await expect(bounded(settings[method]())).rejects.toThrow("reentrant atomic YAML operation");
+					await expect(bounded(applyAtomicYamlPatches(configPath, []))).rejects.toThrow(
+						"reentrant atomic YAML operation",
+					);
+					entered.resolve();
+					await bounded(release.promise);
+					return [{ path: "temperature", op: "set", value: 0.1 }];
+				});
+				// Attach a rejection handler before releasing the builder, without
+				// waiting for the commit's queued failure refresh.
+				const commitResult = commit.then(
+					() => ({ error: undefined }),
+					error => ({ error }),
+				);
+				await bounded(entered.promise);
+				let observedTemperature: unknown;
+				const later = applyAtomicYamlPatchesWithCurrent(configPath, current => {
+					observedTemperature = current.temperature;
+					return [{ path: "topP", op: "set", value: 0.7 }];
+				});
+				// Release the deferred debounce slot while the builder still holds the
+				// queue; neither the later writer nor flush can overtake that slot.
+				const flush = settings.flush();
+				const progress = Promise.allSettled([commitResult, later, flush]);
+				release.resolve();
+				const [commitOutcome, laterOutcome, flushOutcome] = await bounded(progress);
+				expect(commitOutcome.status).toBe("fulfilled");
+				if (commitOutcome.status !== "fulfilled") throw commitOutcome.reason;
+				expect(commitOutcome.value.error).toBeInstanceOf(Error);
+				expect(String(commitOutcome.value.error)).toContain("changed");
+				if (laterOutcome.status === "rejected") throw laterOutcome.reason;
+				if (flushOutcome.status === "rejected") throw flushOutcome.reason;
+				expect(observedTemperature).toBe(0.6);
+				expect(YAML.parse(await Bun.file(configPath).text())).toMatchObject({ temperature: 0.6, topP: 0.7 });
+				expect(settings.getGlobal("temperature")).toBe(0.6);
+				await new Promise<void>(resolve => setImmediate(resolve));
+				expect(unhandled).toEqual([]);
+			} finally {
+				release.resolve();
+				process.off("unhandledRejection", onUnhandled);
+				await settings.close();
+				temp.removeSync();
+			}
+		});
+	}
 	it("preserves literal model role names through ordinary flush and disk reload", async () => {
 		const temp = TempDir.createSync("@gjc-literal-roles-reload-");
 		const scope = { cwd: temp.path(), agentDir: path.join(temp.path(), "agent") };
