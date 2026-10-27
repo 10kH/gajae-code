@@ -93,6 +93,8 @@ function rawAutoroutingState(current: Readonly<RawSettings>): RoutingState {
 export class RoutingSettingsService {
 	#inFlight = false;
 	readonly #previews = new WeakMap<RoutingSettingsPreview, PreviewAuthority>();
+	// An admitted operation may still raise a guard after its preview is discarded.
+	readonly #discardedPreviews = new WeakSet<RoutingSettingsPreview>();
 	constructor(private readonly dependencies: RoutingSettingsDependencies) {}
 
 	previewSmartRouting(draft: AutoroutingSetup): RoutingSettingsPreview {
@@ -234,6 +236,7 @@ export class RoutingSettingsService {
 	}
 
 	discardPreview(preview: RoutingSettingsPreview): void {
+		this.#discardedPreviews.add(preview);
 		this.#previews.delete(preview);
 	}
 
@@ -298,7 +301,7 @@ export class RoutingSettingsService {
 				});
 			});
 		} catch (error) {
-			if (guardRaised) this.#previews.set(supplied, authority);
+			if (guardRaised && !this.#discardedPreviews.has(supplied)) this.#previews.set(supplied, authority);
 			throw error;
 		}
 		return {

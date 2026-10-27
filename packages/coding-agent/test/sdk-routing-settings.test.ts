@@ -521,6 +521,82 @@ describe("SDK smart-routing settings", () => {
 		expect(settings.getGlobal("task.autorouting.tiers")).toEqual(preview.tiers);
 	});
 
+	test("discarding a queued preview prevents its hand-edit guard from restoring authority", async () => {
+		const temp = TempDir.createSync("@gjc-routing-discard-");
+		const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") });
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		try {
+			const routing = service(settings);
+			await routing.applySmartRouting(setup);
+			const edited = { fast: ["anthropic/custom"] };
+			settings.set("task.autorouting.tiers", edited);
+			await settings.flushOrThrow();
+			const preview = routing.previewSmartRouting(setup);
+			const unrelated = routing.previewSmartRouting(setup);
+			const configPath = settings.getGlobalConfigPath();
+			if (!configPath) throw new Error("Expected disk settings");
+			const blocker = enqueueAtomicYamlOperation(configPath, () => {
+				entered.resolve();
+				return release.promise;
+			});
+			await entered.promise;
+			const guardPromise = confirmationRequired(routing.applySmartRouting(setup, { preview }));
+			routing.discardPreview(preview);
+			release.resolve();
+			await blocker;
+			const guard = await guardPromise;
+			expect(guard.preview).toBe(preview);
+			await expect(
+				routing.applySmartRouting(setup, { preview: guard.preview, confirmHandEdit: true }),
+			).rejects.toThrow("not valid for this service");
+			expect(settings.getGlobal("task.autorouting.tiers")).toEqual(edited);
+			const disk = await Settings.loadReadonly({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") });
+			try {
+				expect(disk.getGlobal("task.autorouting.tiers")).toEqual(edited);
+			} finally {
+				await disk.close();
+			}
+			const otherGuard = await confirmationRequired(routing.applySmartRouting(setup, { preview: unrelated }));
+			await routing.applySmartRouting(setup, { preview: otherGuard.preview, confirmHandEdit: true });
+			expect(settings.getGlobal("task.autorouting.tiers")).toEqual(unrelated.tiers);
+		} finally {
+			release.resolve();
+			await settings.close();
+			temp.removeSync();
+		}
+	});
+
+	test("discarding an admitted queued preview does not undo its successful commit", async () => {
+		const temp = TempDir.createSync("@gjc-routing-discard-commit-");
+		const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") });
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		try {
+			const routing = service(settings);
+			const preview = routing.previewSmartRouting(setup);
+			const configPath = settings.getGlobalConfigPath();
+			if (!configPath) throw new Error("Expected disk settings");
+			const blocker = enqueueAtomicYamlOperation(configPath, () => {
+				entered.resolve();
+				return release.promise;
+			});
+			await entered.promise;
+			const pending = routing.applySmartRouting(setup, { preview });
+			routing.discardPreview(preview);
+			release.resolve();
+			await blocker;
+			const result = await pending;
+			expect(result.durability).toBe("persisted");
+			expect(settings.getGlobal("task.autorouting.tiers")).toEqual(preview.tiers);
+			await expect(routing.applySmartRouting(setup, { preview })).rejects.toThrow("not valid for this service");
+		} finally {
+			release.resolve();
+			await settings.close();
+			temp.removeSync();
+		}
+	});
+
 	test("a queued disk Apply cannot consume a newer local setup patch", async () => {
 		const temp = TempDir.createSync("@gjc-routing-current-");
 		const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") });

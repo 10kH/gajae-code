@@ -107,8 +107,11 @@ intent during an asynchronous builder, including same-value and ABA overrides.
 Prepare again after refusal; builders returning patches must not perform irreversible
 external work before that commit. Empty batches can serve as lock-only transactions
 for adjacent durable work (such as profile deletion) and do not receive a post-action
-stale-patch rejection. Runtime intent does not take ownership of durable receipt
-paths. Synchronous memory-only builders publish without yielding between their check
+stale-patch rejection. The queue and disk lock do not block synchronous `set` or
+runtime overrides: an empty batch alone does not make an external side effect atomic
+with those mutations. In particular, a concurrent legacy profile-default setter can
+race profile deletion; callers must not infer profile ownership safety from this
+lock-only mechanism. Runtime intent does not take ownership of durable receipt paths. Synchronous memory-only builders publish without yielding between their check
 and mutation. Earlier queued atomic batches still serialize normally and supply the
 next builder's current input.
 
