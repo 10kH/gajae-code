@@ -23,14 +23,10 @@ describe("current-value atomic batch local ownership", () => {
 			const onUnhandled = (error: unknown) => unhandled.push(error);
 			process.on("unhandledRejection", onUnhandled);
 			const bounded = async <T>(promise: Promise<T>): Promise<T> => {
-				let timer: ReturnType<typeof setTimeout> | undefined;
+				const timeout = Promise.withResolvers<never>();
+				const timer = setTimeout(() => timeout.reject(new Error("operation timed out")), 1000);
 				try {
-					return await Promise.race([
-						promise,
-						new Promise<never>((_, reject) => {
-							timer = setTimeout(() => reject(new Error("operation timed out")), 1000);
-						}),
-					]);
+					return await Promise.race([promise, timeout.promise]);
 				} finally {
 					clearTimeout(timer);
 				}
@@ -73,7 +69,9 @@ describe("current-value atomic batch local ownership", () => {
 				expect(observedTemperature).toBe(0.6);
 				expect(YAML.parse(await Bun.file(configPath).text())).toMatchObject({ temperature: 0.6, topP: 0.7 });
 				expect(settings.getGlobal("temperature")).toBe(0.6);
-				await new Promise<void>(resolve => setImmediate(resolve));
+				const immediate = Promise.withResolvers<void>();
+				setImmediate(immediate.resolve);
+				await immediate.promise;
 				expect(unhandled).toEqual([]);
 			} finally {
 				release.resolve();

@@ -265,8 +265,11 @@ check current durable state; post-publication `activate` is a host notification,
 not model execution or lifecycle admission. Results report `persisted` versus
 `memory` and `notified` versus `not_requested`. An activation failure throws
 `RoutingSettingsActivationError` with the CAS rollback outcome; `conflict` means
-a newer writer prevented restoration, not that the save never happened. Do not
-serialize error causes or rollback diagnostics into generic queries. This service
+a newer writer prevented restoration, not that the save never happened. After an
+unresolved durable rollback, `stateUnknown` is true and that Settings instance
+cannot issue routing previews or mutations; create a freshly loaded Settings owner
+before continuing, without discarding pending local changes. Do not serialize error
+causes or rollback diagnostics into generic queries. This service
 does not implement temporary/default profile selection or role/all-target model
 assignment; use their existing session/model APIs with their separate scopes.
 
