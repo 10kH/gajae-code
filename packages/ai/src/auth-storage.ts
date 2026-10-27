@@ -1034,6 +1034,22 @@ const DEFAULT_RANKING_STRATEGIES = new Map<Provider, CredentialRankingStrategy>(
 ]);
 
 const USAGE_CACHE_PREFIX = "usage_cache:";
+
+/**
+ * Report-shape version per provider. Bump when a provider's limits change
+ * meaning under an unchanged credential identity so rows written by an older
+ * binary are never read back as if they had the current shape. Antigravity
+ * schema 2 separates the 5-hour and weekly horizons and the Gemini / Gemini
+ * Argon / Claude-GPT quota pools; schema 1 rows carry window `default` with
+ * per-model labels and pool nothing.
+ */
+const USAGE_REPORT_SCHEMA_VERSIONS: Readonly<Record<string, number>> = { "google-antigravity": 2 };
+
+function usageReportSchemaTag(provider: string): string {
+	const version = USAGE_REPORT_SCHEMA_VERSIONS[provider];
+	return version === undefined ? "" : `|schema:${version}`;
+}
+
 function hashUsageDiagnosticValue(value: unknown): string | undefined {
 	if (typeof value !== "string" || value.length === 0) return undefined;
 	return Bun.hash(value).toString(16);
@@ -4648,15 +4664,16 @@ export class AuthStorage {
 	#buildUsageReportCacheKey(request: UsageRequestDescriptor): string {
 		const baseUrl = this.#normalizeUsageBaseUrl(request.baseUrl) || "default";
 		const identity = this.#buildUsageCacheIdentity(request.credential);
-		return `report:${request.provider}:${baseUrl}:${identity}`;
+		return `report:${request.provider}:${baseUrl}:${identity}${usageReportSchemaTag(request.provider)}`;
 	}
 
 	#buildUsageReportsCacheKey(requests: ReadonlyArray<UsageRequestDescriptor>): string {
 		const snapshot = requests
-			.map(
-				request =>
-					`${request.provider}:${this.#normalizeUsageBaseUrl(request.baseUrl) || "default"}:${this.#buildUsageCacheIdentity(request.credential)}`,
-			)
+			.map(request => {
+				const baseUrl = this.#normalizeUsageBaseUrl(request.baseUrl) || "default";
+				const identity = this.#buildUsageCacheIdentity(request.credential);
+				return `${request.provider}:${baseUrl}:${identity}${usageReportSchemaTag(request.provider)}`;
+			})
 			.sort()
 			.join("\n");
 		return `reports:${Bun.hash(snapshot).toString(16)}`;

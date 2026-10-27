@@ -4,7 +4,9 @@
  * quota. `/usage` must show each pool once; credential rotation still needs the
  * per-model limits.
  */
-import { describe, expect, it } from "bun:test";
+
+import { describe, expect, it, vi } from "bun:test";
+import * as path from "node:path";
 import { collapseUsageLimitsForDisplay } from "../src/usage";
 import {
 	ANTIGRAVITY_FIVE_HOUR_WINDOW_MS,
@@ -288,5 +290,108 @@ describe("antigravity usage", () => {
 	it("exposes the credential email so /usage labels accounts by email", async () => {
 		const report = await fetchReport();
 		expect(report.metadata?.email).toBe("me@example.com");
+	});
+});
+
+/**
+ * Fixtures are the 2026-10-27T18:40Z production captures of four real accounts.
+ * `retrieveUserQuotaSummary` is stored verbatim; `fetchAvailableModels` is
+ * reduced to one representative model per quota pool plus one internal and one
+ * editor-only model. Every model of a pool shared a single `quotaInfo`
+ * signature in the raw capture, so the pool classification is unchanged.
+ */
+const CAPTURE_DIR = path.join(import.meta.dir, "fixtures", "antigravity-2026-10-27");
+const CAPTURED_AT_MS = Date.parse("2026-10-27T18:40:00Z");
+
+async function capturedReport(account: string, options: { summary: boolean }) {
+	const models: unknown = await Bun.file(path.join(CAPTURE_DIR, `${account}-fetchAvailableModels.json`)).json();
+	const summary: unknown = await Bun.file(path.join(CAPTURE_DIR, `${account}-retrieveUserQuotaSummary.json`)).json();
+	const report = await antigravityUsageProvider.fetchUsage(
+		{
+			provider: "google-antigravity",
+			credential: {
+				type: "oauth",
+				accessToken: "token",
+				projectId: "proj-1",
+				accountId: `acct-${account}`,
+				email: `${account}@example.com`,
+			},
+		},
+		{
+			fetch: (async (url: string | URL | Request) => {
+				if (String(url).endsWith("/v1internal:retrieveUserQuotaSummary")) {
+					return options.summary
+						? new Response(JSON.stringify(summary), { status: 200 })
+						: new Response("{}", { status: 500 });
+				}
+				return new Response(JSON.stringify(models), { status: 200 });
+			}) as unknown as typeof fetch,
+		},
+	);
+	if (!report) throw new Error(`expected a report for ${account}`);
+	return collapseUsageLimitsForDisplay(report.limits);
+}
+
+describe("antigravity captured account pools", () => {
+	const ULTRA_ROWS = ["Claude / GPT-OSS|5h", "Claude / GPT-OSS|7d", "Gemini|5h", "Gemini|7d"];
+	const PRO_ROWS = ["Claude / GPT-OSS|5h", "Claude / GPT-OSS|7d", "Gemini Argon|7d", "Gemini|5h", "Gemini|7d"];
+
+	function rowKeys(rows: Awaited<ReturnType<typeof capturedReport>>): string[] {
+		return rows.map(row => `${row.label}|${row.window?.id}`).sort();
+	}
+
+	it("renders two pools for Ultra accounts and three for the Pro account", async () => {
+		const nowSpy = vi.spyOn(Date, "now").mockReturnValue(CAPTURED_AT_MS);
+		try {
+			const cases = [
+				["byteworx70", ULTRA_ROWS, 2],
+				["byteworx71", ULTRA_ROWS, 2],
+				["kkookk112727", ULTRA_ROWS, 2],
+				["skuk27", PRO_ROWS, 3],
+			] as const;
+			for (const [account, expectedRows, expectedPools] of cases) {
+				expect(rowKeys(await capturedReport(account, { summary: true }))).toEqual([...expectedRows].sort());
+
+				// Without the quota summary, `fetchAvailableModels` alone still
+				// separates the same pools: the Argon bucket signature matches the
+				// general Gemini models on Ultra and differs on Pro.
+				const withoutSummary = await capturedReport(account, { summary: false });
+				const pools = new Set(withoutSummary.map(row => row.label));
+				expect(pools.size).toBe(expectedPools);
+				expect(pools.has("Gemini Argon")).toBe(account === "skuk27");
+			}
+		} finally {
+			nowSpy.mockRestore();
+		}
+	});
+
+	it("keeps the captured readings and the omitted-zero Argon exhaustion", async () => {
+		const nowSpy = vi.spyOn(Date, "now").mockReturnValue(CAPTURED_AT_MS);
+		try {
+			const ultra = await capturedReport("byteworx71", { summary: true });
+			expect(
+				ultra.find(row => row.label === "Gemini" && row.window?.id === "7d")?.amount.remainingFraction,
+			).toBeCloseTo(0.21197523);
+			expect(
+				ultra.find(row => row.label === "Claude / GPT-OSS" && row.window?.id === "7d")?.amount.remainingFraction,
+			).toBeCloseTo(0.055549);
+
+			const drained = await capturedReport("kkookk112727", { summary: true });
+			const drainedGemini = drained.find(row => row.label === "Gemini" && row.window?.id === "7d");
+			expect(drainedGemini?.amount.remainingFraction).toBe(0);
+			expect(drainedGemini?.status).toBe("exhausted");
+
+			const pro = await capturedReport("skuk27", { summary: true });
+			const argon = pro.find(row => row.label === "Gemini Argon");
+			// `gemini-argon-wtu-weekly` arrives with resetTime but no remainingFraction.
+			expect(argon?.window?.id).toBe("7d");
+			expect(argon?.amount.remainingFraction).toBe(0);
+			expect(argon?.status).toBe("exhausted");
+			expect(
+				pro.find(row => row.label === "Gemini" && row.window?.id === "7d")?.amount.remainingFraction,
+			).toBeCloseTo(0.99973905);
+		} finally {
+			nowSpy.mockRestore();
+		}
 	});
 });
