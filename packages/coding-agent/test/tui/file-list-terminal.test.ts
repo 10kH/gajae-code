@@ -85,6 +85,16 @@ test("file list hands the hyperlink a name without terminal controls", () => {
 	expect(rendered).toContain("tail.ts");
 });
 
+test("renderFileList strips controls from the entry name and meta before styling", () => {
+	const osc = "\x1b]52;c;aGVsbG8=\x07";
+	const rendered = renderList(`keep${osc}name.ts`, `2 KB${osc}`);
+	expect(rendered).not.toContain("\x1b]52;");
+	expect(rendered).not.toContain("aGVsbG8=");
+	expect(rendered).toContain("keep");
+	expect(rendered).toContain("name.ts");
+	expect(rendered).toContain("2 KB");
+});
+
 test("file list meta does not render terminal controls", () => {
 	const rendered = renderList("src/notes.txt", "2 KB\x1b]52;c;aGVsbG8=\x07");
 	expect(rendered).not.toContain("\x1b]52;");
