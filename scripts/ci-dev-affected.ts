@@ -1014,6 +1014,10 @@ export function planTasks(
 	// embedded index is generated from, so either side changing must run its gate.
 	// The gate loads the generated corpus through the package barrel, so it is a
 	// native consumer and must bring its own producer.
+	if (paths.includes("docs/custom-providers-and-multi-account.md")) {
+		addTestFileTask(tasks, "packages/coding-agent/test/custom-provider-docs.test.ts");
+		ensureNativeBuild(tasks);
+	}
 	if (paths.some(isEmbeddedDocsSourcePath)) {
 		addTestFileTask(tasks, EMBEDDED_DOCS_GATE_TEST);
 		addNativeBuild(tasks);
@@ -1128,6 +1132,10 @@ export function planTargetedTasks(
 	// A docs edit is cheap, but it is not free: docs/ is the source the embedded docs
 	// index is generated from, so shipping the edit without regenerating that index is
 	// the one drift class a docs-only PR can introduce. Select just its gate.
+	if (paths.includes("docs/custom-providers-and-multi-account.md")) {
+		addTestFileTask(tasks, "packages/coding-agent/test/custom-provider-docs.test.ts");
+		ensureNativeBuild(tasks);
+	}
 	if (paths.some(isEmbeddedDocsSourcePath)) {
 		addTestFileTask(tasks, EMBEDDED_DOCS_GATE_TEST);
 	}
