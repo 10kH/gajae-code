@@ -40,6 +40,7 @@ import {
 } from "./receipts";
 import {
 	acquireLease,
+	canonicalLeaseSocket,
 	canWriteEvents,
 	classifyLeaseStatus,
 	heartbeat,
@@ -1207,7 +1208,10 @@ export async function resolveOwner(root: string, sessionId: string): Promise<Res
 	const status = classifyLeaseStatus(lease);
 	// Owner process alive (live / lease-expired-but-alive / EPERM-alive) => endpoint reachable => routable.
 	const live = status === "live" || status === "expiredAlive" || status === "epermAlive";
-	return { live, socketPath: lease.endpoint?.path ?? null, lease };
+	const endpointPath = lease.endpoint?.kind === "unix-socket" ? lease.endpoint.path : null;
+	// The dial path is the private socket. A workspace lease does not choose a different path.
+	const socketPath = live && endpointPath ? canonicalLeaseSocket(root, sessionId, endpointPath) : null;
+	return { live, socketPath, lease };
 }
 
 /**

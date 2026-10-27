@@ -328,6 +328,93 @@ describe("SessionLease", () => {
 		await expect(readFile(paths.controlSock, "utf8")).rejects.toThrow();
 	});
 
+	it("takes over a live lease whose unix endpoint is outside the private socket", async () => {
+		const foreign = path.join(root, "outside.sock");
+		await acquireLease(root, SID, {
+			ownerId: "owner-a",
+			pid: 1,
+			eventsPath: "e",
+			endpoint: { kind: "unix-socket", path: foreign },
+			ttlMs: 10_000,
+			probe: aliveProbe,
+		});
+		const taken = await acquireLease(root, SID, {
+			ownerId: "owner-b",
+			pid: 2,
+			eventsPath: "e",
+			endpoint: { kind: "unix-socket", path: controlSocketPath(root, SID) },
+			ttlMs: 10_000,
+			probe: aliveProbe,
+		});
+		expect(taken.lease.ownerId).toBe("owner-b");
+		expect(taken.lease.leaseEpoch).toBe(2);
+	});
+
+	it("keeps holding a live lease on the private owner socket", async () => {
+		const canonical = controlSocketPath(root, SID);
+		await acquireLease(root, SID, {
+			ownerId: "owner-a",
+			pid: 1,
+			eventsPath: "e",
+			endpoint: { kind: "unix-socket", path: canonical },
+			ttlMs: 10_000,
+			probe: aliveProbe,
+		});
+		await expect(
+			acquireLease(root, SID, {
+				ownerId: "owner-b",
+				pid: 2,
+				eventsPath: "e",
+				endpoint: { kind: "unix-socket", path: canonical },
+				ttlMs: 10_000,
+				probe: aliveProbe,
+			}),
+		).rejects.toThrow(/lease_held/);
+	});
+
+	it("keeps holding a live lease when the endpoint uses dot segments", async () => {
+		const canonical = controlSocketPath(root, SID);
+		const dotted = `${canonical}${path.sep}..${path.sep}${path.basename(canonical)}`;
+		await acquireLease(root, SID, {
+			ownerId: "owner-a",
+			pid: 1,
+			eventsPath: "e",
+			endpoint: { kind: "unix-socket", path: dotted },
+			ttlMs: 10_000,
+			probe: aliveProbe,
+		});
+		await expect(
+			acquireLease(root, SID, {
+				ownerId: "owner-b",
+				pid: 2,
+				eventsPath: "e",
+				endpoint: { kind: "unix-socket", path: canonical },
+				ttlMs: 10_000,
+				probe: aliveProbe,
+			}),
+		).rejects.toThrow(/lease_held/);
+	});
+
+	it("keeps holding a live fifo endpoint", async () => {
+		await acquireLease(root, SID, {
+			ownerId: "owner-a",
+			pid: 1,
+			eventsPath: "e",
+			endpoint: { kind: "fifo", path: path.join(root, "control.fifo") },
+			ttlMs: 10_000,
+			probe: aliveProbe,
+		});
+		await expect(
+			acquireLease(root, SID, {
+				ownerId: "owner-b",
+				pid: 2,
+				eventsPath: "e",
+				ttlMs: 10_000,
+				probe: aliveProbe,
+			}),
+		).rejects.toThrow(/lease_held/);
+	});
+
 	it("does not signal pids while reaping dead owner artifacts", async () => {
 		await acquireLease(root, SID, { ownerId: "owner-a", pid: 1, eventsPath: "e", ttlMs: 10_000, probe: aliveProbe });
 		let probes = 0;
