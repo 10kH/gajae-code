@@ -99,8 +99,10 @@ is logged by setting path without hiding the commit receipt or
 preventing other observers from receiving the change. Atomic batches reject
 ancestor/descendant path mixtures (for example `modelRoles` together with
 `modelRoles.default`) before applying any patch: their restore scopes overlap.
-Write one parent value or disjoint leaf paths instead. Repeated writes to the
-same exact path retain ordered last-write semantics.
+Write one parent value or disjoint leaf paths instead. A set also rejects a path
+through an existing scalar, null, or array ancestor: replacing that ancestor would
+exceed the receipt's restore scope. Repeated writes to the same exact path retain
+ordered last-write semantics.
 `commitAtomicBatchWithCurrent` also refuses newer local staged mutations that
 arrive while it waits, and fences nonempty batches against local or runtime-override
 intent during an asynchronous builder, including same-value and ABA overrides.
