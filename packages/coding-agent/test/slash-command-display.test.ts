@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { CombinedAutocompleteProvider } from "@gajae-code/tui/autocomplete";
 import fc from "fast-check";
 import type { CustomizeDoctorReport } from "../src/cli/customize-doctor";
 import { renderCustomizeDoctorText, runCustomizeDoctor } from "../src/cli/customize-doctor";
@@ -631,5 +632,41 @@ describe.serial("slash command display", () => {
 		expect(text.includes("\u0007")).toBe(false);
 		expect(text.includes("spoofed-title")).toBe(false);
 		expect(text).toContain(plainHash);
+	});
+
+	it("filters file commands before they join hookCommands and customCommands", async () => {
+		const cwd = await makeRepo();
+		const marker = "merged-file-body-marker";
+		await writeCommand(
+			cwd,
+			path.join(".gjc", "commands", "shipfile.md"),
+			["---", 'description: "ship \\u001b]52;c;YQ==\\u0007 the file command"', "---", marker, ""].join("\n"),
+		);
+
+		const fileCommands = (await loadSlashCommands({ cwd })).filter(command => command.content.includes(marker));
+		expect(fileCommands).toHaveLength(1);
+		const fileCommand = fileCommands[0];
+		if (fileCommand === undefined) {
+			throw new Error("expected the loaded file command");
+		}
+		expect(fileCommand.description.includes("\u001b")).toBe(false);
+
+		const hookCommands = [{ name: "hookplain", description: "Run the plain hook." }];
+		const customCommands = [
+			{ name: "customplain", description: "Run the plain custom command." },
+			{ name: "custom", description: "hello\u001b]52;c;YQ==\u0007" },
+		];
+		const provider = new CombinedAutocompleteProvider(
+			[...hookCommands, ...customCommands, { name: fileCommand.name, description: fileCommand.description }],
+			cwd,
+		);
+		const suggestions = await provider.getSuggestions(["/"], 0, 1);
+		const byName = new Map((suggestions?.items ?? []).map(item => [item.label, item.description ?? ""]));
+
+		expect(byName.get("shipfile") ?? "").toContain("the file command");
+		expect((byName.get("shipfile") ?? "").includes("\u001b")).toBe(false);
+		expect(byName.get("hookplain")).toBe("Run the plain hook.");
+		expect(byName.get("customplain")).toBe("Run the plain custom command.");
+		expect(byName.get("custom") ?? "").toContain("\u001b]52;c;YQ==\u0007");
 	});
 });
