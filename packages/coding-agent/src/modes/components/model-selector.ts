@@ -596,6 +596,7 @@ export class ModelSelectorComponent extends Container {
 	#imageRoleFilter: boolean = false;
 	#smartRoutingPanel?: SmartRoutingPanelComponent;
 	#smartRoutingStateUnknown = false;
+	#isSmartRoutingStateUnknown?: () => boolean;
 	#smartRoutingPreviewBuilder?: (draft: AutoroutingSetup) => RoutingSettingsPreview;
 	#smartRoutingDiscardPreview?: (preview: RoutingSettingsPreview) => void;
 	#isBillingDismissed?: (key: string) => boolean;
@@ -628,7 +629,7 @@ export class ModelSelectorComponent extends Container {
 			configuredDefaultChain?: readonly string[];
 			smartRoutingPreview?: (draft: AutoroutingSetup) => RoutingSettingsPreview;
 			smartRoutingDiscardPreview?: (preview: RoutingSettingsPreview) => void;
-			smartRoutingStateUnknown?: boolean;
+			smartRoutingStateUnknown?: () => boolean;
 			/** Open the smart-routing panel directly instead of the preset landing. */
 			smartRoutingOnly?: boolean;
 			/** Test seam: synchronous persisted-dismissal check to avoid async render churn. */
@@ -650,7 +651,7 @@ export class ModelSelectorComponent extends Container {
 		this.#authSessionId = options?.sessionId;
 		this.#smartRoutingPreviewBuilder = options?.smartRoutingPreview;
 		this.#smartRoutingDiscardPreview = options?.smartRoutingDiscardPreview;
-		this.#smartRoutingStateUnknown = options?.smartRoutingStateUnknown === true;
+		this.#isSmartRoutingStateUnknown = options?.smartRoutingStateUnknown;
 		this.#isBillingDismissed = (options as any)?.isBillingDismissed;
 		this.#markBillingDismissed = (options as any)?.markBillingDismissed;
 		this.#currentModel = _currentModel;
@@ -1961,8 +1962,12 @@ export class ModelSelectorComponent extends Container {
 		return this.#smartRoutingPreviewBuilder(setup);
 	}
 
+	#smartRoutingUnknown(): boolean {
+		return this.#smartRoutingStateUnknown || this.#isSmartRoutingStateUnknown?.() === true;
+	}
+
 	#smartRoutingIsStale(committedPreview?: RoutingSettingsPreview): boolean {
-		if (this.#smartRoutingStateUnknown) return false;
+		if (this.#smartRoutingUnknown()) return false;
 		const provenance = this.#settings.get("task.autorouting.provenance");
 		if (!provenance) return false;
 		try {
@@ -1984,7 +1989,7 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#enterSmartRoutingMode(): void {
-		if (this.#smartRoutingStateUnknown) {
+		if (this.#smartRoutingUnknown()) {
 			this.#viewMode = "presets";
 			this.#presetLoginHint = "Smart-routing settings are unknown; reload Settings before continuing.";
 			this.#renderPresetLanding();
@@ -2023,6 +2028,7 @@ export class ModelSelectorComponent extends Container {
 			effectiveGeneratedSetup: this.#hasEffectiveGeneratedSetup(),
 			providerOrderHint: this.#providerOrderHintFor(setup.providers),
 			readOnly: this.#smartRoutingReadOnly(),
+			isStateUnknown: () => this.#smartRoutingUnknown(),
 			stale: this.#smartRoutingIsStale(),
 			preview,
 			generatePreview: draft => this.#smartRoutingPreview(draft),
@@ -2063,8 +2069,12 @@ export class ModelSelectorComponent extends Container {
 		this.#smartRoutingStateUnknown = true;
 	}
 
+	markSmartRoutingEffectiveStateUnknown(): void {
+		this.#smartRoutingPanel?.markEffectiveStateUnknown();
+	}
+
 	refreshSmartRoutingState(committedPreview?: RoutingSettingsPreview): void {
-		if (this.#smartRoutingStateUnknown) return;
+		if (this.#smartRoutingUnknown()) return;
 		const panel = this.#smartRoutingPanel;
 		if (!panel || this.#viewMode !== "smart-routing") return;
 		// Catalog and provider-order reads are advisory after publication. A failure must
@@ -2124,7 +2134,7 @@ export class ModelSelectorComponent extends Container {
 			const prefix = selected ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
 			if (row.kind === "smartRouting") {
 				const stale = this.#smartRoutingIsStale();
-				const label = this.#smartRoutingStateUnknown
+				const label = this.#smartRoutingUnknown()
 					? "Smart routing (unknown)"
 					: stale
 						? "Smart routing (stale)"
@@ -2547,6 +2557,15 @@ export class ModelSelectorComponent extends Container {
 		return this.#isCanonicalTab()
 			? this.#filteredCanonicalModels[this.#selectedIndex]
 			: this.#filteredModels[this.#selectedIndex];
+	}
+
+	render(width: number): string[] {
+		// The service does not notify the TUI: observe shared invalidation on the next render.
+		if (this.#viewMode === "presets" && this.#smartRoutingUnknown() && !this.#smartRoutingStateUnknown) {
+			this.#smartRoutingStateUnknown = true;
+			this.#renderPresetLanding();
+		}
+		return super.render(width);
 	}
 
 	handleInput(keyData: string): void {

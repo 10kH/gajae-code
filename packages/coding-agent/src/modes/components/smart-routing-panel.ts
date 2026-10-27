@@ -49,6 +49,7 @@ export interface SmartRoutingPanelOptions {
 	enabled: boolean;
 	effectiveGeneratedSetup?: boolean;
 	readOnly: boolean;
+	isStateUnknown?: () => boolean;
 	stale: boolean;
 	preview: RoutingSettingsPreview;
 	generatePreview: (draft: AutoroutingSetup) => RoutingSettingsPreview;
@@ -102,6 +103,8 @@ export class SmartRoutingPanelComponent extends Container {
 	readonly #discardPreview?: (preview: RoutingSettingsPreview) => void;
 	readonly #generatePreview: (draft: AutoroutingSetup) => RoutingSettingsPreview;
 	readonly #readOnly: boolean;
+	readonly #isStateUnknown?: () => boolean;
+	#sharedStateInvalidated = false;
 	#draft: AutoroutingSetup;
 
 	#tiers?: TierMap;
@@ -133,6 +136,7 @@ export class SmartRoutingPanelComponent extends Container {
 		this.#effectiveDiffersFromSaved = options.effectiveDiffersFromSaved === true;
 		this.#generatePreview = options.generatePreview;
 		this.#readOnly = options.readOnly;
+		this.#isStateUnknown = options.isStateUnknown;
 		this.#draft = cloneSetup(options.setup);
 
 		this.#tiers = options.tiers ? structuredClone(options.tiers) : undefined;
@@ -189,6 +193,31 @@ export class SmartRoutingPanelComponent extends Container {
 	updateProviderOrderHint(hint: AutoroutingProviderOrderHint | undefined): void {
 		this.#providerOrderHint = hint ? structuredClone(hint) : undefined;
 		this.#render();
+	}
+
+	/** Forget effective indicators when a committed result cannot be presented reliably. */
+	markEffectiveStateUnknown(): void {
+		this.#enabled = undefined;
+		this.#effectiveGeneratedSetup = undefined;
+		this.#provenance = undefined;
+		this.#stale = false;
+		this.#providerOrderHint = undefined;
+		this.#effectiveDiffersFromSaved = false;
+		this.#status = "";
+	}
+
+	#observeSharedInvalidation(): boolean {
+		if (!this.#sharedStateInvalidated && this.#isStateUnknown?.()) {
+			this.#sharedStateInvalidated = true;
+			this.markEffectiveStateUnknown();
+			this.#render();
+		}
+		return this.#sharedStateInvalidated;
+	}
+
+	render(width: number): string[] {
+		this.#observeSharedInvalidation();
+		return super.render(width);
 	}
 
 	/** Replace the panel's persisted snapshot after a controller mutation. */
@@ -397,7 +426,10 @@ export class SmartRoutingPanelComponent extends Container {
 			);
 		}
 		this.addChild(new Spacer(1));
-		const actions = this.#readOnly ? "Esc: cancel" : "a: apply · r: refresh · t: toggle · c: clear · Esc: cancel";
+		const actions =
+			this.#readOnly || this.#sharedStateInvalidated
+				? "Esc: cancel"
+				: "a: apply · r: refresh · t: toggle · c: clear · Esc: cancel";
 		this.addChild(new Text(theme.fg("muted", actions), 0, 0));
 	}
 
@@ -414,7 +446,7 @@ export class SmartRoutingPanelComponent extends Container {
 	}
 
 	async #emit(intent: SmartRoutingIntent): Promise<void> {
-		if (this.#readOnly || this.#mode === "committing") return;
+		if (this.#observeSharedInvalidation() || this.#readOnly || this.#mode === "committing") return;
 		if (intent.kind === "apply" && !this.#previewValid) {
 			this.#error = "Preview unavailable; edit the setup to generate and review a fresh preview.";
 			this.#render();
@@ -433,10 +465,10 @@ export class SmartRoutingPanelComponent extends Container {
 				this.#draft = cloneSetup(result.setup);
 				this.#preview = result;
 				this.#previewValid = true;
-			} else if (this.#stateRevision === stateRevision) {
-				// A callback-only host cannot establish the effective state after a write.
-				if (intent.kind === "toggle") this.#enabled = undefined;
-				if (intent.kind === "clear") this.#effectiveGeneratedSetup = undefined;
+			}
+			if (this.#stateRevision === stateRevision) {
+				// A callback-only host cannot establish effective state after any write.
+				this.markEffectiveStateUnknown();
 			}
 			this.#mode = "done";
 			this.#status =
@@ -517,6 +549,13 @@ export class SmartRoutingPanelComponent extends Container {
 	}
 
 	handleInput(data: string): void {
+		if (this.#observeSharedInvalidation()) {
+			if (getKeybindings().matches(data, "tui.select.cancel")) {
+				this.#discardPreview?.(this.#preview);
+				this.#onCancel();
+			}
+			return;
+		}
 		if (this.#mode === "committing") return;
 		if (this.#mode === "done" || this.#mode === "error") {
 			if (getKeybindings().matches(data, "tui.select.cancel")) {

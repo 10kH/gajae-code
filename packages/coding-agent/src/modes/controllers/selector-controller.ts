@@ -1591,6 +1591,14 @@ export class SelectorController {
 		}
 	}
 
+	#refreshSmartRoutingUi(selector: ModelSelectorComponent, preview?: RoutingSettingsPreview): void {
+		try {
+			selector.refreshSmartRoutingState(preview);
+		} catch {
+			this.#updateSmartRoutingUi(() => selector.markSmartRoutingEffectiveStateUnknown());
+		}
+	}
+
 	async applySmartRouting(
 		draft: AutoroutingSetup,
 		options?: { preview?: RoutingSettingsPreview; confirmHandEdit?: boolean },
@@ -1641,7 +1649,7 @@ export class SelectorController {
 										preview: selection.intent.preview,
 										confirmHandEdit: selection.intent.confirmHandEdit,
 									});
-									this.#updateSmartRoutingUi(() => modelSelector.refreshSmartRoutingState(preview));
+									this.#refreshSmartRoutingUi(modelSelector, preview);
 									return preview;
 								}
 								case "refresh": {
@@ -1649,7 +1657,7 @@ export class SelectorController {
 										preview: selection.intent.preview,
 										confirmHandEdit: selection.intent.confirmHandEdit,
 									});
-									this.#updateSmartRoutingUi(() => modelSelector.refreshSmartRoutingState(preview));
+									this.#refreshSmartRoutingUi(modelSelector, preview);
 									return preview;
 								}
 								case "clear":
@@ -1659,7 +1667,7 @@ export class SelectorController {
 									await this.setAutoroutingEnabled(selection.intent.enabled);
 									break;
 							}
-							this.#updateSmartRoutingUi(() => modelSelector.refreshSmartRoutingState());
+							this.#refreshSmartRoutingUi(modelSelector);
 							return;
 						} catch (error) {
 							if (
@@ -1671,7 +1679,7 @@ export class SelectorController {
 								if (error.durability === "persisted") {
 									this.#updateSmartRoutingUi(() => modelSelector.invalidateSmartRoutingState());
 								} else {
-									this.#updateSmartRoutingUi(() => modelSelector.refreshSmartRoutingState());
+									this.#refreshSmartRoutingUi(modelSelector);
 								}
 							}
 							throw error;
@@ -1934,7 +1942,7 @@ export class SelectorController {
 					isCurrentModelFastModeActive: () => this.ctx.session.isFastModeActive(),
 					smartRoutingPreview: draft => this.previewSmartRouting(draft),
 					smartRoutingDiscardPreview: preview => this.#smartRouting.discardPreview(preview),
-					smartRoutingStateUnknown: this.#smartRouting.stateUnknown,
+					smartRoutingStateUnknown: () => this.#smartRouting.stateUnknown,
 					smartRoutingOnly: options?.smartRoutingOnly,
 				},
 			);

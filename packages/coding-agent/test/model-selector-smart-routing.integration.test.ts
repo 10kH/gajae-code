@@ -329,6 +329,12 @@ describe("/model smart-routing panel integration", () => {
 					expect(panel.mode).toBe("done");
 					expect(ctx.showError).not.toHaveBeenCalled();
 					expect(renderText(panel)).not.toContain("private");
+					if (failure === "refresh") {
+						expect(renderText(panel)).toContain("Effective enabled: unknown");
+						expect(renderText(panel)).toContain("Effective generated setup: unknown");
+						expect(renderText(panel)).not.toContain("Provenance recorded");
+						expect(renderText(panel)).not.toContain("effective settings currently differ");
+					}
 					const disk = await Settings.loadReadonly({ cwd: temp.path(), agentDir });
 					try {
 						for (const key of [
@@ -396,6 +402,81 @@ describe("/model smart-routing panel integration", () => {
 			}
 		});
 	}
+
+	test("failed effective-state marking cannot turn a committed apply into failure or retain stale labels", async () => {
+		const { panel, selector, ctx } = await openPanel();
+		vi.spyOn(selector, "refreshSmartRoutingState").mockImplementation(() => {
+			throw new Error("refresh failed");
+		});
+		vi.spyOn(selector, "markSmartRoutingEffectiveStateUnknown").mockImplementation(() => {
+			throw new Error("mark failed");
+		});
+		await panel.__testApply();
+		expect(panel.mode).toBe("done");
+		expect(ctx.showError).not.toHaveBeenCalled();
+		expect(renderText(panel)).toContain("Effective enabled: unknown");
+		expect(renderText(panel)).toContain("Effective generated setup: unknown");
+		expect(renderText(panel)).not.toContain("Provenance recorded");
+	});
+
+	test("another service invalidates an already open panel sharing Settings", async () => {
+		const temp = TempDir.createSync("@gjc-routing-ui-shared-conflict-");
+		const agentDir = path.join(temp.path(), "agent");
+		const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir });
+		const other = await Settings.loadForScope({ cwd: temp.path(), agentDir });
+		try {
+			settings.set("task.autorouting.enabled", false);
+			await settings.flushOrThrow();
+			const { panel, selector, controller, ctx } = await openPanel({ settings });
+			const scoped = await openPanel({ settings, scopedModels: [{ model: catalog[0] }] });
+			expect(renderText(panel)).toContain("Effective enabled: no");
+			expect(renderText(scoped.panel)).toContain("Read-only");
+			const routing = createRoutingSettingsService({
+				settings,
+				getCatalog: () => catalog,
+				getProviderOrder: () => ["anthropic", "openai-codex"],
+				isScoped: () => false,
+				activate: async () => {
+					await other.commitAtomicBatchWithCurrent(() => [
+						{ path: "task.autorouting.enabled", op: "set", value: false },
+					]);
+					throw new Error("activation failed");
+				},
+			});
+			const renders = ctx.ui.requestRender.mock.calls.length;
+			const error = await routing.setAutoroutingEnabled(true).catch(failure => failure);
+			expect(error).toMatchObject({ durability: "persisted", rollback: "conflict" });
+			// No listener requests a frame; the next render or input observes the shared state.
+			expect(ctx.ui.requestRender.mock.calls.length).toBe(renders);
+			await panel.__testToggle(false);
+			await scoped.panel.__testToggle(false);
+			expect(panel.mode).not.toBe("done");
+			expect(scoped.panel.mode).not.toBe("done");
+			expect(renderText(scoped.panel)).toContain("Effective enabled: unknown");
+			expect(renderText(scoped.panel)).toContain("Effective generated setup: unknown");
+			expect(renderText(panel)).toContain("Effective enabled: unknown");
+			expect(renderText(panel)).toContain("Effective generated setup: unknown");
+			expect(renderText(panel)).not.toContain("Effective enabled: yes");
+			expect(renderText(panel)).not.toContain("Effective generated setup: absent");
+			await expect(controller.setAutoroutingEnabled(false)).rejects.toThrow("settings are unknown");
+			panel.handleInput("\x1b");
+			expect(renderText(selector)).toContain("Smart routing (unknown)");
+			selector.__testOpenSmartRoutingPanel();
+			expect(selector.__testGetSmartRoutingPanel()).toBeUndefined();
+			expect(renderText(selector)).toContain("reload Settings before continuing");
+			controller.showModelSelector();
+			const reopened = ctx.editorContainer.addChild.mock.calls.at(-1)?.[0] as ModelSelectorComponent;
+			await settle();
+			expect(renderText(reopened)).toContain("Smart routing (unknown)");
+			reopened.__testOpenSmartRoutingPanel();
+			expect(reopened.__testGetSmartRoutingPanel()).toBeUndefined();
+			expect(renderText(reopened)).toContain("reload Settings before continuing");
+		} finally {
+			await settings.close();
+			await other.close();
+			temp.removeSync();
+		}
+	});
 
 	test("cross-instance rollback conflict leaves stale local state unknown in the panel", async () => {
 		const temp = TempDir.createSync("@gjc-routing-ui-cross-conflict-");
