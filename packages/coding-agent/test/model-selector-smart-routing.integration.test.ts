@@ -234,7 +234,7 @@ describe("/model smart-routing panel integration", () => {
 			expect(settings.get("task.autorouting.provenance")).toEqual(committed.provenance);
 			expect(panel.getPreviewPayload()).toEqual(committed);
 			expect(renderText(panel)).toContain("openai-codex/gpt-5.6-terra");
-			expect(renderText(panel)).toContain("Smart-routing settings saved.");
+			expect(renderText(panel)).toContain("Global smart-routing settings saved.");
 
 			// A separately requested preview is a new candidate, not the saved result.
 			const candidate = controller.previewSmartRouting(committed.setup);
@@ -269,7 +269,7 @@ describe("/model smart-routing panel integration", () => {
 			expect(settings.get("task.autorouting.tiers")).toEqual(committed.tiers);
 			expect(settings.get("task.autorouting.provenance")).toEqual(committed.provenance);
 			expect(ctx.showError).not.toHaveBeenCalled();
-			expect(renderText(panel)).toContain("Smart-routing settings saved.");
+			expect(renderText(panel)).toContain("Global smart-routing settings saved.");
 			expect(renderText(panel)).not.toContain("catalog unavailable after publication");
 		});
 	}
@@ -287,7 +287,92 @@ describe("/model smart-routing panel integration", () => {
 
 		expect(observedPatches).toHaveLength(1);
 		expect(observedPatches[0]).toMatchObject({ path: "task.autorouting.enabled", op: "set", value: true });
+		expect(renderText(panel)).toContain("Global enabled saved: yes.");
+		expect(renderText(panel)).toContain("Effective enabled: yes");
 	});
+
+	test("toggle reports the saved global value separately from the runtime overlay", async () => {
+		const settings = Settings.isolated({ "task.autorouting.enabled": false });
+		settings.override("task.autorouting.enabled", false);
+		const { panel } = await openPanel({ settings });
+		await panel.__testToggle(true);
+		expect(settings.getGlobal("task.autorouting.enabled")).toBe(true);
+		expect(settings.get("task.autorouting.enabled")).toBe(false);
+		expect(renderText(panel)).toContain("Global enabled saved: yes.");
+		expect(renderText(panel)).toContain("Effective enabled: no");
+	});
+
+	test("clear removes global generated settings without clearing runtime generated settings", async () => {
+		const { panel: initialPanel, selector, settings } = await openPanel();
+		await initialPanel.__testApply();
+		initialPanel.handleInput("\x1b");
+		selector.handleInput("\n");
+		await settle();
+		const panel = selector.__testGetSmartRoutingPanel();
+		if (!panel) throw new Error("Expected reopened routing panel");
+		const runtimeSetup: AutoroutingSetup = { schema: 1, providers: ["openai-codex"] };
+		const runtimeTiers = { fast: ["openai-codex/custom"] };
+		const runtimeProvenance = settings.getGlobal("task.autorouting.provenance");
+		if (!runtimeProvenance) throw new Error("Expected generated provenance");
+		settings.override("task.autorouting.setup", runtimeSetup);
+		settings.override("task.autorouting.tiers", runtimeTiers);
+		settings.override("task.autorouting.provenance", runtimeProvenance);
+		panel.handleInput("c");
+		expect(panel.confirmation).toBe("clear");
+		await panel.__testConfirm();
+		expect(settings.getGlobal("task.autorouting.setup")).toBeUndefined();
+		expect(settings.getGlobal("task.autorouting.provenance")).toBeUndefined();
+		expect(settings.getGlobal("task.autorouting.tiers") ?? {}).toEqual({});
+		expect(settings.get("task.autorouting.setup")).toEqual(runtimeSetup);
+		expect(settings.get("task.autorouting.tiers")).toEqual(runtimeTiers);
+		expect(settings.get("task.autorouting.provenance")).toEqual(runtimeProvenance);
+		expect(renderText(panel)).toContain("Global generated setup cleared.");
+		expect(renderText(panel)).toContain("Effective generated setup: present");
+	});
+
+	for (const operation of ["toggle", "clear"] as const) {
+		for (const failure of ["catalog", "provider order"] as const) {
+			test(`${operation} remains committed when ${failure} fails after activation`, async () => {
+				const { panel: initialPanel, selector, settings, ctx } = await openPanel();
+				let panel = initialPanel;
+				if (operation === "clear") {
+					await initialPanel.__testApply();
+					initialPanel.handleInput("\x1b");
+					selector.handleInput("\n");
+					await settle();
+					const reopened = selector.__testGetSmartRoutingPanel();
+					if (!reopened) throw new Error("Expected reopened routing panel");
+					panel = reopened;
+				}
+				const commit = vi.spyOn(settings, "commitAtomicBatchWithCurrent");
+				ctx.notifyConfigChanged.mockImplementation(async () => {
+					if (failure === "catalog") {
+						vi.spyOn(ctx.session.modelRegistry, "getAll").mockImplementation(() => {
+							throw new Error("catalog unavailable");
+						});
+					} else {
+						vi.spyOn(ctx.session.modelRegistry, "autoroutingProviderOrder").mockImplementation(() => {
+							throw new Error("provider order unavailable");
+						});
+					}
+				});
+				if (operation === "toggle") await panel.__testToggle(true);
+				else {
+					panel.handleInput("c");
+					await panel.__testConfirm();
+				}
+				expect(commit).toHaveBeenCalledTimes(1);
+				expect(panel.mode).toBe("done");
+				expect(ctx.showError).not.toHaveBeenCalled();
+				expect(renderText(panel)).toContain(
+					operation === "toggle" ? "Global enabled saved: yes." : "Global generated setup cleared.",
+				);
+				expect(renderText(panel)).toContain("Preview invalid; regenerate before applying:");
+				if (operation === "toggle") expect(settings.getGlobal("task.autorouting.enabled")).toBe(true);
+				else expect(settings.getGlobal("task.autorouting.setup")).toBeUndefined();
+			});
+		}
+	}
 
 	test("refresh shows the committed global setup alongside its preview when runtime settings differ", async () => {
 		const globalSetup: AutoroutingSetup = { schema: 1, providers: ["anthropic"] };
@@ -315,12 +400,19 @@ describe("/model smart-routing panel integration", () => {
 	});
 
 	test("controller and selector forward the exact refresh guard after keyboard cancellation and retry", async () => {
-		const { controller, panel: initialPanel, selector, settings } = await openPanel();
+		const settings = Settings.isolated({
+			"task.autorouting.setup": { schema: 1, providers: ["anthropic"], models: ["anthropic/claude-haiku-4-5"] },
+		});
+		const { controller, panel: initialPanel, selector } = await openPanel({ settings });
 		await initialPanel.__testApply();
 		initialPanel.handleInput("\x1b");
 		const globalSetup = settings.getGlobal("task.autorouting.setup");
 		if (!globalSetup) throw new Error("Expected a recorded global setup");
-		const runtimeSetup: AutoroutingSetup = { schema: 1, providers: ["openai-codex"] };
+		const runtimeSetup: AutoroutingSetup = {
+			schema: 1,
+			providers: ["openai-codex"],
+			models: ["openai-codex/gpt-5.6-terra"],
+		};
 		settings.override("task.autorouting.setup", runtimeSetup);
 		settings.set("task.autorouting.tiers", { fast: ["anthropic/hand-edited"] });
 		selector.handleInput("\n");
@@ -347,7 +439,10 @@ describe("/model smart-routing panel integration", () => {
 		expect(renderText(panel)).toContain(
 			`Pending refresh uses recorded global providers: ${globalSetup.providers.join(", ")}`,
 		);
+		expect(renderText(panel)).toContain("Pending refresh uses recorded global allowlist: anthropic/claude-haiku-4-5");
+		expect(renderText(panel)).toContain("Allowlist: openai-codex/gpt-5.6-terra");
 		panel.handleInput("\x1b");
+		expect(panel.getDraft()).toEqual(runtimeSetup);
 		panel.handleInput("r");
 		await calls[1]?.catch(error => {
 			if (error instanceof RoutingSettingsConfirmationRequiredError) guards.push(error);
@@ -365,6 +460,7 @@ describe("/model smart-routing panel integration", () => {
 		expect(panel.mode).toBe("done");
 		expect(panel.getDraft()).toEqual(globalSetup);
 		expect(panel.getPreviewPayload().setup).toEqual(globalSetup);
+		expect(settings.getGlobal("task.autorouting.setup")).toEqual(globalSetup);
 		expect(settings.get("task.autorouting.setup")).toEqual(runtimeSetup);
 		expect(renderText(panel)).toContain("Saved preview is global; effective settings currently differ.");
 	});
@@ -425,6 +521,8 @@ describe("/model smart-routing panel integration", () => {
 		expect(settings.get("task.autorouting.setup")).toBeUndefined();
 		expect(settings.get("task.autorouting.provenance")).toBeUndefined();
 		expect(settings.get("task.autorouting.enabled")).toBe(true);
+		expect(renderText(reopened)).toContain("Global generated setup cleared.");
+		expect(renderText(reopened)).toContain("Effective generated setup: absent");
 	});
 
 	test("stale-provenance indicator renders and scoped sessions are read-only", async () => {
@@ -612,6 +710,19 @@ describe("smart-routing panel hostile render boundary", () => {
 			onCancel: () => undefined,
 		});
 	}
+
+	test("callback-only actions do not invent effective settings", async () => {
+		const toggle = hostilePanel();
+		await toggle.__testToggle(false);
+		const toggleText = renderText(toggle);
+		expect(toggleText).toContain("Global enabled saved: no.");
+		expect(toggleText).toContain("Effective enabled: unknown");
+		const clear = hostilePanel();
+		clear.handleInput("c");
+		await clear.__testConfirm();
+		expect(renderText(clear)).toContain("Global generated setup cleared.");
+		expect(renderText(clear)).toContain("Effective generated setup: unknown");
+	});
 
 	test("strips control sequences from provider, allowlist, preset, and tier rows", () => {
 		const rendered = rawRender(hostilePanel());

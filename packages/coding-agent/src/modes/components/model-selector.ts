@@ -1960,8 +1960,9 @@ export class ModelSelectorComponent extends Container {
 
 	#smartRoutingIsStale(committedPreview?: RoutingSettingsPreview): boolean {
 		const provenance = this.#settings.get("task.autorouting.provenance");
-		if (!provenance || validateAutoroutingSetup(this.#smartRoutingSetup()).length > 0) return false;
+		if (!provenance) return false;
 		try {
+			if (validateAutoroutingSetup(this.#smartRoutingSetup()).length > 0) return false;
 			const preview = committedPreview ?? this.#smartRoutingPreview(this.#smartRoutingSetup());
 			const state = evaluateAutoroutingProvenanceState(provenance, {
 				catalogFingerprint: preview.sourceIdentity.catalogFingerprint,
@@ -2009,6 +2010,7 @@ export class ModelSelectorComponent extends Container {
 			tiers,
 			provenance,
 			enabled: this.#settings.get("task.autorouting.enabled") === true,
+			effectiveGeneratedSetup: this.#hasEffectiveGeneratedSetup(),
 			providerOrderHint: this.#providerOrderHintFor(setup.providers),
 			readOnly: this.#smartRoutingReadOnly(),
 			stale: this.#smartRoutingIsStale(),
@@ -2038,12 +2040,34 @@ export class ModelSelectorComponent extends Container {
 		this.#requestRender();
 	}
 
+	#hasEffectiveGeneratedSetup(): boolean {
+		return (
+			this.#settings.get("task.autorouting.setup") !== undefined ||
+			this.#settings.get("task.autorouting.provenance") !== undefined ||
+			Object.keys(this.#settings.get("task.autorouting.tiers") ?? {}).length > 0
+		);
+	}
+
 	refreshSmartRoutingState(committedPreview?: RoutingSettingsPreview): void {
 		const panel = this.#smartRoutingPanel;
 		if (!panel || this.#viewMode !== "smart-routing") return;
-		const setup = committedPreview?.setup ?? this.#smartRoutingSetup();
-		// A post-publication catalog may already differ; only the service result describes this commit.
-		const preview = committedPreview ?? this.#smartRoutingPreview(setup);
+		// Catalog and provider-order reads are advisory after publication. A failure must
+		// invalidate the preview, not turn an already committed write into a failure.
+		let setup = committedPreview?.setup ?? panel.getDraft();
+		let preview = committedPreview;
+		let providerOrderHint: AutoroutingProviderOrderHint | undefined;
+		try {
+			if (!committedPreview) {
+				setup = this.#smartRoutingSetup();
+				preview = this.#smartRoutingPreview(setup);
+			}
+			providerOrderHint = this.#providerOrderHintFor(setup.providers);
+		} catch {
+			if (!committedPreview) {
+				if (preview) this.#smartRoutingDiscardPreview?.(preview);
+				preview = undefined;
+			}
+		}
 		const effectiveDiffersFromSaved =
 			committedPreview !== undefined &&
 			(!util.isDeepStrictEqual(this.#settings.get("task.autorouting.setup"), committedPreview.setup) ||
@@ -2055,8 +2079,9 @@ export class ModelSelectorComponent extends Container {
 			provenance: committedPreview?.provenance ?? this.#settings.get("task.autorouting.provenance"),
 			effectiveDiffersFromSaved,
 			enabled: this.#settings.get("task.autorouting.enabled") === true,
-			providerOrderHint: this.#providerOrderHintFor(setup.providers),
-			stale: committedPreview ? false : this.#smartRoutingIsStale(),
+			effectiveGeneratedSetup: this.#hasEffectiveGeneratedSetup(),
+			providerOrderHint,
+			stale: committedPreview ? false : preview ? this.#smartRoutingIsStale(preview) : false,
 			preview,
 		});
 		this.#requestRender();

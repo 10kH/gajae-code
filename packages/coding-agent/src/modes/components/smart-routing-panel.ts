@@ -43,6 +43,7 @@ export interface SmartRoutingPanelOptions {
 	/** Advisory drift between the recorded declaration and current provider priority. */
 	providerOrderHint?: AutoroutingProviderOrderHint;
 	enabled: boolean;
+	effectiveGeneratedSetup?: boolean;
 	readOnly: boolean;
 	stale: boolean;
 	preview: RoutingSettingsPreview;
@@ -101,7 +102,9 @@ export class SmartRoutingPanelComponent extends Container {
 
 	#tiers?: TierMap;
 	#provenance?: AutoroutingProvenance;
-	#enabled: boolean;
+	#enabled: boolean | undefined;
+	#effectiveGeneratedSetup: boolean | undefined;
+	#stateRevision = 0;
 	#stale: boolean;
 	/** Service-owned preview identity; never clone it when forwarding a mutation intent. */
 	#preview: RoutingSettingsPreview;
@@ -131,6 +134,7 @@ export class SmartRoutingPanelComponent extends Container {
 		this.#tiers = options.tiers ? structuredClone(options.tiers) : undefined;
 		this.#provenance = options.provenance ? structuredClone(options.provenance) : undefined;
 		this.#enabled = options.enabled;
+		this.#effectiveGeneratedSetup = options.effectiveGeneratedSetup;
 		this.#providerOrderHint = options.providerOrderHint ? structuredClone(options.providerOrderHint) : undefined;
 		this.#stale = options.stale;
 		this.#preview = options.preview;
@@ -189,20 +193,23 @@ export class SmartRoutingPanelComponent extends Container {
 		tiers?: TierMap;
 		provenance?: AutoroutingProvenance;
 		enabled: boolean;
+		effectiveGeneratedSetup: boolean;
 		providerOrderHint?: AutoroutingProviderOrderHint;
 		stale: boolean;
-		preview: RoutingSettingsPreview;
+		preview?: RoutingSettingsPreview;
 		effectiveDiffersFromSaved?: boolean;
 	}): void {
+		this.#stateRevision++;
 		if (this.#preview !== options.preview) this.#discardPreview?.(this.#preview);
 		this.#draft = cloneSetup(options.setup);
 		this.#tiers = options.tiers ? structuredClone(options.tiers) : undefined;
 		this.#provenance = options.provenance ? structuredClone(options.provenance) : undefined;
 		this.#enabled = options.enabled;
+		this.#effectiveGeneratedSetup = options.effectiveGeneratedSetup;
 		this.#stale = options.stale;
 		this.#providerOrderHint = options.providerOrderHint ? structuredClone(options.providerOrderHint) : undefined;
-		this.#preview = options.preview;
-		this.#previewValid = true;
+		if (options.preview) this.#preview = options.preview;
+		this.#previewValid = options.preview !== undefined;
 		this.#effectiveDiffersFromSaved = options.effectiveDiffersFromSaved === true;
 		this.#providerCursor = Math.min(this.#providerCursor, Math.max(0, this.#draft.providers.length - 1));
 		this.#mode = "editing";
@@ -269,7 +276,26 @@ export class SmartRoutingPanelComponent extends Container {
 		if (this.#provenance)
 			this.addChild(new Text(theme.fg("dim", "Provenance recorded for this generated setup."), 0, 0));
 		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.fg("muted", `Enabled: ${this.#enabled ? "yes" : "no"}`), 0, 0));
+		this.addChild(
+			new Text(
+				theme.fg(
+					"muted",
+					`Effective enabled: ${this.#enabled === undefined ? "unknown" : this.#enabled ? "yes" : "no"}`,
+				),
+				0,
+				0,
+			),
+		);
+		this.addChild(
+			new Text(
+				theme.fg(
+					"muted",
+					`Effective generated setup: ${this.#effectiveGeneratedSetup === undefined ? "unknown" : this.#effectiveGeneratedSetup ? "present" : "absent"}`,
+				),
+				0,
+				0,
+			),
+		);
 		this.addChild(new Text(theme.fg("muted", "Providers (↑/↓ reorder; x removes; m edits allowlist):"), 0, 0));
 		for (let index = 0; index < this.#draft.providers.length; index++) {
 			const provider = this.#draft.providers[index] ?? "";
@@ -301,6 +327,11 @@ export class SmartRoutingPanelComponent extends Container {
 		}
 		this.addChild(new Spacer(1));
 		const visiblePreview = this.#visiblePreview();
+		const visiblePreviewValid =
+			this.#previewValid ||
+			(this.#confirmation === "hand-edit" &&
+				this.#pendingIntent?.kind === "refresh" &&
+				this.#pendingIntent.preview !== undefined);
 		if (this.#confirmation === "hand-edit" && this.#pendingIntent?.kind === "refresh") {
 			this.addChild(
 				new Text(
@@ -314,23 +345,37 @@ export class SmartRoutingPanelComponent extends Container {
 					0,
 				),
 			);
+			this.addChild(
+				new Text(
+					theme.fg(
+						"warning",
+						displaySafe(
+							`Pending refresh uses recorded global allowlist: ${visiblePreview.setup.models?.length ? visiblePreview.setup.models.join(", ") : "(all labeled models)"}`,
+						),
+					),
+					0,
+					0,
+				),
+			);
 		}
 		this.addChild(
 			new Text(
-				theme.fg("muted", this.#previewValid ? "Preview:" : "Preview invalid; regenerate before applying:"),
+				theme.fg("muted", visiblePreviewValid ? "Preview:" : "Preview invalid; regenerate before applying:"),
 				0,
 				0,
 			),
 		);
-		for (const tier of ["fast", "balanced", "strong"] as const) {
-			this.addChild(new Text(`  ${formatTier(tier, visiblePreview.tiers)}`, 0, 0));
+		if (visiblePreviewValid) {
+			for (const tier of ["fast", "balanced", "strong"] as const) {
+				this.addChild(new Text(`  ${formatTier(tier, visiblePreview.tiers)}`, 0, 0));
+			}
 		}
 		if (this.#status) this.addChild(new Text(theme.fg("success", displaySafe(this.#status)), 0, 0));
 		if (this.#error) this.addChild(new Text(theme.fg("error", displaySafe(this.#error)), 0, 0));
 		if (this.#confirmation === "clear") {
 			this.addChild(
 				new Text(
-					theme.fg("warning", "Clear generated tiers, setup, and provenance? Enter confirms; Esc cancels."),
+					theme.fg("warning", "Clear global generated tiers, setup, and provenance? Enter confirms; Esc cancels."),
 					0,
 					0,
 				),
@@ -376,6 +421,7 @@ export class SmartRoutingPanelComponent extends Container {
 		this.#error = "";
 		this.#confirmation = undefined;
 		this.#render();
+		const stateRevision = this.#stateRevision;
 		try {
 			const result = await this.#onSelect(intent);
 			if ((intent.kind === "apply" || intent.kind === "refresh") && result) {
@@ -383,11 +429,18 @@ export class SmartRoutingPanelComponent extends Container {
 				this.#draft = cloneSetup(result.setup);
 				this.#preview = result;
 				this.#previewValid = true;
-			} else if (intent.kind === "toggle") {
-				this.#enabled = intent.enabled;
+			} else if (this.#stateRevision === stateRevision) {
+				// A callback-only host cannot establish the effective state after a write.
+				if (intent.kind === "toggle") this.#enabled = undefined;
+				if (intent.kind === "clear") this.#effectiveGeneratedSetup = undefined;
 			}
 			this.#mode = "done";
-			this.#status = intent.kind === "clear" ? "Generated setup cleared." : "Smart-routing settings saved.";
+			this.#status =
+				intent.kind === "clear"
+					? "Global generated setup cleared."
+					: intent.kind === "toggle"
+						? `Global enabled saved: ${intent.enabled ? "yes" : "no"}.`
+						: "Global smart-routing settings saved.";
 		} catch (error) {
 			if (
 				error instanceof RoutingSettingsConfirmationRequiredError &&
@@ -563,7 +616,7 @@ export class SmartRoutingPanelComponent extends Container {
 			return;
 		}
 		if (data === "t" || data === "T") {
-			void this.#emit({ kind: "toggle", enabled: !this.#enabled });
+			void this.#emit({ kind: "toggle", enabled: this.#enabled !== true });
 			return;
 		}
 		if (data === "c" || data === "C") {
@@ -586,7 +639,7 @@ export class SmartRoutingPanelComponent extends Container {
 		return this.#emit({ kind: "refresh" });
 	}
 
-	__testToggle(enabled = !this.#enabled): Promise<void> {
+	__testToggle(enabled = this.#enabled !== true): Promise<void> {
 		return this.#emit({ kind: "toggle", enabled });
 	}
 
