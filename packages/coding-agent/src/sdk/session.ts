@@ -2884,21 +2884,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						error: error instanceof Error ? error.message : String(error),
 					});
 				}
-				mcpManager = nextManager;
-				ownsMcpManager = Boolean(nextManager);
 				try {
 					await session.replaceOwnedMcpManager(nextManager);
 				} catch (error) {
-					if (session.isDisposed) {
-						// If disposal has started, skip the MCP manager replacement.
-						// Disposal will handle cleaning up the MCP manager.
-						logger.warn("Skipping MCP manager replacement during session disposal", {
-							error: error instanceof Error ? error.message : String(error),
-						});
-					} else {
-						throw error;
-					}
+					// A committed move that races disposal keeps its cwd; the refused candidate was
+					// already disconnected and the current manager stays disposal's responsibility,
+					// so there is no tool surface left to rebind.
+					if (session.isDisposed) return;
+					throw error;
 				}
+				mcpManager = nextManager;
+				ownsMcpManager = Boolean(nextManager);
 				await session.refreshMCPTools((nextManager?.getTools() ?? []) as CustomTool[], {
 					mandatoryMCPToolNames: pluginMcpToolNames,
 				});
