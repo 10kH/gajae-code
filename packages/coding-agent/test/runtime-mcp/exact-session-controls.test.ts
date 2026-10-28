@@ -269,7 +269,9 @@ describe("exact-config MCP session controls", () => {
 			const disposal = session.dispose();
 			void disposal.catch(() => {});
 			let settled = false;
-			const completion = session.awaitDisposeCompletion().finally(() => { settled = true; });
+			const completion = session.awaitDisposeCompletion().finally(() => {
+				settled = true;
+			});
 			void completion.catch(() => {});
 			vi.advanceTimersByTime(50);
 			await expect(disposal).rejects.toMatchObject({ name: "SessionDisposalIncompleteError" });
@@ -300,12 +302,15 @@ describe("exact-config MCP session controls", () => {
 			const reset = manager.prepareExactServerControlReset.bind(manager);
 			vi.spyOn(manager, "prepareExactServerControlReset").mockImplementation(async () => {
 				const prepared = await reset();
-				return { ...prepared, commit: async () => {
-					commitStarted.resolve();
-					await releaseCommit.promise;
-					if (failure) throw new Error("injected retirement failure after adoption");
-					await prepared.commit();
-				} };
+				return {
+					...prepared,
+					commit: async () => {
+						commitStarted.resolve();
+						await releaseCommit.promise;
+						if (failure) throw new Error("injected retirement failure after adoption");
+						await prepared.commit();
+					},
+				};
 			});
 			const transition = session.newSession();
 			void transition.catch(() => {});
@@ -435,10 +440,14 @@ describe("exact-config MCP session controls", () => {
 				return { ...prepared, canCommit: () => false };
 			});
 			try {
-				await expect(session.switchSession(targetFile)).rejects.toThrow("Exact MCP control retirement changed before session switch commit");
+				await expect(session.switchSession(targetFile)).rejects.toThrow(
+					"Exact MCP control retirement changed before session switch commit",
+				);
 				expect(sessionManager.getSessionId()).toBe(originalId);
 				expect(sessionManager.getSessionFile()).toBe(originalFile);
-				expect(getExactMcpControls(session)).toBe(mutation === "unchanged" ? grant : mutation === "replaced" ? replacement : undefined);
+				expect(getExactMcpControls(session)).toBe(
+					mutation === "unchanged" ? grant : mutation === "replaced" ? replacement : undefined,
+				);
 			} finally {
 				await session.dispose();
 				await target.close();

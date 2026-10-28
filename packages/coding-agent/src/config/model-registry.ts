@@ -4382,10 +4382,7 @@ export class ModelRegistry {
 				const live = this.#settings;
 				if (!live) return;
 				const currentOwnership = readDurableModelProfileOwnership(live);
-				if (
-					currentOwnership.marker.kind === "profile" &&
-					currentOwnership.marker.profile === normalizedName
-				) {
+				if (currentOwnership.marker.kind === "profile" && currentOwnership.marker.profile === normalizedName) {
 					throw new ModelProfileReplacementRequiredError(normalizedName);
 				}
 			});
