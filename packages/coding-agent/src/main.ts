@@ -1982,7 +1982,7 @@ export function rejectProjectHerdrBinPath(
 }
 
 /** Drop a project-supplied Herdr executable before this command spawns anything. */
-function dropProjectSuppliedHerdrBinPath(env: NodeJS.ProcessEnv): void {
+export function dropProjectSuppliedHerdrBinPath(env: NodeJS.ProcessEnv): void {
 	const snapshot = startupProjectEnvSnapshot();
 	const key = canonicalEnvKey("HERDR_BIN_PATH");
 	if (!rejectProjectHerdrBinPath(env.HERDR_BIN_PATH, snapshot.values[key], snapshot.dynamic.has(key))) return;
