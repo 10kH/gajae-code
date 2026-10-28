@@ -89,7 +89,7 @@ function getPrunedToolResultContent(message: ToolResultMessage): (TextContent | 
 function escapeSummaryMarkup(value: string): string {
 	// First, neutralize control characters and bidirectional markers.
 	// These are replaced with a unicode escape to neutralize them without visual impact.
-	let result = value.replace(
+	const result = value.replace(
 		/[\u0000-\u001f\u007f-\u009f\u061c\u200e-\u200f\u202a-\u202e\u2066-\u2069\ud800-\udfff]/g,
 		(char, offset) => {
 			const code = char.charCodeAt(0);
@@ -109,17 +109,9 @@ function escapeSummaryMarkup(value: string): string {
 		},
 	);
 
-	// Now handle tag-breaking sequences with zero-width space insertion.
-	// This prevents closing/opening the wrapper tags without encoding legitimate code.
-	// We insert \u200b (zero-width space) after the opening < to break the tag syntax.
-	result = result
-		.replace(/<\/untrusted-content>/gi, "<\u200b/untrusted-content>")
-		.replace(/<\/untrusted-content[ \t\n\r\f]+>/gi, "<\u200b/untrusted-content>")
-		.replace(/<untrusted-content>/gi, "<\u200buntrusted-content>")
-		.replace(/<\/summary>/gi, "<\u200b/summary>")
-		.replace(/<summary>/gi, "<\u200bsummary>");
-
-	return result;
+	// Break every opening or closing wrapper tag token, whatever its case, attributes or
+	// whitespace, by inserting a zero-width space after `<`. Other markup stays verbatim.
+	return result.replace(/<(\/?)(summary|untrusted-content)(?=[\s/>]|$)/gi, "<\u200b$1$2");
 }
 
 function renderFencedSummary(template: string, summary: string): string {
