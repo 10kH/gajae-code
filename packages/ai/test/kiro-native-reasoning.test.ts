@@ -11,8 +11,10 @@ import type { AssistantMessage, Context, Model } from "../src/types";
 
 const PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:123456789012:profile/social-profile";
 
+const originalFetch = globalThis.fetch;
+
 afterEach(() => {
-	(globalThis.fetch as any) = undefined;
+	globalThis.fetch = originalFetch;
 });
 
 function encodeStringHeader(name: string, value: string): Uint8Array {

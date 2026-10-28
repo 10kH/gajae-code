@@ -44,7 +44,7 @@ import {
 	streamKiroApiKey,
 	toKiroModelId,
 } from "./kiro-api-key";
-import { parseReasoningContentEventHelper } from "./kiro-reasoning-parser";
+import { closeReasoningBlock, createReasoningBlockState, parseReasoningContentEventHelper, type ReasoningBlockState } from "./kiro-reasoning-parser";
 
 /**
  * Trust assumption: globalThis.fetch is treated as a trusted source for authenticated
@@ -298,6 +298,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 		};
 
 		const blocks = output.content as Block[];
+		const reasoningState: ReasoningBlockState = createReasoningBlockState();
 		const thinkingParser = createInlineThinkingParser(blocks, output, stream);
 
 		try {
@@ -458,6 +459,8 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 						const ev = payload as AssistantResponseEvent;
 						const content = ev.content;
 						if (content) {
+							// Transition from reasoning to text: close active reasoning block
+							closeReasoningBlock(blocks, output, stream, reasoningState);
 							if (!firstTokenTime) firstTokenTime = Date.now();
 							if (!started) {
 								stream.push({ type: "start", partial: output });
@@ -475,7 +478,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 								stream.push({ type: "start", partial: output });
 								started = true;
 							}
-							parseReasoningContentEventHelper(ev, blocks, output, stream);
+							parseReasoningContentEventHelper(ev, blocks, output, stream, reasoningState);
 						}
 						break;
 					}
@@ -486,6 +489,8 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 							stream.push({ type: "start", partial: output });
 							started = true;
 						}
+						// Transition from reasoning to tool: close active reasoning block
+						closeReasoningBlock(blocks, output, stream, reasoningState);
 						handleToolUseEvent(ev, blocks, output, stream, toolInputAccumulator, pendingToolCalls);
 						// Clear accumulator for completed tool
 						if (ev.stop) {
@@ -529,6 +534,9 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				throw new Error(`Kiro CodeWhisperer stream ended with incomplete tool calls: ${unfinishedIds}`);
 			}
 			thinkingParser.finish();
+
+			// Finalize active reasoning block if any
+			closeReasoningBlock(blocks, output, stream, reasoningState);
 
 			// Emit all pending tool call events (safe since no refusal occurred)
 			for (const { toolCall, index } of pendingToolCalls) {
@@ -684,16 +692,27 @@ function convertToWireMessage(
 	// results can reference the toolUseId they answer.
 	const textParts: string[] = [];
 	const toolUses: WireToolUse[] = [];
-	let reasoningSignature: string | undefined;
+	let reasoningSignature: Record<string, string> | undefined;
 	for (const block of msg.content) {
 		if (typeof block === "string") {
 			textParts.push(block);
 		} else if (block.type === "text") {
 			textParts.push(block.text);
 		} else if (block.type === "thinking") {
-			// Capture reasoning signature for signature replay
-			if (block.thinkingSignature?.startsWith("kiro:")) {
-				reasoningSignature = block.thinkingSignature;
+			// Decode reasoning signature/redactedContent from tagged values.
+			// Only the last valid tagged block per assistant turn is used.
+			if (block.thinkingSignature) {
+				if (
+					block.thinkingSignature.startsWith("kiro:signature:") &&
+					block.thinkingSignature.length > "kiro:signature:".length
+				) {
+					reasoningSignature = { signature: block.thinkingSignature.slice("kiro:signature:".length) };
+				} else if (
+					block.thinkingSignature.startsWith("kiro:redactedContent:") &&
+					block.thinkingSignature.length > "kiro:redactedContent:".length
+				) {
+					reasoningSignature = { redactedContent: block.thinkingSignature.slice("kiro:redactedContent:".length) };
+				}
 			}
 		} else if (block.type === "toolCall") {
 			toolUses.push({
@@ -708,7 +727,7 @@ function convertToWireMessage(
 		...(toolUses.length > 0 ? { toolUses } : {}),
 	};
 	if (reasoningSignature) {
-		resp.reasoningContent = { signature: reasoningSignature };
+		resp.reasoningContent = reasoningSignature;
 	}
 	return {
 		assistantResponseMessage: resp,
