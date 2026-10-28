@@ -1037,8 +1037,8 @@ function outboundSummaryText(text: string, convert: ConvertToLlm): string {
  */
 export function frameOutboundPreviousSummary(text: string): string {
 	const escaped = escapeSummaryFenceClosers(text)
-		.replace(/<\/previous-summary>/gi, "&lt;/previous-summary>")
-		.replace(/<\/previous-summary[ \t\n\r\f]+>/gi, "&lt;/previous-summary>");
+		.replace(/<\/previous-summary>/gi, "<\u200b/previous-summary>")
+		.replace(/<\/previous-summary[ \t\n\r\f]+>/gi, "<\u200b/previous-summary>");
 	return `${SUMMARY_FENCE_OPEN}${escaped}${SUMMARY_FENCE_CLOSE}`;
 }
 
