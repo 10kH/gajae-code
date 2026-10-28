@@ -8034,8 +8034,8 @@ export class ModelRegistry {
 		if (circuit.openUntil > now) return true;
 		const probe = circuit.probe;
 		if (probe && probe.leaseUntil > now && probe.owner !== probeOwner) return true;
-		if (probeOwner !== undefined) {
-			circuit.probe = { owner: probeOwner, leaseUntil: now + Math.max(circuit.cooldownMs, 1) };
+		 if (probeOwner !== undefined) {
+			circuit.probe = { owner: probeOwner, leaseUntil: now + Math.max(circuit.cooldownMs, 30_000) };
 		}
 		return false;
 	}
