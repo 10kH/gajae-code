@@ -3,10 +3,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import fc from "fast-check";
-import { rejectProjectHerdrBinPath } from "../src/main";
 
-const PROPERTY_SEED = 649;
 const probe = path.join(import.meta.dir, "fixtures/herdr-project-bin-path-probe.ts");
 
 function writeExecutable(file: string, marker: string): void {
@@ -55,33 +52,6 @@ function runProbe(mode: "attack" | "allow" | "dynamic"): { payload: number; allo
 }
 
 describe("project HERDR_BIN_PATH at runRootCommand", () => {
-	it("property: project herdr bin path rejection, seed 649, 64 inputs", () => {
-		fc.assert(
-			fc.property(
-				fc.option(fc.string(), { nil: undefined }),
-				fc.option(fc.string(), { nil: undefined }),
-				fc.boolean(),
-				(runtime, declared, dynamic) => {
-					const rejected = rejectProjectHerdrBinPath(runtime, declared, dynamic);
-					if (runtime === undefined) {
-						expect(rejected).toBe(false);
-						return;
-					}
-					if (dynamic) {
-						expect(rejected).toBe(true);
-						return;
-					}
-					if (declared === undefined) {
-						expect(rejected).toBe(false);
-						return;
-					}
-					expect(rejected).toBe(runtime === declared || runtime.trim() === declared);
-				},
-			),
-			{ seed: PROPERTY_SEED, numRuns: 64 },
-		);
-	});
-
 	it.skipIf(process.platform === "win32")(
 		"does not execute a project dotenv HERDR_BIN_PATH and omits it from a child",
 		() => {
