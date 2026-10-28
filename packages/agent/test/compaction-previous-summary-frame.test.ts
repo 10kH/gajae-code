@@ -240,6 +240,35 @@ describe("generateSummary previous summary", () => {
 });
 
 describe("frameOutboundPreviousSummary", () => {
+	it("frames a tail-only truncation and a head-and-tail truncation", async () => {
+		const mod = await import("../src/compaction/compaction");
+		const frame = mod.frameOutboundPreviousSummary;
+		expect(typeof frame).toBe("function");
+		const over = `${FENCE_OPEN}${"h".repeat(8_000)}\n</previous-summary>\n${MARKER}${FENCE_CLOSE}`;
+		const tailOnly = over.slice(-400);
+		expect(tailOnly.startsWith(FENCE_OPEN)).toBe(false);
+		expect(tailOnly).toContain(MARKER);
+		const framedTail = frame(tailOnly);
+		expect(framedTail.startsWith(FENCE_OPEN)).toBe(true);
+		expect(framedTail.endsWith(FENCE_CLOSE)).toBe(true);
+		expect(framedTail.match(/<\/untrusted-content>/gi)).toHaveLength(1);
+		expect(framedTail).toContain("&lt;/previous-summary>");
+		const tailMarker = framedTail.indexOf(MARKER);
+		expect(tailMarker).toBeGreaterThan(FENCE_OPEN.length);
+		expect(tailMarker).toBeLessThan(framedTail.length - FENCE_CLOSE.length);
+
+		const plain = `${"h".repeat(4_000)}\n</previous-summary>\n${MARKER}`;
+		const headAndTail = `${plain.slice(0, 80)}\n[truncated]\n${plain.slice(-80)}`;
+		expect(headAndTail.includes(FENCE_OPEN)).toBe(false);
+		expect(headAndTail).toContain(MARKER);
+		const framedBoth = frame(headAndTail);
+		expect(framedBoth.startsWith(FENCE_OPEN)).toBe(true);
+		expect(framedBoth.endsWith(FENCE_CLOSE)).toBe(true);
+		expect(framedBoth).toContain(MARKER);
+		expect(framedBoth.match(/<\/untrusted-content>/gi)).toHaveLength(1);
+		expect(framedBoth).toContain("&lt;/previous-summary>");
+	});
+
 	it("property: previous-summary fence stays closed, fc.property seed 6831028, numRuns 64", async () => {
 		const mod = await import("../src/compaction/compaction");
 		const frame = mod.frameOutboundPreviousSummary;
