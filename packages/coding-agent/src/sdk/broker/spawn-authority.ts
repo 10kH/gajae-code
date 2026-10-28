@@ -1160,11 +1160,15 @@ export class SpawnAuthorityStore {
 				// state never accepted, and the retry would append a duplicate that
 				// makes the journal unreopenable.
 				if (write) await this.#options.beforeDirectorySyncForTest?.(write);
-				const directory = await fs.open(path.dirname(this.#file), fsSync.constants.O_RDONLY);
-				try {
-					await directory.sync();
-				} finally {
-					await directory.close();
+				// Windows cannot open or flush a directory handle; the appended row is
+				// still flushed above. Same rule as lifecycle-ledger.ts #syncDirectory.
+				if (process.platform !== "win32") {
+					const directory = await fs.open(path.dirname(this.#file), fsSync.constants.O_RDONLY);
+					try {
+						await directory.sync();
+					} finally {
+						await directory.close();
+					}
 				}
 			} catch (error) {
 				try {

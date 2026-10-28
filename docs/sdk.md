@@ -1343,7 +1343,10 @@ identity-fenced headless substrate before any multiplexer probe, because a
 managed tmux/psmux child cannot pass owner admission there: Windows has no
 owner-only reader for its private child binding. The headless proof file is
 still flushed and exclusively created, but Windows offers no directory-entry
-flush, so that step is skipped as lifecycle storage already does.
+flush, so that step is skipped as lifecycle storage already does. The same
+applies to the spawn authority journal, which every fresh spawn appends to
+before launch: each row is still flushed, and only the directory flush is
+skipped on Windows.
 
 Substrate supervisor identity and registered SDK-host identity are distinct
 proofs. Before publishing the lifecycle marker, the Broker resolves the actual
