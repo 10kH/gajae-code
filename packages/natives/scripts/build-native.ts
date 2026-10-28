@@ -246,6 +246,7 @@ const requiredGeneratedBindingSymbols = [
 	"openRecoveryFsRoot",
 	"rasterizeSvg",
 	"TtyWriter",
+	"reassertRawTty",
 	"repairOwnerOnlyPathSecurityExpected",
 	"structuredPatchHunks",
 	"verifyOwnerOnlyPathSecurityExpected",
