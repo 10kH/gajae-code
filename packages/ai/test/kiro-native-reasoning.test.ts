@@ -265,8 +265,8 @@ describe("Kiro native reasoning", () => {
 			maxTokens: 8_192,
 		};
 
-		// First turn with reasoning
-		const { message: firstMessage, request: firstRequest } = await runStream(
+		// First turn with reasoning: build request and capture assistant message with signature
+		const { message: firstMessage } = await runStream(
 			[
 				{ type: "reasoningContentEvent", payload: { text: "analyzing...", signature: "sig1" } },
 				{ type: "assistantResponseEvent", payload: { content: "result" } },
@@ -280,8 +280,100 @@ describe("Kiro native reasoning", () => {
 		);
 		expect(thinkingBlock).toBeDefined();
 
-		// Verify additionalModelRequestFields is in request
-		expect((firstRequest as any).additionalModelRequestFields).toBeDefined();
-		expect(((firstRequest as any).additionalModelRequestFields as any)?.thinking?.type).toBe("adaptive");
+		// Second turn: build request with first turn's message in history
+		let secondRequest: Record<string, unknown> | undefined;
+		(globalThis.fetch as any) = async (_input: string | URL | Request, init?: RequestInit) => {
+			if (!(init?.body instanceof Uint8Array)) throw new Error("expected encoded Kiro request body");
+			secondRequest = JSON.parse(new TextDecoder().decode(init.body)) as Record<string, unknown>;
+			return eventStreamResponse([
+				{ type: "assistantResponseEvent", payload: { content: "follow-up answer" } },
+			]);
+		};
+
+		const secondMessage: AssistantMessage | undefined = await (async () => {
+			for await (const event of streamKiroCodeWhisperer(
+				model,
+				{
+					messages: [
+						{ role: "user", content: "First question", timestamp: 1 },
+						firstMessage,
+						{ role: "user", content: "Second question", timestamp: 2 },
+					],
+				} satisfies Context,
+				{ apiKey: JSON.stringify({ token: "social-access-token", profileArn: PROFILE_ARN }), reasoning: Effort.High },
+			)) {
+				if (event.type === "done") return event.message;
+			}
+			return undefined;
+		})();
+
+		expect(secondMessage).toBeDefined();
+		expect(secondRequest).toBeDefined();
+
+		// Verify the second request's history includes the first turn's thinking signature
+		const history = (secondRequest as any)?.conversationState?.history;
+		expect(history).toBeDefined();
+		expect(Array.isArray(history)).toBe(true);
+
+		// First message in history should be the first user message
+		const firstHistoryUserMsg = history?.[0];
+		expect(firstHistoryUserMsg?.userInputMessage?.content).toBe("First question");
+
+		// Second message in history should be the assistant's response with signature
+		const assistantHistoryMsg = history?.[1];
+		expect(assistantHistoryMsg?.assistantResponseMessage).toBeDefined();
+		expect(assistantHistoryMsg?.assistantResponseMessage?.content).toContain("result");
+		expect((assistantHistoryMsg?.assistantResponseMessage as any)?.reasoningContent?.signature).toBe(
+			"kiro:signature:sig1",
+		);
+	});
+
+	test("prompt prefix is absent when native fields are sent", async () => {
+		const model: Model<"kiro-codewhisperer-stream"> = {
+			id: "claude-opus-4.6",
+			name: "Claude Opus 4.6",
+			api: "kiro-codewhisperer-stream",
+			provider: "kiro",
+			baseUrl: "",
+			reasoning: true,
+			input: ["text"],
+			output: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 8_192,
+		};
+
+		const originalSystemPrompt = "You are a helpful assistant.";
+		let request: Record<string, unknown> | undefined;
+		(globalThis.fetch as any) = async (_input: string | URL | Request, init?: RequestInit) => {
+			if (!(init?.body instanceof Uint8Array)) throw new Error("expected encoded Kiro request body");
+			request = JSON.parse(new TextDecoder().decode(init.body)) as Record<string, unknown>;
+			return eventStreamResponse([{ type: "assistantResponseEvent", payload: { content: "answer" } }]);
+		};
+
+		for await (const _event of streamKiroCodeWhisperer(
+			model,
+			{
+				systemPrompt: [originalSystemPrompt],
+				messages: [{ role: "user", content: "Test", timestamp: 1 }],
+			} satisfies Context,
+			{ apiKey: JSON.stringify({ token: "social-access-token", profileArn: PROFILE_ARN }), reasoning: Effort.High },
+		)) {
+			if (_event.type === "done") break;
+		}
+
+		expect(request).toBeDefined();
+		const content = (request as any)?.conversationState?.currentMessage?.userInputMessage?.content;
+		expect(content).toBeDefined();
+
+		// When native reasoning is enabled (additionalModelRequestFields is sent),
+		// the prompt should not include the thinking mode prefix
+		expect(content).not.toContain("<thinking_mode>");
+		expect(content).not.toContain("<max_thinking_length>");
+		expect(content).toContain(originalSystemPrompt);
+
+		// additionalModelRequestFields should be present
+		expect((request as any)?.additionalModelRequestFields).toBeDefined();
+		expect(((request as any)?.additionalModelRequestFields as any)?.thinking?.type).toBe("adaptive");
 	});
 });
