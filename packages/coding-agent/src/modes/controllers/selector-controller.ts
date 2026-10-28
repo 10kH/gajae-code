@@ -2879,6 +2879,7 @@ export class SelectorController {
 
 							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
 							let defaultMutationStarted = false;
+							let defaultUsageSequence: number | undefined;
 							let assignmentMutationStarted = false;
 							let materializedProfile = false;
 							try {
@@ -2887,8 +2888,11 @@ export class SelectorController {
 										selector: defaultSelector,
 										thinkingLevel,
 										cause: "user-selection",
+										// Recorded below once every assignment succeeded; a rollback leaves no usage.
+										recordUsage: false,
 										onMutationStarted: () => {
 											defaultMutationStarted = true;
+											defaultUsageSequence = this.ctx.session.beginModelSelectionUsage();
 										},
 									});
 									if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
@@ -2926,7 +2930,11 @@ export class SelectorController {
 								activeModelProfile:
 									this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
 							});
-							this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+							// A DEFAULT pick awaited setModel: a newer recorded choice keeps the MRU head.
+							if (defaultUsageSequence !== undefined)
+								this.ctx.session.recordModelSelectionUsage(model, defaultUsageSequence);
+							else if (!includesDefault)
+								this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 							this.ctx.statusLine.invalidate();
 							this.ctx.updateEditorBorderColor();
 							await this.ctx.notifyConfigChanged?.();
@@ -2949,6 +2957,7 @@ export class SelectorController {
 							if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
 							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
 							let defaultMutationStarted = false;
+							let defaultUsageSequence: number | undefined;
 							let assignmentMutationStarted = false;
 							const value = formatModelSelectorValue(
 								selectedSelector ?? `${model.provider}/${model.id}`,
@@ -2959,8 +2968,11 @@ export class SelectorController {
 									selector: selectedSelector,
 									thinkingLevel,
 									cause: "user-selection",
+									// Recorded below once the assignment succeeded; a rollback leaves no usage.
+									recordUsage: false,
 									onMutationStarted: () => {
 										defaultMutationStarted = true;
+										defaultUsageSequence = this.ctx.session.beginModelSelectionUsage();
 									},
 								});
 								assignmentMutationStarted = true;
@@ -2985,6 +2997,9 @@ export class SelectorController {
 								);
 							}
 							refreshRoleAssignments();
+							// setModel awaited: a newer recorded choice keeps the MRU head.
+							if (defaultUsageSequence !== undefined)
+								this.ctx.session.recordModelSelectionUsage(model, defaultUsageSequence);
 							this.ctx.statusLine.invalidate();
 							this.ctx.updateEditorBorderColor();
 							this.ctx.showStatus(`Default model: ${selectedSelector ?? model.id}`);
@@ -3377,6 +3392,7 @@ export class SelectorController {
 					}
 
 					try {
+						this.ctx.promptSuggestion?.clear();
 						const result = await this.ctx.session.navigateTree(entryId, {
 							summarize: wantsSummary,
 							customInstructions,
@@ -3512,6 +3528,7 @@ export class SelectorController {
 			return true;
 		}
 
+		this.ctx.promptSuggestion?.clear();
 		const detached = await this.ctx.session.newSession();
 		if (this.ctx.isStopped?.()) return false;
 		if (!detached) {
@@ -3544,6 +3561,7 @@ export class SelectorController {
 	#resumeInFlight = false;
 
 	async handleResumeSession(sessionPath: string): Promise<void> {
+		this.ctx.promptSuggestion?.clear();
 		if (this.#resumeInFlight) {
 			this.ctx.showStatus("Resume already in progress");
 			return;
@@ -3960,6 +3978,23 @@ export class SelectorController {
 									this.ctx.showStatus(`Using AUTO (ranked) OAuth accounts for ${selectedProviderId}.`);
 								},
 								onAddAccount: async () => {
+									selector.stopValidation();
+									done();
+									await this.#handleOAuthLogin(selectedProviderId, options);
+								},
+								onReloginAccount: async (credentialId: number) => {
+									const authStorage = this.ctx.session.modelRegistry.authStorage;
+									const removalTargets = authStorage.listCredentialRemovalTargets(selectedProviderId);
+									const targetToRemove = removalTargets.find(target => target.id === credentialId);
+									if (targetToRemove) {
+										const result = authStorage.removeAuthCredentialsHard(selectedProviderId, [
+											targetToRemove,
+										]);
+										if (result.kind !== "removed") {
+											this.ctx.showError("Failed to clear disabled credential. Retry or re-login manually.");
+											return;
+										}
+									}
 									selector.stopValidation();
 									done();
 									await this.#handleOAuthLogin(selectedProviderId, options);

@@ -118,6 +118,14 @@ import {
 import { reconcileRunningManagedVerification, verifyManagedTaskAttempt } from "./managed-task-verification";
 import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
 import { isProcessIncarnation, observeProcessIncarnation } from "./process-incarnation";
+import {
+	armPublicationLivenessWatchdog,
+	disarmPublicationLivenessWatchdog,
+	notePublicationLivenessLoop,
+	notePublicationLivenessProven,
+	publicationLivenessWatchdogLost,
+	syncPublicationLivenessGrace,
+} from "./publication-liveness-watchdog";
 import { sdkInternalRuntimeImage } from "./runtime";
 import {
 	type IndexedSession,
@@ -1047,6 +1055,8 @@ type BrokerSessionControlRequest = {
 
 type BrokerSessionControlAuthority = {
 	record: IndexedSession;
+	/** Value the session runtime's operator-abort gate expects; see `sessionAbortCapability`. */
+	abortCapability: string;
 	endpoint: Record<string, unknown>;
 	endpointIdentity: {
 		dev: bigint;
@@ -1097,6 +1107,24 @@ function brokerControlResponse(value: unknown): BrokerResponse {
 	return { ok: false, error: { code, message } };
 }
 
+/**
+ * The operator-abort marker the session's runtime expects from the Broker.
+ *
+ * A Broker-launched host expects its lifecycle request id. A TUI or direct CLI host
+ * has none and expects the marker it published in its own endpoint registration.
+ * Either way the value is read only from broker-owned index state; a session that
+ * published neither cannot be reached by the operator route.
+ */
+function sessionAbortCapability(record: IndexedSession): string | undefined {
+	const capability = record.lifecycleRequestId ?? record.abortCapability;
+	return typeof capability === "string" &&
+		capability.length > 0 &&
+		capability.length <= 128 &&
+		/^[A-Za-z0-9._-]+$/u.test(capability)
+		? capability
+		: undefined;
+}
+
 function sameSessionControlAuthority(
 	left: BrokerSessionControlAuthority,
 	right: BrokerSessionControlAuthority,
@@ -1106,6 +1134,7 @@ function sameSessionControlAuthority(
 		left.record.processIncarnation === right.record.processIncarnation &&
 		left.record.hostIncarnation === right.record.hostIncarnation &&
 		left.record.lifecycleRequestId === right.record.lifecycleRequestId &&
+		left.abortCapability === right.abortCapability &&
 		endpointIncarnation(left.record, left.record.sessionId) ===
 			endpointIncarnation(right.record, right.record.sessionId) &&
 		left.endpoint.sessionId === right.endpoint.sessionId &&
@@ -1438,7 +1467,11 @@ const BROKER_AMBIGUITY_GRACE_MS = 120_000;
 // to reclaim a lock whose owner pid is alive, so the deadlock is permanent (#4704).
 // Liveness is proven by publishing, not by being scheduled, so this deadline runs
 // from the last *successful* publication and is the only bound that survives a
-// stalled tick.
+// stalled tick. The interval that evaluates it shares the JS thread with the
+// tick's fsync/rename, so a syscall that never returns also suppresses the
+// check. An off-thread watchdog enforces the same deadline in that case. Startup
+// rejects when that watchdog cannot be armed, so the broker is not left published
+// without it. The test runner and `GJC_BROKER_LIVENESS_HARD_EXIT=0` opt out.
 const BROKER_LIVENESS_GRACE_MS = 60_000;
 // The floor must still be a multiple of the peer-visible TTL: with a longer TTL
 // configured, a fixed floor would terminate a broker whose published heartbeat is
@@ -1623,6 +1656,7 @@ const brokerLockReclaimHooksForTest = new WeakMap<
 const livenessGraceOverridesForTest = new WeakMap<Broker, number>();
 const abandonedGraceOverridesForTest = new WeakMap<Broker, number>();
 const heartbeatStallOverridesForTest = new WeakMap<Broker, PromiseWithResolvers<void>>();
+const heartbeatMainThreadBlockMsForTest = new WeakMap<Broker, number>();
 const managedCloseWaitOverridesForTest = new WeakMap<Broker, number>();
 
 export class Broker {
@@ -1670,6 +1704,8 @@ export class Broker {
 	#stopping = false;
 	#transport: BrokerTransport | null = null;
 	#heartbeatTimer: NodeJS.Timeout | null = null;
+	/** This generation armed the watchdog. A later worker loss must end the broker. */
+	#publicationWatchdogArmed = false;
 	#startupAbortSignal: AbortSignal | undefined;
 	#startupCheckpointDeadline: number | undefined;
 	#onStartupReady: (() => void) | undefined;
@@ -1948,7 +1984,7 @@ export class Broker {
 		setOwner(true);
 		inFlight.claimId = decision.claim.claimId;
 		inFlight.phase = decision.claim.state;
-		await this.ledger.begin(lifecycleIdentity, decision.claim.bindingMac);
+		await this.ledger.begin(lifecycleIdentity, decision.claim.bindingMac, { spawnAnchor: true });
 		return await this.#driveSpawn(lifecycleIdentity, decision.claim, admission, inFlight, decision.recovery);
 	}
 
@@ -4109,6 +4145,7 @@ export class Broker {
 			this.#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
 		}
 		this.#stopping = false;
+		this.#publicationWatchdogArmed = false;
 		this.#publicationState = "healthy-owned";
 		this.#fenceReason = null;
 		this.#lossAt = null;
@@ -4221,7 +4258,7 @@ export class Broker {
 			await this.#spawnAuthority.open();
 			for (const claim of this.#spawnAuthority.claims()) {
 				const mirror = this.ledger.get(claim.lifecycleIdentity);
-				if (!mirror) await this.ledger.begin(claim.lifecycleIdentity, claim.bindingMac);
+				if (!mirror) await this.ledger.begin(claim.lifecycleIdentity, claim.bindingMac, { spawnAnchor: true });
 				else if (mirror.requestHash !== claim.bindingMac)
 					throw new Error("Spawn claim lifecycle mirror binding differs from durable authority.");
 			}
@@ -4295,10 +4332,22 @@ export class Broker {
 				Math.min(BROKER_PUBLICATION_CADENCE_MS, Math.floor(this.settings.heartbeatTtlMs / 3)),
 			);
 			this.#heartbeatTimer = setInterval(() => {
+				if (this.#publicationWatchdogArmed && publicationLivenessWatchdogLost()) {
+					void this.#complete("lost-root", "publication-liveness-timeout");
+					return;
+				}
+				notePublicationLivenessLoop(this, this.#livenessGraceMs());
 				void this.#watchPublication();
 				void this.#reapSpawnOrphans();
 				void this.#reapSelfIfAbandoned();
 			}, cadenceMs);
+			// The timer above cannot run while a discovery write blocks this thread.
+			// Hard-exit startup must not return until the off-thread watchdog is armed.
+			this.#publicationWatchdogArmed = await armPublicationLivenessWatchdog(
+				this,
+				this.#livenessGraceMs(),
+				cadenceMs,
+			);
 			if (this.#startupPostPublicationDelayMs > 0) await Bun.sleep(this.#startupPostPublicationDelayMs);
 			// This process is now the independently verified successor: its own
 			// discovery just published under its own retained authority. Release the
@@ -4319,11 +4368,26 @@ export class Broker {
 			}
 			return this.discovery;
 		} catch (error) {
-			if (this.#startupAbortSignal?.aborted && this.discovery) {
+			disarmPublicationLivenessWatchdog(this);
+			this.#publicationWatchdogArmed = false;
+			if (this.#heartbeatTimer) {
+				clearInterval(this.#heartbeatTimer);
+				this.#heartbeatTimer = null;
+				// A tick already queued must not publish or complete over this cleanup.
+				this.#stopping = true;
+				this.#publicationState = "stopping";
+			}
+			// `close()` drops the retained handle and leaves the file. After publication,
+			// a rejected start has to remove that file too: the lock release below would
+			// otherwise leave a live pid in discovery with no watchdog. Cancellation
+			// before the publication is retained uses the same rollback.
+			const published = this.#publishedAt !== null;
+			this.#publishedAt = null;
+			if (this.discovery && (this.#startupAbortSignal?.aborted || published)) {
 				try {
 					await rollbackBrokerDiscoveryIfCurrent(this.settings.agentDir, this.discovery);
 				} catch (rollbackError) {
-					logger.error("sdk broker: cancelled startup publication rollback failed", {
+					logger.error("sdk broker: startup publication rollback failed", {
 						reason: "startup-publication-rollback-failed",
 						pid: process.pid,
 						error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
@@ -4587,6 +4651,12 @@ export class Broker {
 	}
 	async #writeHeartbeat(publication: RetainedBrokerDiscovery): Promise<void> {
 		if (!this.discovery || this.#publication !== publication || this.#publicationState === "stopping") return;
+		// Refresh the grace before a test blocks the thread, so the watchdog
+		// observes the overridden deadline rather than the one stored on the
+		// previous interval tick.
+		syncPublicationLivenessGrace(this, this.#livenessGraceMs());
+		const blockMs = heartbeatMainThreadBlockMsForTest.get(this);
+		if (blockMs !== undefined && blockMs > 0) blockHeartbeatMainThreadForTest(blockMs);
 		const stall = heartbeatStallOverridesForTest.get(this);
 		if (stall) await stall.promise;
 		const heartbeatAt = Date.now();
@@ -4605,6 +4675,7 @@ export class Broker {
 		// The durable write landed, so liveness is proven for this cycle whatever the
 		// authority re-check below decides about this broker's cached state.
 		this.#publishedAt = process.hrtime.bigint();
+		notePublicationLivenessProven(this);
 		const recovery = this.runSynchronousEffectWithFreshPublicationAuthority(() => {
 			this.discovery = { ...this.discovery!, heartbeatAt };
 		});
@@ -4651,6 +4722,10 @@ export class Broker {
 		blockingLockPath?: string,
 	): Promise<void> {
 		if (this.#completionTask) return this.#completionTask;
+		// Disarm before any later syscall. A graceful exit that then blocks must
+		// not be SIGKILLed by the watchdog it has already superseded.
+		disarmPublicationLivenessWatchdog(this);
+		this.#publicationWatchdogArmed = false;
 		this.#terminalExit = { mode, reason };
 		const now = process.hrtime.bigint();
 		const fenceStartedAt = this.#lossAt ?? this.#ambiguousAt;
@@ -4905,13 +4980,15 @@ export class Broker {
 			indexed.endpointMtimeMs === undefined ||
 			!Number.isFinite(indexed.endpointMtimeMs) ||
 			indexed.endpointMtimeMs <= 0 ||
-			typeof indexed.lifecycleRequestId !== "string" ||
-			indexed.lifecycleRequestId.length === 0 ||
-			indexed.lifecycleRequestId.length > 128 ||
-			!/^[A-Za-z0-9._-]+$/u.test(indexed.lifecycleRequestId) ||
 			endpointIncarnation(indexed, indexed.sessionId) === undefined
 		)
 			return error("endpoint_stale", "session endpoint authority is incomplete");
+		const abortCapability = sessionAbortCapability(indexed);
+		// The endpoint itself is current; only its host never published operator
+		// authority (a gjc that predates the operator route). Retrying cannot help, so
+		// this must not read as a stale endpoint.
+		if (abortCapability === undefined)
+			return error("operator_control_unsupported", "session host does not publish operator control authority");
 		let endpointResponse: BrokerResponse;
 		try {
 			endpointResponse = await this.#readEndpoint(indexed, {});
@@ -4938,6 +5015,7 @@ export class Broker {
 			if (!endpointIdentity.isFile()) return error("endpoint_stale", "session endpoint is not a regular file");
 			return {
 				record: indexed,
+				abortCapability,
 				endpoint,
 				endpointIdentity: {
 					dev: endpointIdentity.dev,
@@ -4993,7 +5071,7 @@ export class Broker {
 					"turn.abort",
 					{
 						...request.abortInput,
-						[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: authority.record.lifecycleRequestId,
+						[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: authority.abortCapability,
 					},
 					{
 						confirm: true,
@@ -5095,7 +5173,11 @@ export class Broker {
 			...(scope === undefined ? {} : { scope, observedAt: observedAt! }),
 		};
 		const sessions = snapshot.sessions.slice(snapshot.offset, snapshot.offset + snapshot.limit).map(session => {
-			const { lifecycleRequestId: _lifecycleRequestId, ...publicSession } = session;
+			const {
+				lifecycleRequestId: _lifecycleRequestId,
+				abortCapability: _abortCapability,
+				...publicSession
+			} = session;
 			const incarnation = endpointIncarnation(session, session.sessionId);
 			return incarnation === undefined ? publicSession : { ...publicSession, endpointIncarnation: incarnation };
 		});
@@ -5744,6 +5826,25 @@ export function setAbandonedGraceForTest(broker: Broker, graceMs: number | undef
 export function setLivenessGraceForTest(broker: Broker, graceMs: number | undefined): void {
 	if (graceMs === undefined) livenessGraceOverridesForTest.delete(broker);
 	else livenessGraceOverridesForTest.set(broker, graceMs);
+	syncPublicationLivenessGrace(
+		broker,
+		graceMs ?? Math.max(BROKER_LIVENESS_GRACE_MS, broker.settings.heartbeatTtlMs * BROKER_LIVENESS_TTL_MULTIPLIER),
+	);
+}
+
+/**
+ * Test-only hook that blocks the JS thread inside the heartbeat write.
+ * `Atomics.wait` stands in for an fsync/rename that does not return to the
+ * event loop, which a never-settling promise does not reproduce.
+ */
+export function setHeartbeatMainThreadBlockForTest(broker: Broker, blockMs: number | undefined): void {
+	if (blockMs === undefined || blockMs <= 0) heartbeatMainThreadBlockMsForTest.delete(broker);
+	else heartbeatMainThreadBlockMsForTest.set(broker, blockMs);
+}
+
+function blockHeartbeatMainThreadForTest(blockMs: number): void {
+	const scratch = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+	Atomics.wait(scratch, 0, 0, blockMs);
 }
 
 /** Test-only hook for shortening the bounded wait before a deferred managed close is queued. */

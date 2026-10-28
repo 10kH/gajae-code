@@ -89,10 +89,21 @@ discovery pid is the supervised process itself.
   failure.
 - It exits 1 without serving when another live broker already owns the agent
   directory (even one this version cannot reuse), or when startup fails. It
-  never retires the other owner.
+  never retires the other owner. Startup also fails when the off-thread
+  publication-liveness watchdog cannot be armed. That attempt removes its
+  discovery file and lock instead of leaving a live pid published without
+  the watchdog.
 - It exits 1 when it stops abnormally while serving: its discovery root was
   lost or replaced, or its heartbeat could not be renewed. A requested
   `broker.shutdown` is a clean stop (exit 0). Use `Restart=on-failure`.
+- It is SIGKILLed (signal status 137, not exit 1) when a discovery
+  publication write blocks the process so the event loop cannot reach that
+  same liveness deadline (`publication-liveness-timeout`, `max(60s, heartbeat
+  TTL × 4)`). `Restart=on-failure` still restarts it; do not add 137 to
+  `SuccessExitStatus`. stderr includes `sdk broker: publication-liveness-timeout`
+  only when that write can finish without waiting. A full stderr pipe does
+  not postpone the SIGKILL. While the event loop is still running, the
+  exit-1 path above is the one that runs.
 - Pair it with attach-only clients (`GJC_SDK_BROKER_AUTOSTART=0`) so nothing
   else starts a competing broker. Set the variable on the broker unit as well
   if its session hosts should stay attach-only.
@@ -377,6 +388,27 @@ not settle earlier effects.
   `accepted`, `effect_started`, `awaiting_ready`, and `terminal_uncertain` legacy
   history stays fenced even for an apparently unrelated empty session. Recovery
   after restart marking a row `terminal_uncertain` is not proof of no effect.
+- `session.spawn` claim mirrors are not legacy requests. Current brokers mark
+  each mirror with `spawnAnchor: true` in its row, and a marked mirror never
+  fences, even after its claim leaves `sdk/spawn-authority.jsonl`. Mirrors
+  written by brokers that predate the marker have no durable field, position, or
+  timestamp that proves they are mirrors (in-place legacy migration rewrites
+  row timestamps), so the broker never infers them: they stay fenced like any
+  other unkeyed row.
+- Operator release of a pre-marker mirror: with the broker stopped, write
+  `sdk/lifecycle-ledger.spawn-anchor-attestation.json` as
+  `{"version":1,"identities":["<identity>", ...]}` and start the broker. List
+  only identities you can match to a `claim.lifecycleIdentity` in a preserved
+  copy of `sdk/spawn-authority.jsonl` or other first-hand evidence; listing a
+  genuine legacy request removes its fence. The broker never writes or derives
+  this file. It honors a listed identity only while that identity's entire
+  history is a single unkeyed, unmarked `accepted` row with no session target
+  and no quarantined or corruption-uncertain history; other entries, and the
+  whole file when it is malformed or cannot be read (for example a directory or
+  a file without read permission), are ignored and stay fenced. An unreadable
+  file is logged as a broker warning and never stops the broker from starting. A still-fenced
+  identity keeps returning `legacy_lifecycle_ambiguous`. Removing an identity
+  restores its fence at the next broker start.
 
 This diagnostic identifies the actual admission guard without exposing ledger
 identities, request hashes, filesystem paths, credentials, or broker free text.
@@ -404,6 +436,19 @@ requests cannot mint operator authority: copying `operator:true` and
 omitting the key, or supplying `operator:false` fails closed without invoking
 the terminal-abort surface. Non-operator terminal abort retains its existing
 connection-ownership semantics.
+
+The route reaches every session host on the current gjc, including a TUI or a
+direct CLI session the Broker did not launch. A Broker-launched host is bound by
+its lifecycle request id; any other host publishes a process-local random marker
+in its own endpoint registration in the Broker-owned session index, and the
+Broker echoes exactly that marker. The marker never appears in endpoint
+discovery, `session list`, or any SDK response, so an endpoint-token holder
+cannot forge it. When the operator abort stops a turn, the host's terminal shows
+`Turn stopped by a remote operator.` A host that published no marker (a gjc that
+predates the operator route) is refused before dispatch with
+`authorization_denied`, `outcomeCertainty: "not-applied"`, and diagnostic
+`sdk_operator_control_unsupported`; unlike `endpoint_stale`, retrying the same
+request cannot succeed until the session restarts on a current gjc.
 
 `session.get_endpoint` is refused unconditionally: endpoint credentials remain
 an SDK-core implementation detail. The raw hatch validates operation names and

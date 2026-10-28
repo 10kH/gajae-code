@@ -1171,6 +1171,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#subscribeToAgent();
 		this.#eventBusUnsubscribers.push(
 			this.session.subscribeSessionIdentityChanges(async () => {
+				// Any committed identity change (extension tree navigation, reload, ...) stales the suggestion.
+				this.promptSuggestion.clear();
 				try {
 					await this.refreshSlashCommandState();
 				} catch (error) {
@@ -1911,6 +1913,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		const draftText = selectShutdownDraft(this.editor.getText(), hadActiveBtw);
 		if (hadActiveBtw) this.pendingImages = [];
+		this.promptSuggestion.clear();
 		this.#btwController.dispose();
 
 		// Flush pending session writes before shutdown.
@@ -2395,6 +2398,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#prepareSessionSwitch(cleanupPreviousSessionUi?: () => void): void {
 		const errors: unknown[] = [];
+		this.promptSuggestion.clear();
 		try {
 			this.#btwController.dispose();
 		} catch (error) {
