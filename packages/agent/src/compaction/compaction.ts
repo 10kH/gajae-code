@@ -1159,11 +1159,38 @@ export interface HandoffOptions {
 	preferWebsockets?: boolean;
 }
 
+/** Characters of handoff focus or prompt extension kept before framing. */
+export const HANDOFF_UNTRUSTED_FIELD_MAX_CHARS = 4_000;
+
+const HANDOFF_FIELD_OPEN = "<untrusted-content>\n";
+const HANDOFF_FIELD_CLOSE = "\n</untrusted-content>";
+
+/**
+ * Tail-clip, then frame. The fence is the last step so a tail cut cannot drop
+ * the opener or leave a closer outside it.
+ */
+function clipHandoffField(text: string): string {
+	if (text.length <= HANDOFF_UNTRUSTED_FIELD_MAX_CHARS) return text;
+	let start = text.length - HANDOFF_UNTRUSTED_FIELD_MAX_CHARS;
+	// A code-unit cut can begin on a low surrogate and emit an isolated half of a character.
+	const code = text.charCodeAt(start);
+	if (code >= 0xdc00 && code <= 0xdfff) start += 1;
+	return text.slice(start);
+}
+
+function frameHandoffField(text: string): string {
+	const clipped = clipHandoffField(text);
+	const escaped = clipped
+		.replace(/<\s*\/?\s*untrusted-content(?=[\s>/]|$)/gi, tag => tag.replace(/</g, "&lt;"))
+		.replace(/<\s*\/\s*instruction(?=[\s>/]|$)/gi, tag => tag.replace(/</g, "&lt;"));
+	return `${HANDOFF_FIELD_OPEN}${escaped}${HANDOFF_FIELD_CLOSE}`;
+}
+
 export function renderHandoffPrompt(customInstructions?: string, promptExtension?: string): string {
 	if (!customInstructions && !promptExtension) return HANDOFF_DOCUMENT_PROMPT;
 	return prompt.render(handoffDocumentPrompt, {
-		additionalFocus: customInstructions,
-		promptExtension,
+		additionalFocus: customInstructions ? frameHandoffField(customInstructions) : customInstructions,
+		promptExtension: promptExtension ? frameHandoffField(promptExtension) : promptExtension,
 	});
 }
 
