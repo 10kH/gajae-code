@@ -32,11 +32,9 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { withHttpStatus } from "../utils/http-inspector";
 import type { KiroCodeWhispererOptions } from "./kiro-codewhisperer";
 import {
-	closeReasoningBlock,
-	createReasoningBlockState,
+	encodeKiroThinkingSignature,
+	type KiroAdditionalModelRequestFields,
 	kiroReasoningContentForReplay,
-	parseReasoningContentEventHelper,
-	type ReasoningBlockState,
 } from "./kiro-reasoning-parser";
 
 /**
@@ -872,45 +870,31 @@ function convertTools(tools: Tool[]) {
 }
 
 export function buildKiroThinkingPrefix(reasoning: string | boolean | undefined): string {
-	if (!reasoning || reasoning === true) return "";
+	if (!reasoning || reasoning === true || reasoning === "none") return "";
 	const budget = EFFORT_BUDGET[String(reasoning)] ?? 20_000;
 	return `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>`;
 }
 
-/**
- * Map of models that support native reasoning to their native field type.
- * Covers:
- * - Claude Opus/Sonnet 4.6+ and 5.x (thinking_output_config)
- * - Kimi K3 (thinking_output_config)
- * - GPT 5.6+ and 6.x (reasoning)
- */
-const NATIVE_REASONING_MODELS: Record<string, "thinking_output_config" | "reasoning"> = {
-	// Claude Opus (4.6+, 5.x)
-	"claude-opus-4.6": "thinking_output_config",
-	"claude-opus-4.7": "thinking_output_config",
-	"claude-opus-4.8": "thinking_output_config",
-	"claude-opus-5": "thinking_output_config",
-	"claude-opus-5.5": "thinking_output_config",
-	// Claude Sonnet (4.6+, 5.x)
-	"claude-sonnet-4.6": "thinking_output_config",
-	"claude-sonnet-5": "thinking_output_config",
-	"claude-sonnet-5.5": "thinking_output_config",
-	// Kimi K3
-	"kimi-k3": "thinking_output_config",
-	// GPT (5.6+, 6.x)
-	"gpt-5.6-sol": "reasoning",
-	"gpt-5.6-terra": "reasoning",
-	"gpt-5.6-luna": "reasoning",
-	"gpt-6-sol": "reasoning",
-	"gpt-6-luna": "reasoning",
-};
+type KiroNativeReasoningField = "thinking_output_config" | "reasoning";
+
+function versionAtLeast(major: number, minor: number, wantMajor: number, wantMinor: number): boolean {
+	return major > wantMajor || (major === wantMajor && minor >= wantMinor);
+}
 
 /**
- * Get the native reasoning field type for a model, or undefined if not supported.
- * Uses explicit map to avoid substring-matching issues like '-5' matching '4.5'.
+ * Native reasoning field for a Kiro model id (dotted form, see toKiroModelId):
+ * Claude Opus/Sonnet 4.6+ and Kimi K3 take adaptive thinking; GPT 5.6+ takes
+ * reasoning.effort. Anything else keeps the prompt fallback.
  */
-function getNativeReasoningFieldType(modelId: string): "thinking_output_config" | "reasoning" | undefined {
-	return NATIVE_REASONING_MODELS[modelId];
+function getNativeReasoningFieldType(modelId: string): KiroNativeReasoningField | undefined {
+	if (modelId === "kimi-k3") return "thinking_output_config";
+	const claude = /^claude-(?:opus|sonnet)-(\d+)(?:\.(\d+))?(?:$|-)/.exec(modelId);
+	if (claude) {
+		return versionAtLeast(Number(claude[1]), Number(claude[2] ?? 0), 4, 6) ? "thinking_output_config" : undefined;
+	}
+	const gpt = /^gpt-(\d+)(?:\.(\d+))?(?:$|-)/.exec(modelId);
+	if (gpt) return versionAtLeast(Number(gpt[1]), Number(gpt[2] ?? 0), 5, 6) ? "reasoning" : undefined;
+	return undefined;
 }
 
 /**
@@ -925,7 +909,7 @@ function getNativeReasoningFieldType(modelId: string): "thinking_output_config" 
 export function buildKiroAdditionalModelRequestFields(
 	model: Model<"kiro-codewhisperer-stream">,
 	reasoning: string | boolean | undefined,
-): Record<string, unknown> | undefined {
+): KiroAdditionalModelRequestFields | undefined {
 	const modelId = toKiroModelId(model.wireModelId || model.id);
 	const nativeFieldType = getNativeReasoningFieldType(modelId);
 
@@ -1047,7 +1031,7 @@ function buildApiKeyRequest(
 	if (toolResults.length > 0) uimc.toolResults = toolResults;
 	if (context.tools?.length) uimc.tools = convertTools(context.tools);
 
-	const request: any = {
+	return {
 		conversationState: {
 			chatTriggerType: "MANUAL",
 			agentTaskType: "vibe",
@@ -1063,11 +1047,8 @@ function buildApiKeyRequest(
 			...(history.length > 0 ? { history } : {}),
 		},
 		agentMode: "vibe",
+		...(additionalRequestFields ? { additionalModelRequestFields: additionalRequestFields } : {}),
 	};
-	if (additionalRequestFields) {
-		request.additionalModelRequestFields = additionalRequestFields;
-	}
-	return request;
 }
 
 type Block = (TextContent | ThinkingContent | ToolCall) & { index?: number };
@@ -1103,7 +1084,6 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			timestamp: Date.now(),
 		};
 		const blocks = output.content as Block[];
-		const reasoningState: ReasoningBlockState = createReasoningBlockState();
 		const snapshotOutput = (): AssistantMessage => ({
 			...output,
 			content: output.content.map(block => ({ ...block })),
@@ -1350,6 +1330,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			let inThink = false;
 			let thinkBuf = "";
 			let thinkingAccumulated = ""; // Buffer thinking until end or refusal
+			let thinkingSignature: string | undefined; // Last native reasoning signature, tagged for replay
 
 			const consumeContent = (raw: string) => {
 				thinkBuf += raw;
@@ -1384,7 +1365,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 
 			// Emit accumulated thinking (from buffer)
 			const emitThinking = () => {
-				if (!thinkingAccumulated) return;
+				if (!thinkingAccumulated && !thinkingSignature) return;
 				if (thinkingIndex === undefined) {
 					if (textIndex !== undefined && !textStartDeferred) {
 						// Text_start has already been emitted (not deferred) with contentIndex.
@@ -1394,6 +1375,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						blocks.push({
 							type: "thinking",
 							thinking: thinkingAccumulated,
+							...(thinkingSignature ? { thinkingSignature } : {}),
 							index: thinkingIndex,
 						} as ThinkingContent & { index: number });
 					} else {
@@ -1403,6 +1385,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						blocks.unshift({
 							type: "thinking",
 							thinking: thinkingAccumulated,
+							...(thinkingSignature ? { thinkingSignature } : {}),
 							index: 0,
 						} as ThinkingContent & { index: number });
 						// Update indices of blocks that were shifted
@@ -1455,6 +1438,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 					if (
 						completionSeen &&
 						(event.type === "content" ||
+							event.type === "reasoningContent" ||
 							((event.type === "toolUse" || event.type === "toolUseInput" || event.type === "toolUseStop") &&
 								!isActiveToolContinuation))
 					) {
@@ -1462,16 +1446,12 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 					}
 					if (event.type === "content") {
 						if (!hasTerminalEvent) {
-							// Transition from reasoning to text: close active reasoning block
-							closeReasoningBlock(blocks, output, stream, reasoningState);
 							if (event.data === lastContent) continue;
 							lastContent = event.data;
 							consumeContent(event.data);
 						}
 					} else if (event.type === "toolUse") {
 						if (!hasTerminalEvent) {
-							// Transition from reasoning to tool: close active reasoning block
-							closeReasoningBlock(blocks, output, stream, reasoningState);
 							if (!firstTokenEmitted) {
 								firstTokenEmitted = true;
 								firstTokenTime = Date.now();
@@ -1507,7 +1487,11 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							firstTokenEmitted = true;
 							firstTokenTime = Date.now();
 						}
-						parseReasoningContentEventHelper(event.data, blocks, output, stream, reasoningState);
+						// Native reasoning shares the inline-thinking quarantine: it is published
+						// only at clean EOF, so refusals and completion fences cover it too.
+						if (event.data.text) thinkingAccumulated += event.data.text;
+						const signature = encodeKiroThinkingSignature(event.data);
+						if (signature) thinkingSignature = signature;
 					} else if (event.type === "usage") {
 						if (event.data.inputTokens !== undefined) output.usage.input = event.data.inputTokens;
 						if (event.data.outputTokens !== undefined) output.usage.output = event.data.outputTokens;
@@ -1596,8 +1580,6 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			if (currentTool && toolComplete) addToolToBlocks();
 			emitThinking();
 			emitDeferredTextEvents();
-			// Finalize active reasoning block if any
-			closeReasoningBlock(blocks, output, stream, reasoningState);
 			// Now emit all tool call events in order (safe since no refusal occurred)
 			emitPendingToolCalls();
 			closeTextBlock();

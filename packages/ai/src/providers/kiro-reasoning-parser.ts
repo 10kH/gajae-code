@@ -12,11 +12,23 @@ import type { AssistantMessageEventStream } from "../utils/event-stream";
 
 type Block = { type: string; index?: number };
 
+/** Native reasoning request fields Kiro forwards to the model. */
+export type KiroAdditionalModelRequestFields =
+	| { thinking: { type: "adaptive"; display: "summarized" }; output_config: { effort: string } }
+	| { reasoning: { effort: string } };
+
 /** Wire shape Kiro expects on assistantResponseMessage.reasoningContent. */
 export type KiroReasoningContent = { signature: string } | { redactedContent: string };
 
 const SIGNATURE_TAG = "kiro:signature:";
 const REDACTED_TAG = "kiro:redactedContent:";
+
+/** Tag a native reasoning signature/redactedContent for storage on a thinking block. */
+export function encodeKiroThinkingSignature(ev: { signature?: string; redactedContent?: string }): string | undefined {
+	if (ev.signature) return `${SIGNATURE_TAG}${ev.signature}`;
+	if (ev.redactedContent) return `${REDACTED_TAG}${ev.redactedContent}`;
+	return undefined;
+}
 
 /**
  * Decode the Kiro reasoning payload to replay for one assistant turn: the last
@@ -109,13 +121,8 @@ export function parseReasoningContentEventHelper(
 		});
 	}
 
-	// Set thinkingSignature from the last valid tagged block
-	// Ignore empty tags and unknown tag prefixes
-	if (typeof ev.signature === "string" && ev.signature.length > 0) {
-		block.thinkingSignature = `${SIGNATURE_TAG}${ev.signature}`;
-	} else if (typeof ev.redactedContent === "string" && ev.redactedContent.length > 0) {
-		block.thinkingSignature = `${REDACTED_TAG}${ev.redactedContent}`;
-	}
+	const signature = encodeKiroThinkingSignature(ev);
+	if (signature) block.thinkingSignature = signature;
 }
 
 /**

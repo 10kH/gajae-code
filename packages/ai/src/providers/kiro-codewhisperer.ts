@@ -47,6 +47,7 @@ import {
 import {
 	closeReasoningBlock,
 	createReasoningBlockState,
+	type KiroAdditionalModelRequestFields,
 	type KiroReasoningContent,
 	kiroReasoningContentForReplay,
 	parseReasoningContentEventHelper,
@@ -133,7 +134,7 @@ interface ConversationState {
 
 interface GenerateAssistantResponseRequest {
 	conversationState: ConversationState;
-	additionalModelRequestFields?: Record<string, unknown>;
+	additionalModelRequestFields?: KiroAdditionalModelRequestFields;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -486,6 +487,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 								stream.push({ type: "start", partial: output });
 								started = true;
 							}
+							thinkingParser.flush();
 							parseReasoningContentEventHelper(ev, blocks, output, stream, reasoningState);
 						}
 						break;
@@ -568,6 +570,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			stream.end();
 		} catch (error) {
 			thinkingParser.finish();
+			closeReasoningBlock(blocks, output, stream, reasoningState);
 			for (const block of output.content) {
 				delete (block as Block).index;
 				delete (block as Block).partialJson;
@@ -819,7 +822,7 @@ function createInlineThinkingParser(
 	blocks: Block[],
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
-): { push: (delta: string) => void; finish: () => void } {
+): { push: (delta: string) => void; flush: () => void; finish: () => void } {
 	const openTag = "<thinking>";
 	const closeTag = "</thinking>";
 	let pending = "";
@@ -893,9 +896,8 @@ function createInlineThinkingParser(
 			pending += delta;
 			consume();
 		},
-		finish() {
+		flush() {
 			if (finished) return;
-			finished = true;
 			if (currentThinking) {
 				appendThinking(pending);
 				pending = "";
@@ -904,6 +906,10 @@ function createInlineThinkingParser(
 				if (pending.length > 0) handleTextDelta(pending, blocks, output, stream);
 				pending = "";
 			}
+		},
+		finish() {
+			this.flush();
+			finished = true;
 		},
 	};
 }

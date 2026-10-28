@@ -7,6 +7,7 @@ import { Effort } from "../src/model-thinking";
 import { crc32 } from "../src/providers/aws-eventstream";
 import { buildKiroAdditionalModelRequestFields, streamKiroApiKey } from "../src/providers/kiro-api-key";
 import { streamKiroCodeWhisperer } from "../src/providers/kiro-codewhisperer";
+import type { KiroAdditionalModelRequestFields } from "../src/providers/kiro-reasoning-parser";
 import type { AssistantMessage, Context, Model } from "../src/types";
 
 const PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:123456789012:profile/social-profile";
@@ -117,7 +118,7 @@ describe("Kiro native reasoning", () => {
 
 		const fields = buildKiroAdditionalModelRequestFields(model, Effort.High);
 		expect(fields).toBeDefined();
-		expect(fields?.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect((fields as any)?.thinking).toEqual({ type: "adaptive", display: "summarized" });
 		expect((fields as any)?.output_config?.effort).toBe(Effort.High);
 	});
 
@@ -157,7 +158,7 @@ describe("Kiro native reasoning", () => {
 
 		const fields = buildKiroAdditionalModelRequestFields(model, Effort.High);
 		expect(fields).toBeDefined();
-		expect(fields?.reasoning).toBeDefined();
+		expect((fields as any)?.reasoning).toBeDefined();
 		expect((fields as any)?.reasoning?.effort).toBe(Effort.High);
 	});
 
@@ -410,13 +411,21 @@ describe("Kiro native reasoning field matrix", () => {
 		["claude-opus-4.6", false, undefined],
 		["claude-opus-4.5", Effort.High, undefined],
 		["claude-sonnet-4-5", Effort.High, undefined],
+		["claude-opus-4.9", Effort.High, adaptive("high")],
+		["claude-opus-6", Effort.High, adaptive("high")],
+		["claude-sonnet-4", Effort.High, undefined],
+		["claude-haiku-4.5", Effort.High, undefined],
+		["gpt-6-sol", Effort.High, { reasoning: { effort: "high" } }],
+		["gpt-6.1-terra", Effort.Low, { reasoning: { effort: "low" } }],
 		["gpt-5.6-luna", Effort.High, { reasoning: { effort: "high" } }],
 		["gpt-5-6-terra", Effort.XHigh, { reasoning: { effort: "xhigh" } }],
 		["gpt-5.6-sol", false, { reasoning: { effort: "none" } }],
 		["gpt-5.6-sol", undefined, undefined],
 		["gpt-5.5", Effort.High, undefined],
 		["deepseek-3.2", Effort.High, undefined],
-	] as const)("%s with reasoning %p", (id, reasoning, expected) => {
+	] as Array<
+		[string, Effort | boolean | undefined, KiroAdditionalModelRequestFields | undefined]
+	>)("%s with reasoning %p", (id, reasoning, expected) => {
 		expect(buildKiroAdditionalModelRequestFields(kiroModel(id), reasoning)).toEqual(expected);
 	});
 });
@@ -486,6 +495,17 @@ describe("Kiro native reasoning (API key transport)", () => {
 			thinking: { type: "adaptive", display: "summarized" },
 			output_config: { effort: "high" },
 		});
+		expect(JSON.stringify(request)).not.toContain("<thinking_mode>");
+	});
+
+	test("'none' on Claude sends neither native fields nor the prompt prefix", async () => {
+		const { request } = await runApiKey(
+			kiroModel("claude-opus-4.6"),
+			{ systemPrompt: ["sys"], messages: [{ role: "user", content: "Test", timestamp: 1 }] },
+			[{ content: "ok" }],
+			"none" as unknown as Effort,
+		);
+		expect(request.additionalModelRequestFields).toBeUndefined();
 		expect(JSON.stringify(request)).not.toContain("<thinking_mode>");
 	});
 
@@ -582,5 +602,87 @@ describe("Kiro reasoning replay decoding (OAuth)", () => {
 		[["kiro:signature:keep", "kiro:unknown:x"], { signature: "keep" }],
 	] as const)("%p replays %p", async (signatures, expected) => {
 		expect(await replayed([...signatures])).toEqual(expected);
+	});
+});
+
+function chunkedResponse(chunks: string[]): Response {
+	const encoder = new TextEncoder();
+	return new Response(
+		new ReadableStream<Uint8Array>({
+			start(controller) {
+				for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+				controller.close();
+			},
+		}),
+		{ status: 200 },
+	);
+}
+
+async function collectApiKey(chunks: string[]): Promise<{ types: string[]; message: AssistantMessage }> {
+	(globalThis.fetch as any) = async () => chunkedResponse(chunks);
+	const types: string[] = [];
+	let message: AssistantMessage | undefined;
+	for await (const event of streamKiroApiKey(
+		kiroModel("claude-opus-4.6"),
+		{ messages: [{ role: "user", content: "Test", timestamp: 1 }] },
+		{ apiKey: "ksk_test-secret", region: "us-east-1", reasoning: Effort.High },
+	)) {
+		types.push(event.type);
+		if (event.type === "done") message = event.message;
+		if (event.type === "error") message = event.error;
+	}
+	if (!message) throw new Error("no terminal event");
+	return { types, message };
+}
+
+describe("Kiro native reasoning quarantine (API key transport)", () => {
+	test("a refusal in a later read discards native reasoning already received", async () => {
+		const { types, message } = await collectApiKey([
+			JSON.stringify({ text: "withheld", signature: "sig" }),
+			JSON.stringify({
+				stopReason: "CONTENT_FILTERED",
+				stopDetails: { refusal: { category: "CYBER", explanation: "refused" } },
+			}),
+		]);
+		expect(types.filter(t => t.startsWith("thinking_"))).toEqual([]);
+		expect(message.content).toEqual([]);
+	});
+
+	test("reasoning after successful completion is fenced out", async () => {
+		const { message } = await collectApiKey([
+			JSON.stringify({ text: "early", signature: "early-sig" }) + JSON.stringify({ content: "answer" }),
+			JSON.stringify({ stopReason: "COMPLETED" }),
+			JSON.stringify({ text: "late", signature: "late-sig" }),
+		]);
+		const thinking = message.content.filter(b => b.type === "thinking") as any[];
+		expect(thinking.map(b => [b.thinking, b.thinkingSignature])).toEqual([["early", "kiro:signature:early-sig"]]);
+	});
+
+	test("thinking precedes text and every lifecycle index matches the final blocks", async () => {
+		const { message } = await collectApiKey([
+			JSON.stringify({ content: "<thinking>I</thinking>A" }),
+			JSON.stringify({ text: "N", redactedContent: "blob" }),
+		]);
+		expect(message.content.map(b => b.type)).toEqual(["thinking", "text"]);
+		const thinking = message.content[0] as any;
+		expect(thinking.thinking).toBe("IN");
+		expect(thinking.thinkingSignature).toBe("kiro:redactedContent:blob");
+	});
+});
+
+describe("Kiro native reasoning boundaries (OAuth)", () => {
+	test("pending inline text is flushed before a native reasoning block opens", async () => {
+		const { message } = await runStream(
+			[
+				{ type: "assistantResponseEvent", payload: { content: "literal <think" } },
+				{ type: "reasoningContentEvent", payload: { text: "N" } },
+			],
+			kiroModel("claude-opus-4.6"),
+			{ reasoning: Effort.High },
+		);
+		expect(message.content.map(b => [b.type, (b as any).text ?? (b as any).thinking])).toEqual([
+			["text", "literal <think"],
+			["thinking", "N"],
+		]);
 	});
 });
