@@ -55,6 +55,7 @@ import {
 	GJC_TMUX_PROFILE_ENV,
 	GJC_TMUX_SESSION_PREFIX,
 	type GjcTmuxProfileCommand,
+	normalizeOperatorStateFilePin,
 	type ProviderAuthority,
 	persistGjcTmuxProviderAuthoritySync,
 	readGjcTmuxProviderAuthoritySync,
@@ -1140,9 +1141,11 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	const gjcSessionId = identityEnv.GJC_SESSION_ID?.trim() || sessionId;
 	const derivedStateFile = tmuxRuntimeSessionPath(cwd, gjcSessionId, buildGjcTmuxSessionSlug(sessionName));
 	// Supervised launches verify their lifecycle root with no-follow walks, so a derived
-	// path through a symlinked workspace is named canonically; an operator pin is verbatim.
+	// path through a symlinked workspace is named canonically; an operator pin is only
+	// lexically normalized.
+	const pinnedStateFile = identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
 	const sessionStateFile =
-		identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() ||
+		(pinnedStateFile && normalizeOperatorStateFilePin(pinnedStateFile, platform)) ||
 		(platform === "linux" || platform === "darwin"
 			? canonicalManagedStateFile(cwd, derivedStateFile)
 			: derivedStateFile);

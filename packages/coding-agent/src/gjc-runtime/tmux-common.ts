@@ -318,6 +318,19 @@ export function normalizeTmuxCreatedAt(raw: string): string {
 }
 
 /**
+ * An absolute operator state-file pin, spelled the way every supervised consumer reads it.
+ *
+ * The launcher already joins the lifecycle root lexically, while the supervisor and
+ * child admission refuse a state directory with a `..` component. Normalizing the pin
+ * once at its source keeps all of them on the same path. Relative pins and other
+ * platforms stay verbatim.
+ */
+export function normalizeOperatorStateFilePin(pin: string, platform: NodeJS.Platform): string {
+	if ((platform !== "linux" && platform !== "darwin") || !path.posix.isAbsolute(pin)) return pin;
+	return path.posix.normalize(pin);
+}
+
+/**
  * A derived managed state file named through its canonical trusted anchor: the
  * workspace, or its `.gjc` directory when that exists, is resolved once so a
  * workspace or `.gjc` reached through a symlink has one spelling that lifecycle
