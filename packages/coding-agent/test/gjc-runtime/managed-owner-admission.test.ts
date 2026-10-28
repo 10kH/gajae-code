@@ -19,6 +19,7 @@ import {
 	replaceOwnerGeneration,
 	replaceOwnerGenerationSync,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
+import { managedOwnerAdmittedChildFile } from "../../src/gjc-runtime/managed-owner-binding";
 import { observeProcessIncarnation } from "../../src/sdk/broker/process-incarnation";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
@@ -80,6 +81,49 @@ async function admit(
 		exitCode,
 		stderr,
 		root: lifecyclePaths(stateDir, "session-2681", "generation-2681").root,
+	};
+}
+
+/** An admitted child that stays alive, like a CLI whose supervisor was killed after admission. */
+function admitLingering(
+	stateDir: string,
+	token: string,
+): { pid: number; admitted: Promise<boolean>; stop: () => Promise<void> } {
+	const script = `import { admitManagedOwnerBeforeCli } from ${JSON.stringify(admissionModule)}; const admission = await admitManagedOwnerBeforeCli(); console.log(JSON.stringify({ admitted: admission.kind !== "blocked" })); setInterval(() => {}, 1000);`;
+	const child = Bun.spawn({
+		cmd: [process.execPath, "-e", script],
+		cwd: repoRoot,
+		stdout: "pipe",
+		stderr: "ignore",
+		env: {
+			...managedOwnerEnvironment(),
+			GJC_TMUX_OWNER_STATE_DIR: stateDir,
+			GJC_COORDINATOR_SESSION_ID: "session-2681",
+			GJC_TMUX_OWNER_GENERATION: "generation-2681",
+			GJC_MANAGED_OWNER_RUN_ID: "run-2681",
+			GJC_MANAGED_OWNER_INCARNATION: "incarnation-2681",
+			GJC_MANAGED_OWNER_CHILD_TOKEN: token,
+		},
+	});
+	const admitted = (async () => {
+		const reader = child.stdout.getReader();
+		let line = "";
+		while (!line.includes("\n")) {
+			const chunk = await reader.read();
+			if (chunk.done) throw new Error("lingering admission exited before reporting");
+			line += new TextDecoder().decode(chunk.value);
+		}
+		reader.releaseLock();
+		return (JSON.parse(line) as { admitted: boolean }).admitted;
+	})();
+	admitted.catch(() => {});
+	return {
+		pid: child.pid,
+		admitted,
+		stop: async () => {
+			child.kill("SIGKILL");
+			await child.exited;
+		},
 	};
 }
 
@@ -677,6 +721,169 @@ describe.skipIf(process.platform === "win32")("managed owner admission", () => {
 			expect(captureOwnerGenerationBaselineSync(stateDir, "session-2681")).toEqual(baselineA);
 			expect(await admit(stateDir, "current-token")).toMatchObject({ admitted: true, exitCode: 0 });
 		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	// Linux proves a killed supervisor's child through its SIGABRT receipt instead.
+	it.skipIf(process.platform === "linux")(
+		"refuses every publisher while a child admitted under a killed supervisor lives",
+		async () => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-admission-orphan-"));
+			let lingering: ReturnType<typeof admitLingering> | undefined;
+			try {
+				const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
+				replaceOwnerGenerationSync(stateDir, "session-2681", "generation-2681", { state: "absent" });
+				const baselineA = captureOwnerGenerationBaselineSync(stateDir, "session-2681");
+				// The recorded supervisor pid now names another process: the supervisor was killed.
+				await writeBinding(root, "orphan-token", {
+					supervisor_pid: process.pid,
+					supervisor_start_time: "killed-supervisor",
+				});
+				lingering = admitLingering(stateDir, "orphan-token");
+				expect(await lingering.admitted).toBe(true);
+				const records = (await fs.readdir(root)).filter(name => name.startsWith("admitted-"));
+				expect(records).toHaveLength(1);
+				const record = JSON.parse(await fs.readFile(path.join(root, records[0]!), "utf8")) as {
+					child_pid: number;
+					child_incarnation: string;
+				};
+				const observed = observeProcessIncarnation(lingering.pid);
+				expect(observed.status).toBe("present");
+				expect(record).toMatchObject({
+					child_pid: lingering.pid,
+					child_incarnation: observed.status === "present" ? observed.incarnation : "",
+				});
+				expect((await fs.stat(path.join(root, records[0]!))).mode & 0o777).toBe(0o600);
+				const refusal = "managed_owner_predecessor_live";
+				expect(() =>
+					replaceOwnerGenerationSync(stateDir, "session-2681", "generation-relaunch", baselineA),
+				).toThrow(refusal);
+				expect(() =>
+					publishOwnerGenerationSync({
+						schema_version: 1,
+						op: "publish_generation",
+						session_id: "session-2681",
+						owner_generation: "generation-raw",
+						state_dir: stateDir,
+						baseline: baselineA,
+					}),
+				).toThrow(refusal);
+				await expect(
+					replaceOwnerGeneration(stateDir, "session-2681", "generation-async", baselineA),
+				).rejects.toThrow(refusal);
+				expect(captureOwnerGenerationBaselineSync(stateDir, "session-2681")).toEqual(baselineA);
+				// Once that exact child is gone, its record is history and the relaunch proceeds.
+				await lingering.stop();
+				lingering = undefined;
+				replaceOwnerGenerationSync(stateDir, "session-2681", "generation-relaunch", baselineA);
+				expect(captureOwnerGenerationBaselineSync(stateDir, "session-2681")).toMatchObject({
+					generation: "generation-relaunch",
+				});
+			} finally {
+				await lingering?.stop();
+				await fs.rm(stateDir, { recursive: true, force: true });
+			}
+		},
+	);
+
+	// Both CLI entry layers run admission in one process.
+	it.skipIf(process.platform === "linux")(
+		"keeps one record across repeated admission and refuses a conflicting record",
+		async () => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-admission-record-reuse-"));
+			try {
+				const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
+				replaceOwnerGenerationSync(stateDir, "session-2681", "generation-2681", { state: "absent" });
+				const run = async (token: string, conflict: boolean) => {
+					await writeBinding(root, token);
+					const script = [
+						`import * as fs from "node:fs";`,
+						`import * as path from "node:path";`,
+						`import { admitManagedOwnerBeforeCli } from ${JSON.stringify(admissionModule)};`,
+						`import { managedOwnerAdmittedChildFile } from ${JSON.stringify(path.join(path.dirname(admissionModule), "managed-owner-binding.ts"))};`,
+						`import { observeProcessIncarnation } from ${JSON.stringify(path.join(path.dirname(admissionModule), "..", "sdk", "broker", "process-incarnation.ts"))};`,
+						`const self = observeProcessIncarnation(process.pid);`,
+						conflict
+							? `fs.writeFileSync(path.join(${JSON.stringify(root)}, managedOwnerAdmittedChildFile(${JSON.stringify(token)}, process.pid, self.incarnation)), "{}\\n", { mode: 0o600 });`
+							: "",
+						`const kinds = [];`,
+						`for (let i = 0; i < 2; i++) kinds.push((await admitManagedOwnerBeforeCli()).kind);`,
+						`console.log(JSON.stringify({ kinds, exitCode: process.exitCode ?? 0 }));`,
+					].join("\n");
+					const child = Bun.spawn({
+						cmd: [process.execPath, "-e", script],
+						cwd: repoRoot,
+						stdout: "pipe",
+						stderr: "pipe",
+						env: {
+							...managedOwnerEnvironment(),
+							GJC_TMUX_OWNER_STATE_DIR: stateDir,
+							GJC_COORDINATOR_SESSION_ID: "session-2681",
+							GJC_TMUX_OWNER_GENERATION: "generation-2681",
+							GJC_MANAGED_OWNER_RUN_ID: "run-2681",
+							GJC_MANAGED_OWNER_INCARNATION: "incarnation-2681",
+							GJC_MANAGED_OWNER_CHILD_TOKEN: token,
+						},
+					});
+					const [stdout, stderr] = await Promise.all([
+						new Response(child.stdout).text(),
+						new Response(child.stderr).text(),
+						child.exited,
+					]);
+					const records = (await fs.readdir(root)).filter(name => name.startsWith(`admitted-${token}-`));
+					return { ...(JSON.parse(stdout) as { kinds: string[]; exitCode: number }), stderr, records };
+				};
+				const repeated = await run("repeat-token", false);
+				expect(repeated.kinds).toEqual(["supervised", "supervised"]);
+				expect(repeated.exitCode).toBe(0);
+				expect(repeated.records).toHaveLength(1);
+				const conflicting = await run("conflict-token", true);
+				expect(conflicting.kinds).toEqual(["blocked", "blocked"]);
+				expect(conflicting.exitCode).toBe(75);
+				expect(conflicting.stderr).toContain("child admission blocked: admitted_child_record_unavailable");
+				expect(conflicting.records).toHaveLength(1);
+			} finally {
+				await fs.rm(stateDir, { recursive: true, force: true });
+			}
+		},
+	);
+
+	// A relaunch either sees an admitted child's record under the generation lock or
+	// replaces the generation first, so the fence (which takes that lock) refuses the child.
+	it.skipIf(process.platform === "linux")("records an admitted child before its generation fence", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-admission-record-order-"));
+		let lingering: ReturnType<typeof admitLingering> | undefined;
+		try {
+			const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
+			replaceOwnerGenerationSync(stateDir, "session-2681", "generation-2681", { state: "absent" });
+			await writeBinding(root, "fenced-token", {
+				supervisor_pid: process.pid,
+				supervisor_start_time: "killed-supervisor",
+			});
+			const holder = new Database(path.join(root, "owner-locks.sqlite"));
+			try {
+				holder.exec("BEGIN IMMEDIATE");
+				lingering = admitLingering(stateDir, "fenced-token");
+				const observed = observeProcessIncarnation(lingering.pid);
+				if (observed.status !== "present") throw new Error("lingering child incarnation unavailable");
+				const record = path.join(
+					root,
+					managedOwnerAdmittedChildFile("fenced-token", lingering.pid, observed.incarnation),
+				);
+				const deadline = Date.now() + 5_000;
+				while (!fsSync.existsSync(record) && Date.now() < deadline) await Bun.sleep(25);
+				// Another writer holds the generation lock, so the child cannot have passed its
+				// fence, yet its record is already published.
+				expect(fsSync.existsSync(record)).toBe(true);
+				expect(Bun.peek.status(lingering.admitted)).toBe("pending");
+			} finally {
+				holder.exec("ROLLBACK");
+				holder.close();
+			}
+			expect(await lingering.admitted).toBe(true);
+		} finally {
+			await lingering?.stop();
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
 	});

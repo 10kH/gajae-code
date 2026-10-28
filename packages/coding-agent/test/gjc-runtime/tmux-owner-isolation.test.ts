@@ -5,7 +5,10 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ManagedOwnerOpaqueBinding } from "@gajae-code/coding-agent/gjc-runtime/managed-owner-binding";
+import {
+	type ManagedOwnerOpaqueBinding,
+	managedOwnerAdmittedChildFile,
+} from "@gajae-code/coding-agent/gjc-runtime/managed-owner-binding";
 import {
 	type AttemptCapability,
 	type BootstrapRequest,
@@ -458,6 +461,100 @@ describe("closed managed predecessor evidence", () => {
 				expect(resolve()?.predecessorToken).toBe("token");
 				await write("sigabrt-second.receipt.json", { ...receipt, child_token: "second" });
 				expect(resolve).toThrow("managed_owner_replacement_evidence_ambiguous");
+			} finally {
+				await fs.rm(stateDir, { recursive: true, force: true });
+			}
+		},
+	);
+
+	// Linux proves a killed supervisor's child through its SIGABRT receipt instead.
+	it.skipIf(process.platform === "linux" || process.platform === "win32")(
+		"requires every child admitted under a killed predecessor supervisor to be gone",
+		async () => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-predecessor-admitted-"));
+			try {
+				const baseline = {
+					state: "current",
+					schema_version: 1,
+					generation: "generation",
+					session_id: "session",
+					published_at: "2026-09-08T00:00:00.000Z",
+				} as const;
+				const root = lifecyclePaths(stateDir, "session", "generation").root;
+				await fs.mkdir(root, { recursive: true, mode: 0o700 });
+				const write = (name: string, value: object, mode = 0o600) =>
+					fs.writeFile(path.join(root, name), `${JSON.stringify(value)}\n`, { mode });
+				await write("child-token.binding.json", {
+					schema_version: 3,
+					binding_kind: "opaque",
+					generation: "generation",
+					session_id: "session",
+					run_id: "run",
+					endpoint_incarnation: "incarnation",
+					child_token: "token",
+					supervisor_pid: 4242,
+					supervisor_start_time: "supervisor-start",
+					created_at: baseline.published_at,
+				});
+				const admitted = {
+					schema_version: 1,
+					generation: "generation",
+					session_id: "session",
+					child_token: "token",
+					child_pid: 4343,
+					child_incarnation: "child-start",
+				};
+				const name = (pid: number, incarnation: string, token = "token") =>
+					managedOwnerAdmittedChildFile(token, pid, incarnation);
+				await write(name(4343, "child-start"), admitted);
+				const live = new Map<number, ProcessIncarnationObservation>();
+				// The supervisor itself is gone in every case below.
+				const resolve = () =>
+					resolveManagedOwnerPredecessorSync(
+						stateDir,
+						"session",
+						baseline,
+						pid => live.get(pid) ?? { status: "absent" },
+					);
+				live.set(4343, { status: "present", incarnation: "child-start" });
+				expect(resolve).toThrow("managed_owner_predecessor_live");
+				live.set(4343, { status: "unknown", reasonCode: "lookup_failed" });
+				expect(resolve).toThrow("managed_owner_replacement_evidence_unavailable");
+				// A reused pid is another process, and an absent one has exited.
+				live.set(4343, { status: "present", incarnation: "another-start" });
+				expect(resolve()).toBeUndefined();
+				live.delete(4343);
+				expect(resolve()).toBeUndefined();
+				// Every process admitted through the binding counts, including a later process on a reused pid.
+				await write(name(4343, "reused"), { ...admitted, child_incarnation: "reused" });
+				live.set(4343, { status: "present", incarnation: "reused" });
+				expect(resolve).toThrow("managed_owner_predecessor_live");
+				live.delete(4343);
+				await write(name(4444, "second"), { ...admitted, child_pid: 4444, child_incarnation: "second" });
+				live.set(4444, { status: "present", incarnation: "second" });
+				expect(resolve).toThrow("managed_owner_predecessor_live");
+				await fs.rm(path.join(root, name(4444, "second")));
+				// Records of a token without a binding here (a longer token sharing this prefix
+				// included) are not this binding's.
+				for (const token of ["other", "token-4545"]) {
+					await write(name(4545, "child-start", token), { ...admitted, child_token: token, child_pid: 4545 });
+				}
+				live.set(4545, { status: "present", incarnation: "child-start" });
+				expect(resolve()).toBeUndefined();
+				const forged = name(4646, "child-start");
+				for (const [value, mode] of [
+					[{ ...admitted, child_pid: 4343 }, 0o600],
+					[{ ...admitted, child_pid: 4646, child_incarnation: "forged" }, 0o600],
+					[{ ...admitted, child_pid: 4646, generation: "older" }, 0o600],
+					[{ ...admitted, child_pid: 4646, session_id: "other" }, 0o600],
+					[{ ...admitted, child_pid: 4646, child_incarnation: "" }, 0o600],
+					[{ ...admitted, child_pid: 4646, extra: true }, 0o600],
+					[{ ...admitted, child_pid: 4646 }, 0o644],
+				] as const) {
+					await fs.rm(path.join(root, forged), { force: true });
+					await write(forged, value, mode);
+					expect(resolve).toThrow("managed_owner_replacement_evidence_untrusted");
+				}
 			} finally {
 				await fs.rm(stateDir, { recursive: true, force: true });
 			}

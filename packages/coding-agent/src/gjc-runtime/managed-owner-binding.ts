@@ -183,6 +183,63 @@ export function isManagedOwnerSupervisorIndex(value: unknown): value is ManagedO
 }
 
 /**
+ * Off Linux: published no-replace by each process admitted through a binding,
+ * before its generation fence. A supervisor killed after admission leaves no
+ * receipt and cannot reconcile its child, so a relaunch proves every admitted
+ * process gone through these records before it replaces the generation.
+ */
+export interface ManagedOwnerAdmittedChild {
+	schema_version: 1;
+	generation: string;
+	session_id: string;
+	child_token: string;
+	child_pid: number;
+	child_incarnation: string;
+}
+function incarnationDigest(incarnation: string): string {
+	return crypto.createHash("sha256").update(incarnation).digest("hex").slice(0, 32);
+}
+/**
+ * Named for the exact process: one process admits more than once (both CLI entry
+ * layers run admission), and a reused pid is a different process with its own record.
+ */
+export function managedOwnerAdmittedChildFile(token: string, pid: number, incarnation: string): string {
+	return `admitted-${token}-${pid}-${incarnationDigest(incarnation)}.json`;
+}
+/** The pid an admitted-child record of `token` is named for, or undefined for any other entry. */
+export function managedOwnerAdmittedChildPid(token: string, entry: string): number | undefined {
+	const prefix = `admitted-${token}-`;
+	if (!entry.startsWith(prefix)) return undefined;
+	const match = /^([1-9]\d*)-[0-9a-f]{32}\.json$/.exec(entry.slice(prefix.length));
+	const pid = match ? Number(match[1]) : Number.NaN;
+	return positivePid(pid) ? pid : undefined;
+}
+export function isManagedOwnerAdmittedChild(
+	value: unknown,
+	binding: ManagedOwnerBinding,
+	entry: string,
+): value is ManagedOwnerAdmittedChild {
+	return (
+		record(value) &&
+		exactKeys(value, [
+			"schema_version",
+			"generation",
+			"session_id",
+			"child_token",
+			"child_pid",
+			"child_incarnation",
+		]) &&
+		value.schema_version === 1 &&
+		value.generation === binding.generation &&
+		value.session_id === binding.session_id &&
+		value.child_token === binding.child_token &&
+		positivePid(value.child_pid) &&
+		nonempty(value.child_incarnation) &&
+		entry === managedOwnerAdmittedChildFile(value.child_token, value.child_pid, value.child_incarnation)
+	);
+}
+
+/**
  * Darwin: published no-replace by the exact supervisor, under the generation lock,
  * as `relay-<generation>.pending.json` before it relays its cooperative signal for one
  * intent. Only after the signal was sent does it publish `relay-<generation>.json`,

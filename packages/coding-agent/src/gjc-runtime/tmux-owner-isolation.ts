@@ -23,6 +23,7 @@ import { isCompiledBinary } from "@gajae-code/utils/env";
 import { observeProcessIncarnation, type ProcessIncarnationObservation } from "../sdk/broker/process-incarnation";
 import { parseLinuxProcStartTime } from "./linux-proc";
 import {
+	isManagedOwnerAdmittedChild,
 	isManagedOwnerBinding,
 	isManagedOwnerChildExit,
 	isManagedOwnerCooperativeReady,
@@ -36,6 +37,7 @@ import {
 	type ManagedOwnerCooperativeReady,
 	type ManagedOwnerRelayRecord,
 	type ManagedOwnerShutdownCause,
+	managedOwnerAdmittedChildPid,
 } from "./managed-owner-binding";
 
 export const TMUX_OWNER_ISOLATION_SCHEMA_VERSION = 1;
@@ -1231,7 +1233,7 @@ export function resolveManagedOwnerPredecessorSync(
 	// fence that owner out of its own close.
 	if (receipts.size === 0 && process.platform !== "linux") {
 		for (const token of bindings)
-			assertPredecessorSupervisorExited(root, baseline.generation, sessionId, token, observe);
+			assertPredecessorSupervisorExited(root, entries, baseline.generation, sessionId, token, observe);
 		return undefined;
 	}
 	const tokens = [...bindings].filter(token => receipts.has(token));
@@ -1266,6 +1268,7 @@ export function resolveManagedOwnerPredecessorSync(
 
 function assertPredecessorSupervisorExited(
 	root: string,
+	entries: readonly string[],
 	generation: string,
 	sessionId: string,
 	token: string,
@@ -1278,12 +1281,32 @@ function assertPredecessorSupervisorExited(
 	// A pinned session keeps one lifecycle root, so bindings of generations before the
 	// baseline are retained history; each was replaced only after this same check.
 	if (binding.generation !== generation) return;
-	const supervisor = observe(binding.supervisor_pid);
-	if (supervisor.status === "absent") return;
-	if (supervisor.status === "present" && supervisor.incarnation !== binding.supervisor_start_time) return;
 	// A live or unobservable predecessor supervisor still owns its generation.
+	assertProcessExited(observe(binding.supervisor_pid), binding.supervisor_start_time);
+	// A supervisor killed after admission never reconciled its child, so every process
+	// admitted through this binding must also be gone. One that has not recorded itself
+	// yet meets the replaced generation at its fence.
+	for (const entry of entries) {
+		const pid = managedOwnerAdmittedChildPid(token, entry);
+		if (pid === undefined) continue;
+		let admitted: unknown;
+		try {
+			admitted = readSecureOwnerJson(path.join(root, entry));
+		} catch {
+			throw new Error("managed_owner_replacement_evidence_untrusted");
+		}
+		if (!isManagedOwnerAdmittedChild(admitted, binding, entry))
+			throw new Error("managed_owner_replacement_evidence_untrusted");
+		assertProcessExited(observe(pid), admitted.child_incarnation);
+	}
+}
+
+function assertProcessExited(observation: ProcessIncarnationObservation, incarnation: string): void {
+	if (observation.status === "absent") return;
+	// A reused pid is a different process.
+	if (observation.status === "present" && observation.incarnation !== incarnation) return;
 	throw new Error(
-		supervisor.status === "present"
+		observation.status === "present"
 			? "managed_owner_predecessor_live"
 			: "managed_owner_replacement_evidence_unavailable",
 	);

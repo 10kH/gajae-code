@@ -5,11 +5,16 @@ import * as natives from "@gajae-code/natives";
 import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 // Its signal handlers must precede the cooperative-shutdown cause recorders.
 import * as postmortem from "@gajae-code/utils/postmortem";
+import { observeProcessIncarnation } from "../sdk/broker/process-incarnation";
+import { prepareManagedDirectoryRoot, publishManagedFileNoReplace } from "../session/internal/managed-session-storage";
 import {
 	isManagedOwnerBinding,
 	isManagedOwnerSigabrtReceipt,
+	type ManagedOwnerAdmittedChild,
+	type ManagedOwnerBinding,
 	type ManagedOwnerRecoverableBinding,
 	type ManagedOwnerSigabrtReceipt,
+	managedOwnerAdmittedChildFile,
 } from "./managed-owner-binding";
 import { assertSafePathComponent } from "./session-layout";
 import { trustedCoordinatorEnv } from "./sidecar-bootstrap-env";
@@ -18,6 +23,7 @@ import {
 	installManagedOwnerCooperativeShutdown,
 	lifecyclePaths,
 	parseExactOwnerJson,
+	readOwnerOnlyFileSettled,
 	readSecureOwnerJson,
 } from "./tmux-owner-isolation";
 import {
@@ -150,6 +156,38 @@ function readCurrentChildBinding(root: string, token: string): unknown {
 		return null;
 	}
 }
+/**
+ * Off Linux a supervisor killed after admission leaves no receipt and never reconciles
+ * its child. Each admitted process therefore records itself before the generation
+ * fence: a relaunch either finds the record under the generation lock and needs this
+ * exact process gone, or replaces the generation first and the fence refuses it.
+ */
+async function recordAdmittedChild(root: string, binding: ManagedOwnerBinding): Promise<void> {
+	const self = observeProcessIncarnation(process.pid);
+	if (self.status !== "present") throw new Error("admitted_child_incarnation_unavailable");
+	const record: ManagedOwnerAdmittedChild = {
+		schema_version: 1,
+		generation: binding.generation,
+		session_id: binding.session_id,
+		child_token: binding.child_token,
+		child_pid: process.pid,
+		child_incarnation: self.incarnation,
+	};
+	const file = path.join(root, managedOwnerAdmittedChildFile(binding.child_token, process.pid, self.incarnation));
+	const assertSafe = () => {
+		if (!natives.verifyOwnerOnlyPathSecurity(root, "directory").ok) throw new Error("managed_owner_storage_unsafe");
+	};
+	assertSafe();
+	const bytes = Buffer.from(`${JSON.stringify(record)}\n`);
+	const matches = () => {
+		const persisted = readOwnerOnlyFileSettled(file, 4096);
+		return persisted.ok && !!persisted.data && bytes.equals(Buffer.from(persisted.data));
+	};
+	// This exact process already recorded itself in an earlier admission layer.
+	if (matches()) return;
+	await publishManagedFileNoReplace(file, bytes, assertSafe, prepareManagedDirectoryRoot(root));
+	if (!matches()) throw new Error("admitted_child_record_reread_failed");
+}
 type ExactJsonRead = { values: unknown[] } | { reader: "unsupported_platform" | "read_failed" };
 /** Recovery authority remains Linux-only and separate from ordinary child admission. */
 async function readLinuxRecoveryJsons(root: string, files: readonly string[]): Promise<ExactJsonRead> {
@@ -266,6 +304,13 @@ async function admitManagedOwner(): Promise<ManagedOwnerAdmission> {
 		if (!safeChildToken(childToken)) return deny(owner, "exact_child_binding_unavailable");
 		const binding = readCurrentChildBinding(owner.root, childToken);
 		if (isManagedOwnerBinding(binding, { ...owner, token: childToken })) {
+			if (process.platform !== "linux") {
+				try {
+					await recordAdmittedChild(owner.root, binding);
+				} catch {
+					return deny(owner, "admitted_child_record_unavailable");
+				}
+			}
 			// A relaunch may have replaced this generation before its supervisor
 			// published the binding; that child would outlive every close path.
 			try {

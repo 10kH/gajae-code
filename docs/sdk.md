@@ -1435,7 +1435,23 @@ signs its runtime marker, so a relay whose persistence outlasts the wait leaves
 the recoverable `owner_verdict_unavailable` marker even if the close later
 succeeds. A pinned relaunch is
 refused with `managed_owner_predecessor_live` while the current generation's
-supervisor is still live. The closer holds a per-generation closer lock
+supervisor, or any process admitted through one of its bindings, is still live.
+A supervisor killed after admission leaves no SIGABRT receipt and never reconciles
+its child, so each admitted process first publishes an owner-only
+`admitted-<token>-<pid>-<incarnation digest>.json` record of its exact pid and
+start time, before its generation fence. Once the generation is published, the
+fence and the relaunch's predecessor check run under the same generation lock:
+the relaunch either finds
+the record and requires that exact process to be gone (a reused pid is a
+different process), or replaces the generation first and the fence refuses the
+child with `owner_generation_stale`. A child that cannot publish its record is
+refused with `admitted_child_record_unavailable`, an unobservable admitted
+process fails the relaunch with `managed_owner_replacement_evidence_unavailable`,
+and a record that does not match its name or binding fails it with
+`managed_owner_replacement_evidence_untrusted`. A child admitted before its
+generation was published is not covered by this record check; as before, it
+relies on the launcher removing the provisional tmux session when publication
+fails. The closer holds a per-generation closer lock
 (`closer-<generation>.sqlite`) from before its intent is visible until it stops
 waiting. The supervisor checks that lock before publishing its pending record
 and again immediately before signaling, so no relay is newly authorized after
