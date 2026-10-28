@@ -1390,4 +1390,4 @@ export function getBehaviorByModel(cutoff?: number | null): BehaviorModelStats[]
 		totalChars: row.total_chars ?? 0,
 		lastTimestamp: row.last_timestamp ?? 0,
 	}));
-		  }
+}
