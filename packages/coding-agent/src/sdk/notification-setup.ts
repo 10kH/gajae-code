@@ -30,6 +30,8 @@ import {
 import {
 	buildNotificationStatusReport,
 	checkNotificationHealth,
+	type DaemonHealth,
+	type NotificationRecoveryReport,
 	recoverNotifications,
 	sanitizeProviderDiagnostic,
 	sendNotificationTest,
@@ -141,6 +143,23 @@ export function createNotificationsEditorOperations(
 	};
 	const operationError = (error: unknown, token?: string): Error =>
 		new Error(sanitize(error instanceof Error ? error.message : "Notification operation failed.", token));
+	// Persisted daemon records are accepted verbatim by the service: an owner tag or
+	// diagnostic string written by an older or foreign build can contain a configured
+	// token or its fingerprint. The SDK surface is a secret-safe contract, so every
+	// free-form daemon field is redacted here instead of being spread through.
+	const redactDaemonHealth = (daemon: DaemonHealth): DaemonHealth => ({
+		...daemon,
+		ownerId: daemon.ownerId === undefined ? undefined : sanitize(daemon.ownerId),
+	});
+	const redactRecoveryDaemon = (
+		daemon: NotificationRecoveryReport["daemon"],
+	): NotificationRecoveryReport["daemon"] => ({
+		...daemon,
+		detail: sanitize(daemon.detail),
+		ownerId: daemon.ownerId === undefined ? undefined : sanitize(daemon.ownerId),
+		...(daemon.blockingReason === undefined ? {} : { blockingReason: sanitize(daemon.blockingReason) }),
+		...(daemon.forceCommand === undefined ? {} : { forceCommand: sanitize(daemon.forceCommand) }),
+	});
 	const drafts = new WeakMap<
 		PreparedTelegramConfiguration,
 		{ token: string; activationAllowed: boolean; busy: boolean }
@@ -247,6 +266,7 @@ export function createNotificationsEditorOperations(
 						...check,
 						detail: sanitize(check.detail),
 					})),
+					daemon: redactDaemonHealth(report.daemon),
 					reachability: {
 						...report.reachability,
 						detail: sanitize(report.reachability.detail),
@@ -291,10 +311,7 @@ export function createNotificationsEditorOperations(
 				});
 				return {
 					...result,
-					daemon: {
-						...result.daemon,
-						detail: sanitize(result.daemon.detail),
-					},
+					daemon: redactRecoveryDaemon(result.daemon),
 				};
 			} catch (error) {
 				throw operationError(error);

@@ -1833,6 +1833,49 @@ describe("notification settings controller adapter", () => {
 		);
 	});
 
+	it("redacts persisted daemon metadata at the SDK boundary", async () => {
+		const secrets = [TOKEN, "shared-secret"];
+		const sensitive = [...secrets, ...secrets.map(tokenFingerprint)];
+		const settings = {
+			canPersistDurableConfig: () => true,
+			getNotificationSettingsSnapshot: () =>
+				snapshot({
+					telegram: { ...snapshot().telegram, botToken: secrets[0] },
+					discord: { botToken: secrets[1] },
+				}),
+		} as unknown as Settings;
+		const context = {
+			settings,
+			session: { notificationSessionController: undefined },
+			sessionManager: { getCwd: () => "/unused", getSessionId: () => "session" },
+		} as unknown as NotificationsEditorAdapterContext;
+		const ownerId = `owner-${sensitive.join("-")}`;
+		const operations = createNotificationsEditorOperations(context, {
+			checkNotificationHealth: async () => ({
+				...health(),
+				daemon: { ...health().daemon, present: true, ownerId },
+			}),
+			recoverNotifications: async () => ({
+				...recovery(),
+				daemon: {
+					...recovery().daemon,
+					ownerId,
+					detail: `detail ${sensitive.join(" ")}`,
+					blockingReason: `blocked ${sensitive.join(" ")}`,
+					forceCommand: `gjc notify stop ${sensitive.join(" ")}`,
+				},
+			}),
+		});
+		const healthReport = await operations.refreshHealth({ probe: false });
+		const recovered = await operations.recover();
+		const serialized = JSON.stringify({ healthReport, recovered });
+		for (const secret of sensitive) expect(serialized).not.toContain(secret);
+		expect(healthReport.daemon.ownerId).toContain("owner-");
+		expect(recovered.daemon.ownerId).toContain("owner-");
+		expect(recovered.daemon.detail).toContain("detail");
+		expect(recovered.daemon.forceCommand).toContain("gjc notify stop");
+	});
+
 	it("stops the Telegram supervisor before removing its configuration", async () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-settings-remove-"));
 		const currentSnapshot = snapshot();
