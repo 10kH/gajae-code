@@ -76,38 +76,50 @@ function getPrunedToolResultContent(message: ToolResultMessage): (TextContent | 
 }
 
 /**
- * Encode a stored summary before it is placed in the summary template.
+ * Neutralize control characters, bidirectional text markers, and tag-breaking sequences
+ * in a stored summary before placing it in the summary template.
+ *
+ * Strategy: Rather than using lossy HTML entity encoding that corrupts code (e.g., `<` → `&lt;`),
+ * we only escape sequences that could actually break the wrapper or template tags.
+ * Control/bidi characters are neutralized to prevent injection/confusion attacks.
+ *
  * `prompt.render` does not escape, and the summary can contain tool output,
- * repository text, or fetched pages. Newlines stay so the summary remains readable.
+ * repository text, or fetched pages. Newlines and tabs stay so the summary remains readable.
  */
 function escapeSummaryMarkup(value: string): string {
-	return value.replace(
-		/[&<>"\u0000-\u001f\u007f-\u009f\u061c\u200e-\u200f\u202a-\u202e\u2066-\u2069\ud800-\udfff]/g,
+	// First, neutralize control characters and bidirectional markers.
+	// These are replaced with a unicode escape to neutralize them without visual impact.
+	let result = value.replace(
+		/[\u0000-\u001f\u007f-\u009f\u061c\u200e-\u200f\u202a-\u202e\u2066-\u2069\ud800-\udfff]/g,
 		(char, offset) => {
 			const code = char.charCodeAt(0);
 			const next = value.charCodeAt(offset + 1);
 			const prev = value.charCodeAt(offset - 1);
+			// Preserve valid surrogate pairs
 			if (
 				(code >= 0xd800 && code <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) ||
 				(code >= 0xdc00 && code <= 0xdfff && prev >= 0xd800 && prev <= 0xdbff)
 			) {
 				return char;
 			}
+			// Preserve newlines and tabs for readability
 			if (char === "\n" || char === "\t") return char;
-			switch (char) {
-				case "&":
-					return "&amp;";
-				case "<":
-					return "&lt;";
-				case ">":
-					return "&gt;";
-				case '"':
-					return "&quot;";
-				default:
-					return `\\u${code.toString(16).padStart(4, "0")}`;
-			}
+			// Neutralize other control characters
+			return `\\u${code.toString(16).padStart(4, "0")}`;
 		},
 	);
+
+	// Now handle tag-breaking sequences with zero-width space insertion.
+	// This prevents closing/opening the wrapper tags without encoding legitimate code.
+	// We insert \u200b (zero-width space) after the opening < to break the tag syntax.
+	result = result
+		.replace(/<\/untrusted-content>/gi, "<\u200b/untrusted-content>")
+		.replace(/<\/untrusted-content[ \t\n\r\f]+>/gi, "<\u200b/untrusted-content>")
+		.replace(/<untrusted-content>/gi, "<\u200buntrusted-content>")
+		.replace(/<\/summary>/gi, "<\u200b/summary>")
+		.replace(/<summary>/gi, "<\u200bsummary>");
+
+	return result;
 }
 
 function renderFencedSummary(template: string, summary: string): string {
