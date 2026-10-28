@@ -327,7 +327,7 @@ describe("Kiro native reasoning", () => {
 		expect(assistantHistoryMsg?.assistantResponseMessage).toBeDefined();
 		expect(assistantHistoryMsg?.assistantResponseMessage?.content).toContain("result");
 		expect((assistantHistoryMsg?.assistantResponseMessage as any)?.reasoningContent?.signature).toBe(
-			"kiro:signature:sig1",
+			"sig1",
 		);
 	});
 

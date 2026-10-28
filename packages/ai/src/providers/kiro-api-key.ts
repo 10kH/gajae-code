@@ -914,8 +914,9 @@ function getNativeReasoningFieldType(
  * Returns undefined when reasoning is not applicable, so buildKiroThinkingPrefix fallback applies.
  * For models that support native reasoning, returns structured request fields instead.
  * - true: use model default effort
- * - false/'none': explicitly disable via effort: 'none'
+ * - false/'none': explicitly disable (GPT only; Claude uses default thinking)
  * - effort name: use that effort
+ * - undefined: no native fields, use prompt fallback
  */
 export function buildKiroAdditionalModelRequestFields(
 	model: Model<"kiro-codewhisperer-stream">,
@@ -927,19 +928,18 @@ export function buildKiroAdditionalModelRequestFields(
 	// Unknown model or model without native reasoning: use prompt fallback
 	if (!nativeFieldType) return undefined;
 
-	// No reasoning requested at all: let the caller fall back to prompt injection
-	if (reasoning === undefined) return undefined;
+	// Reasoning disabled or not requested: use prompt fallback (or default model behavior)
+	if (!reasoning || reasoning === "none") return undefined;
 
 	// Map reasoning parameter to effort: true -> undefined (uses model default),
-	// false/'none' -> 'none', string -> pass through or normalize
+	// string -> pass through or normalize
 	const mapEffort = (val: string | boolean): string | undefined => {
 		if (val === true) return undefined; // Use model default
-		if (val === false || val === "none") return "none";
 		if (val === "minimal") return "low"; // Normalize to Kiro effort names
 		return val as string;
 	};
 
-	const effort = mapEffort(reasoning);
+	const effort = mapEffort(reasoning as string | boolean);
 
 	if (nativeFieldType === "thinking_output_config") {
 		// Claude/Kimi: adaptive thinking with summarized display
@@ -948,12 +948,12 @@ export function buildKiroAdditionalModelRequestFields(
 				type: "adaptive",
 				display: "summarized",
 			},
-			...(effort && effort !== "none" ? { output_config: { effort } } : {}),
+			...(effort ? { output_config: { effort } } : {}),
 		};
 	}
 
 	if (nativeFieldType === "reasoning") {
-		// GPT: reasoning with effort. Must always send the field, even if effort is 'none'.
+		// GPT: reasoning with effort
 		return {
 			reasoning: {
 				...(effort ? { effort } : {}),
