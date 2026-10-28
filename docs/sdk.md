@@ -1295,7 +1295,8 @@ inside managed storage is still refused (`gjc_tmux_managed_storage_unsafe` or
 `GJC_COORDINATOR_SESSION_STATE_FILE` is used verbatim, never rewritten, because
 a `..` after a symlink resolves elsewhere than its lexical form. A supervised
 root launch refuses a pin whose directory is not an absolute path free of `..`
-(`gjc_tmux_state_file_pin_unsafe`) before it prepares any lifecycle storage,
+and of edge whitespace (`gjc_tmux_state_file_pin_unsafe`) before it creates any
+lifecycle storage, coordinator bootstrap directory or tmux session,
 since its supervisor would refuse that directory. A Broker-redacted launch publishes an opaque binding that carries
 neither the launch command nor a command digest; an ordinary launch publishes a
 recoverable binding with its exact command and digest. The CLI validates its
