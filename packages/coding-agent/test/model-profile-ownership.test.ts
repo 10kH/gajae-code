@@ -293,6 +293,99 @@ describe("model-profile ownership contract", () => {
 		}
 	});
 
+	it("preserves a profile claimed by a synchronous settings write during deletion", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-ownership-delete-race-");
+		const modelsDir = path.join(tempDir.path(), "models");
+		const modelsPath = path.join(modelsDir, "models.yml");
+		const configPath = path.join(tempDir.path(), "config.yml");
+		const profile: ModelProfileConfig = {
+			display_name: "First",
+			required_providers: ["my-oai"],
+			model_mapping: { default: "my-oai/gpt-custom" },
+		};
+		let settings: Settings | undefined;
+		let authStorage: AuthStorage | undefined;
+		let registry: ModelRegistry | undefined;
+		let deletion: Promise<ModelProfileConfig> | undefined;
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		try {
+			settings = await Settings.loadForScope({ cwd: tempDir.path(), agentDir: tempDir.path() });
+			authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+			registry = new ModelRegistry(authStorage, modelsPath, settings, {
+				automaticRefresh: false,
+				agentDir: tempDir.path(),
+			});
+			await registry.saveCustomModelProfile("first", profile);
+			expect(registry.getModelProfile("first")?.displayName).toBe("First");
+			expect(readDurableModelProfileOwnership(settings)).toEqual({ schemaVersion: 1, version: 0, marker: inherit });
+			const originalConfig = await Bun.file(modelsPath).text();
+			const realpath = fs.realpath;
+			let paused = false;
+			const realpathSpy = vi.spyOn(fs, "realpath").mockImplementation((async (target, options) => {
+				if (!paused && typeof target === "string" && target === modelsDir) {
+					paused = true;
+					entered.resolve();
+					await release.promise;
+				}
+				const encoding = typeof options === "string" ? options : options?.encoding;
+				return encoding === "buffer" ? realpath(target, { encoding: "buffer" }) : realpath(target, { encoding });
+			}) as typeof fs.realpath);
+			try {
+				deletion = registry.deleteCustomModelProfile("first");
+				await Promise.race([
+					entered.promise,
+					deletion.then(() => {
+						throw new Error("Deletion completed without reaching the models write pause");
+					}),
+				]);
+				expect(await Bun.file(modelsPath).text()).toBe(originalConfig);
+				settings.set("modelProfile.default", "first");
+				release.resolve();
+				const outcome = await deletion.then(
+					value => ({ status: "fulfilled" as const, value }),
+					error => ({ status: "rejected" as const, error }),
+				);
+				await settings.flushOrThrow();
+
+				const models = Bun.YAML.parse(await Bun.file(modelsPath).text()) as {
+					profiles?: Record<string, ModelProfileConfig>;
+				};
+				const config = Bun.YAML.parse(await Bun.file(configPath).text()) as {
+					modelProfile?: { default?: string; ownership?: unknown };
+				};
+				expect(config.modelProfile?.default).toBe("first");
+				expect(readDurableModelProfileOwnership(settings)).toEqual({
+					schemaVersion: 1,
+					version: 0,
+					marker: { kind: "profile", profile: "first" },
+				});
+				expect(readDurableModelProfileOwnershipFromRaw(config)).toEqual(readDurableModelProfileOwnership(settings));
+				// A successful owner write must never be left pointing at a deleted profile.
+				expect(models.profiles?.first).toEqual(profile);
+				expect(registry.getModelProfile("first")?.displayName).toBe("First");
+				if (outcome.status === "rejected") {
+					expect(outcome.error).toMatchObject({ code: "model_profile_replacement_required" });
+				}
+			} finally {
+				release.resolve();
+				await deletion?.catch(() => undefined);
+				realpathSpy.mockRestore();
+			}
+		} finally {
+			try {
+				await registry?.dispose();
+			} finally {
+				authStorage?.close();
+				try {
+					await settings?.close();
+				} finally {
+					tempDir.removeSync();
+				}
+			}
+		}
+	});
+
 	it("persists ownership markers through transcript reopen", async () => {
 		const tempDir = TempDir.createSync("@gjc-profile-ownership-transcript-");
 		let manager: SessionManager | undefined;
