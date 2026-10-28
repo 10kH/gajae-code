@@ -1,6 +1,5 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
 import { VERSION } from "@gajae-code/utils/dirs";
@@ -567,14 +566,9 @@ function stageCoordinatorSidecarBootstrap(
 	const key = signingEnv[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
 	const keyId = signingEnv[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV];
 	if (!key || !keyId) return undefined;
-	let bootstrapDir = stateDir;
-	try {
-		fs.mkdirSync(bootstrapDir, { recursive: true, mode: 0o700 });
-	} catch {
-		bootstrapDir = path.join(os.tmpdir(), "gjc-coordinator-bootstrap");
-		fs.mkdirSync(bootstrapDir, { recursive: true, mode: 0o700 });
-	}
-	return { path: path.join(bootstrapDir, `.coordinator-sidecar-${crypto.randomUUID()}.key`), keyId };
+	// Only a unique placeholder: writeCoordinatorSidecarBootstrapFile replaces it with a
+	// loopback endpoint before launch, so staging creates nothing on disk.
+	return { path: path.join(stateDir, `.coordinator-sidecar-${crypto.randomUUID()}.key`), keyId };
 }
 
 /**

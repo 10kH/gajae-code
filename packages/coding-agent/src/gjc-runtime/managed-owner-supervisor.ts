@@ -45,9 +45,17 @@ function requiredEnvironment(name: string): string {
 	return value;
 }
 
-/** Whether the supervisor accepts a lifecycle state directory: absolute, without NUL, and without a `..` component. */
+/**
+ * Whether the supervisor accepts a lifecycle state directory exactly as given: absolute,
+ * unchanged by the trimming its environment read applies, without NUL, and without a `..` component.
+ */
 export function managedOwnerStateDirAccepted(stateDir: string): boolean {
-	return path.isAbsolute(stateDir) && !stateDir.includes("\0") && !stateDir.split(path.sep).includes("..");
+	return (
+		path.isAbsolute(stateDir) &&
+		stateDir.trim() === stateDir &&
+		!stateDir.includes("\0") &&
+		!stateDir.split(path.sep).includes("..")
+	);
 }
 
 function lifecycleRoot(): {
