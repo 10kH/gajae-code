@@ -102,4 +102,18 @@ describe.skipIf(process.platform === "win32" || !PYTHON)("lspmux status probe ch
 		expect(result.env.BASH_ENV).toBe("operator-bash");
 		expect(result.env.KEEP_FROM_SHELL).toBe("operator-export");
 	});
+
+	it("drops a shell hook value that repeats the project dotenv declaration", async () => {
+		const result = await probe({
+			BASH_ENV: "project-bash-hook",
+			LD_PRELOAD: "project-ld-preload",
+			NODE_OPTIONS: "--require project-node-hook",
+		});
+		expect(result.available).toBe(true);
+		expect(result.running).toBe(true);
+		expect(result.env.BASH_ENV ?? null).toBeNull();
+		expect(result.env.LD_PRELOAD ?? null).toBeNull();
+		expect(result.env.NODE_OPTIONS ?? null).toBeNull();
+		expect(result.env.KEEP_FROM_SHELL).toBe("operator-export");
+	});
 });
