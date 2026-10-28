@@ -364,6 +364,7 @@ describe("model-profile ownership contract", () => {
 				// A successful owner write must never be left pointing at a deleted profile.
 				expect(models.profiles?.first).toEqual(profile);
 				expect(registry.getModelProfile("first")?.displayName).toBe("First");
+				expect(outcome.status).toBe("rejected");
 				if (outcome.status === "rejected") {
 					expect(outcome.error).toMatchObject({ code: "model_profile_replacement_required" });
 				}

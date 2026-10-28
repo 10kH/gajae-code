@@ -499,6 +499,35 @@ describe("exact-config MCP session controls", () => {
 		}
 	});
 
+	test("same-path reload retires authority when the loaded header identity changes", async () => {
+		const { session, sessionManager, root } = await exactSessionFixture(undefined, true);
+		const originalId = sessionManager.getSessionId();
+		const originalFile = sessionManager.getSessionFile();
+		if (!originalFile) throw new Error("Expected persisted predecessor");
+		const target = SessionManager.create(root, root);
+		await target.ensureOnDisk();
+		const targetFile = target.getSessionFile();
+		if (!targetFile) throw new Error("Expected persisted successor");
+		const targetId = target.getSessionId();
+		expect(targetId).not.toBe(originalId);
+		const setSessionFile = sessionManager.setSessionFile.bind(sessionManager);
+		vi.spyOn(sessionManager, "setSessionFile").mockImplementation(async (...args) => {
+			await Bun.write(originalFile, Bun.file(targetFile));
+			await setSessionFile(...args);
+		});
+		try {
+			expect(await session.switchSession(originalFile)).toBe(true);
+			expect(sessionManager.getSessionFile()).toBe(originalFile);
+			expect(sessionManager.getSessionId()).toBe(targetId);
+			expect(getExactMcpControls(session)).toBeUndefined();
+			await expect(session.getExactMcpStatusSnapshot()).resolves.toBeUndefined();
+			await expect(session.controlExactMcpServer("suspend", "exact")).resolves.toBeUndefined();
+		} finally {
+			await session.dispose();
+			await target.close();
+		}
+	});
+
 	test("failed retirement never resurrects an externally revoked predecessor grant", async () => {
 		const { session, sessionManager, manager } = await exactSessionFixture();
 		const originalId = sessionManager.getSessionId();
