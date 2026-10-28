@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
@@ -12,10 +13,12 @@ import { sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/sessio
 import {
 	captureOwnerGenerationBaselineSync,
 	lifecyclePaths,
+	publishOwnerGenerationSync,
 	readSecureOwnerJson,
+	replaceOwnerGeneration,
 	replaceOwnerGenerationSync,
-	resolveManagedOwnerPredecessorSync,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
+import { observeProcessIncarnation } from "../../src/sdk/broker/process-incarnation";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const admissionModule = path.join(
@@ -602,12 +605,10 @@ describe.skipIf(process.platform === "win32")("managed owner admission", () => {
 			replaceOwnerGenerationSync(stateDir, "session-2681", "generation-2681", { state: "absent" });
 			const baselineA = captureOwnerGenerationBaselineSync(stateDir, "session-2681");
 			// Launch B finds no binding of A under the publication lock and replaces A.
-			let predecessorChecked = false;
-			replaceOwnerGenerationSync(stateDir, "session-2681", "generation-relaunch", baselineA, () => {
-				predecessorChecked = true;
-				expect(resolveManagedOwnerPredecessorSync(stateDir, "session-2681", baselineA)).toBeUndefined();
+			replaceOwnerGenerationSync(stateDir, "session-2681", "generation-relaunch", baselineA);
+			expect(captureOwnerGenerationBaselineSync(stateDir, "session-2681")).toMatchObject({
+				generation: "generation-relaunch",
 			});
-			expect(predecessorChecked).toBe(true);
 			// A resumes: its supervisor writes the binding and starts the child.
 			await writeBinding(root, "late-token");
 			const late = await admit(stateDir, "late-token");
@@ -621,28 +622,56 @@ describe.skipIf(process.platform === "win32")("managed owner admission", () => {
 		}
 	});
 
-	it("admits the current published generation, and a relaunch then sees its binding and refuses", async () => {
+	it("admits the current published generation, and every publisher then sees its binding and refuses", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-admission-current-"));
 		try {
 			const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
 			replaceOwnerGenerationSync(stateDir, "session-2681", "generation-2681", { state: "absent" });
 			const baselineA = captureOwnerGenerationBaselineSync(stateDir, "session-2681");
-			await writeBinding(root, "current-token");
+			// The admitted child's supervisor is this live test process, so every publisher's
+			// default observer sees it. Off Linux the observation runs while the publication
+			// still holds its write transaction; Linux refuses a receipt-less binding before
+			// any observation.
+			const self = observeProcessIncarnation(process.pid);
+			if (self.status !== "present") throw new Error("test process incarnation unavailable");
+			await writeBinding(root, "current-token", {
+				supervisor_pid: process.pid,
+				supervisor_start_time: self.incarnation,
+			});
 			expect(await admit(stateDir, "current-token")).toMatchObject({ admitted: true, exitCode: 0 });
-			// The admitted child's supervisor (pid 1 in the fixture) is observed live, so the
-			// relaunch must refuse inside the lock and leave generation A current.
-			expect(() =>
-				replaceOwnerGenerationSync(stateDir, "session-2681", "generation-relaunch", baselineA, () =>
-					resolveManagedOwnerPredecessorSync(stateDir, "session-2681", baselineA, () => ({
-						status: "present",
-						incarnation: "1",
-					})),
-				),
-			).toThrow(
+			let observedUnderLock = false;
+			const live = (pid: number) => {
+				const probe = new Database(path.join(root, "owner-locks.sqlite"));
+				try {
+					probe.exec("PRAGMA busy_timeout = 0");
+					expect(() => probe.exec("BEGIN IMMEDIATE")).toThrow();
+					observedUnderLock = true;
+				} finally {
+					probe.close();
+				}
+				return observeProcessIncarnation(pid);
+			};
+			const refusal =
 				process.platform === "linux"
 					? "managed_owner_replacement_evidence_ambiguous"
-					: "managed_owner_predecessor_live",
+					: "managed_owner_predecessor_live";
+			expect(() =>
+				replaceOwnerGenerationSync(stateDir, "session-2681", "generation-relaunch", baselineA, live),
+			).toThrow(refusal);
+			expect(() =>
+				publishOwnerGenerationSync({
+					schema_version: 1,
+					op: "publish_generation",
+					session_id: "session-2681",
+					owner_generation: "generation-raw",
+					state_dir: stateDir,
+					baseline: baselineA,
+				}),
+			).toThrow(refusal);
+			await expect(replaceOwnerGeneration(stateDir, "session-2681", "generation-async", baselineA)).rejects.toThrow(
+				refusal,
 			);
+			expect(observedUnderLock).toBe(process.platform !== "linux");
 			expect(captureOwnerGenerationBaselineSync(stateDir, "session-2681")).toEqual(baselineA);
 			expect(await admit(stateDir, "current-token")).toMatchObject({ admitted: true, exitCode: 0 });
 		} finally {

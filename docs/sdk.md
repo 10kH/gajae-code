@@ -1334,8 +1334,10 @@ Off Linux, a prior generation's child binding without any receipt is ordinary
 history, so relaunching the same pinned session starts fresh; any receipt there
 still fails closed as unavailable recovery evidence.
 
-A relaunch of a pinned session checks its predecessor inside the same
-generation lock that publishes the replacement. A supervised child whose
+Every owner generation publication (a pinned relaunch, `gjc session create`
+from a pinned shell, a harness launch, or a raw `publish_generation` request)
+checks its predecessor inside the same generation lock that publishes the
+replacement; callers cannot publish around the check. A supervised child whose
 generation is already published is admitted only while that generation is
 still current, read under that lock; a child whose generation a relaunch
 replaced first (for example because its supervisor had not yet published the

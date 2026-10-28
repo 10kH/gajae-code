@@ -2040,11 +2040,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	}
 	try {
 		const stateDir = path.dirname(plan.sessionStateFile!);
-		// The predecessor check runs under the publication lock, so it cannot interleave
-		// with the admission fence of the generation it replaces.
-		replaceOwnerGenerationSync(stateDir, plan.sessionId!, plan.ownerGeneration!, plan.ownerGenerationBaseline!, () =>
-			resolveManagedOwnerPredecessorSync(stateDir, plan.sessionId!, plan.ownerGenerationBaseline!),
-		);
+		replaceOwnerGenerationSync(stateDir, plan.sessionId!, plan.ownerGeneration!, plan.ownerGenerationBaseline!);
 		providerAuthorityPublished = true;
 	} catch (error) {
 		cleanupCreatedTmuxSessionBeforePublicationFailure(plan, spawnSync, controlOptions, ownerIsolationProbe);

@@ -3998,7 +3998,7 @@ describe("tmux owner isolation launch gate", () => {
 	);
 
 	it.skipIf(process.platform === "win32")(
-		"checks the predecessor of a pinned root relaunch inside the generation publication lock",
+		"refuses a pinned root relaunch over a live bound predecessor and keeps its generation",
 		() => {
 			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-relaunch-locked-check-"));
 			try {
@@ -4048,26 +4048,22 @@ describe("tmux owner isolation launch gate", () => {
 					return diagnostics;
 				};
 				expect(launch()).toEqual([]);
-				// A binding published between an unlocked check and the publication lock would
-				// be missed; the publication-time check must run inside replaceOwnerGenerationSync.
-				const replace = ownerIsolation.replaceOwnerGenerationSync;
-				const resolve = ownerIsolation.resolveManagedOwnerPredecessorSync;
-				let insidePublication = false;
-				const checks: boolean[] = [];
-				spyOn(ownerIsolation, "replaceOwnerGenerationSync").mockImplementation((...replaceArgs) => {
-					insidePublication = true;
-					try {
-						return replace(...replaceArgs);
-					} finally {
-						insidePublication = false;
-					}
-				});
-				spyOn(ownerIsolation, "resolveManagedOwnerPredecessorSync").mockImplementation((...resolveArgs) => {
-					checks.push(insidePublication);
-					return resolve(...resolveArgs);
-				});
-				expect(launch()).toEqual([]);
-				expect(checks.at(-1)).toBe(true);
+				const baseline = ownerIsolation.captureOwnerGenerationBaselineSync(root, "locked-check-session");
+				if (baseline.state !== "current") throw new Error("first launch did not publish a generation");
+				// The first launch's supervisor binds its child; the supervisor is this live process.
+				const self = observeProcessIncarnation(process.pid);
+				if (self.status !== "present") throw new Error("test process incarnation unavailable");
+				const bindingRoot = ownerIsolation.lifecyclePaths(root, "locked-check-session", baseline.generation).root;
+				fs.mkdirSync(bindingRoot, { recursive: true, mode: 0o700 });
+				const command = ["gjc", "--resume"];
+				fs.writeFileSync(
+					path.join(bindingRoot, "child-live.binding.json"),
+					`${JSON.stringify({ schema_version: 3, binding_kind: "recoverable", generation: baseline.generation, session_id: "locked-check-session", run_id: "run-live", endpoint_incarnation: "incarnation-live", child_token: "live", command, command_sha256: createHash("sha256").update(JSON.stringify(command)).digest("hex"), supervisor_pid: process.pid, supervisor_start_time: self.incarnation, created_at: new Date().toISOString() })}\n`,
+					{ mode: 0o600 },
+				);
+				const diagnostics = launch();
+				expect(diagnostics.join("")).toContain("managed_owner_");
+				expect(ownerIsolation.captureOwnerGenerationBaselineSync(root, "locked-check-session")).toEqual(baseline);
 			} finally {
 				fs.rmSync(root, { recursive: true, force: true });
 			}

@@ -1067,11 +1067,30 @@ function monotonicGenerationPublishedAt(paths: LifecyclePaths, previous: OwnerGe
 	return new Date(Number.isNaN(floor) || now > floor ? now : floor + 1).toISOString();
 }
 
+/**
+ * Every publication replaces the current generation only after its predecessor
+ * check, inside the publication's own generation lock. The child admission fence
+ * reads the current generation under that same lock, so a predecessor child is
+ * either already bound (and refused here while its supervisor lives) or refused at
+ * admission once replaced. No caller can publish around the check.
+ */
+function assertOwnerGenerationReplaceable(
+	stateDir: string,
+	sessionId: string,
+	generation: string,
+	previous: OwnerGenerationBaseline,
+	observe: (pid: number) => ProcessIncarnationObservation,
+): void {
+	if (previous.state === "current" && previous.generation === generation) return;
+	resolveManagedOwnerPredecessorSync(stateDir, sessionId, previous, observe);
+}
+
 export async function replaceOwnerGeneration(
 	stateDir: string,
 	sessionId: string,
 	generation: string = crypto.randomUUID(),
 	expectedBaseline?: OwnerGenerationBaseline,
+	observe: (pid: number) => ProcessIncarnationObservation = observeProcessIncarnation,
 ): Promise<string> {
 	const paths = lifecyclePaths(stateDir, sessionId, generation);
 	const token = await acquireOwnerGenerationLock(paths, sessionId);
@@ -1080,6 +1099,7 @@ export async function replaceOwnerGeneration(
 		const previous = await captureOwnerGenerationBaseline(stateDir, sessionId);
 		if (expectedBaseline && !sameOwnerGenerationBaseline(previous, expectedBaseline))
 			throw new Error("generation_baseline_changed");
+		assertOwnerGenerationReplaceable(stateDir, sessionId, generation, previous, observe);
 		const published = {
 			schema_version: 1 as const,
 			generation,
@@ -1346,17 +1366,13 @@ export function isOwnerGenerationBaselineCurrentSync(
 	}
 }
 
-/**
- * Synchronous publication for managed launch paths, serialized by a SQLite write transaction.
- * `assertReplaceable` runs inside that transaction after the baseline check, so a
- * predecessor check cannot interleave with a child admission of the generation it replaces.
- */
+/** Synchronous publication for managed launch paths, serialized by a SQLite write transaction. */
 export function replaceOwnerGenerationSync(
 	stateDir: string,
 	sessionId: string,
 	generation: string,
 	expectedBaseline: OwnerGenerationBaseline,
-	assertReplaceable?: () => void,
+	observe: (pid: number) => ProcessIncarnationObservation = observeProcessIncarnation,
 ): string {
 	const paths = lifecyclePaths(stateDir, sessionId, generation);
 	const db = acquireSqliteLockSync(paths, 7_000);
@@ -1365,8 +1381,8 @@ export function replaceOwnerGenerationSync(
 	try {
 		if (!isOwnerGenerationBaselineCurrentSync(stateDir, sessionId, expectedBaseline))
 			throw new Error("baseline_generation_changed");
-		assertReplaceable?.();
 		const previous = captureOwnerGenerationBaselineSync(stateDir, sessionId);
+		assertOwnerGenerationReplaceable(stateDir, sessionId, generation, previous, observe);
 		const published = {
 			schema_version: 1 as const,
 			generation,
