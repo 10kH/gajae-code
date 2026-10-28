@@ -938,6 +938,115 @@ describe("GJC tmux session management", () => {
 		expect(innerCommand).toContain("GJC_MANAGED_OWNER_REDACT_COMMAND='1'");
 	});
 
+	// A Linux service cgroup plans a scoped bootstrap that carries the tmux argv
+	// in its stdin request; a safe cgroup (and macOS) executes the tmux argv directly.
+	it.skipIf(process.platform === "win32").each([
+		{ platform: "darwin" as const, cgroup: null },
+		{ platform: "linux" as const, cgroup: "0::/user.slice/user-1000.slice/session-1.scope\n" },
+		{ platform: "linux" as const, cgroup: "0::/system.slice/gjc-ci.service\n" },
+	])(
+		"verifies a Broker launch from a symlinked workspace through its canonical lifecycle root ($platform $cgroup)",
+		async ({ platform, cgroup }) => {
+			const root = fsSync.realpathSync(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-symlinked-")));
+			fixtureDirectories.push(root);
+			const real = path.join(root, "real");
+			const cwd = path.join(root, "link");
+			await fs.mkdir(real);
+			await fs.symlink(real, cwd);
+			let plannedArgv: string[] | undefined;
+			let plannedMode: string | undefined;
+			__setCreateOwnerIsolationForTests({
+				probe: {
+					readCallerCgroup: () => cgroup,
+					probeServer: () => ({ state: "absent" }),
+				},
+				execute: plan => {
+					if (!plan.ok) throw new Error("expected owner-isolation plan");
+					plannedMode = plan.execution.mode;
+					plannedArgv =
+						plan.execution.mode === "scoped"
+							? (JSON.parse(plan.execution.stdin_line) as { tmux_argv: string[] }).tmux_argv
+							: plan.execution.argv;
+					return { ok: false, code: "scope_bootstrap_failed", diagnostic: "test-stop" };
+				},
+			});
+			// Lifecycle verification passes, so the launch reaches owner isolation.
+			expect(() =>
+				createGjcTmuxSession(
+					{ GJC_TMUX_COMMAND: "tmux" },
+					{ platform, launch: { childSessionId: "broker-child", cwd, argv: ["child-command"] } },
+				),
+			).toThrow("gjc_tmux_owner_isolation_scope_bootstrap_failed:test-stop");
+			expect(plannedMode).toBe(cgroup?.includes(".service") ? "scoped" : "direct");
+			expect(plannedArgv?.[0]).toBe("tmux");
+			// The child still runs in the workspace spelling the Broker authorized.
+			expect(plannedArgv?.[plannedArgv.indexOf("-c") + 1]).toBe(cwd);
+			const innerCommand = plannedArgv?.at(-1) ?? "";
+			const stateDir = /GJC_TMUX_OWNER_STATE_DIR='([^']+)'/.exec(innerCommand)?.[1];
+			expect(stateDir, innerCommand).toStartWith(`${real}${path.sep}`);
+			expect(/GJC_COORDINATOR_SESSION_STATE_FILE='([^']+)'/.exec(innerCommand)?.[1]).toStartWith(
+				`${real}${path.sep}`,
+			);
+			// Only a scoped bootstrap records its attempt capability before execution.
+			expect(fsSync.readdirSync(path.join(stateDir!, "broker-child", "owner-lifecycle"))).toEqual(
+				plannedMode === "scoped" ? [expect.stringMatching(/^attempt-[0-9a-f-]{36}\.json$/)] : [],
+			);
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"refuses a Broker launch whose private state tail is a symlink",
+		async () => {
+			const root = fsSync.realpathSync(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-tail-link-")));
+			fixtureDirectories.push(root);
+			const cwd = path.join(root, "workspace");
+			const outside = path.join(root, "outside");
+			await fs.mkdir(outside, { mode: 0o700 });
+			const stateFile = tmuxRuntimeSessionPath(cwd, "broker-child", buildGjcTmuxSessionSlug("broker-child"));
+			await fs.mkdir(path.dirname(path.dirname(stateFile)), { recursive: true, mode: 0o700 });
+			// Link the private tail itself to a separate owner-only directory.
+			await fs.symlink(outside, path.dirname(stateFile));
+			let reachedIsolation = false;
+			__setCreateOwnerIsolationForTests({
+				execute: () => {
+					reachedIsolation = true;
+					return { ok: false, code: "scope_bootstrap_failed", diagnostic: "test-stop" };
+				},
+			});
+			expect(() =>
+				createGjcTmuxSession(
+					{ GJC_TMUX_COMMAND: "tmux" },
+					{
+						platform: process.platform === "linux" ? "linux" : "darwin",
+						launch: { childSessionId: "broker-child", cwd, argv: ["child-command"] },
+					},
+				),
+			).toThrow("gjc_tmux_managed_storage_unsafe");
+			expect(reachedIsolation).toBe(false);
+			expect(fsSync.readdirSync(outside)).toEqual([]);
+		},
+	);
+
+	it("rejects a managed launch on Windows before any lifecycle storage or owner isolation", () => {
+		const root = fsSync.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-win32-"));
+		fixtureDirectories.push(root);
+		let reachedIsolation = false;
+		__setCreateOwnerIsolationForTests({
+			execute: () => {
+				reachedIsolation = true;
+				return { ok: false, code: "scope_bootstrap_failed", diagnostic: "test-stop" };
+			},
+		});
+		expect(() =>
+			createGjcTmuxSession(
+				{ GJC_TMUX_COMMAND: "psmux" },
+				{ platform: "win32", launch: { childSessionId: "broker-child", cwd: root, argv: ["child-command"] } },
+			),
+		).toThrow("gjc_tmux_managed_launch_platform_unsupported:win32");
+		expect(reachedIsolation).toBe(false);
+		expect(fsSync.readdirSync(root)).toEqual([]);
+	});
+
 	it("cleans the exact created session when managed proof rejects multiple pane PIDs", () => {
 		const cwd = path.join(os.tmpdir(), `gjc-managed-proof-cleanup-${crypto.randomUUID()}`);
 		const sessionName = "broker-child";

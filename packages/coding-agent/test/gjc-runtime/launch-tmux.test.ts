@@ -21,13 +21,14 @@ import {
 	__setBinaryResolverForTests,
 	__setExecutableIdentityResolverForTests,
 } from "@gajae-code/coding-agent/gjc-runtime/psmux-detect";
-import { sessionRuntimeDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { sessionRuntimeDir, tmuxRuntimeSessionPath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
 	GJC_COORDINATOR_SIDECAR_KEY_ID_ENV,
 	GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV,
 	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
 	persistCoordinatorRuntimeStateFromPostmortem,
 } from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
+import { buildGjcTmuxSessionSlug } from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
 import {
 	captureOwnerGenerationBaselineSync,
 	isExactScopedBootstrapSuccessReceipt,
@@ -3760,7 +3761,15 @@ describe("tmux owner isolation launch gate", () => {
 		}
 	});
 
-	it("propagates only an exact durable SIGABRT predecessor token into a replacement launch", () => {
+	it.each([
+		"valid",
+		"stale",
+		"opaque",
+		"mixed",
+		"mismatch",
+		"ambiguous",
+		"changed-before-publication",
+	])("validates exact predecessor evidence at both launch checkpoints: %s", scenario => {
 		if (process.platform !== "linux") return;
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-replacement-"));
 		try {
@@ -3776,7 +3785,7 @@ describe("tmux owner isolation launch gate", () => {
 			const incarnation = "replacement-incarnation";
 			const predecessorToken = "exact-predecessor";
 			const ownerRoot = lifecyclePaths(root, sessionId, generation).root;
-			fs.mkdirSync(ownerRoot, { recursive: true });
+			fs.mkdirSync(ownerRoot, { recursive: true, mode: 0o700 });
 			fs.writeFileSync(
 				lifecyclePaths(root, sessionId, generation).generationFile,
 				`${JSON.stringify({ schema_version: 1, generation, session_id: sessionId, published_at: "2026-07-19T00:00:00.000Z" })}\n`,
@@ -3785,13 +3794,33 @@ describe("tmux owner isolation launch gate", () => {
 			const commandSha256 = createHash("sha256").update(JSON.stringify(command)).digest("hex");
 			fs.writeFileSync(
 				path.join(ownerRoot, `child-${predecessorToken}.binding.json`),
-				`${JSON.stringify({ schema_version: 2, generation, session_id: sessionId, run_id: runId, endpoint_incarnation: incarnation, child_token: predecessorToken, command, command_sha256: commandSha256, supervisor_pid: supervisorPid, supervisor_start_time: supervisorStartTime, created_at: "2026-07-19T00:00:00.000Z" })}\n`,
+				`${JSON.stringify({ schema_version: 3, binding_kind: "recoverable", generation, session_id: sessionId, run_id: runId, endpoint_incarnation: incarnation, child_token: predecessorToken, command, command_sha256: commandSha256, supervisor_pid: supervisorPid, supervisor_start_time: supervisorStartTime, created_at: "2026-07-19T00:00:00.000Z" })}\n`,
+				{ mode: 0o600 },
 			);
 			fs.writeFileSync(
 				path.join(ownerRoot, `sigabrt-${predecessorToken}.receipt.json`),
 				`${JSON.stringify({ schema_version: 2, generation, session_id: sessionId, run_id: runId, endpoint_incarnation: incarnation, child_token: predecessorToken, command_sha256: commandSha256, supervisor_pid: supervisorPid, supervisor_start_time: supervisorStartTime, child_pid: 2, child_start_time: "2", signal: "SIGABRT", signal_number: 6, exit_code: null, received_at: "2026-07-19T00:00:00.000Z" })}\n`,
+				{ mode: 0o600 },
 			);
+			const bindingPath = path.join(ownerRoot, `child-${predecessorToken}.binding.json`);
+			const changeBinding = (patch: Record<string, unknown>) => {
+				const binding = JSON.parse(fs.readFileSync(bindingPath, "utf8"));
+				fs.writeFileSync(bindingPath, `${JSON.stringify({ ...binding, ...patch })}\n`);
+			};
+			if (scenario === "stale") changeBinding({ schema_version: 2 });
+			if (scenario === "opaque")
+				changeBinding({ binding_kind: "opaque", command: undefined, command_sha256: undefined });
+			if (scenario === "mixed") changeBinding({ binding_kind: "opaque" });
+			if (scenario === "mismatch") changeBinding({ run_id: "mismatched-run" });
+			if (scenario === "ambiguous") {
+				fs.copyFileSync(bindingPath, path.join(ownerRoot, "child-second.binding.json"));
+				fs.copyFileSync(
+					path.join(ownerRoot, `sigabrt-${predecessorToken}.receipt.json`),
+					path.join(ownerRoot, "sigabrt-second.receipt.json"),
+				);
+			}
 			const calls: string[][] = [];
+			const diagnostics: string[] = [];
 			const handled = launchDefaultTmuxIfNeeded({
 				parsed: args({ messages: ["hello"], tmux: true }),
 				rawArgs: ["--tmux", "hello"],
@@ -3811,17 +3840,180 @@ describe("tmux owner isolation launch gate", () => {
 				tty: interactiveTty,
 				tmuxAvailable: true,
 				existingBranchSessionName: null,
+				diagnosticWriter: message => diagnostics.push(message),
+				spawnSync: (_command, spawnArgs) => {
+					calls.push(spawnArgs);
+					if (scenario === "changed-before-publication" && spawnArgs[0] === "new-session")
+						changeBinding({ run_id: "changed-after-prepare" });
+					return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+				},
+			});
+			expect(handled).toBe(true);
+			if (scenario !== "valid") {
+				expect(calls.some(call => call[0] === "attach-session")).toBe(false);
+				expect(captureOwnerGenerationBaselineSync(root, sessionId)).toMatchObject({ state: "current", generation });
+				if (scenario === "changed-before-publication") {
+					expect(calls.some(call => call[0] === "new-session")).toBe(true);
+					expect(diagnostics.join("\n")).toContain("tmux owner lifecycle publication failed");
+				} else expect(calls.some(call => call[0] === "new-session")).toBe(false);
+				return;
+			}
+			const innerCommand = calls.find(call => call[0] === "new-session")?.at(-1);
+			expect(innerCommand).toContain(`GJC_MANAGED_OWNER_PREDECESSOR_TOKEN='${predecessorToken}'`);
+			expect(innerCommand).toContain(`GJC_MANAGED_OWNER_PREDECESSOR_GENERATION='${generation}'`);
+			expect(innerCommand).toContain(`GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID='${runId}'`);
+			expect(innerCommand).toContain(`GJC_MANAGED_OWNER_PREDECESSOR_INCARNATION='${incarnation}'`);
+			expect(innerCommand).toMatch(/GJC_TMUX_OWNER_GENERATION='[0-9a-f-]{36}'/i);
+			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_RUN_ID='[0-9a-f-]{36}'/i);
+			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_INCARNATION='[0-9a-f-]{36}'/i);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		"missing",
+		"public",
+		"symlink",
+	])("prepares only a trusted private lifecycle root before launching: %s", scenario => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-root-preparation-"));
+		const outside = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-root-outside-"));
+		try {
+			const sessionId = "prelaunch-root";
+			const ownerRoot = lifecyclePaths(root, sessionId, "generation").root;
+			if (scenario !== "missing") fs.mkdirSync(path.dirname(ownerRoot), { mode: 0o700 });
+			if (scenario === "public") {
+				fs.mkdirSync(ownerRoot, { mode: 0o755 });
+				// mkdir modes are masked by umask; the public fixture must not depend on it.
+				fs.chmodSync(ownerRoot, 0o755);
+			}
+			if (scenario === "symlink") fs.symlinkSync(outside, ownerRoot);
+			const calls: string[][] = [];
+			launchDefaultTmuxIfNeeded({
+				parsed: args({ messages: ["hello"], tmux: true }),
+				rawArgs: ["--tmux", "hello"],
+				cwd: root,
+				env: {
+					GJC_COORDINATOR_SESSION_ID: sessionId,
+					GJC_COORDINATOR_SESSION_STATE_FILE: path.join(root, "runtime-state.json"),
+				},
+				argv: ["bun", "cli.ts"],
+				execPath: "/bin/bun",
+				platform: "linux",
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				existingBranchSessionName: null,
+				diagnosticWriter: () => {},
+				spawnSync: (_command, spawnArgs) => {
+					calls.push(spawnArgs);
+					if (spawnArgs[0] === "new-session") {
+						expect(fs.lstatSync(ownerRoot).isDirectory()).toBe(true);
+						expect(fs.lstatSync(ownerRoot).mode & 0o777).toBe(0o700);
+					}
+					return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+				},
+			});
+			expect(calls.some(call => call[0] === "new-session")).toBe(scenario === "missing");
+			expect(fs.readdirSync(outside)).toEqual([]);
+			if (scenario === "public") expect(fs.statSync(ownerRoot).mode & 0o777).toBe(0o755);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+			fs.rmSync(outside, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.platform === "win32").each(["workspace", ".gjc"] as const)(
+		"derives a supervised lifecycle root canonically through a symlinked %s",
+		link => {
+			const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-symlinked-anchor-")));
+			try {
+				const real = path.join(root, "real");
+				fs.mkdirSync(real);
+				let cwd = real;
+				if (link === "workspace") {
+					cwd = path.join(root, "link");
+					fs.symlinkSync(real, cwd);
+				} else {
+					fs.mkdirSync(path.join(root, "gjc-store"));
+					fs.symlinkSync(path.join(root, "gjc-store"), path.join(real, ".gjc"));
+				}
+				const calls: string[][] = [];
+				const diagnostics: string[] = [];
+				launchDefaultTmuxIfNeeded({
+					parsed: args({ messages: ["hello"], tmux: true }),
+					rawArgs: ["--tmux", "hello"],
+					cwd,
+					// No operator pin: the state path is derived from the workspace.
+					env: {
+						GJC_COORDINATOR_SESSION_ID: "anchor-session",
+						GJC_SESSION_ID: "anchor-gjc-session",
+						GJC_COORDINATOR_SESSION_STATE_FILE: "",
+					},
+					argv: ["bun", "cli.ts"],
+					execPath: "/bin/bun",
+					platform: "linux",
+					tty: interactiveTty,
+					tmuxAvailable: true,
+					existingBranchSessionName: null,
+					diagnosticWriter: message => diagnostics.push(message),
+					spawnSync: (_command, spawnArgs) => {
+						calls.push(spawnArgs);
+						return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+					},
+				});
+				expect(diagnostics).toEqual([]);
+				const innerCommand = calls.find(call => call[0] === "new-session")?.at(-1);
+				expect(innerCommand).toBeString();
+				const canonical = link === "workspace" ? real : path.join(root, "gjc-store");
+				const stateDir = /GJC_TMUX_OWNER_STATE_DIR='([^']+)'/.exec(innerCommand!)?.[1];
+				expect(stateDir, innerCommand).toStartWith(`${canonical}${path.sep}`);
+				const stateFile = /GJC_COORDINATOR_SESSION_STATE_FILE='([^']+)'/.exec(innerCommand!)?.[1];
+				expect(stateFile).toStartWith(`${canonical}${path.sep}`);
+				expect(fs.existsSync(path.join(stateDir!, "anchor-session", "owner-lifecycle", "generation.json"))).toBe(
+					true,
+				);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")("refuses a root launch whose private state tail is a symlink", () => {
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-tail-link-")));
+		try {
+			const cwd = path.join(root, "workspace");
+			const outside = path.join(root, "outside");
+			fs.mkdirSync(outside, { mode: 0o700 });
+			const stateFile = tmuxRuntimeSessionPath(cwd, "tail-gjc-session", buildGjcTmuxSessionSlug("gjc_tail"));
+			fs.mkdirSync(path.dirname(path.dirname(stateFile)), { recursive: true, mode: 0o700 });
+			fs.symlinkSync(outside, path.dirname(stateFile));
+			const calls: string[][] = [];
+			const diagnostics: string[] = [];
+			launchDefaultTmuxIfNeeded({
+				parsed: args({ messages: ["hello"], tmux: true }),
+				rawArgs: ["--tmux", "hello"],
+				cwd,
+				env: {
+					GJC_TMUX_SESSION: "gjc_tail",
+					GJC_COORDINATOR_SESSION_ID: "tail-session",
+					GJC_SESSION_ID: "tail-gjc-session",
+					GJC_COORDINATOR_SESSION_STATE_FILE: "",
+				},
+				argv: ["bun", "cli.ts"],
+				execPath: "/bin/bun",
+				platform: "linux",
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				existingBranchSessionName: null,
+				diagnosticWriter: message => diagnostics.push(message),
 				spawnSync: (_command, spawnArgs) => {
 					calls.push(spawnArgs);
 					return { exitCode: 0, stdout: NATIVE_SESSION_ID };
 				},
 			});
-			expect(handled).toBe(true);
-			const innerCommand = calls.find(call => call[0] === "new-session")?.at(-1);
-			expect(innerCommand).toContain(`GJC_MANAGED_OWNER_PREDECESSOR_TOKEN='${predecessorToken}'`);
-			expect(innerCommand).toMatch(/GJC_TMUX_OWNER_GENERATION='[0-9a-f-]{36}'/i);
-			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_RUN_ID='[0-9a-f-]{36}'/i);
-			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_INCARNATION='[0-9a-f-]{36}'/i);
+			expect(calls.some(call => call[0] === "new-session")).toBe(false);
+			expect(diagnostics.join("\n")).toContain("managed_owner_storage_unsafe");
+			expect(fs.readdirSync(outside)).toEqual([]);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

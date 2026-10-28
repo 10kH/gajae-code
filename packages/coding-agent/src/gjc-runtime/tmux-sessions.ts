@@ -3,11 +3,14 @@ import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { Process } from "@gajae-code/natives";
+import { type Process, verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
 import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
 import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
-import { managedSecurityFailureClassification } from "../session/internal/managed-session-storage";
+import {
+	managedSecurityFailureClassification,
+	prepareManagedDirectoryRoot,
+} from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTime, readLinuxProcStartTimeSync } from "./linux-proc";
 import {
 	MANAGED_OWNER_COMMAND_ENV,
@@ -36,6 +39,7 @@ import {
 	buildGjcTmuxSessionSlug,
 	buildGjcTmuxUntaggedSessionError,
 	buildTmuxProviderCommand,
+	canonicalManagedStateFile,
 	GJC_TMUX_BRANCH_OPTION,
 	GJC_TMUX_BRANCH_SLUG_OPTION,
 	GJC_TMUX_COMMAND_ENV,
@@ -774,6 +778,9 @@ export function createGjcTmuxSession(
 ): GjcTmuxSessionStatus {
 	const launch = options.launch;
 	const platform = options.platform ?? process.platform;
+	// Managed admission requires the retained owner-only reader, unavailable on Windows.
+	// Reject before provider probes, lifecycle storage, or supervisor allocation.
+	if (launch && platform === "win32") throw new Error("gjc_tmux_managed_launch_platform_unsupported:win32");
 	if (launch && !validManagedLaunchSpec(launch, platform)) throw new Error("gjc_tmux_managed_launch_spec_invalid");
 	const provider = resolveGjcTmuxProviderContext({ env, platform });
 	const tmuxCommand = provider.command;
@@ -783,11 +790,31 @@ export function createGjcTmuxSession(
 	const sessionName = buildGjcTmuxSessionName(launchEnvironment);
 	const sessionId = launch?.childSessionId ?? (identityEnv[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || sessionName);
 	const filteredGjcSessionId = identityEnv.GJC_SESSION_ID?.trim() || sessionId;
+	const derivedStateFile = tmuxRuntimeSessionPath(
+		cwd,
+		launch?.childSessionId ?? filteredGjcSessionId,
+		buildGjcTmuxSessionSlug(sessionName),
+	);
 	const stateFile =
 		(!launch ? identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() : undefined) ||
-		tmuxRuntimeSessionPath(cwd, launch?.childSessionId ?? filteredGjcSessionId, buildGjcTmuxSessionSlug(sessionName));
+		// A managed launch verifies its lifecycle root with no-follow walks, so a
+		// workspace reached through a symlink must be named by its canonical path.
+		(launch && platform !== "win32" ? canonicalManagedStateFile(cwd, derivedStateFile) : derivedStateFile);
 	const stateDir = (platform === "win32" ? path.win32 : path).dirname(stateFile);
 	const generation = crypto.randomUUID();
+	if (launch) {
+		const lifecycleRoot = lifecyclePaths(stateDir, sessionId, generation).root;
+		if (fsSync.existsSync(lifecycleRoot) && !verifyOwnerOnlyPathSecurity(lifecycleRoot, "directory").ok)
+			throw new Error("gjc_tmux_managed_storage_unsafe");
+		try {
+			prepareManagedDirectoryRoot(lifecycleRoot);
+		} catch {
+			// Preparation refuses a linked or unsafe component without naming it.
+			throw new Error("gjc_tmux_managed_storage_unsafe");
+		}
+		if (!verifyOwnerOnlyPathSecurity(lifecycleRoot, "directory").ok)
+			throw new Error("gjc_tmux_managed_storage_unsafe");
+	}
 	const authority = bindGjcTmuxProviderAuthority(provider, { stateDir, sessionId, generation });
 	const managedEnvironment: Record<string, string> = {
 		GJC_TMUX_LAUNCHED: "1",

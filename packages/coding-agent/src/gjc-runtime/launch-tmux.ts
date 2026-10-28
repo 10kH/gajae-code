@@ -2,11 +2,13 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
 import { VERSION } from "@gajae-code/utils/dirs";
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import { safeStderrWrite } from "@gajae-code/utils/safe-stderr";
 import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import type { Args } from "../cli/args";
+import { prepareManagedDirectoryRoot } from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTimeSync } from "./linux-proc";
 import {
 	MANAGED_OWNER_PREDECESSOR_GENERATION_ENV,
@@ -42,6 +44,7 @@ import {
 	buildGjcTmuxProfileCommands,
 	buildGjcTmuxSessionName,
 	buildGjcTmuxSessionSlug,
+	canonicalManagedStateFile,
 	GJC_DEFAULT_TMUX_SESSION,
 	GJC_TMUX_ACTIVE_SESSION_ENV,
 	GJC_TMUX_COMMAND_ENV,
@@ -1127,9 +1130,14 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	// tmux launches with no GJC session context. Project dotenv pins are already
 	// removed from identityEnv.
 	const gjcSessionId = identityEnv.GJC_SESSION_ID?.trim() || sessionId;
+	const derivedStateFile = tmuxRuntimeSessionPath(cwd, gjcSessionId, buildGjcTmuxSessionSlug(sessionName));
+	// Supervised launches verify their lifecycle root with no-follow walks, so a derived
+	// path through a symlinked workspace is named canonically; an operator pin is verbatim.
 	const sessionStateFile =
 		identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() ||
-		tmuxRuntimeSessionPath(cwd, gjcSessionId, buildGjcTmuxSessionSlug(sessionName));
+		(platform === "linux" || platform === "darwin"
+			? canonicalManagedStateFile(cwd, derivedStateFile)
+			: derivedStateFile);
 	const signingEnv = coordinatorSidecarSigningEnv(env);
 	// Stage only the one-shot channel descriptor (path + key id). The PKCS#8 key
 	// itself stays in memory until writeCoordinatorSidecarBootstrapFile runs
@@ -1420,6 +1428,25 @@ function createIsolatedTmuxSession(
 ): TmuxSpawnResult {
 	const sessionId = plan.sessionId ?? plan.sessionName;
 	const stateDir = path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime"));
+	if (plan.platform === "linux" || plan.platform === "darwin") {
+		try {
+			const root = lifecyclePaths(stateDir, sessionId, plan.ownerGeneration ?? plan.sessionName).root;
+			let exists = false;
+			try {
+				fs.lstatSync(root);
+				exists = true;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			if (exists && !verifyOwnerOnlyPathSecurity(root, "directory").ok)
+				throw new Error("managed_owner_storage_unsafe");
+			prepareManagedDirectoryRoot(root);
+			if (!verifyOwnerOnlyPathSecurity(root, "directory").ok) throw new Error("managed_owner_storage_unsafe");
+		} catch {
+			diagnostic("tmux owner lifecycle preparation failed");
+			return { exitCode: 1, stderr: "managed_owner_storage_unsafe" };
+		}
+	}
 	const baseline = plan.ownerGenerationBaseline ?? captureOwnerGenerationBaselineSync(stateDir, sessionId);
 	plan.ownerGenerationBaseline = baseline;
 	const ownerPlan = planTmuxOwnerIsolationSync(
