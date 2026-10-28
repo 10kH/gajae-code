@@ -29334,11 +29334,17 @@ export class AgentSession {
 			let durableDefaultRecoveryError: string | undefined;
 			let transitionCleanupCommitted = false;
 			let exactRetirement: PreparedExactMcpRetirement | undefined;
+			let exactOwnershipChanged = switchingToDifferentSession;
 
 			try {
 				await this.sessionManager.setSessionFile(sessionPath, {
 					deferEphemeralArtifactRetirement: switchingToDifferentSession,
 				});
+				const loadedSessionFile = this.sessionManager.getSessionFile();
+				exactOwnershipChanged =
+					this.sessionManager.getSessionId() !== previousSessionState.sessionId ||
+					(loadedSessionFile ? path.resolve(loadedSessionFile) : undefined) !==
+						(previousSessionState.sessionFile ? path.resolve(previousSessionState.sessionFile) : undefined);
 				// setSessionFile rotated the endpoint identity to the successor;
 				// re-register the manager under it so post-transition lineage
 				// bindings resolve and owned aborts classify in the successor
@@ -29590,16 +29596,18 @@ export class AgentSession {
 					this.#resetIrcRosterDeliveryState();
 				}
 
-				if (switchingToDifferentSession) {
-					const predecessorEndpointId = this.#asyncJobEndpointId(
-						previousSessionState.sessionId,
-						previousSessionState.sessionFile,
-					);
+				if (exactOwnershipChanged) {
 					exactRetirement = await this.#prepareExactMcpControlRetirement(previousSessionState.sessionId, true);
 					if (exactRetirement && !exactRetirement.canCommit())
 						throw new Error("Exact MCP control retirement changed before session switch commit");
 					await exactRetirement?.commit();
 					revokeExactMcpControls(this);
+				}
+				if (switchingToDifferentSession) {
+					const predecessorEndpointId = this.#asyncJobEndpointId(
+						previousSessionState.sessionId,
+						previousSessionState.sessionFile,
+					);
 					transitionCleanupCommitted = true;
 					sessionIdentityCommitted = true;
 					// A checkpoint count and entry id belong to the predecessor file.
@@ -29700,6 +29708,7 @@ export class AgentSession {
 				);
 				if (recoveredDefaultChainMessage) this.#emitResolutionFallbackSwitch(this.#defaultFallbackChain(false));
 				if (recoveredDefaultChainMessage) this.emitNotice("warning", recoveredDefaultChainMessage, "fallback");
+				if (exactOwnershipChanged) sessionIdentityCommitted = true;
 				this.#commitSessionTransition();
 				return true;
 			} catch (error) {
@@ -29729,7 +29738,7 @@ export class AgentSession {
 					AsyncJobManager.forEndpoint(successorEndpointId),
 				);
 				if (!rekeyed) {
-					if (switchingToDifferentSession) revokeExactMcpControls(this);
+					revokeExactMcpControls(this);
 					// Another top-level session claimed the freed predecessor endpoint
 					// while the switch's cleanup was in flight: restoring the old
 					// identity would leave this manager registered under the successor
@@ -29748,9 +29757,9 @@ export class AgentSession {
 				} catch (restoreError) {
 					sessionRestoreError = restoreError;
 				}
-				if (switchingToDifferentSession && (sessionRestoreError ||
+				if (sessionRestoreError ||
 					this.sessionManager.getSessionId() !== previousSessionState.sessionId ||
-					this.sessionManager.getSessionFile() !== previousSessionState.sessionFile)) {
+					this.sessionManager.getSessionFile() !== previousSessionState.sessionFile) {
 					revokeExactMcpControls(this);
 				}
 				this.restoreDefaultFallbackRuntimeState(previousDefaultFallbackRuntimeState);
