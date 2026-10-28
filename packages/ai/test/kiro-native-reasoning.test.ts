@@ -285,9 +285,7 @@ describe("Kiro native reasoning", () => {
 		(globalThis.fetch as any) = async (_input: string | URL | Request, init?: RequestInit) => {
 			if (!(init?.body instanceof Uint8Array)) throw new Error("expected encoded Kiro request body");
 			secondRequest = JSON.parse(new TextDecoder().decode(init.body)) as Record<string, unknown>;
-			return eventStreamResponse([
-				{ type: "assistantResponseEvent", payload: { content: "follow-up answer" } },
-			]);
+			return eventStreamResponse([{ type: "assistantResponseEvent", payload: { content: "follow-up answer" } }]);
 		};
 
 		const secondMessage: AssistantMessage | undefined = await (async () => {
@@ -300,7 +298,10 @@ describe("Kiro native reasoning", () => {
 						{ role: "user", content: "Second question", timestamp: 2 },
 					],
 				} satisfies Context,
-				{ apiKey: JSON.stringify({ token: "social-access-token", profileArn: PROFILE_ARN }), reasoning: Effort.High },
+				{
+					apiKey: JSON.stringify({ token: "social-access-token", profileArn: PROFILE_ARN }),
+					reasoning: Effort.High,
+				},
 			)) {
 				if (event.type === "done") return event.message;
 			}

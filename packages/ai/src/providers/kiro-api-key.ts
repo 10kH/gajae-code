@@ -952,8 +952,7 @@ function buildApiKeyRequest(
 					if (block.thinkingSignature?.startsWith("kiro:")) {
 						reasoningSignature = block.thinkingSignature;
 					}
-				}
-				else if (block.type === "toolCall") {
+				} else if (block.type === "toolCall") {
 					toolUses.push({
 						name: block.name,
 						toolUseId: block.id,

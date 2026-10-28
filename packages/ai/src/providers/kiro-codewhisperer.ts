@@ -125,6 +125,7 @@ interface ConversationState {
 
 interface GenerateAssistantResponseRequest {
 	conversationState: ConversationState;
+	additionalModelRequestFields?: Record<string, unknown>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -328,12 +329,10 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				profileArn: options.profileArn ?? credentials.profileArn,
 			});
 			const additionalRequestFields = buildKiroAdditionalModelRequestFields(model, options.reasoning);
-			let requestBody: any = {
+			let requestBody: GenerateAssistantResponseRequest = {
 				conversationState,
+				...(additionalRequestFields && { additionalModelRequestFields: additionalRequestFields }),
 			};
-			if (additionalRequestFields) {
-				requestBody.additionalModelRequestFields = additionalRequestFields;
-			}
 
 			const replacementPayload = await options?.onPayload?.(
 				requestBody,
