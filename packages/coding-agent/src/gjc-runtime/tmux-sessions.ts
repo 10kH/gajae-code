@@ -228,6 +228,11 @@ const FORCE_CLOSE_VERDICT_POLL_MS = 50;
 export interface CreateGjcTmuxSessionOptions {
 	platform?: NodeJS.Platform;
 	launch?: ManagedTmuxLaunchSpec;
+	/**
+	 * @internal Program prefix (executable and entrypoint) of the supervisor in isolated
+	 * managed-launch tests; the supervisor flag is appended as in production.
+	 */
+	supervisorArgvForTest?: readonly string[];
 }
 
 export type CreateOwnerIsolationTestDependencies = {
@@ -803,10 +808,13 @@ export function createGjcTmuxSession(
 	const childEnvironment: Record<string, string> = { ...(launch?.env ?? {}), ...managedEnvironment };
 	const executionEnv = { ...identityEnv, ...managedEnvironment };
 	const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
+	const supervisorArgv = options.supervisorArgvForTest
+		? [...options.supervisorArgvForTest, MANAGED_OWNER_SUPERVISOR_ARG]
+		: managedOwnerSupervisorArgv();
 	const command =
 		platform === "win32"
 			? buildWindowsPowerShellInnerCommand({
-					command: launch ? managedOwnerSupervisorArgv() : ["gjc"],
+					command: launch ? [...supervisorArgv] : ["gjc"],
 					environment: {
 						...childEnvironment,
 						...(launch ? { [MANAGED_OWNER_COMMAND_ENV]: JSON.stringify(launch.argv) } : {}),
@@ -814,7 +822,7 @@ export function createGjcTmuxSession(
 				})
 			: (() => {
 					const supervisorEnvironment = launch ? { [MANAGED_OWNER_COMMAND_ENV]: JSON.stringify(launch.argv) } : {};
-					const invocation = launch ? managedOwnerSupervisorArgv() : ["gjc"];
+					const invocation = launch ? supervisorArgv : ["gjc"];
 					return `exec env ${Object.entries({ ...childEnvironment, ...supervisorEnvironment })
 						.map(([name, value]) => `${name}=${shellQuote(value)}`)
 						.join(" ")} ${invocation.map(shellQuote).join(" ")}`;
