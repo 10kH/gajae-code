@@ -28,10 +28,7 @@ import {
 	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
 	persistCoordinatorRuntimeStateFromPostmortem,
 } from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
-import {
-	buildGjcTmuxSessionSlug,
-	normalizeOperatorStateFilePin,
-} from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
+import { buildGjcTmuxSessionSlug } from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
 import * as ownerIsolation from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 import {
 	captureOwnerGenerationBaselineSync,
@@ -831,45 +828,6 @@ describe("default GJC tmux launch", () => {
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
-	});
-
-	it.each([
-		"linux",
-		"darwin",
-	] as const)("normalizes an absolute %s operator state-file pin so the supervisor accepts its state directory", platform => {
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-pin-normalize-"));
-		try {
-			const plan = (pin: string) =>
-				buildDefaultTmuxLaunchPlan({
-					parsed: args({ tmux: true }),
-					rawArgs: ["--tmux"],
-					cwd,
-					env: { GJC_COORDINATOR_SESSION_STATE_FILE: pin },
-					argv: ["bun", "cli.ts"],
-					execPath: "/bin/bun",
-					platform,
-					tty: interactiveTty,
-					tmuxAvailable: true,
-					currentBranch: "",
-					existingBranchSessionName: null,
-				});
-			const normalized = plan(`${cwd}/pins/../runtime/./state.json`);
-			expect(normalized?.sessionStateFile).toBe(path.posix.join(cwd, "runtime", "state.json"));
-			// The supervisor and admission refuse a state directory with a `..` component.
-			expect(path.dirname(normalized!.sessionStateFile!).split("/")).not.toContain("..");
-			expect(plan(`${cwd}/runtime/state.json`)?.sessionStateFile).toBe(`${cwd}/runtime/state.json`);
-			// A relative pin is not resolved against the launcher's cwd.
-			expect(plan("pins/../state.json")?.sessionStateFile).toBe("pins/../state.json");
-		} finally {
-			fs.rmSync(cwd, { recursive: true, force: true });
-		}
-	});
-
-	it("keeps a Windows operator state-file pin verbatim", () => {
-		expect(normalizeOperatorStateFilePin("C:\\gjc\\pins\\..\\state.json", "win32")).toBe(
-			"C:\\gjc\\pins\\..\\state.json",
-		);
-		expect(normalizeOperatorStateFilePin("/gjc/pins/../state.json", "win32")).toBe("/gjc/pins/../state.json");
 	});
 
 	it("sizes detached tmux new-session to the caller terminal when dimensions are known", () => {
@@ -4365,6 +4323,60 @@ describe("tmux owner isolation launch gate", () => {
 			expect(calls.some(call => call[0] === "new-session")).toBe(false);
 			expect(diagnostics.join("\n")).toContain("managed_owner_storage_unsafe");
 			expect(fs.readdirSync(outside)).toEqual([]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		{ platform: "linux" as const, pin: (root: string) => `${root}/pins/../runtime-state.json`, refused: true },
+		{ platform: "linux" as const, pin: () => "pins/runtime-state.json", refused: true },
+		{ platform: "linux" as const, pin: (root: string) => `${root}/.//runtime-state.json`, refused: false },
+		{ platform: "darwin" as const, pin: (root: string) => `${root}/pins/../runtime-state.json`, refused: true },
+		{ platform: "darwin" as const, pin: (root: string) => `${root}/.//runtime-state.json`, refused: false },
+	])("keeps a $platform operator pin verbatim and refuses it before any storage only when its supervisor would (%#)", ({
+		platform,
+		pin,
+		refused,
+	}) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-operator-pin-"));
+		try {
+			const stateFile = pin(root);
+			const context = {
+				parsed: args({ messages: ["hello"], tmux: true }),
+				rawArgs: ["--tmux", "hello"],
+				cwd: root,
+				env: { GJC_COORDINATOR_SESSION_ID: "operator-pin", GJC_COORDINATOR_SESSION_STATE_FILE: stateFile },
+				argv: ["bun", "cli.ts"],
+				execPath: "/bin/bun",
+				platform,
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				existingBranchSessionName: null,
+			};
+			// The pin is never rewritten: a `..` after a symlink resolves elsewhere than its lexical form.
+			expect(buildDefaultTmuxLaunchPlan(context)?.sessionStateFile).toBe(stateFile);
+			const calls: string[][] = [];
+			const diagnostics: string[] = [];
+			const handled = launchDefaultTmuxIfNeeded({
+				...context,
+				diagnosticWriter: message => diagnostics.push(message),
+				spawnSync: (_command, spawnArgs) => {
+					calls.push(spawnArgs);
+					return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+				},
+			});
+			expect(handled).toBe(true);
+			if (refused) {
+				expect(diagnostics.join("\n")).toContain(
+					"tmux owner lifecycle publication failed: Error: gjc_tmux_state_file_pin_unsafe",
+				);
+				expect(calls.some(call => call[0] === "new-session")).toBe(false);
+				expect(fs.readdirSync(root)).toEqual([]);
+			} else {
+				expect(diagnostics.join("\n")).not.toContain("gjc_tmux_state_file_pin_unsafe");
+				expect(calls.some(call => call[0] === "new-session")).toBe(true);
+			}
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

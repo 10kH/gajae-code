@@ -64,6 +64,11 @@ function requiredEnvironment(name: string): string {
 	return value;
 }
 
+/** Whether the supervisor accepts a lifecycle state directory: absolute, without NUL, and without a `..` component. */
+export function managedOwnerStateDirAccepted(stateDir: string): boolean {
+	return path.isAbsolute(stateDir) && !stateDir.includes("\0") && !stateDir.split(path.sep).includes("..");
+}
+
 function lifecycleRoot(): {
 	root: string;
 	stateDir: string;
@@ -84,8 +89,7 @@ function lifecycleRoot(): {
 		[incarnation, "managed owner incarnation"],
 	] as const)
 		assertSafePathComponent(value, label);
-	if (!path.isAbsolute(stateDir) || stateDir.includes("\0") || stateDir.split(path.sep).includes(".."))
-		throw new Error("managed_owner_lifecycle_path_unsafe");
+	if (!managedOwnerStateDirAccepted(stateDir)) throw new Error("managed_owner_lifecycle_path_unsafe");
 	const root = lifecyclePaths(stateDir, sessionId, generation).root;
 	if (!root.startsWith(`${path.resolve(stateDir)}${path.sep}`)) throw new Error("managed_owner_lifecycle_path_unsafe");
 	return { root, stateDir, generation, sessionId, runId, incarnation };

@@ -60,7 +60,6 @@ import {
 	GJC_TMUX_SESSION_STATE_FILE_OPTION,
 	GJC_TMUX_VERSION_OPTION,
 	hasGjcTmuxProviderAuthoritySync,
-	normalizeOperatorStateFilePin,
 	normalizeTmuxCreatedAt,
 	type ProviderAuthority,
 	persistGjcTmuxProviderAuthoritySync,
@@ -837,9 +836,8 @@ export function createGjcTmuxSession(
 		launch?.childSessionId ?? filteredGjcSessionId,
 		buildGjcTmuxSessionSlug(sessionName),
 	);
-	const pinnedStateFile = !launch ? identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() : undefined;
 	const stateFile =
-		(pinnedStateFile && normalizeOperatorStateFilePin(pinnedStateFile, platform)) ||
+		(!launch ? identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() : undefined) ||
 		// A managed launch verifies its lifecycle root with no-follow walks, so a
 		// workspace reached through a symlink must be named by its canonical path.
 		(launch && platform !== "win32" ? canonicalManagedStateFile(cwd, derivedStateFile) : derivedStateFile);

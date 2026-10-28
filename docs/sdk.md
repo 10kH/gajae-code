@@ -1294,7 +1294,11 @@ reached through a symlink passes the no-follow verification of the private
 lifecycle root. The `_session-*` tail below `.gjc` stays lexical, so a link
 inside managed storage is still refused (`gjc_tmux_managed_storage_unsafe` or
 `managed_owner_storage_unsafe`); an operator-pinned
-`GJC_COORDINATOR_SESSION_STATE_FILE` is used verbatim. A Broker-redacted
+`GJC_COORDINATOR_SESSION_STATE_FILE` is used verbatim, never rewritten, because
+a `..` after a symlink resolves elsewhere than its lexical form. A supervised
+root launch refuses a pin whose directory is not an absolute path free of `..`
+(`gjc_tmux_state_file_pin_unsafe`) before it prepares any lifecycle storage,
+since its supervisor would refuse that directory. A Broker-redacted
 launch, and every macOS launch, publishes an opaque binding that carries
 neither the launch command nor a command digest, so prompts and flags such as
 `--api-key` never reach disk there; an ordinary Linux launch publishes a
