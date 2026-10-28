@@ -43,10 +43,11 @@ import {
 	canonicalLeaseSocket,
 	canWriteEvents,
 	classifyLeaseStatus,
-	clearOwnerSocketNote,
+	clearOwnerSocketRecord,
 	heartbeat,
 	LeaseError,
-	publishOwnerSocketNote,
+	type OwnerSocketRecordIdentity,
+	publishOwnerSocketRecord,
 	readLease,
 	releaseLease,
 	type SessionLease,
@@ -170,6 +171,7 @@ export class RuntimeOwner {
 	// polling the lease mutation lock when releaseLease runs.
 	#heartbeatInFlight = new Set<Promise<unknown>>();
 	#socketPath: string;
+	#socketRecord: OwnerSocketRecordIdentity | null = null;
 	#finalizeChecks?: FinalizeChecks;
 	#validationCommands?: ValidationCommandSpec[];
 	#unsubscribeFrames: (() => void) | null = null;
@@ -245,7 +247,6 @@ export class RuntimeOwner {
 
 	async #startOnce(): Promise<OwnerStartInfo> {
 		const { root, sessionId } = this.#opts;
-		publishOwnerSocketNote(root, sessionId, this.#socketPath);
 		const eventsPath = sessionPaths(root, sessionId).events;
 		const existing = await readEvents(root, sessionId, 0);
 		this.#cursor = existing.reduce((max, e) => Math.max(max, e.cursor), 0);
@@ -259,6 +260,12 @@ export class RuntimeOwner {
 		});
 		this.#leaseHeld = true;
 		this.#leaseEpoch = lease.leaseEpoch;
+		this.#socketRecord = {
+			ownerId: this.ownerId,
+			leaseEpoch: lease.leaseEpoch,
+			nonce: lease.leaseTokenHash,
+		};
+		await publishOwnerSocketRecord(root, sessionId, this.#socketPath, this.#socketRecord);
 		this.#heartbeatTimer = setInterval(() => {
 			// Once teardown fences the heartbeat we must never start a renewal again:
 			// a renewal here would contend the lease mutation lock with the release
@@ -1170,7 +1177,11 @@ export class RuntimeOwner {
 			clearInterval(this.#heartbeatTimer);
 			this.#heartbeatTimer = null;
 		}
-		clearOwnerSocketNote(this.#opts.root, this.#opts.sessionId);
+		if (this.#socketRecord) {
+			const identity = this.#socketRecord;
+			await clearOwnerSocketRecord(this.#opts.root, this.#opts.sessionId, identity);
+			this.#socketRecord = null;
+		}
 		if (failures.length > 0) throw new AggregateError(failures, "Runtime owner cleanup failed.");
 	}
 
@@ -1214,7 +1225,7 @@ export async function resolveOwner(root: string, sessionId: string): Promise<Res
 	const live = status === "live" || status === "expiredAlive" || status === "epermAlive";
 	const endpointPath = lease.endpoint?.kind === "unix-socket" ? lease.endpoint.path : null;
 	// The dial path is the private socket. A workspace lease does not choose a different path.
-	const socketPath = live && endpointPath ? canonicalLeaseSocket(root, sessionId, endpointPath) : null;
+	const socketPath = live && endpointPath ? canonicalLeaseSocket(root, sessionId, endpointPath, lease) : null;
 	return { live, socketPath, lease };
 }
 

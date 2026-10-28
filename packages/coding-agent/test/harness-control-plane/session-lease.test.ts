@@ -389,7 +389,7 @@ describe("SessionLease", () => {
 		expect((await resolveOwner(root, SID)).socketPath).toBeNull();
 	});
 
-	it("takes over a live lease whose unix endpoint is outside the private socket", async () => {
+	it("keeps holding a live lease whose unix endpoint is outside the private socket", async () => {
 		const foreign = path.join(root, "outside.sock");
 		await acquireLease(root, SID, {
 			ownerId: "owner-a",
@@ -399,16 +399,16 @@ describe("SessionLease", () => {
 			ttlMs: 10_000,
 			probe: aliveProbe,
 		});
-		const taken = await acquireLease(root, SID, {
-			ownerId: "owner-b",
-			pid: 2,
-			eventsPath: "e",
-			endpoint: { kind: "unix-socket", path: controlSocketPath(root, SID) },
-			ttlMs: 10_000,
-			probe: aliveProbe,
-		});
-		expect(taken.lease.ownerId).toBe("owner-b");
-		expect(taken.lease.leaseEpoch).toBe(2);
+		await expect(
+			acquireLease(root, SID, {
+				ownerId: "owner-b",
+				pid: 2,
+				eventsPath: "e",
+				endpoint: { kind: "unix-socket", path: controlSocketPath(root, SID) },
+				ttlMs: 10_000,
+				probe: aliveProbe,
+			}),
+		).rejects.toThrow(/lease_held/);
 	});
 
 	it("keeps holding a live lease on the private owner socket", async () => {

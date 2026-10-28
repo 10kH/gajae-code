@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import fc from "fast-check";
 import { RuntimeOwner } from "../../src/harness-control-plane/owner";
-import { acquireLease } from "../../src/harness-control-plane/session-lease";
+import { acquireLease, readLease } from "../../src/harness-control-plane/session-lease";
 import type { HarnessSessionTransport } from "../../src/harness-control-plane/session-transport";
 import { controlSocketPath, sessionPaths, writeSessionState } from "../../src/harness-control-plane/storage";
 import { SESSION_SCHEMA_VERSION, type SessionHandle, type SessionState } from "../../src/harness-control-plane/types";
@@ -166,6 +166,55 @@ async function withSocketEnv(
 			if (value === undefined) delete process.env[key];
 			else process.env[key] = value;
 		}
+	}
+}
+
+async function recordPath(): Promise<string | null> {
+	const mod = await import("../../src/harness-control-plane/session-lease");
+	const fn = (mod as { ownerSocketRecordPath?: (sessionRoot: string, sessionId: string) => string | null })
+		.ownerSocketRecordPath;
+	return fn ? fn(root, SID) : null;
+}
+
+function forgedRecord(socketPath: string): string {
+	return JSON.stringify({
+		socketPath,
+		pid: process.pid,
+		ownerId: "owner-planted",
+		leaseEpoch: 1,
+		nonce: "ab".repeat(32),
+	});
+}
+
+async function expectUntrustedRecordIgnored(setup: (dir: string, file: string) => void): Promise<void> {
+	const foreign = path.join(root, "attacker.sock");
+	const server = await listen(foreign, FORGED);
+	let sessionDir: string | null = null;
+	try {
+		const file = await recordPath();
+		expect(file).toBeTruthy();
+		sessionDir = path.dirname(file!);
+		setup(sessionDir, file!);
+		await plantLease(foreign);
+		const promptFile = path.join(root, "prompt.txt");
+		await writeFile(promptFile, SECRET, "utf8");
+		const res = await runHarness(["submit", "--session", SID, "--prompt-file", promptFile, "--input", "{}"]);
+		expect(server.received).toHaveLength(0);
+		expect(server.received.join("\n")).not.toContain(SECRET);
+		expect(res.raw).not.toContain(FORGED);
+		await expect(
+			acquireLease(root, SID, {
+				ownerId: "owner-other",
+				pid: process.pid,
+				eventsPath: sessionPaths(root, SID).events,
+				endpoint: { kind: "unix-socket", path: controlSocketPath(root, SID) },
+				ttlMs: 10_000,
+			}),
+		).rejects.toThrow(/lease_held/);
+		expect((await readLease(root, SID))?.ownerId).toBe("owner-planted");
+	} finally {
+		await server.close();
+		if (sessionDir) fsSync.rmSync(sessionDir, { recursive: true, force: true });
 	}
 }
 
@@ -422,6 +471,227 @@ describe("harness owner socket routing", () => {
 					else process.env.GJC_HARNESS_SOCKET_DIR = previous;
 				}
 			});
+		},
+		20_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"a second owner start from another socket dir leaves the first lease and record",
+		async () => {
+			const socketDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			const otherDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			extraDirs.push(socketDir, otherDir);
+			const saved = process.env.GJC_HARNESS_SOCKET_DIR;
+			process.env.GJC_HARNESS_SOCKET_DIR = socketDir;
+			const owner1 = new RuntimeOwner({
+				root,
+				sessionId: SID,
+				transport: new IdleTransport(),
+				heartbeatMs: 60_000,
+			});
+			try {
+				await owner1.start();
+				const before = await readLease(root, SID);
+				const file = await recordPath();
+				expect(file).toBeTruthy();
+				const recordBefore = fsSync.readFileSync(file!, "utf8");
+				process.env.GJC_HARNESS_SOCKET_DIR = otherDir;
+				const owner2 = new RuntimeOwner({
+					root,
+					sessionId: SID,
+					transport: new IdleTransport(),
+					heartbeatMs: 60_000,
+				});
+				await expect(owner2.start()).rejects.toThrow(/lease_held/);
+				const after = await readLease(root, SID);
+				expect(after?.ownerId).toBe(before?.ownerId);
+				expect(after?.leaseEpoch).toBe(before?.leaseEpoch);
+				expect(after?.endpoint).toEqual(before?.endpoint);
+				expect(fsSync.readFileSync(file!, "utf8")).toBe(recordBefore);
+				const res = await runHarness(["observe", "--session", SID], { GJC_HARNESS_SOCKET_DIR: socketDir });
+				const body = JSON.parse(res.raw) as { evidence?: { ownerRouted?: boolean } };
+				expect(res.code).toBe(0);
+				expect(body.evidence?.ownerRouted).toBe(true);
+			} finally {
+				await owner1.stop();
+				const file = await recordPath();
+				if (file) fsSync.rmSync(path.dirname(file), { recursive: true, force: true });
+				if (saved === undefined) delete process.env.GJC_HARNESS_SOCKET_DIR;
+				else process.env.GJC_HARNESS_SOCKET_DIR = saved;
+			}
+		},
+		20_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"clears the socket record when owner start fails after the lease is held",
+		async () => {
+			const socketDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			extraDirs.push(socketDir);
+			const savedSocket = process.env.GJC_HARNESS_SOCKET_DIR;
+			process.env.GJC_HARNESS_SOCKET_DIR = socketDir;
+			const owner = new RuntimeOwner({
+				root,
+				sessionId: SID,
+				transport: new IdleTransport(),
+				heartbeatMs: 60_000,
+				controlServerFactory: () =>
+					({
+						listen: async () => {
+							const file = await recordPath();
+							if (!file || !fsSync.existsSync(file)) throw new Error("record-missing");
+							throw new Error("listen-failed");
+						},
+						close: async () => {},
+					}) as never,
+			});
+			try {
+				await expect(owner.start()).rejects.toThrow(/listen-failed/);
+				expect(await readLease(root, SID)).toBeNull();
+				const file = await recordPath();
+				expect(file).toBeTruthy();
+				expect(fsSync.existsSync(file!)).toBe(false);
+			} finally {
+				const file = await recordPath();
+				if (file) fsSync.rmSync(path.dirname(file), { recursive: true, force: true });
+				if (savedSocket === undefined) delete process.env.GJC_HARNESS_SOCKET_DIR;
+				else process.env.GJC_HARNESS_SOCKET_DIR = savedSocket;
+			}
+		},
+		20_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"keeps a base-format live lease when another socket dir reads it",
+		async () => {
+			const socketDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			const otherDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			extraDirs.push(socketDir, otherDir);
+			const endpoint = controlSocketPath(root, SID, { GJC_HARNESS_SOCKET_DIR: socketDir });
+			const server = await listen(endpoint, ALLOWED);
+			const saved = process.env.GJC_HARNESS_SOCKET_DIR;
+			try {
+				await plantLease(endpoint);
+				const same = await runHarness(["observe", "--session", SID], { GJC_HARNESS_SOCKET_DIR: socketDir });
+				expect(same.code).toBe(0);
+				expect(same.raw).toContain(ALLOWED);
+				expect(server.received.some(line => line.includes('"observe"'))).toBe(true);
+				process.env.GJC_HARNESS_SOCKET_DIR = otherDir;
+				await expect(
+					acquireLease(root, SID, {
+						ownerId: "owner-other",
+						pid: process.pid,
+						eventsPath: sessionPaths(root, SID).events,
+						endpoint: { kind: "unix-socket", path: controlSocketPath(root, SID) },
+						ttlMs: 10_000,
+					}),
+				).rejects.toThrow(/lease_held/);
+				expect((await readLease(root, SID))?.ownerId).toBe("owner-planted");
+				expect((await readLease(root, SID))?.endpoint?.path).toBe(endpoint);
+			} finally {
+				await server.close();
+				if (saved === undefined) delete process.env.GJC_HARNESS_SOCKET_DIR;
+				else process.env.GJC_HARNESS_SOCKET_DIR = saved;
+			}
+		},
+		20_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"does not route or take over through a world-writable socket record directory",
+		async () => {
+			await expectUntrustedRecordIgnored((dir, file) => {
+				fsSync.mkdirSync(dir, { recursive: true, mode: 0o700 });
+				fsSync.chmodSync(dir, 0o777);
+				fsSync.writeFileSync(file, forgedRecord(path.join(root, "attacker.sock")), { mode: 0o600 });
+			});
+		},
+		20_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"does not route or take over through an oversized socket record",
+		async () => {
+			await expectUntrustedRecordIgnored((dir, file) => {
+				fsSync.mkdirSync(dir, { recursive: true, mode: 0o700 });
+				fsSync.chmodSync(dir, 0o700);
+				fsSync.writeFileSync(file, "x".repeat(2048), { mode: 0o600 });
+			});
+		},
+		20_000,
+	);
+
+	it.skipIf(process.platform === "win32" || !canSymlink)(
+		"does not route or take over through a symlinked socket record directory",
+		async () => {
+			const real = await mkdtemp(path.join(tmpdir(), "hsn-"));
+			extraDirs.push(real);
+			await expectUntrustedRecordIgnored((dir, file) => {
+				fsSync.rmSync(dir, { recursive: true, force: true });
+				fsSync.symlinkSync(real, dir);
+				fsSync.writeFileSync(path.join(real, path.basename(file)), forgedRecord(path.join(root, "attacker.sock")), {
+					mode: 0o600,
+				});
+			});
+		},
+		20_000,
+	);
+
+	it.skipIf(process.platform === "win32" || !canSymlink)(
+		"does not route or take over through a symlinked socket record",
+		async () => {
+			await expectUntrustedRecordIgnored((dir, file) => {
+				fsSync.mkdirSync(dir, { recursive: true, mode: 0o700 });
+				fsSync.chmodSync(dir, 0o700);
+				const planted = path.join(root, "forged-record.json");
+				fsSync.writeFileSync(planted, forgedRecord(path.join(root, "attacker.sock")), { mode: 0o600 });
+				fsSync.symlinkSync(planted, file);
+			});
+		},
+		20_000,
+	);
+
+	it.skipIf(process.platform === "win32" || !canSymlink)(
+		"does not follow a pre-planted socket record temp symlink",
+		async () => {
+			const socketDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			const otherDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			extraDirs.push(socketDir, otherDir);
+			const savedSocket = process.env.GJC_HARNESS_SOCKET_DIR;
+			process.env.GJC_HARNESS_SOCKET_DIR = socketDir;
+			const secret = path.join(root, "record-secret.txt");
+			fsSync.writeFileSync(secret, "secret-bytes", { mode: 0o600 });
+			const owner = new RuntimeOwner({
+				root,
+				sessionId: SID,
+				transport: new IdleTransport(),
+				heartbeatMs: 60_000,
+			});
+			try {
+				const file = await recordPath();
+				expect(file).toBeTruthy();
+				fsSync.mkdirSync(path.dirname(file!), { recursive: true, mode: 0o700 });
+				fsSync.chmodSync(path.dirname(file!), 0o700);
+				fsSync.symlinkSync(secret, `${file}.tmp-${process.pid}`);
+				await owner.start();
+				expect(fsSync.readFileSync(secret, "utf8")).toBe("secret-bytes");
+				expect(fsSync.lstatSync(secret).isFile()).toBe(true);
+				process.env.GJC_HARNESS_SOCKET_DIR = otherDir;
+				const owner2 = new RuntimeOwner({
+					root,
+					sessionId: SID,
+					transport: new IdleTransport(),
+					heartbeatMs: 60_000,
+				});
+				await expect(owner2.start()).rejects.toThrow(/lease_held/);
+				expect((await readLease(root, SID))?.ownerId).toBe(owner.ownerId);
+			} finally {
+				await owner.stop();
+				const file = await recordPath();
+				if (file) fsSync.rmSync(path.dirname(file), { recursive: true, force: true });
+				if (savedSocket === undefined) delete process.env.GJC_HARNESS_SOCKET_DIR;
+				else process.env.GJC_HARNESS_SOCKET_DIR = savedSocket;
+			}
 		},
 		20_000,
 	);
