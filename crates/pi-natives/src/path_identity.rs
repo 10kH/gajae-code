@@ -3978,6 +3978,28 @@ pub(crate) mod platform {
 
 		#[test]
 		fn owner_only_read_closes_every_retained_descriptor_on_success_and_faults() {
+			const CHILD_ENV: &str = "GJC_NATIVE_OWNER_READ_FD_TEST_CHILD";
+			if std::env::var_os(CHILD_ENV).is_none() {
+				// Released fd numbers are probed for EBADF, so no other test may
+				// allocate them meanwhile: run alone in an isolated child.
+				use std::process::Command;
+				let output = Command::new(std::env::current_exe().expect("native test executable"))
+					.arg("--exact")
+					.arg("path_identity::platform::owner_only_read_tests::owner_only_read_closes_every_retained_descriptor_on_success_and_faults")
+					.arg("--nocapture")
+					.arg("--test-threads=1")
+					.env(CHILD_ENV, "1")
+					.output()
+					.expect("run isolated descriptor regression");
+				let stdout = String::from_utf8_lossy(&output.stdout);
+				assert!(
+					output.status.success(),
+					"{stdout}\n{}",
+					String::from_utf8_lossy(&output.stderr)
+				);
+				assert!(stdout.contains("1 passed"), "child did not run the regression: {stdout}");
+				return;
+			}
 			for failure_stage in [
 				"none",
 				"acquired",
