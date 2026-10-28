@@ -987,15 +987,17 @@ const SUMMARY_FENCE_OPEN = "<untrusted-content>\n";
 const SUMMARY_FENCE_CLOSE = "\n</untrusted-content>";
 
 /**
- * Closers that would end the summary fence or the surrounding conversation
- * block. Whitespace before ">" still closes the tag, so those spellings go too.
+ * Neutralize sequences that would close the summary fence or the surrounding
+ * conversation block, without lossy HTML entity encoding that corrupts code.
+ * We insert zero-width spaces to break the tag syntax instead.
+ * Whitespace before ">" still closes the tag, so those spellings go too.
  */
 function escapeSummaryFenceClosers(text: string): string {
 	return text
-		.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>")
-		.replace(/<\/untrusted-content[ \t\n\r\f]+>/gi, "&lt;/untrusted-content>")
-		.replace(/<\/conversation>/gi, "&lt;/conversation>")
-		.replace(/<\/conversation[ \t\n\r\f]+>/gi, "&lt;/conversation>");
+		.replace(/<\/untrusted-content>/gi, "<\u200b/untrusted-content>")
+		.replace(/<\/untrusted-content[ \t\n\r\f]+>/gi, "<\u200b/untrusted-content>")
+		.replace(/<\/conversation>/gi, "<\u200b/conversation>")
+		.replace(/<\/conversation[ \t\n\r\f]+>/gi, "<\u200b/conversation>");
 }
 
 /**
