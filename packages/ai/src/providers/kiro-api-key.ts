@@ -930,7 +930,8 @@ function buildApiKeyRequest(
 	options: KiroCodeWhispererOptions,
 ): unknown {
 	const modelId = toKiroModelId(model.wireModelId || model.id);
-	const prefix = buildKiroThinkingPrefix(options.reasoning);
+	const additionalRequestFields = buildKiroAdditionalModelRequestFields(model, options.reasoning);
+	const prefix = additionalRequestFields ? "" : buildKiroThinkingPrefix(options.reasoning);
 	let systemPrompt = context.systemPrompt?.join("\n") ?? "";
 	if (prefix) systemPrompt = systemPrompt ? `${prefix}\n${systemPrompt}` : prefix;
 
@@ -941,10 +942,17 @@ function buildApiKeyRequest(
 		if (msg.role === "assistant") {
 			let content = "";
 			const toolUses: Array<{ name: string; toolUseId: string; input: Record<string, unknown> }> = [];
+			let reasoningSignature: string | undefined;
 			for (const block of msg.content) {
 				if (typeof block === "string") content += block;
 				else if (block.type === "text") content += block.text;
-				else if (block.type === "thinking") content = `<thinking>${block.thinking}</thinking>\n\n${content}`;
+				else if (block.type === "thinking") {
+					content = `<thinking>${block.thinking}</thinking>\n\n${content}`;
+					// Capture reasoning signature for signature replay
+					if (block.thinkingSignature?.startsWith("kiro:")) {
+						reasoningSignature = block.thinkingSignature;
+					}
+				}
 				else if (block.type === "toolCall") {
 					toolUses.push({
 						name: block.name,
@@ -953,11 +961,15 @@ function buildApiKeyRequest(
 					});
 				}
 			}
+			const resp: any = {
+				content,
+				...(toolUses.length > 0 ? { toolUses } : {}),
+			};
+			if (reasoningSignature) {
+				resp.reasoningContent = { signature: reasoningSignature };
+			}
 			history.push({
-				assistantResponseMessage: {
-					content,
-					...(toolUses.length > 0 ? { toolUses } : {}),
-				},
+				assistantResponseMessage: resp,
 			});
 		} else if (msg.role === "user") {
 			let content = extractText(msg);
@@ -1016,7 +1028,6 @@ function buildApiKeyRequest(
 	if (toolResults.length > 0) uimc.toolResults = toolResults;
 	if (context.tools?.length) uimc.tools = convertTools(context.tools);
 
-	const additionalRequestFields = buildKiroAdditionalModelRequestFields(model, options.reasoning);
 	const request: any = {
 		conversationState: {
 			chatTriggerType: "MANUAL",

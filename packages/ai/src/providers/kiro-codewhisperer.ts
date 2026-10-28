@@ -603,7 +603,8 @@ function buildConversationState(
 
 	// Build history from all messages except the last
 	const history: WireHistoryMessage[] = [];
-	const thinkingPrefix = buildKiroThinkingPrefix(options.reasoning);
+	const additionalRequestFields = buildKiroAdditionalModelRequestFields(model, options.reasoning);
+	const thinkingPrefix = additionalRequestFields ? "" : buildKiroThinkingPrefix(options.reasoning);
 	const baseSystemPrompt = context.systemPrompt?.join("\n") ?? "";
 	const systemPrompt = thinkingPrefix
 		? baseSystemPrompt
@@ -684,11 +685,17 @@ function convertToWireMessage(
 	// results can reference the toolUseId they answer.
 	const textParts: string[] = [];
 	const toolUses: WireToolUse[] = [];
+	let reasoningSignature: string | undefined;
 	for (const block of msg.content) {
 		if (typeof block === "string") {
 			textParts.push(block);
 		} else if (block.type === "text") {
 			textParts.push(block.text);
+		} else if (block.type === "thinking") {
+			// Capture reasoning signature for signature replay
+			if (block.thinkingSignature?.startsWith("kiro:")) {
+				reasoningSignature = block.thinkingSignature;
+			}
 		} else if (block.type === "toolCall") {
 			toolUses.push({
 				toolUseId: block.id,
@@ -697,11 +704,15 @@ function convertToWireMessage(
 			});
 		}
 	}
+	const resp: any = {
+		content: textParts.join("\n"),
+		...(toolUses.length > 0 ? { toolUses } : {}),
+	};
+	if (reasoningSignature) {
+		resp.reasoningContent = { signature: reasoningSignature };
+	}
 	return {
-		assistantResponseMessage: {
-			content: textParts.join("\n"),
-			...(toolUses.length > 0 ? { toolUses } : {}),
-		},
+		assistantResponseMessage: resp,
 	};
 }
 
