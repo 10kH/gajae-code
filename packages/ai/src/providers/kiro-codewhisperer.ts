@@ -37,12 +37,14 @@ import { withHttpStatus } from "../utils/http-inspector";
 import { captureUnicodeEscapeEvidence } from "../utils/json-parse";
 import { decodeEventStream } from "./aws-eventstream";
 import {
+	buildKiroAdditionalModelRequestFields,
 	buildKiroThinkingPrefix,
 	isKiroApiKey,
 	sanitizeKiroError,
 	streamKiroApiKey,
 	toKiroModelId,
 } from "./kiro-api-key";
+import { parseReasoningContentEventHelper } from "./kiro-reasoning-parser";
 
 /**
  * Trust assumption: globalThis.fetch is treated as a trusted source for authenticated
@@ -167,6 +169,12 @@ interface ErrorPayload {
 		message?: string;
 		code?: string;
 	};
+}
+
+interface ReasoningContentEvent {
+	text?: string;
+	signature?: string;
+	redactedContent?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -319,9 +327,13 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				...options,
 				profileArn: options.profileArn ?? credentials.profileArn,
 			});
-			let requestBody: GenerateAssistantResponseRequest = {
+			const additionalRequestFields = buildKiroAdditionalModelRequestFields(model, options.reasoning);
+			let requestBody: any = {
 				conversationState,
 			};
+			if (additionalRequestFields) {
+				requestBody.additionalModelRequestFields = additionalRequestFields;
+			}
 
 			const replacementPayload = await options?.onPayload?.(
 				requestBody,
@@ -453,6 +465,18 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 								started = true;
 							}
 							thinkingParser.push(content);
+						}
+						break;
+					}
+					case "reasoningContentEvent": {
+						const ev = payload as ReasoningContentEvent;
+						if (ev.text || ev.signature || ev.redactedContent) {
+							if (!firstTokenTime) firstTokenTime = Date.now();
+							if (!started) {
+								stream.push({ type: "start", partial: output });
+								started = true;
+							}
+							parseReasoningContentEventHelper(ev, blocks, output, stream);
 						}
 						break;
 					}

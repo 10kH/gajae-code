@@ -31,6 +31,7 @@ import type {
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { withHttpStatus } from "../utils/http-inspector";
 import type { KiroCodeWhispererOptions } from "./kiro-codewhisperer";
+import { parseReasoningContentEventHelper } from "./kiro-reasoning-parser";
 
 /**
  * Trust assumption: globalThis.fetch is treated as a trusted source for authenticated
@@ -443,6 +444,7 @@ type KiroStreamEvent =
 	| { type: "toolUse"; data: { name: string; toolUseId: string; input: string; stop?: boolean } }
 	| { type: "toolUseInput"; data: { input: string } }
 	| { type: "toolUseStop"; data: { stop: boolean } }
+	| { type: "reasoningContent"; data: { text?: string; signature?: string; redactedContent?: string } }
 	| { type: "usage"; data: { inputTokens?: number; outputTokens?: number } }
 	| { type: "completion"; data: { stopReason: "COMPLETED" | "TOOL_USE" } }
 	| {
@@ -727,6 +729,20 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 			// Classify event based on fields present (order-independent)
 			if (typeof parsed.content === "string") {
 				events.push({ type: "content", data: parsed.content });
+			} else if (
+				parsed.text !== undefined ||
+				parsed.signature !== undefined ||
+				parsed.redactedContent !== undefined
+			) {
+				// Kiro native reasoning event
+				events.push({
+					type: "reasoningContent",
+					data: {
+						text: typeof parsed.text === "string" ? parsed.text : undefined,
+						signature: typeof parsed.signature === "string" ? parsed.signature : undefined,
+						redactedContent: typeof parsed.redactedContent === "string" ? parsed.redactedContent : undefined,
+					},
+				});
 			} else if (parsed.name && parsed.toolUseId) {
 				const raw = parsed.input;
 				const input = typeof raw === "string" ? raw : raw && typeof raw === "object" ? JSON.stringify(raw) : "";
@@ -855,6 +871,59 @@ export function buildKiroThinkingPrefix(reasoning: string | boolean | undefined)
 	return `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>`;
 }
 
+/**
+ * Build additional model request fields for Kiro native reasoning.
+ * Returns undefined when reasoning is not enabled, so buildKiroThinkingPrefix fallback applies.
+ * For models that support native reasoning, returns structured request fields instead.
+ */
+export function buildKiroAdditionalModelRequestFields(
+	model: Model<"kiro-codewhisperer-stream">,
+	reasoning: string | boolean | undefined,
+): Record<string, unknown> | undefined {
+	// Reasoning disabled: no additional fields needed
+	if (!reasoning) return undefined;
+
+	const modelId = toKiroModelId(model.wireModelId || model.id);
+	const isClaude = modelId.startsWith("claude-");
+	const isGpt = modelId.startsWith("gpt-");
+	const isKimi = modelId.startsWith("kimi-");
+
+	// Claude and Kimi models that support native reasoning (4.6+, 5.x)
+	const claudeCondition =
+		modelId.includes("-4.6") ||
+		modelId.includes(".4.6") ||
+		modelId.includes("-4.7") ||
+		modelId.includes(".4.7") ||
+		modelId.includes("-4.8") ||
+		modelId.includes(".4.8") ||
+		modelId.includes("-5") ||
+		modelId.includes(".5");
+	if ((isClaude || isKimi) && claudeCondition) {
+		const effort = reasoning === true ? undefined : typeof reasoning === "string" ? reasoning : "none";
+		return {
+			thinking: {
+				type: "adaptive",
+				display: "summarized",
+			},
+			...(effort && effort !== "none" ? { output_config: { effort } } : {}),
+		};
+	}
+
+	// GPT models that support native reasoning (5.6+)
+	const gptCondition =
+		modelId.includes("-5.6") || modelId.includes(".5.6") || modelId.includes("-6") || modelId.includes(".6");
+	if (isGpt && gptCondition) {
+		const effort = reasoning === true ? undefined : typeof reasoning === "string" ? reasoning : "none";
+		return {
+			reasoning: {
+				...(effort && effort !== "none" ? { effort } : {}),
+			},
+		};
+	}
+
+	return undefined;
+}
+
 function buildApiKeyRequest(
 	model: Model<"kiro-codewhisperer-stream">,
 	context: Context,
@@ -947,7 +1016,8 @@ function buildApiKeyRequest(
 	if (toolResults.length > 0) uimc.toolResults = toolResults;
 	if (context.tools?.length) uimc.tools = convertTools(context.tools);
 
-	return {
+	const additionalRequestFields = buildKiroAdditionalModelRequestFields(model, options.reasoning);
+	const request: any = {
 		conversationState: {
 			chatTriggerType: "MANUAL",
 			agentTaskType: "vibe",
@@ -964,6 +1034,10 @@ function buildApiKeyRequest(
 		},
 		agentMode: "vibe",
 	};
+	if (additionalRequestFields) {
+		request.additionalModelRequestFields = additionalRequestFields;
+	}
+	return request;
 }
 
 type Block = (TextContent | ThinkingContent | ToolCall) & { index?: number };
@@ -1393,6 +1467,12 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 					} else if (event.type === "toolUseStop" && event.data.stop && !hasTerminalEvent) {
 						toolComplete = true; // Mark tool as complete when toolUseStop is received
 						addToolToBlocks();
+					} else if (event.type === "reasoningContent" && !hasTerminalEvent) {
+						if (!firstTokenEmitted) {
+							firstTokenEmitted = true;
+							firstTokenTime = Date.now();
+						}
+						parseReasoningContentEventHelper(event.data, blocks, output, stream);
 					} else if (event.type === "usage") {
 						if (event.data.inputTokens !== undefined) output.usage.input = event.data.inputTokens;
 						if (event.data.outputTokens !== undefined) output.usage.output = event.data.outputTokens;
