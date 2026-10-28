@@ -1,4 +1,3 @@
 ### Fixed
 
-- Retire exact MCP grants at session ownership boundaries using both loaded session ID and transcript path, including same-path transcript replacement; fence queued controls, rollback and disposal without recreating separately revoked authority.
-- Refuse deletion of a custom profile claimed during the final write preparation, preserving the profile and returning the explicit replacement-required error.
+- Retire exact MCP grants when a loaded transcript's session ID changes at the same path, preventing stale controls from retaining authority after in-place transcript replacement.
