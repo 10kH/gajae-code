@@ -2672,6 +2672,17 @@ export declare function rasterizeSvg(input: Uint8Array, maxWidthPx: number, maxH
  */
 export declare function readImageFromClipboard(): Promise<ClipboardImage | undefined | null>
 
+/**
+ * Re-apply raw mode to `fd` when a direct termios change left it cooked.
+ *
+ * Applies the transform Bun's `setRawMode(true)` uses (libuv's
+ * `UV_TTY_MODE_RAW`) to the live termios with `TCSANOW`, so the tty never
+ * enters an echoing mode. Returns `true` when it had to restore raw mode.
+ * Returns `false` when the tty was already raw, and in that case issues no
+ * `tcsetattr`. Throws when `fd` is not a tty and on non-Unix hosts.
+ */
+export declare function reassertRawTty(fd: number): boolean
+
 export interface RecoveryFsIdentity {
   dev: string
   ino: string
