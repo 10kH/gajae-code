@@ -151,8 +151,11 @@ Foreign or unknown Telegram daemon identity prevents activation, but permits an
 inactive save or discard. Active commit rechecks identity before writing without
 locking out external daemon changes. Single-file CAS restoration preserves newer
 writers; it does not make configuration and runtime activation cross-file atomic.
-Health/recovery strings and free-form daemon metadata redact configured provider
-tokens and their fingerprints. Unknown foreign secrets cannot be recognized reliably.
+Health diagnostics and free-form daemon metadata redact configured provider tokens
+and their fingerprints. Recovery endpoint identities and filesystem/path metadata
+can still contain sensitive values: keep raw recovery reports inside the trusted
+host and sanitize display data before forwarding it. Unknown foreign secrets
+cannot be recognized reliably.
 
 Treat runtime-fence and restore-marker failures as degraded: a blocked reconnect
 can fail to establish a durable inactive marker. A restore-time marker conflict
