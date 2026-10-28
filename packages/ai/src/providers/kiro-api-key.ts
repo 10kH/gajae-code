@@ -1495,9 +1495,9 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						if (!hasTerminalEvent) {
 							// Transition from reasoning to text: close active reasoning block
 							closeReasoningBlock(blocks, output, stream, reasoningState);
-							if (event.data === lastContent) continue;
-							lastContent = event.data;
-							consume Content(event.data);
+						if (event.data === lastContent) continue;
+						lastContent = event.data;
+						consumeContent(event.data);
 						}
 					} else if (event.type === "toolUse") {
 						if (!hasTerminalEvent) {
