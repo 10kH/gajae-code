@@ -2601,7 +2601,9 @@ if (process.argv.includes("--internal-managed-owner-supervisor")) {
 					GJC_TMUX_COMMAND: "tmux",
 					GJC_TMUX_SESSION: "root",
 					GJC_COORDINATOR_SESSION_ID: sessionId,
-					GJC_COORDINATOR_SESSION_STATE_FILE: stateFile,
+					// An operator pin spelled with `..` and `.` reaches the real supervisor and
+					// admission, which refuse a `..` state directory, as `stateFile`.
+					GJC_COORDINATOR_SESSION_STATE_FILE: `${stateDir}/pins/.././/runtime-state.json`,
 				},
 				argv: [process.execPath, entry],
 				execPath: process.execPath,
