@@ -104,6 +104,7 @@ export const ptyTimeoutCount = nativeBindings.ptyTimeoutCount;
 export const rasterizeSvg = nativeBindings.rasterizeSvg;
 export const readImageFromClipboard = nativeBindings.readImageFromClipboard;
 export const readOwnerOnlyFile = nativeBindings.readOwnerOnlyFile;
+export const reassertRawTty = nativeBindings.reassertRawTty;
 export const renameDirectoryNoReplacePath = nativeBindings.renameDirectoryNoReplacePath;
 export const renameDirectoryNoReplacePathAsync = nativeBindings.renameDirectoryNoReplacePathAsync;
 export const renameNoReplacePath = nativeBindings.renameNoReplacePath;
