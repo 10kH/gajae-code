@@ -20,6 +20,7 @@ import {
 } from "./managed-owner-admission";
 import {
 	MANAGED_OWNER_INCARNATION_ENV,
+	MANAGED_OWNER_LAUNCH_BASELINE_ENV,
 	MANAGED_OWNER_RECOVERABLE_COMMAND_MAX_BYTES,
 	MANAGED_OWNER_REDACT_COMMAND_ENV,
 	MANAGED_OWNER_RUN_ID_ENV,
@@ -67,6 +68,7 @@ import {
 	classifyCgroup,
 	executeTmuxOwnerIsolationPlanSync,
 	isOwnerGenerationBaselineCurrentSync,
+	launchBaselineToken,
 	lifecyclePaths,
 	type ManagedOwnerPredecessorEvidence,
 	type OwnerGenerationBaseline,
@@ -1292,6 +1294,7 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 				[GJC_TMUX_OWNER_SERVER_KEY_ENV]: plan.tmuxCommand,
 				[MANAGED_OWNER_RUN_ID_ENV]: runId,
 				[MANAGED_OWNER_INCARNATION_ENV]: incarnation,
+				[MANAGED_OWNER_LAUNCH_BASELINE_ENV]: launchBaselineToken(baseline),
 				// Darwin close needs only the binding identity, and owner-loss recovery is
 				// Linux-only; never persist the child argv (prompts, API keys) there.
 				...(plan.platform === "darwin" ? { [MANAGED_OWNER_REDACT_COMMAND_ENV]: "1" } : {}),

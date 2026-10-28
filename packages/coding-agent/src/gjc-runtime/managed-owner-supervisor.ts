@@ -42,6 +42,12 @@ export const MANAGED_OWNER_STATE_DIR_ENV = "GJC_TMUX_OWNER_STATE_DIR";
 export const MANAGED_OWNER_RUN_ID_ENV = "GJC_MANAGED_OWNER_RUN_ID";
 export const MANAGED_OWNER_INCARNATION_ENV = "GJC_MANAGED_OWNER_INCARNATION";
 /**
+ * The generation baseline the launcher captured before creating the session
+ * (`launchBaselineToken`). Off Linux a child of a not yet published generation is
+ * admitted only while that baseline is still current.
+ */
+export const MANAGED_OWNER_LAUNCH_BASELINE_ENV = "GJC_MANAGED_OWNER_LAUNCH_BASELINE";
+/**
  * Serialized child argv budget inside a recoverable binding. The binding's other
  * fields stay under 1 KiB, so the whole record fits the 64 KiB owner-only reader.
  */

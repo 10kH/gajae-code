@@ -11,6 +11,7 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/managed-owner-binding";
 import {
 	type AttemptCapability,
+	assertManagedOwnerGenerationNotReplaced,
 	type BootstrapRequest,
 	bootstrapTmuxOwnerIsolation,
 	captureOwnerGenerationBaselineSync,
@@ -561,6 +562,120 @@ describe("closed managed predecessor evidence", () => {
 		},
 	);
 
+	// Linux proves a killed supervisor's child through its SIGABRT receipt instead.
+	it.skipIf(process.platform === "linux" || process.platform === "win32")(
+		"checks a never-published generation's owners before publishing past it",
+		async () => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-predecessor-unpublished-"));
+			const freshDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-predecessor-unpublished-first-"));
+			try {
+				const binding = (generation: string, token: string, supervisorPid: number) => ({
+					schema_version: 3,
+					binding_kind: "opaque",
+					generation,
+					session_id: "session",
+					run_id: "run",
+					endpoint_incarnation: "incarnation",
+					child_token: token,
+					supervisor_pid: supervisorPid,
+					supervisor_start_time: `supervisor-${token}`,
+					created_at: "2026-09-08T00:00:00.000Z",
+				});
+				const write = (root: string, name: string, value: object) =>
+					fs.writeFile(path.join(root, name), `${JSON.stringify(value)}\n`, { mode: 0o600 });
+				const seed = async (dir: string) => {
+					const root = lifecyclePaths(dir, "session", "generation-b").root;
+					await fs.mkdir(root, { recursive: true, mode: 0o700 });
+					// Launch B created its session and admitted a child, then crashed before publishing.
+					await write(root, "child-b.binding.json", binding("generation-b", "b", 4242));
+					await write(root, managedOwnerAdmittedChildFile("b", 4343, "child-b"), {
+						schema_version: 1,
+						generation: "generation-b",
+						session_id: "session",
+						child_token: "b",
+						child_pid: 4343,
+						child_incarnation: "child-b",
+					});
+					// The publishing launch C has its own session, and a live supervisor, before publication.
+					await write(root, "child-c.binding.json", binding("generation-c", "c", 4444));
+					return root;
+				};
+				const live = new Map<number, ProcessIncarnationObservation>([
+					[4444, { status: "present", incarnation: "supervisor-c" }],
+				]);
+				const observe = (pid: number) => live.get(pid) ?? { status: "absent" as const };
+				replaceOwnerGenerationSync(stateDir, "session", "generation-a", { state: "absent" });
+				const baselineA = captureOwnerGenerationBaselineSync(stateDir, "session");
+				const root = await seed(stateDir);
+				const publish = () => replaceOwnerGenerationSync(stateDir, "session", "generation-c", baselineA, observe);
+				live.set(4242, { status: "present", incarnation: "supervisor-b" });
+				expect(publish).toThrow("managed_owner_predecessor_live");
+				await expect(
+					replaceOwnerGeneration(stateDir, "session", "generation-c", baselineA, observe),
+				).rejects.toThrow("managed_owner_predecessor_live");
+				live.delete(4242);
+				live.set(4343, { status: "present", incarnation: "child-b" });
+				expect(publish).toThrow("managed_owner_predecessor_live");
+				live.set(4343, { status: "unknown", reasonCode: "lookup_failed" });
+				expect(publish).toThrow("managed_owner_replacement_evidence_unavailable");
+				expect(captureOwnerGenerationBaselineSync(stateDir, "session")).toEqual(baselineA);
+				// B's owners are gone. C's own live supervisor is not a predecessor.
+				live.delete(4343);
+				expect(publish()).toBe("generation-c");
+				// Before any publication the scan still runs off Linux.
+				await seed(freshDir);
+				live.set(4242, { status: "present", incarnation: "supervisor-b" });
+				expect(() =>
+					replaceOwnerGenerationSync(freshDir, "session", "generation-c", { state: "absent" }, observe),
+				).toThrow("managed_owner_predecessor_live");
+				live.delete(4242);
+				expect(replaceOwnerGenerationSync(freshDir, "session", "generation-c", { state: "absent" }, observe)).toBe(
+					"generation-c",
+				);
+			} finally {
+				await fs.rm(stateDir, { recursive: true, force: true });
+				await fs.rm(freshDir, { recursive: true, force: true });
+			}
+		},
+	);
+
+	// Owner-only evidence reads do not exist on Windows, where managed launches are refused.
+	it.skipIf(process.platform === "win32")(
+		"admits an unpublished generation's child only while its launch baseline is current off Linux",
+		async () => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-fence-launch-baseline-"));
+			try {
+				const fence = (generation: string, launchBaseline: string | undefined) => () =>
+					assertManagedOwnerGenerationNotReplaced(stateDir, "session", generation, launchBaseline);
+				if (process.platform === "linux") {
+					// Linux keeps relying on its launcher's publication failure cleanup.
+					replaceOwnerGenerationSync(stateDir, "session", "generation-a", { state: "absent" });
+					expect(fence("generation-b", undefined)).not.toThrow();
+					expect(fence("generation-b", "absent")).not.toThrow();
+					return;
+				}
+				// Before any publication: only an absent launch baseline still holds.
+				expect(fence("generation-b", "absent")).not.toThrow();
+				expect(fence("generation-b", "current:generation-a")).toThrow("owner_generation_unverifiable");
+				expect(fence("generation-b", undefined)).toThrow("owner_generation_unverifiable");
+				replaceOwnerGenerationSync(stateDir, "session", "generation-a", { state: "absent" });
+				const baselineA = captureOwnerGenerationBaselineSync(stateDir, "session");
+				expect(fence("generation-b", "current:generation-a")).not.toThrow();
+				// B launched before A was first published, and its launcher never published B.
+				expect(fence("generation-b", "absent")).toThrow("owner_generation_stale");
+				expect(fence("generation-b", undefined)).toThrow("owner_generation_unverifiable");
+				replaceOwnerGenerationSync(stateDir, "session", "generation-c", baselineA);
+				// C was published past B's launch baseline, whether or not C saw B's binding.
+				expect(fence("generation-b", "current:generation-a")).toThrow("owner_generation_stale");
+				// A published generation is judged by the current generation alone.
+				expect(fence("generation-c", "current:generation-a")).not.toThrow();
+				expect(fence("generation-a", "absent")).toThrow("owner_generation_stale");
+			} finally {
+				await fs.rm(stateDir, { recursive: true, force: true });
+			}
+		},
+	);
+
 	// Owner-only evidence reads do not exist on Windows, where managed launches are refused.
 	itOwnerOnlyReads(
 		"treats a receipt-less prior binding as history only where SIGABRT receipts cannot exist",
@@ -610,8 +725,10 @@ describe("closed managed predecessor evidence", () => {
 					expect(() => resolve({ status: "unknown", reasonCode: "lookup_failed" })).toThrow(
 						"managed_owner_replacement_evidence_unavailable",
 					);
-					// Bindings of earlier generations share the pinned root and stay history, even
-					// when their pid now names a live process with the recorded start time.
+					// Bindings of other generations share the pinned root. They are history once
+					// their exact supervisor is gone, and refuse the relaunch while it lives: a
+					// generation that never became current (its launcher crashed before or during
+					// publication) can still have a live owner.
 					await fs.writeFile(
 						path.join(root, "child-older.binding.json"),
 						`${JSON.stringify({ ...binding, generation: "older-generation", child_token: "older", supervisor_pid: 5151 })}\n`,
@@ -619,9 +736,14 @@ describe("closed managed predecessor evidence", () => {
 					);
 					expect(
 						resolveManagedOwnerPredecessorSync(stateDir, "session", baseline, pid =>
-							pid === 5151 ? { status: "present", incarnation: "supervisor-start" } : { status: "absent" },
+							pid === 5151 ? { status: "present", incarnation: "reused" } : { status: "absent" },
 						),
 					).toBeUndefined();
+					expect(() =>
+						resolveManagedOwnerPredecessorSync(stateDir, "session", baseline, pid =>
+							pid === 5151 ? { status: "present", incarnation: "supervisor-start" } : { status: "absent" },
+						),
+					).toThrow("managed_owner_predecessor_live");
 					expect(() =>
 						resolveManagedOwnerPredecessorSync(stateDir, "session", baseline, pid =>
 							pid === 4242 ? { status: "present", incarnation: "supervisor-start" } : { status: "absent" },

@@ -23,6 +23,7 @@ import {
 } from "./managed-owner-binding";
 import {
 	MANAGED_OWNER_INCARNATION_ENV,
+	MANAGED_OWNER_LAUNCH_BASELINE_ENV,
 	MANAGED_OWNER_REDACT_COMMAND_ENV,
 	MANAGED_OWNER_RUN_ID_ENV,
 	managedOwnerSupervisorInvocation,
@@ -74,6 +75,7 @@ import {
 	executeTmuxOwnerIsolationPlanSync,
 	isOwnerGenerationBaselineCurrentSync,
 	isValidOwnerVerdict,
+	launchBaselineToken,
 	lifecyclePaths,
 	type OwnerIsolationProbeSync,
 	type OwnerVerdict,
@@ -856,6 +858,8 @@ export function createGjcTmuxSession(
 		if (!verifyOwnerOnlyPathSecurity(lifecycleRoot, "directory").ok)
 			throw new Error("gjc_tmux_managed_storage_unsafe");
 	}
+	// Captured before the session exists: its child is admitted only while this stays current.
+	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
 	const authority = bindGjcTmuxProviderAuthority(provider, { stateDir, sessionId, generation });
 	const managedEnvironment: Record<string, string> = {
 		GJC_TMUX_LAUNCHED: "1",
@@ -869,6 +873,7 @@ export function createGjcTmuxSession(
 			? {
 					[MANAGED_OWNER_RUN_ID_ENV]: crypto.randomUUID(),
 					[MANAGED_OWNER_INCARNATION_ENV]: crypto.randomUUID(),
+					[MANAGED_OWNER_LAUNCH_BASELINE_ENV]: launchBaselineToken(baseline),
 					[MANAGED_OWNER_REDACT_COMMAND_ENV]: "1",
 				}
 			: {}),
@@ -1000,7 +1005,6 @@ export function createGjcTmuxSession(
 			}),
 	};
 
-	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
 	const ownerPlan = planTmuxOwnerIsolationSync(
 		{
 			schema_version: 1,

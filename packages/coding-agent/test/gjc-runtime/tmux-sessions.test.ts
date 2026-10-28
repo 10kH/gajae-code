@@ -2819,7 +2819,10 @@ if (process.argv.includes("--internal-managed-owner-supervisor")) {
 					const relaunched = relaunchCalls.find(call => call[0] === "new-session")?.at(-1);
 					expect(relaunched).toContain("--internal-managed-owner-supervisor");
 					expect(relaunched).not.toContain("GJC_MANAGED_OWNER_PREDECESSOR_TOKEN");
-					expect(relaunched).not.toContain(generation);
+					// The closed generation is only the captured baseline, never the new owner's.
+					expect(relaunched).not.toContain(`GJC_TMUX_OWNER_GENERATION='${generation}'`);
+					expect(relaunched).toContain(`GJC_MANAGED_OWNER_LAUNCH_BASELINE='current:${generation}'`);
+					expect(relaunched?.split(generation)).toHaveLength(2);
 				}
 			} catch (error) {
 				failures.push(error);

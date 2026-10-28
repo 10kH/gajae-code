@@ -3713,6 +3713,8 @@ describe("tmux owner isolation launch gate", () => {
 		try {
 			const sessionId = "managed-owner-session";
 			const stateFile = path.join(root, "runtime-state.json");
+			// An earlier launch's generation is current; its owner left no binding behind.
+			replaceOwnerGenerationSync(root, sessionId, "prior-generation", { state: "absent" });
 			const calls: string[][] = [];
 			const handled = launchDefaultTmuxIfNeeded({
 				parsed: args({ messages: ["hello"], tmux: true }),
@@ -3761,6 +3763,8 @@ describe("tmux owner isolation launch gate", () => {
 			expect(innerCommand).not.toContain("__gjc_sidecar_key");
 			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_RUN_ID='[0-9a-f-]{36}'/i);
 			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_INCARNATION='[0-9a-f-]{36}'/i);
+			// The child is admitted before publication only while the captured baseline stays current.
+			expect(innerCommand).toContain("GJC_MANAGED_OWNER_LAUNCH_BASELINE='current:prior-generation'");
 			expect(innerCommand).not.toContain("GJC_MANAGED_OWNER_PREDECESSOR_TOKEN");
 			expect(innerCommand).not.toContain("tmux-exit.json");
 			// `exec` keeps the pane PID equal to the supervisor PID that managed close pins.
@@ -4172,6 +4176,7 @@ describe("tmux owner isolation launch gate", () => {
 			expect(innerCommand).toContain(`GJC_MANAGED_OWNER_PREDECESSOR_GENERATION='${generation}'`);
 			expect(innerCommand).toContain(`GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID='${runId}'`);
 			expect(innerCommand).toContain(`GJC_MANAGED_OWNER_PREDECESSOR_INCARNATION='${incarnation}'`);
+			expect(innerCommand).toContain(`GJC_MANAGED_OWNER_LAUNCH_BASELINE='current:${generation}'`);
 			expect(innerCommand).toMatch(/GJC_TMUX_OWNER_GENERATION='[0-9a-f-]{36}'/i);
 			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_RUN_ID='[0-9a-f-]{36}'/i);
 			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_INCARNATION='[0-9a-f-]{36}'/i);

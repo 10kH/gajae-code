@@ -1337,9 +1337,10 @@ is defense in depth for direct managed launches: Broker `session.spawn` selects
 the headless substrate on Windows before any launch, so it never reaches this
 guard. A rejected managed launch is never retried as headless. Ordinary
 unmanaged Windows launches are unchanged.
-Off Linux, a prior generation's child binding without any receipt is ordinary
-history, so relaunching the same pinned session starts fresh; any receipt there
-still fails closed as unavailable recovery evidence.
+Off Linux, a child binding without any receipt is ordinary history once its exact
+supervisor and every process admitted through it have positively exited, so
+relaunching the same pinned session then starts fresh; any receipt there still
+fails closed as unavailable recovery evidence.
 
 Every owner generation publication (a pinned relaunch, `gjc session create`
 from a pinned shell, a harness launch, or a raw `publish_generation` request)
@@ -1351,9 +1352,18 @@ replaced first (for example because its supervisor had not yet published the
 binding the relaunch would have found) is blocked with
 `owner_generation_stale`, and an unreadable current generation blocks it with
 `owner_generation_unverifiable`. So a relaunch either sees the live
-predecessor's binding and refuses, or the predecessor's child never runs. A
-child whose generation is not yet published is admitted; its launcher's own
-publication then fails against any replacement and removes the session.
+predecessor's binding and refuses, or the predecessor's child never runs. On
+Linux a child whose generation is not yet published is admitted; its launcher's
+own publication then fails against any replacement and removes the session. Off
+Linux that cleanup is not relied on, because the launcher may have died: the
+launcher passes the generation baseline it captured before creating the session
+(`GJC_MANAGED_OWNER_LAUNCH_BASELINE`), and a child of a generation not yet
+published is admitted only while that baseline is still current, read under the
+lock; otherwise it is blocked with `owner_generation_stale`, and without the
+baseline with `owner_generation_unverifiable`. Before any publication has created
+the session's lock database, only an absent baseline is admitted, without the
+lock; a publisher that runs later scans after taking the lock and finds the
+child's record.
 
 Admission denial does not depend on being able to save a diagnostic. Unsafe or
 unavailable storage never receives a fallback pathname write: the child stays
@@ -1434,24 +1444,26 @@ the child's postmortem cleanup deadline, and only the child holds the key that
 signs its runtime marker, so a relay whose persistence outlasts the wait leaves
 the recoverable `owner_verdict_unavailable` marker even if the close later
 succeeds. A pinned relaunch is
-refused with `managed_owner_predecessor_live` while the current generation's
-supervisor, or any process admitted through one of its bindings, is still live.
+refused with `managed_owner_predecessor_live` while a supervisor of the session,
+or any process admitted through one of its bindings, is still live.
 A supervisor killed after admission leaves no SIGABRT receipt and never reconciles
 its child, so each admitted process first publishes an owner-only
 `admitted-<token>-<pid>-<incarnation digest>.json` record of its exact pid and
-start time, before its generation fence. Once the generation is published, the
-fence and the relaunch's predecessor check run under the same generation lock:
-the relaunch either finds
+start time, before its generation fence. The fence and the relaunch's
+predecessor check run under the same generation lock: the relaunch either finds
 the record and requires that exact process to be gone (a reused pid is a
 different process), or replaces the generation first and the fence refuses the
 child with `owner_generation_stale`. A child that cannot publish its record is
 refused with `admitted_child_record_unavailable`, an unobservable admitted
 process fails the relaunch with `managed_owner_replacement_evidence_unavailable`,
 and a record that does not match its name or binding fails it with
-`managed_owner_replacement_evidence_untrusted`. A child admitted before its
-generation was published is not covered by this record check; as before, it
-relies on the launcher removing the provisional tmux session when publication
-fails. The closer holds a per-generation closer lock
+`managed_owner_replacement_evidence_untrusted`. The check covers every binding in
+the session's lifecycle root except the publishing launch's own, not only the
+current generation's: a launch that crashed after creating its session but before
+publishing leaves a generation that never became current, and its owner may still
+be live. A child of such a generation whose binding appears only after a relaunch
+published is refused at its fence, because its launch baseline is no longer
+current. The closer holds a per-generation closer lock
 (`closer-<generation>.sqlite`) from before its intent is visible until it stops
 waiting. The supervisor checks that lock before publishing its pending record
 and again immediately before signaling, so no relay is newly authorized after

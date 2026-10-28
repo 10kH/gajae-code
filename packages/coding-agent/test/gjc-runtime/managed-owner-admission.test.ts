@@ -37,6 +37,7 @@ const managedOwnerEnvironmentKeys = [
 	"GJC_TMUX_OWNER_GENERATION",
 	"GJC_MANAGED_OWNER_RUN_ID",
 	"GJC_MANAGED_OWNER_INCARNATION",
+	"GJC_MANAGED_OWNER_LAUNCH_BASELINE",
 	"GJC_MANAGED_OWNER_CHILD_TOKEN",
 	"GJC_MANAGED_OWNER_PREDECESSOR_TOKEN",
 	"GJC_MANAGED_OWNER_PREDECESSOR_GENERATION",
@@ -54,6 +55,7 @@ function managedOwnerEnvironment(overrides: Record<string, string> = {}): NodeJS
 async function admit(
 	stateDir: string,
 	token?: string,
+	launchBaseline = "absent",
 ): Promise<{ admitted: boolean; exitCode: number; root: string; stderr: string }> {
 	const script = `import { admitManagedOwnerBeforeCli } from ${JSON.stringify(admissionModule)}; const admission = await admitManagedOwnerBeforeCli(); console.log(JSON.stringify({ admitted: admission.kind !== "blocked", exitCode: process.exitCode ?? 0 }));`;
 	const child = Bun.spawn({
@@ -68,6 +70,7 @@ async function admit(
 			GJC_TMUX_OWNER_GENERATION: "generation-2681",
 			GJC_MANAGED_OWNER_RUN_ID: "run-2681",
 			GJC_MANAGED_OWNER_INCARNATION: "incarnation-2681",
+			GJC_MANAGED_OWNER_LAUNCH_BASELINE: launchBaseline,
 			...(token ? { GJC_MANAGED_OWNER_CHILD_TOKEN: token } : {}),
 		},
 	});
@@ -783,6 +786,52 @@ describe.skipIf(process.platform === "win32")("managed owner admission", () => {
 			} finally {
 				await lingering?.stop();
 				await fs.rm(stateDir, { recursive: true, force: true });
+			}
+		},
+	);
+
+	// A launch that crashed before publishing leaves its generation unpublished. Its child is
+	// admitted only while the baseline its launcher captured is current, so a relaunch that
+	// published first refuses it even if that child's binding appeared only afterwards.
+	it.skipIf(process.platform === "linux")(
+		"refuses a child of an unpublished generation once its launch baseline was replaced",
+		async () => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-admission-launch-baseline-"));
+			const firstDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-admission-launch-first-"));
+			try {
+				const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
+				replaceOwnerGenerationSync(stateDir, "session-2681", "generation-a", { state: "absent" });
+				const baselineA = captureOwnerGenerationBaselineSync(stateDir, "session-2681");
+				// pid 1 with another start time: the recorded supervisor is gone.
+				await writeBinding(root, "early-token");
+				expect(await admit(stateDir, "early-token", "current:generation-a")).toMatchObject({
+					admitted: true,
+					exitCode: 0,
+				});
+				// C is published before the late child's binding even exists, so C cannot see it.
+				replaceOwnerGenerationSync(stateDir, "session-2681", "generation-c", baselineA);
+				await writeBinding(root, "late-token");
+				const late = await admit(stateDir, "late-token", "current:generation-a");
+				expect(late).toMatchObject({ admitted: false, exitCode: 75 });
+				expect(late.stderr).toContain("child admission blocked: owner_generation_stale");
+				expect((await fs.readdir(root)).filter(name => name.startsWith("admitted-late-token-"))).toHaveLength(1);
+				// The same holds for a launch that captured no generation at all.
+				const firstRoot = lifecyclePaths(firstDir, "session-2681", "generation-2681").root;
+				await writeBinding(firstRoot, "early-token");
+				expect(await admit(firstDir, "early-token", "absent")).toMatchObject({ admitted: true, exitCode: 0 });
+				replaceOwnerGenerationSync(firstDir, "session-2681", "generation-c", { state: "absent" });
+				await writeBinding(firstRoot, "late-token");
+				const lateFirst = await admit(firstDir, "late-token", "absent");
+				expect(lateFirst).toMatchObject({ admitted: false, exitCode: 75 });
+				expect(lateFirst.stderr).toContain("child admission blocked: owner_generation_stale");
+				// Without its launch baseline a child of an unpublished generation is not admitted.
+				await writeBinding(firstRoot, "unbased-token");
+				const unbased = await admit(firstDir, "unbased-token", "");
+				expect(unbased).toMatchObject({ admitted: false, exitCode: 75 });
+				expect(unbased.stderr).toContain("child admission blocked: owner_generation_unverifiable");
+			} finally {
+				await fs.rm(stateDir, { recursive: true, force: true });
+				await fs.rm(firstDir, { recursive: true, force: true });
 			}
 		},
 	);

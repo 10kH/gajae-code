@@ -1084,7 +1084,15 @@ function assertOwnerGenerationReplaceable(
 	observe: (pid: number) => ProcessIncarnationObservation,
 ): void {
 	if (previous.state === "current" && previous.generation === generation) return;
-	resolveManagedOwnerPredecessorSync(stateDir, sessionId, previous, observe);
+	scanManagedOwnerPredecessor(stateDir, sessionId, previous, observe, generation);
+}
+
+/** Names a generation baseline for `MANAGED_OWNER_LAUNCH_BASELINE_ENV`. */
+export function launchBaselineToken(baseline: OwnerGenerationBaseline): string {
+	return generationToken(baseline.state === "current" ? baseline.generation : undefined);
+}
+function generationToken(generation: string | undefined): string {
+	return generation === undefined ? "absent" : `current:${generation}`;
 }
 
 export async function replaceOwnerGeneration(
@@ -1208,12 +1216,29 @@ export function resolveManagedOwnerPredecessorSync(
 	baseline: OwnerGenerationBaseline,
 	observe: (pid: number) => ProcessIncarnationObservation = observeProcessIncarnation,
 ): ManagedOwnerPredecessorEvidence | undefined {
-	if (baseline.state === "absent") return undefined;
-	const root = lifecyclePaths(stateDir, sessionId, baseline.generation).root;
+	return scanManagedOwnerPredecessor(stateDir, sessionId, baseline, observe);
+}
+
+/**
+ * `publishing` names the generation being published, whose own binding (its session
+ * exists before publication) is not a predecessor.
+ */
+function scanManagedOwnerPredecessor(
+	stateDir: string,
+	sessionId: string,
+	baseline: OwnerGenerationBaseline,
+	observe: (pid: number) => ProcessIncarnationObservation,
+	publishing?: string,
+): ManagedOwnerPredecessorEvidence | undefined {
+	// Off Linux an absent baseline still needs the scan: a launch that crashed before the
+	// first publication can leave a live owner behind.
+	if (baseline.state === "absent" && process.platform === "linux") return undefined;
+	const root = lifecyclePaths(stateDir, sessionId, "").root;
 	let entries: string[];
 	try {
 		entries = fsSync.readdirSync(root);
-	} catch {
+	} catch (error) {
+		if (baseline.state === "absent" && isCode(error, "ENOENT")) return undefined;
 		throw new Error("managed_owner_replacement_evidence_unavailable");
 	}
 	const bindings = new Set<string>();
@@ -1227,15 +1252,16 @@ export function resolveManagedOwnerPredecessorSync(
 		if (receipt) receipts.add(receipt[1]!);
 	}
 	if (bindings.size === 0 && receipts.size === 0) return undefined;
-	// SIGABRT receipts are a Linux-only capability. Elsewhere a prior generation's
-	// child binding without a receipt is ordinary history, but only once its exact
-	// supervisor has positively exited: replacing a live supervisor's generation would
-	// fence that owner out of its own close.
+	// SIGABRT receipts are a Linux-only capability. Elsewhere a binding without a receipt
+	// is history only once its exact supervisor and every process admitted through it
+	// have positively exited. That holds for every generation in the root, not only the
+	// baseline: a launch that crashed before publishing leaves a binding of a generation
+	// that never became current, whose owner may still be live.
 	if (receipts.size === 0 && process.platform !== "linux") {
-		for (const token of bindings)
-			assertPredecessorSupervisorExited(root, entries, baseline.generation, sessionId, token, observe);
+		for (const token of bindings) assertPriorOwnerExited(root, entries, publishing, sessionId, token, observe);
 		return undefined;
 	}
+	if (baseline.state === "absent") throw new Error("managed_owner_replacement_evidence_unavailable");
 	const tokens = [...bindings].filter(token => receipts.has(token));
 	if (tokens.length !== 1 || receipts.size !== 1) throw new Error("managed_owner_replacement_evidence_ambiguous");
 	const predecessorToken = tokens[0]!;
@@ -1266,10 +1292,11 @@ export function resolveManagedOwnerPredecessorSync(
 	}
 }
 
-function assertPredecessorSupervisorExited(
+/** Proves a binding's supervisor and every process admitted through it gone, unless it is the publisher's own. */
+function assertPriorOwnerExited(
 	root: string,
 	entries: readonly string[],
-	generation: string,
+	publishing: string | undefined,
 	sessionId: string,
 	token: string,
 	observe: (pid: number) => ProcessIncarnationObservation,
@@ -1278,14 +1305,12 @@ function assertPredecessorSupervisorExited(
 	const binding = readSecureOwnerJson(path.join(root, `child-${token}.binding.json`));
 	if (!isManagedOwnerBinding(binding) || binding.session_id !== sessionId || binding.child_token !== token)
 		throw new Error("managed_owner_replacement_evidence_untrusted");
-	// A pinned session keeps one lifecycle root, so bindings of generations before the
-	// baseline are retained history; each was replaced only after this same check.
-	if (binding.generation !== generation) return;
+	if (binding.generation === publishing) return;
 	// A live or unobservable predecessor supervisor still owns its generation.
 	assertProcessExited(observe(binding.supervisor_pid), binding.supervisor_start_time);
 	// A supervisor killed after admission never reconciled its child, so every process
 	// admitted through this binding must also be gone. One that has not recorded itself
-	// yet meets the replaced generation at its fence.
+	// yet is refused at its fence, which needs its launch baseline still current.
 	for (const entry of entries) {
 		const pid = managedOwnerAdmittedChildPid(token, entry);
 		if (pid === undefined) continue;
@@ -1450,30 +1475,53 @@ export function replaceOwnerGenerationSync(
  * and publication. So either the relaunch saw this child's binding and refused a
  * live predecessor, or it replaced the generation first and this child is
  * refused: no admitted child is left behind a generation that close no longer
- * reaches. A child of a generation not yet published is admitted; its launcher's
- * publication then fails the baseline check against any replacement and removes
- * the session.
+ * reaches. On Linux a child of a generation not yet published is admitted; its
+ * launcher's publication then fails the baseline check against any replacement and
+ * removes the session. Off Linux that cleanup is not relied on, because the
+ * launcher may have died: such a child, which recorded itself before this fence,
+ * is admitted only while `launchBaseline` (`launchBaselineToken` of the baseline
+ * its launcher captured) is still current under the lock. A relaunch that
+ * publishes later scans under that lock and finds the child's record.
  */
-export function assertManagedOwnerGenerationNotReplaced(stateDir: string, sessionId: string, generation: string): void {
+export function assertManagedOwnerGenerationNotReplaced(
+	stateDir: string,
+	sessionId: string,
+	generation: string,
+	launchBaseline: string | undefined,
+): void {
 	const paths = lifecyclePaths(stateDir, sessionId, generation);
-	try {
-		fsSync.lstatSync(paths.generationMarkerFile);
-	} catch (error) {
-		if (isCode(error, "ENOENT")) return;
-		throw new Error("owner_generation_unverifiable");
+	if (!lifecycleEntryExists(paths.generationMarkerFile)) {
+		if (process.platform === "linux") return;
+		if (launchBaseline === undefined) throw new Error("owner_generation_unverifiable");
+		// No publisher has taken the lock, so nothing was published since an absent
+		// baseline; one that does scans after taking it and finds this child's record.
+		if (!lifecycleEntryExists(paths.lockDatabaseFile)) {
+			if (launchBaseline === generationToken(undefined)) return;
+			throw new Error("owner_generation_unverifiable");
+		}
 	}
 	const db = acquireSqliteLockSync(paths, GENERATION_LOCK_WAIT_TIMEOUT_MS, true);
 	if (!db) throw new Error("owner_generation_unverifiable");
 	try {
+		const published = lifecycleEntryExists(paths.generationMarkerFile);
 		let current: unknown;
 		try {
-			current = readSecureOwnerJson(paths.generationFile);
+			current = lifecycleEntryExists(paths.generationFile) ? readSecureOwnerJson(paths.generationFile) : undefined;
 		} catch {
 			throw new Error("owner_generation_unverifiable");
 		}
-		if (!isRecord(current) || current.session_id !== sessionId || !nonEmpty(current.generation))
+		if (
+			current !== undefined &&
+			(!isRecord(current) || current.session_id !== sessionId || !nonEmpty(current.generation))
+		)
 			throw new Error("owner_generation_unverifiable");
-		if (current.generation !== generation) throw new Error("owner_generation_stale");
+		const currentGeneration = current === undefined ? undefined : (current as { generation: string }).generation;
+		if (published) {
+			if (currentGeneration === undefined) throw new Error("owner_generation_unverifiable");
+			if (currentGeneration !== generation) throw new Error("owner_generation_stale");
+			return;
+		}
+		if (generationToken(currentGeneration) !== launchBaseline) throw new Error("owner_generation_stale");
 	} finally {
 		try {
 			db.exec("COMMIT");
@@ -1481,6 +1529,16 @@ export function assertManagedOwnerGenerationNotReplaced(stateDir: string, sessio
 		} finally {
 			db.close();
 		}
+	}
+}
+
+function lifecycleEntryExists(file: string): boolean {
+	try {
+		fsSync.lstatSync(file);
+		return true;
+	} catch (error) {
+		if (isCode(error, "ENOENT")) return false;
+		throw new Error("owner_generation_unverifiable");
 	}
 }
 

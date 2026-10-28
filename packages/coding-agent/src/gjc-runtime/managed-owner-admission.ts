@@ -35,6 +35,7 @@ import {
 const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
 const MANAGED_OWNER_GENERATION_ENV = "GJC_TMUX_OWNER_GENERATION";
 const MANAGED_OWNER_INCARNATION_ENV = "GJC_MANAGED_OWNER_INCARNATION";
+const MANAGED_OWNER_LAUNCH_BASELINE_ENV = "GJC_MANAGED_OWNER_LAUNCH_BASELINE";
 const MANAGED_OWNER_RUN_ID_ENV = "GJC_MANAGED_OWNER_RUN_ID";
 const MANAGED_OWNER_SESSION_ID_ENV = "GJC_COORDINATOR_SESSION_ID";
 const MANAGED_OWNER_STATE_DIR_ENV = "GJC_TMUX_OWNER_STATE_DIR";
@@ -314,7 +315,12 @@ async function admitManagedOwner(): Promise<ManagedOwnerAdmission> {
 			// A relaunch may have replaced this generation before its supervisor
 			// published the binding; that child would outlive every close path.
 			try {
-				assertManagedOwnerGenerationNotReplaced(owner.stateDir, owner.sessionId, owner.generation);
+				assertManagedOwnerGenerationNotReplaced(
+					owner.stateDir,
+					owner.sessionId,
+					owner.generation,
+					process.env[MANAGED_OWNER_LAUNCH_BASELINE_ENV]?.trim() || undefined,
+				);
 			} catch (error) {
 				return deny(
 					owner,

@@ -108,6 +108,8 @@ function startSupervisor(
 			GJC_TMUX_OWNER_GENERATION: "generation-2681",
 			GJC_MANAGED_OWNER_RUN_ID: "run-2681",
 			GJC_MANAGED_OWNER_INCARNATION: "incarnation-2681",
+			// As a first launch: no generation had been published when the session was created.
+			GJC_MANAGED_OWNER_LAUNCH_BASELINE: "absent",
 			...env,
 		},
 	});
@@ -224,6 +226,8 @@ try { await runManagedOwnerSupervisor(${supervisorArgs}); process.exitCode = 22;
 						GJC_TMUX_OWNER_GENERATION: "generation-2681",
 						GJC_MANAGED_OWNER_RUN_ID: "run-2681",
 						GJC_MANAGED_OWNER_INCARNATION: "incarnation-2681",
+						// As a first launch: no generation had been published when the session was created.
+						GJC_MANAGED_OWNER_LAUNCH_BASELINE: "absent",
 						GJC_MANAGED_OWNER_REDACT_COMMAND: "1",
 					},
 				});
