@@ -1,168 +1,181 @@
-import { describe, expect, it } from "bun:test";
-import * as path from "node:path";
-import { EMBEDDED_DOC_FILENAMES, EMBEDDED_DOCS } from "../src/internal-urls/docs-index.generated";
+# Install, update channels, and platform setup
 
-// These probes check loading semantics, not a five-second cold-start budget.
-// Keep a child deadline below the test deadline so stalled imports still fail.
-const DOCS_PROBE_TIMEOUT_MS = 30_000;
+## Standard install
 
-function runBunEval(script: string) {
-	const result = Bun.spawnSync({
-		cmd: [process.execPath, "-e", script],
-		cwd: path.join(import.meta.dir, ".."),
-		stdout: "pipe",
-		stderr: "pipe",
-		timeout: DOCS_PROBE_TIMEOUT_MS,
-		killSignal: "SIGKILL",
-	});
-	const stdout = result.stdout.toString();
-	const stderr = result.stderr.toString();
-	expect(result.exitCode, stderr || stdout).toBe(0);
-	return stdout;
-}
+Prebuilt standalone binaries are the supported end-user install. Bun is not required.
 
-const DOCS_DIR = path.join(import.meta.dir, "../../../docs");
-const REGENERATE_HINT = "run: bun --cwd=packages/coding-agent run generate-docs-index";
+```sh
+# Tagged installer (recommended): pin the ref, then run locally.
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.3/scripts/install.sh -o gjc-install.sh
+sh gjc-install.sh
+gjc --version
+gjc --smoke-test
+```
 
-// Mirrors how scripts/generate-docs-index.ts derives the corpus: a recursive .md
-// scan of docs/, POSIX-separated and sorted. Deriving it here rather than pinning
-// a list is what makes the parity assertions below a drift gate instead of a
-// reminder to update two hand-maintained filenames.
-async function scanDocsCorpus(): Promise<string[]> {
-	const entries: string[] = [];
-	for await (const relativePath of new Bun.Glob("**/*.md").scan(DOCS_DIR)) {
-		entries.push(relativePath.split(path.sep).join("/"));
-	}
-	return entries.sort();
-}
+Piping the `main` branch script executes mutable content:
 
-const REPO_ROOT = path.join(import.meta.dir, "../../..");
-const GENERATED_INDEX = "packages/coding-agent/src/internal-urls/docs-index.generated.ts";
+```sh
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh
+```
 
-/** `git ls-files --error-unmatch <path>`. Exit 0 means git tracks the path. */
-function isTracked(relativePath: string): boolean {
-	const result = Bun.spawnSync({
-		cmd: ["git", "ls-files", "--error-unmatch", "--", relativePath],
-		cwd: REPO_ROOT,
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	return result.exitCode === 0;
-}
+Windows (PowerShell), tagged:
 
-describe("internal-urls docs index loading", () => {
-	it(
-		"does not load the generated docs corpus when importing the barrel",
-		() => {
-			const stdout = runBunEval(`
-			const marker = Symbol.for("gjc.docs-index.generated.loaded");
-			Reflect.deleteProperty(globalThis, marker);
-			await import("@gajae-code/coding-agent/internal-urls");
-			const loaded = Reflect.get(globalThis, marker) === true;
-			console.log(JSON.stringify({ loaded }));
-		`);
-			const result = JSON.parse(stdout.trim()) as { loaded: boolean };
+```powershell
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.3/scripts/install.ps1 -OutFile gjc-install.ps1
+powershell -File gjc-install.ps1
+```
 
-			expect(result.loaded).toBe(false);
-		},
-		DOCS_PROBE_TIMEOUT_MS + 5_000,
-	);
+The installer downloads the current platform's GitHub release asset, verifies HTTP success, non-empty bytes, and published SHA-256 checksums, then runs `--version` and `--smoke-test`. A failed download or verification never replaces a working existing `gjc`. Version discovery uses GitHub only (`https://api.github.com` and `https://github.com/<repo>/releases/download`); firewalled or mirrored registries are not used. Offline/source workflows use `--source` with an existing Bun.
 
-	it(
-		"loads the generated docs corpus when resolving gjc docs",
-		() => {
-			const stdout = runBunEval(`
-			const { InternalUrlRouter } = await import("@gajae-code/coding-agent/internal-urls");
-			const resource = await InternalUrlRouter.instance().resolve("gjc://");
-			console.log(JSON.stringify({
-				contentType: resource.contentType,
-				contentLength: resource.content.length,
-			}));
-		`);
-			const result = JSON.parse(stdout.trim()) as { contentType: string; contentLength: number };
-			expect(result.contentType).toBe("text/markdown");
-			expect(result.contentLength).toBeGreaterThan(0);
-		},
-		DOCS_PROBE_TIMEOUT_MS + 5_000,
-	);
+Unix default location: `~/.local/bin/gjc` (`GJC_INSTALL_DIR` overrides).
+Windows default location: `%LOCALAPPDATA%\gjc\gjc.exe`.
 
-	it(
-		"the install guide retry recipe is read from its documented config path",
-		() => {
-			const stdout = runBunEval(`
-			const fs = await import("node:fs/promises");
-			const os = await import("node:os");
-			const path = await import("node:path");
-			const { Settings } = await import("@gajae-code/coding-agent/config/settings");
-			const document = await Bun.file("../../docs/install.md").text();
-			const section = document.split("## Retry configuration")[1];
-			const documentedPath = section?.match(/Provider retry budgets live in \x60(~[^\x60]+)\x60/)?.[1];
-			const yaml = section?.match(/\x60\x60\x60yaml\\n([\\s\\S]*?)\x60\x60\x60/)?.[1];
-			if (!documentedPath?.startsWith("~/") || !yaml) throw new Error("missing retry config recipe");
-			const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-install-retry-docs-"));
-			try {
-				const agentDir = path.join(root, ".gjc", "agent");
-				const cwd = path.join(root, "project");
-				await fs.mkdir(agentDir, { recursive: true });
-				await fs.mkdir(cwd);
-				await Bun.write(path.join(root, documentedPath.slice(2)), yaml);
-				const settings = await Settings.loadReadonly({ cwd, agentDir });
-				console.log(JSON.stringify({ request: settings.get("retry.requestMaxRetries"), stream: settings.get("retry.streamMaxRetries") }));
-			} finally {
-				await fs.rm(root, { recursive: true, force: true });
-			}
-		`);
-			expect(JSON.parse(stdout.trim())).toEqual({ request: 4, stream: 100 });
-		},
-		DOCS_PROBE_TIMEOUT_MS + 5_000,
-	);
+### PDF extraction in standalone builds
 
-	it("embeds exactly the docs corpus that exists on disk", async () => {
-		const onDisk = await scanDocsCorpus();
+Standalone and source builds extract PDF text through the native `pdf-inspector` backend. The native addon is included with supported platform builds; no JavaScript PDF package, WebAssembly sidecar, or current-working-directory lookup is required. Conversion returns page markers and document metadata. No OCR engine is bundled, so a document with no extracted text reports the page numbers that require OCR rather than treating raw PDF bytes as text. `:raw` remains an explicit request for the original response.
 
-		expect(
-			[...EMBEDDED_DOC_FILENAMES],
-			`docs corpus changed without regenerating the index; ${REGENERATE_HINT}`,
-		).toEqual(onDisk);
-		expect(
-			Object.keys(EMBEDDED_DOCS).sort(),
-			`embedded doc keys drifted from the corpus; ${REGENERATE_HINT}`,
-		).toEqual(onDisk);
-	});
+Published package tarballs include the patched MIT-licensed Markit 0.5.3 converter under `vendor/markit-ai` for DOCX, PPTX, XLSX, EPUB, and RTF conversion. Its license, upstream package manifest, and deterministic provenance/hash inventory are retained. Direct `npm pack` and `bun pm pack` use the checked-in vendor tree, not borrowed or staged `node_modules` graphs. The release packer retains its canonical archive limits and deterministic-output checks.
 
-	it("keeps every embedded doc byte-identical to its source", async () => {
-		const onDisk = await scanDocsCorpus();
-		const sources = await Promise.all(
-			onDisk.map(async fileName => ({
-				fileName,
-				source: await Bun.file(path.join(DOCS_DIR, fileName)).text(),
-			})),
-		);
-		const stale = sources
-			.filter(({ fileName, source }) => EMBEDDED_DOCS[fileName] !== source)
-			.map(({ fileName }) => fileName);
+Maintainers regenerate the converter with `bun packages/coding-agent/scripts/vendor-markit.ts --generate`. This fetches only the pinned registry artifact, verifies its SHA-512 integrity, and applies `packages/coding-agent/vendor/markit-ai.patch` in an owned temporary directory without executing upstream code. `bun packages/coding-agent/scripts/vendor-markit.ts --check` verifies local inventory and patch hashes without network access; package check and build run this verification. Normal packing does not modify installed dependencies or create ownership receipts requiring recovery.
 
-		expect(stale, `stale embedded docs index for ${stale.join(", ") || "(none)"}; ${REGENERATE_HINT}`).toEqual([]);
-	});
+## Korean launcher alias
 
-	/**
-	 * The two assertions above compare the worktree index to the worktree docs,
-	 * which is the whole contract now that the index is generated rather than
-	 * committed: the root `prepare` hook rebuilds it on every `bun install`, so
-	 * the worktree copy is authoritative and a stale *committed* copy cannot
-	 * exist to drift from it.
-	 *
-	 * Keeping it untracked is what makes that true. The generator emits one line
-	 * per doc — each holding an entire document as a single JSON string — so two
-	 * branches editing the same doc produce a whole-line conflict that git cannot
-	 * three-way merge. Tracking it reintroduces a conflict on every rebase, and
-	 * because `.gitignore` only governs untracked paths, the ignore rule goes
-	 * inert the moment something forces it back into the index.
-	 */
-	it("keeps the generated index untracked so it cannot conflict on rebase", () => {
-		expect(
-			isTracked(GENERATED_INDEX),
-			`${GENERATED_INDEX} is committed; it is generated and gitignored. Run: git rm --cached ${GENERATED_INDEX}`,
-		).toBe(false);
-	});
-});
+`가재씨` is installed alongside `gjc` as a launcher alias on package-manager installs. Standalone binaries expose `gjc`. On Windows, use `gjc` (or run from Windows Terminal / PowerShell with UTF-8 `chcp 65001` if a Hangul alias is needed).
+
+## Supported platforms
+
+Prebuilt standalone release binaries are published for:
+
+- **Linux** — x64 and arm64, **glibc only** (musl/Alpine is not supported; use `--source` with existing Bun)
+- **Windows** — x64
+- **macOS** — Apple Silicon (arm64) and Intel (x64)
+
+## Nightly channel
+
+A verified nightly prerelease is published from `main` at 04:23 UTC and can also be started manually with the **nightly-release** CI dispatch. Nightly runs execute the complete main verification graph, build every supported native addon and standalone binary, and create a matching GitHub prerelease. They do not rewrite `main` or consume the `[Unreleased]` changelog sections.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --channel nightly
+gjc --version
+gjc --smoke-test
+```
+
+Windows: pass `-Channel nightly` to `install.ps1`.
+
+Already on GJC? Switch channels without reinstalling: `gjc update --channel nightly` moves to the latest nightly, and `gjc update --channel stable` switches a nightly install back to the latest stable (the command detects the channel switch and installs even though stable is semver-lower than the nightly). To make a channel the default for both `gjc update` and the startup update check, set **Settings → Interaction → Update Channel** (the `startup.updateChannel` setting). In the brief window where a nightly shares the stable core version, add `--force` to move onto it.
+
+Pin an exact release tag (binary assets required):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --ref v0.15.0
+```
+
+## Development / source install
+
+Bun is required only to build GJC from source. The installer never downloads Bun.
+
+```sh
+# Requires an existing Bun 1.3.14+ on PATH
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --source
+```
+
+From a checkout: `bun run install:dev`, then `bun run dev` / `bun run dev:link`. The setup command installs dependencies, rebuilds the native addon, links the source CLI, and installs bundled defaults. See the repository `AGENTS.md` for the development workflow.
+
+From a `git worktree add` checkout, run `bun run setup:worktree` instead: it installs dependencies and builds the native addon without touching the global `gjc` link, git hooks, or user defaults of your primary checkout. `bun run dev:doctor -- --worktree` reports whether the checkout can resolve workspace packages and load the native addon. `install:dev` is for the primary checkout only.
+
+## Windows notes
+
+GJC's shell tool requires a bash-compatible shell on Windows. After a binary install, the PowerShell installer records Git Bash if it finds it. Options:
+
+1. Install Git for Windows: https://git-scm.com/download/win
+2. Use WSL, Cygwin, or MSYS2
+
+Native Windows `gjc --tmux` needs a tmux-compatible executable on `PATH`. For GJC-managed session guarantees, use WSL with real tmux. See [`environment-variables.md`](./environment-variables.md#interactive---tmux-startup-and-scrollmouse-profile).
+
+## Shell completion
+
+GJC can generate a Fig/withfig-compatible spec for [Microsoft inshellisense](https://github.com/microsoft/inshellisense):
+
+```sh
+gjc completion inshellisense --install
+```
+
+The installer writes `gjc.js` plus a minimal `index.js` into inshellisense's default local spec directory (`~/.fig/autocomplete/build`). If that directory already has an unrelated `index.js`, GJC refuses to clobber it unless `--force` is explicit; use `--dir <path>` for a separate GJC-only spec directory.
+
+## Launch-time updates
+
+Interactive startup checks GitHub releases for a newer GJC version in the background by default. This check is notify-only and non-mutating: GJC never installs or replaces itself during launch.
+
+- Standalone binary or former Bun/npm install on a supported platform → `gjc update` installs the matching GitHub release binary. Existing standalone binaries are atomically replaced. Package-manager installs migrate to a separate user binary path, even at the same version; shims are neither overwritten nor uninstalled. A target that already passes release-checksum, version, and smoke-test verification is reused without downloading the binary again (unless `--force` is set).
+- Source checkout or `dev:link` executable → update, pull, build, and link through that checkout's original workflow. `gjc update` refuses to self-overwrite it.
+- Project dependency install (`<project>/node_modules/.bin/gjc`, including the real `.exe` that Windows dependency installs place there) → update the dependency, not the file: `gjc update` refuses with package-manager instructions because that file belongs to the project's lockfile, and replacing it fails on Windows ACLs (#6842).
+- Unsupported platform or unknown target → rerun the documented platform installer.
+
+Run `gjc config set startup.checkUpdate false` to disable the launch-time check. Network failures are ignored so they do not block startup.
+
+`gjc update` resolves `stable` from GitHub `/releases/latest` and `nightly` from the newest published GitHub prerelease. Optional `GITHUB_TOKEN` / `GH_TOKEN` raises API rate limits. `--check`, `--force`, and channel switch-back semantics are unchanged.
+
+### After a package-manager migration
+
+“Installed and verified” confirms the standalone binary, not which executable your current shell will run. A same-version migration changes the installation type, not the version. Use the explicit verified binary path printed by the updater to launch it directly; for the default POSIX location:
+
+```sh
+"$HOME/.local/bin/gjc" --version
+"$HOME/.local/bin/gjc"
+```
+
+Check command resolution in the same shell where you ran the update:
+
+```sh
+type -a gjc
+command -v gjc
+hash -r                  # Bash: clear cached command locations
+# rehash                 # zsh equivalent
+command -v gjc
+gjc --version
+```
+
+A stale Bash command hash can retain the Bun shim even when `type -a gjc` lists the standalone binary first. Clearing that hash can activate the standalone binary without any PATH edit. Only if resolution still selects another install should you check aliases/functions and ensure the standalone directory precedes the shim directory on PATH. On PowerShell, inspect `Get-Command gjc -All` and `where.exe gjc`, and invoke the printed binary path with `& 'path/to/gjc.exe'`. No shim removal is required.
+
+## Optional macOS community app
+
+After a successful macOS binary install or update, GJC may offer:
+
+```text
+Install Gajae Code App (experimental, community-built)? [y/N]
+```
+
+The default is **No**. This optional, third-party app is experimental, separately
+licensed, and community-maintained at <https://github.com/devswha/gajae-code-app>;
+it is not an official first-party support offering. The shared installer skips
+existing verified app bundles in user-local or system Applications locations.
+Only interactive terminals are eligible: CI, pipes, automation, non-macOS hosts,
+and `gjc update --check` never prompt. Set `GJC_NO_COMMUNITY_APP=1` to suppress the
+offer for unattended or repeated installs.
+The fresh-install offer requires Bash job ownership (including macOS `/bin/sh`);
+other shells skip only the optional offer and leave the successful GJC installation intact.
+Piped installer input is preserved rather than replaced with `/dev/tty`.
+
+An accepted offer uses only a canonical published GitHub Release DMG and its
+SHA-256 checksum. If no canonical release exists, installation fails closed;
+there is no fallback to Actions artifacts, source execution, or raw builds.
+GJC verifies the bundle identity, architecture, and pinned Developer ID signature,
+copies to a writable Applications location, launches with macOS `open`, and safely
+detaches the image during cleanup. It never implicitly uses `sudo`, disables Gatekeeper, removes
+quarantine, or bypasses licensing or signature checks. App-specific failures are
+reported with the community repository URL and do not fail the successful GJC
+install or update.
+
+## Retry configuration
+
+Provider retry budgets live in `~/.gjc/agent/config.yml`:
+
+```yaml
+retry:
+  requestMaxRetries: 4
+  streamMaxRetries: 100
+  maxRetries: 3
+  maxDelayMs: 300000
+```
+
+`requestMaxRetries` applies before a stream is established. `streamMaxRetries` applies only to replay-safe transient stream failures. Invalid auth, unsupported models/providers, malformed requests, context overflow, user aborts, and permanent quota failures remain fail-fast.
