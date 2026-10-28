@@ -2886,7 +2886,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 				mcpManager = nextManager;
 				ownsMcpManager = Boolean(nextManager);
-				await session.replaceOwnedMcpManager(nextManager);
+				try {
+					await session.replaceOwnedMcpManager(nextManager);
+				} catch (error) {
+					if (session.isDisposed) {
+						// If disposal has started, skip the MCP manager replacement.
+						// Disposal will handle cleaning up the MCP manager.
+						logger.warn("Skipping MCP manager replacement during session disposal", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					} else {
+						throw error;
+					}
+				}
 				await session.refreshMCPTools((nextManager?.getTools() ?? []) as CustomTool[], {
 					mandatoryMCPToolNames: pluginMcpToolNames,
 				});
