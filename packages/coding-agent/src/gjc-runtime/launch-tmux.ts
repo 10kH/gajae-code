@@ -22,6 +22,7 @@ import {
 	MANAGED_OWNER_INCARNATION_ENV,
 	MANAGED_OWNER_RUN_ID_ENV,
 	MANAGED_OWNER_SUPERVISOR_ARG,
+	managedOwnerStateDirAccepted,
 } from "./managed-owner-supervisor";
 import { tmuxRuntimeSessionPath } from "./session-layout";
 import {
@@ -52,7 +53,6 @@ import {
 	GJC_TMUX_PROFILE_ENV,
 	GJC_TMUX_SESSION_PREFIX,
 	type GjcTmuxProfileCommand,
-	normalizeOperatorStateFilePin,
 	type ProviderAuthority,
 	persistGjcTmuxProviderAuthoritySync,
 	readGjcTmuxProviderAuthoritySync,
@@ -1133,11 +1133,9 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	const gjcSessionId = identityEnv.GJC_SESSION_ID?.trim() || sessionId;
 	const derivedStateFile = tmuxRuntimeSessionPath(cwd, gjcSessionId, buildGjcTmuxSessionSlug(sessionName));
 	// Supervised launches verify their lifecycle root with no-follow walks, so a derived
-	// path through a symlinked workspace is named canonically; an operator pin is only
-	// lexically normalized.
-	const pinnedStateFile = identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
+	// path through a symlinked workspace is named canonically; an operator pin is verbatim.
 	const sessionStateFile =
-		(pinnedStateFile && normalizeOperatorStateFilePin(pinnedStateFile, platform)) ||
+		identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() ||
 		(platform === "linux" || platform === "darwin"
 			? canonicalManagedStateFile(cwd, derivedStateFile)
 			: derivedStateFile);
@@ -1233,6 +1231,11 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 	const identityEnv = tmuxLaunchIdentityEnv(launchEnv, plan.cwd);
 	const gjcSessionId = identityEnv.GJC_SESSION_ID?.trim() || sessionId;
 	const stateDir = path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime"));
+	const supervised = plan.platform === "linux";
+	// The supervisor refuses a state directory that is not an absolute path free of `..`.
+	// Refuse such an operator pin here, before any lifecycle storage exists. It is not
+	// rewritten: lexical normalization would retarget a pin whose `..` follows a symlink.
+	if (supervised && !managedOwnerStateDirAccepted(stateDir)) throw new Error("gjc_tmux_state_file_pin_unsafe");
 	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
 	const replacement = trustedReplacementAuthority(stateDir, sessionId, baseline);
 	const generation = crypto.randomUUID();
@@ -1292,9 +1295,9 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 				: undefined,
 			// Linux managed owner close signals the pane PID. Do not place the exit-marker shell
 			// in front of it; `buildInnerCommand` therefore execs the GJC owner directly.
-			tmuxExitMarkerPath: plan.platform === "linux" ? undefined : tmuxExitMarkerPath(plan.sessionStateFile ?? ""),
+			tmuxExitMarkerPath: supervised ? undefined : tmuxExitMarkerPath(plan.sessionStateFile ?? ""),
 			platform: plan.platform,
-			managedOwnerSupervisor: plan.platform === "linux",
+			managedOwnerSupervisor: supervised,
 		},
 		context.rawArgs,
 	);
