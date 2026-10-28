@@ -701,8 +701,8 @@ describe("harness owner socket routing", () => {
 		"does not block on a fifo socket record",
 		async () => {
 			const file = await recordPath();
-			expect(file).toBeTruthy();
-			const dir = path.dirname(file!);
+			if (!file) throw new Error("missing socket record path");
+			const dir = path.dirname(file);
 			fsSync.mkdirSync(dir, { recursive: true, mode: 0o700 });
 			fsSync.chmodSync(dir, 0o700);
 			execFileSync("mkfifo", [file]);
@@ -725,10 +725,10 @@ describe("harness owner socket routing", () => {
 				expect(server.received).toHaveLength(0);
 				expect(res.raw).not.toContain(FORGED);
 				fsSync.rmSync(sessionPaths(root, SID).lease, { force: true });
-				fsSync.rmSync(file!, { force: true });
+				fsSync.rmSync(file, { force: true });
 				process.env.GJC_HARNESS_SOCKET_DIR = socketDir;
 				await owner.start();
-				fsSync.rmSync(file!, { force: true });
+				fsSync.rmSync(file, { force: true });
 				execFileSync("mkfifo", [file]);
 				await owner.stop();
 			} finally {
