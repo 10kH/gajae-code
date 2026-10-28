@@ -826,16 +826,19 @@ function createInlineThinkingParser(
 	const openTag = "<thinking>";
 	const closeTag = "</thinking>";
 	let pending = "";
+	// Lexical state (inside an unmatched <thinking>) is tracked separately from the emitted
+	// block so native reasoning can close the block without ending the inline region.
+	let inThinking = false;
 	let currentThinking: (ThinkingContent & { index: number }) | undefined;
 	let finished = false;
 
-	const startThinking = (): void => {
-		currentThinking = { type: "thinking", thinking: "", index: blocks.length };
-		blocks.push(currentThinking);
-		stream.push({ type: "thinking_start", contentIndex: currentThinking.index, partial: output });
-	};
 	const appendThinking = (delta: string): void => {
-		if (!currentThinking || delta.length === 0) return;
+		if (delta.length === 0) return;
+		if (!currentThinking) {
+			currentThinking = { type: "thinking", thinking: "", index: blocks.length };
+			blocks.push(currentThinking);
+			stream.push({ type: "thinking_start", contentIndex: currentThinking.index, partial: output });
+		}
 		currentThinking.thinking += delta;
 		stream.push({
 			type: "thinking_delta",
@@ -844,7 +847,7 @@ function createInlineThinkingParser(
 			partial: output,
 		});
 	};
-	const endThinking = (): void => {
+	const closeThinkingBlock = (): void => {
 		if (!currentThinking) return;
 		stream.push({
 			type: "thinking_end",
@@ -862,12 +865,12 @@ function createInlineThinkingParser(
 	};
 	const consume = (): void => {
 		while (pending.length > 0) {
-			if (!currentThinking) {
+			if (!inThinking) {
 				const start = pending.indexOf(openTag);
 				if (start >= 0) {
 					if (start > 0) handleTextDelta(pending.slice(0, start), blocks, output, stream);
 					pending = pending.slice(start + openTag.length);
-					startThinking();
+					inThinking = true;
 					continue;
 				}
 				const safeLength = pending.length - retainedSuffixLength(pending, openTag);
@@ -880,7 +883,8 @@ function createInlineThinkingParser(
 			if (end >= 0) {
 				appendThinking(pending.slice(0, end));
 				pending = pending.slice(end + closeTag.length);
-				endThinking();
+				closeThinkingBlock();
+				inThinking = false;
 				continue;
 			}
 			const safeLength = pending.length - retainedSuffixLength(pending, closeTag);
@@ -896,20 +900,26 @@ function createInlineThinkingParser(
 			pending += delta;
 			consume();
 		},
+		/** Close the emitted inline block before a native reasoning block; an open <thinking> region stays open. */
 		flush() {
 			if (finished) return;
-			if (currentThinking) {
-				appendThinking(pending);
-				pending = "";
-				endThinking();
-			} else {
-				if (pending.length > 0) handleTextDelta(pending, blocks, output, stream);
+			if (inThinking) {
+				closeThinkingBlock();
+			} else if (pending.length > 0) {
+				handleTextDelta(pending, blocks, output, stream);
 				pending = "";
 			}
 		},
 		finish() {
-			this.flush();
+			if (finished) return;
 			finished = true;
+			if (inThinking) {
+				appendThinking(pending);
+				closeThinkingBlock();
+			} else if (pending.length > 0) {
+				handleTextDelta(pending, blocks, output, stream);
+			}
+			pending = "";
 		},
 	};
 }

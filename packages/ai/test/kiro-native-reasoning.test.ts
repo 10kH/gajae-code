@@ -8,7 +8,7 @@ import { crc32 } from "../src/providers/aws-eventstream";
 import { buildKiroAdditionalModelRequestFields, streamKiroApiKey } from "../src/providers/kiro-api-key";
 import { streamKiroCodeWhisperer } from "../src/providers/kiro-codewhisperer";
 import type { KiroAdditionalModelRequestFields } from "../src/providers/kiro-reasoning-parser";
-import type { AssistantMessage, Context, Model } from "../src/types";
+import type { AssistantMessage, AssistantMessageEvent, Context, Model } from "../src/types";
 
 const PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:123456789012:profile/social-profile";
 
@@ -79,7 +79,12 @@ async function runStream(
 	events: Array<{ type: string; payload: Record<string, unknown> }>,
 	model: Model<"kiro-codewhisperer-stream">,
 	options: { reasoning?: Effort | boolean } = {},
-): Promise<{ request: Record<string, unknown>; message: AssistantMessage; eventTypes: string[] }> {
+): Promise<{
+	request: Record<string, unknown>;
+	message: AssistantMessage;
+	eventTypes: string[];
+	streamEvents: AssistantMessageEvent[];
+}> {
 	let request: Record<string, unknown> | undefined;
 	(globalThis.fetch as any) = async (_input: string | URL | Request, init?: RequestInit) => {
 		if (!(init?.body instanceof Uint8Array)) throw new Error("expected encoded Kiro request body");
@@ -88,16 +93,18 @@ async function runStream(
 	};
 	let message: AssistantMessage | undefined;
 	const eventTypes: string[] = [];
+	const streamEvents: AssistantMessageEvent[] = [];
 	for await (const event of streamKiroCodeWhisperer(
 		model,
 		{ messages: [{ role: "user", content: "Test", timestamp: 1 }] } satisfies Context,
 		{ apiKey: JSON.stringify({ token: "social-access-token", profileArn: PROFILE_ARN }), ...options },
 	)) {
 		eventTypes.push(event.type);
+		streamEvents.push(event);
 		if (event.type === "done") message = event.message;
 	}
 	if (!request || !message) throw new Error("Stream did not produce a request and final message");
-	return { request, message, eventTypes };
+	return { request, message, eventTypes, streamEvents };
 }
 
 describe("Kiro native reasoning", () => {
@@ -658,7 +665,7 @@ describe("Kiro native reasoning quarantine (API key transport)", () => {
 		expect(thinking.map(b => [b.thinking, b.thinkingSignature])).toEqual([["early", "kiro:signature:early-sig"]]);
 	});
 
-	test("thinking precedes text and every lifecycle index matches the final blocks", async () => {
+	test("inline and native reasoning merge into one signed thinking block ahead of text", async () => {
 		const { message } = await collectApiKey([
 			JSON.stringify({ content: "<thinking>I</thinking>A" }),
 			JSON.stringify({ text: "N", redactedContent: "blob" }),
@@ -683,6 +690,54 @@ describe("Kiro native reasoning boundaries (OAuth)", () => {
 		expect(message.content.map(b => [b.type, (b as any).text ?? (b as any).thinking])).toEqual([
 			["text", "literal <think"],
 			["thinking", "N"],
+		]);
+	});
+
+	test("an open inline <thinking> region survives an interleaved native reasoning block", async () => {
+		const { streamEvents, message } = await runStream(
+			[
+				{ type: "assistantResponseEvent", payload: { content: "<thinking>I" } },
+				{ type: "reasoningContentEvent", payload: { text: "N" } },
+				{ type: "assistantResponseEvent", payload: { content: "J</thinking>A" } },
+			],
+			kiroModel("claude-opus-4.6"),
+			{ reasoning: Effort.High },
+		);
+		expect(message.content.map(b => [b.type, (b as any).text ?? (b as any).thinking])).toEqual([
+			["thinking", "I"],
+			["thinking", "N"],
+			["thinking", "J"],
+			["text", "A"],
+		]);
+		const lifecycle = streamEvents
+			.filter(e => e.type.endsWith("_start") || e.type.endsWith("_end"))
+			.filter(e => e.type !== "start")
+			.map(e => `${e.type}:${(e as any).contentIndex}`);
+		expect(lifecycle).toEqual([
+			"thinking_start:0",
+			"thinking_end:0",
+			"thinking_start:1",
+			"thinking_end:1",
+			"thinking_start:2",
+			"thinking_end:2",
+			"text_start:3",
+		]);
+	});
+
+	test("a closing tag split around a native reasoning event still ends the inline region", async () => {
+		const { message } = await runStream(
+			[
+				{ type: "assistantResponseEvent", payload: { content: "<thinking>I</thin" } },
+				{ type: "reasoningContentEvent", payload: { text: "N" } },
+				{ type: "assistantResponseEvent", payload: { content: "king>A" } },
+			],
+			kiroModel("claude-opus-4.6"),
+			{ reasoning: Effort.High },
+		);
+		expect(message.content.map(b => [b.type, (b as any).text ?? (b as any).thinking])).toEqual([
+			["thinking", "I"],
+			["thinking", "N"],
+			["text", "A"],
 		]);
 	});
 });
