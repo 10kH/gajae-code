@@ -28,7 +28,10 @@ import {
 	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
 	persistCoordinatorRuntimeStateFromPostmortem,
 } from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
-import { buildGjcTmuxSessionSlug } from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
+import {
+	buildGjcTmuxSessionSlug,
+	normalizeOperatorStateFilePin,
+} from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
 import {
 	captureOwnerGenerationBaselineSync,
 	isExactScopedBootstrapSuccessReceipt,
@@ -826,6 +829,45 @@ describe("default GJC tmux launch", () => {
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
+	});
+
+	it.each([
+		"linux",
+		"darwin",
+	] as const)("normalizes an absolute %s operator state-file pin so the supervisor accepts its state directory", platform => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-pin-normalize-"));
+		try {
+			const plan = (pin: string) =>
+				buildDefaultTmuxLaunchPlan({
+					parsed: args({ tmux: true }),
+					rawArgs: ["--tmux"],
+					cwd,
+					env: { GJC_COORDINATOR_SESSION_STATE_FILE: pin },
+					argv: ["bun", "cli.ts"],
+					execPath: "/bin/bun",
+					platform,
+					tty: interactiveTty,
+					tmuxAvailable: true,
+					currentBranch: "",
+					existingBranchSessionName: null,
+				});
+			const normalized = plan(`${cwd}/pins/../runtime/./state.json`);
+			expect(normalized?.sessionStateFile).toBe(path.posix.join(cwd, "runtime", "state.json"));
+			// The supervisor and admission refuse a state directory with a `..` component.
+			expect(path.dirname(normalized!.sessionStateFile!).split("/")).not.toContain("..");
+			expect(plan(`${cwd}/runtime/state.json`)?.sessionStateFile).toBe(`${cwd}/runtime/state.json`);
+			// A relative pin is not resolved against the launcher's cwd.
+			expect(plan("pins/../state.json")?.sessionStateFile).toBe("pins/../state.json");
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a Windows operator state-file pin verbatim", () => {
+		expect(normalizeOperatorStateFilePin("C:\\gjc\\pins\\..\\state.json", "win32")).toBe(
+			"C:\\gjc\\pins\\..\\state.json",
+		);
+		expect(normalizeOperatorStateFilePin("/gjc/pins/../state.json", "win32")).toBe("/gjc/pins/../state.json");
 	});
 
 	it("sizes detached tmux new-session to the caller terminal when dimensions are known", () => {
