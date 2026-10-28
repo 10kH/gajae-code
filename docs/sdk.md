@@ -1280,21 +1280,30 @@ orphaned children converge through ordinary close after
 `sdk.masterOrphanGraceMs`. Task text and master capability are transient
 dispatch inputs and never persist in any durable store, log, or output.
 
-Supervised managed tmux launches (Broker-spawned sessions on macOS and Linux,
-and interactive root `gjc --tmux` launches on Linux) publish a private (`0600`
-file in a `0700` lifecycle root) child binding before the supervised child
-starts. Launches that do not run the supervisor, such as `gjc session create`
-without a launch specification or an ordinary macOS `gjc --tmux`, start `gjc`
-directly and receive neither a binding nor exact CLI admission. The derived
-state path of a supervised launch is named through its canonical trusted
-anchor (the workspace, or its `.gjc` when present), so a workspace or `.gjc`
+Supervised managed tmux launches (Broker-spawned sessions and interactive root
+`gjc --tmux` launches, on macOS and Linux) publish a private (`0600` file in a
+`0700` lifecycle root) child binding before the supervised child starts.
+Windows has no owner-only reader for that binding, so a managed launch there is
+refused before allocation. Launches that do not
+run the supervisor, such as `gjc session create` without a launch
+specification, start `gjc` directly and receive neither a binding nor exact CLI
+admission. The derived state path of a supervised launch is named through its
+canonical trusted anchor (the workspace, or its `.gjc` when present), so a
+workspace, an in-repository `.worktrees` bucket or a `.gjc`
 reached through a symlink passes the no-follow verification of the private
 lifecycle root. The `_session-*` tail below `.gjc` stays lexical, so a link
 inside managed storage is still refused (`gjc_tmux_managed_storage_unsafe` or
 `managed_owner_storage_unsafe`); an operator-pinned
-`GJC_COORDINATOR_SESSION_STATE_FILE` is used verbatim. A Broker-redacted launch publishes an opaque binding that carries
-neither the launch command nor a command digest; an ordinary launch publishes a
-recoverable binding with its exact command and digest. The CLI validates its
+`GJC_COORDINATOR_SESSION_STATE_FILE` is used verbatim. A Broker-redacted
+launch, and every macOS launch, publishes an opaque binding that carries
+neither the launch command nor a command digest, so prompts and flags such as
+`--api-key` never reach disk there; an ordinary Linux launch publishes a
+recoverable binding with its exact command and digest, which only Linux
+owner-loss recovery uses. The supervisor receives the child argv as its own
+arguments (`--internal-managed-owner-supervisor -- <argv...>`), shell quoted
+once in the pane command and never re-encoded, and accepts any argv with a
+nonempty executable; empty later arguments of a root `gjc --tmux` launch are
+passed through (a Broker launch spec still requires nonempty arguments). The CLI validates its
 exact session, generation, run, incarnation and child token through
 `readOwnerOnlyFile`, a bounded native read (at most 64 KiB) that keeps the
 acquired descriptor authority for the whole read, reads the bytes twice, and
@@ -1304,16 +1313,26 @@ read whose metadata changed mid-window (`metadata_changed`) is re-acquired from
 scratch a bounded number of times; identity, link-count, ownership and ACL
 failures are never retried. There is no pathname fallback.
 
-The 64 KiB bound is not a new prompt limit. A recoverable binding is its fixed
-fields (about 540 bytes) plus the same command JSON the tmux pane command
-already carries, and tmux rejects any pane command over about 16 KiB
-(`command too long`) before a supervisor exists, as it did before supervision.
-An inline prompt too large for that limit already fails at tmux session
-creation, supervised or not; pass it through a file instead.
+Because the argv is not re-encoded, an argument that fit tmux's pane command
+limit (about 16 KiB, `command too long`) before supervision still fits. JSON
+escaping can still expand a Linux recoverable binding (a control character
+becomes six bytes), so a Linux launch whose serialized argv exceeds 63 KiB is
+refused with `managed_owner_command_too_large` before any tmux session exists,
+rather than failing in the supervisor; pass such input through a file.
 
 Opaque bindings never grant crash-recovery authority. Recoverable predecessor
 bindings and SIGABRT receipts remain a separate Linux-only capability backed by
-recovery-fs; stale binding schemas are rejected rather than migrated.
+recovery-fs; stale binding schemas are rejected rather than migrated. Windows
+managed-owner admission is unsupported: managed tmux/psmux launches are rejected
+before supervisor or session allocation and lifecycle-state writes, with the
+bounded reason `gjc_tmux_managed_launch_platform_unsupported:win32`. This guard
+is defense in depth for direct managed launches: Broker `session.spawn` selects
+the headless substrate on Windows before any launch, so it never reaches this
+guard. A rejected managed launch is never retried as headless. Ordinary
+unmanaged Windows launches are unchanged.
+Off Linux, a prior generation's child binding without any receipt is ordinary
+history, so relaunching the same pinned session starts fresh; any receipt there
+still fails closed as unavailable recovery evidence.
 
 Admission denial does not depend on being able to save a diagnostic. Unsafe or
 unavailable storage never receives a fallback pathname write: the child stays
@@ -1327,3 +1346,118 @@ addon, including a retained same-version variant, that lacks `readOwnerOnlyFile`
 and moves on to the next compatible one; compiled installations need a matching
 CLI/native build. Editing source or replacing files does not update a running
 Broker.
+
+Darwin has no identity-bound signal API for an external process, so managed
+shutdown there uses the existing generation-fenced owner intent instead of
+signaling a reconstructed supervisor PID. `forceCloseGjcTmuxSession` proves the
+pinned supervisor, its child binding and the tmux session metadata, then
+publishes the intent no-replace while holding the generation lock that the
+supervisor also takes. The binding is found through the generation's own
+supervisor index (`supervisor-<generation>.json`, published by that supervisor
+after its binding), never by scanning the lifecycle root, so history that a
+reused pinned session leaves from earlier generations never limits a close. A close that arrives before the supervisor
+has published its binding waits inside the same close deadline only while that
+exact supervisor stays live; an untrusted, ambiguous, or still-unavailable
+binding fails closed. A binding's `created_at` is never compared with the
+current wall clock, so a backward clock step does not block a close, and the
+close deadline itself runs on monotonic time: the verdict wait accepts a verdict
+only if its reads completed inside that deadline, and a forward clock step during
+the child's cleanup does not reject a verdict accepted that way.
+Before its CLI starts, an admitted Darwin child installs a handler for the
+cooperative signal (SIGUSR2) and recorders for SIGTERM, SIGHUP and SIGINT, then
+publishes `cooperative-ready-<generation>.json` naming its pid and child token.
+Whichever of these signals the child handles first creates
+`shutdown-cause-<generation>.json` exclusively: `cooperative` for SIGUSR2, which
+then starts the ordinary SIGTERM shutdown, or `signal` for any other. A
+cooperative signal that arrives after another cause records nothing and starts
+no second shutdown. A child whose shutdown already began before the installer
+ran (its postmortem cleanup started) publishes no readiness and is never
+relayed to.
+The supervisor polls for that intent,
+validates it against its own binding, generation and server key, relays only to
+a child whose readiness record names that exact child, and relays in
+two durable phases under that lock: it publishes a pending record for that
+exact intent (`relay-<generation>.pending.json`), samples the relay instant,
+rechecks the intent's deadline on that instant, relays SIGUSR2 exactly once
+through its original child spawn handle (by signal number: Bun's
+`Subprocess.kill` resolves signal names with Linux numbers), and only after the signal was actually
+sent publishes the confirmed relay record (`relay-<generation>.json`, stamped
+with that instant) and removes the pending record. A declined, expired or
+unverifiable attempt renames the pending record to an `.unsent` name instead. A
+close succeeds only when the pinned supervisor has exited, the terminal verdict
+matching the published intent exists, and the supervisor's reconciliation of
+the child's exit (`supervised-exit-<generation>.json`) explains it: the child
+recorded the relay as its first cause and ended through its own exit with 0 or
+143, or through SIGTERM. Publication alone, a timeout, an exit without a
+verdict, a verdict while the supervisor is still alive, or an unexplained child
+exit (`owner_term_child_exit_unexplained`; the supervisor publishes the
+generation's `unexpected_owner_loss` incident before the exit record) is not success, and guarded session cleanup is
+skipped. A verdict the child published before such an exit stays immutable
+history but never completes the close. The child's runtime-state marker is its
+own signed report at the moment it wrote it, and the supervisor cannot re-sign
+it: a child that persisted `completed` and then died keeps that marker, so the
+failed close, the incident and the `supervised-exit` record are the reconciled
+outcome. A plain OS SIGTERM to the
+supervisor still stops its child but never claims an operator verdict: on
+Darwin, and on any generation with a supervisor index, a terminal is classified
+as an operator shutdown only when the confirmed relay record names the pending
+intent, the intent was still valid at the relay instant, the terminal was
+observed at or after that instant, and the indexed child recorded the relay as
+its first termination cause. An unrelated signal observed before the
+relay is therefore recorded as owner loss, whichever observer (supervisor or
+child sidecar) publishes first, while a child that handles a timely relay late
+still completes. A child observer that finds the generation lock held while a
+relay is pending or its confirmed record is being flushed waits up to 3 seconds
+for it instead of ending with `owner_verdict_unavailable`. That wait stays inside
+the child's postmortem cleanup deadline, and only the child holds the key that
+signs its runtime marker, so a relay whose persistence outlasts the wait leaves
+the recoverable `owner_verdict_unavailable` marker even if the close later
+succeeds. A pinned relaunch is
+refused with `managed_owner_predecessor_live` while the current generation's
+supervisor is still live. The closer holds a per-generation closer lock
+(`closer-<generation>.sqlite`) from before its intent is visible until it stops
+waiting. The supervisor checks that lock before publishing its pending record
+and again immediately before signaling, so no relay is newly authorized after
+the closer gave up, exited or crashed, whatever the wall clock says. A relay
+that had already passed that final check when the supervisor was suspended can
+still complete; its pending record then marks the delivery as uncertain. The
+child sidecar captures the intent's dispatch synchronously when its postmortem
+begins, and only if a relay record for that intent is already visible, so a
+SIGTERM whose postmortem began before the relay is never attributed to it. A
+SIGTERM that arrives after the pending record is published but before delivery
+wins the exclusive cause record, so it is not attributed either. The
+supervisor never relays to a child the OS already reports terminated but not
+yet reaped. When the child publishes no verdict of its own, the supervisor's
+fallback observation claims the relayed intent only if the child ended through
+its own exit or the default SIGTERM action; any other fatal signal, such as
+SIGABRT, is published with its actual termination as `unexpected_owner_loss`.
+Signals carry no sender identity, so the remaining limit is the order in which
+the runtime dispatches two signals that are pending at the same time: the one
+handled first is the cause.
+
+A supervisor that is stopped or stalled past the intent's deadline, before or
+during publication, refuses the expired intent and never relays it. A close
+that times out or sees a mismatched verdict retires its own intent at once,
+under the generation lock, when it has neither a pending or confirmed relay
+record nor a verdict. Otherwise the next close, under the same generation lock,
+retires such an intent once expired (renamed to
+`intent-<generation>.<intent_id>.undelivered`) when it is expired and has
+neither a pending or confirmed relay record nor a verdict, and then publishes a
+fresh intent, so retries are not blocked by `owner_intent_replay`. A delivered
+intent stays permanent replay history for its generation. A pending record
+left without confirmation (for example a supervisor crash between publication
+and signal), a verdict, or unreadable relay evidence is uncertain evidence: it
+never classifies a SIGTERM as an operator shutdown, and it keeps the intent in
+place, so cooperative closes of that generation keep failing with
+`owner_intent_replay` until the owner exits. Linux keeps
+its kernel-signaled owner path.
+
+Interactive `gjc --tmux` root launches on Linux and Darwin both exec the
+managed owner supervisor as the tmux pane process, so ordinary root sessions
+and Broker-spawned sessions share the same close path. Because the pane process
+must be that exact supervisor, these launches do not wrap it in the
+`tmux-exit.json` exit-marker shell; other platforms keep the marker. On macOS
+the pane command unsets `MallocStackLogging` and `MallocStackLoggingNoCompact`,
+and a source-mode launch runs Bun with `--no-env-file` (as a compiled binary
+already does), so neither the tmux server environment nor a cwd `.env` can make
+the CLI malloc guard re-exec the supervisor below the pane PID.

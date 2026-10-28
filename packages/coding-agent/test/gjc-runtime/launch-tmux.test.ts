@@ -42,6 +42,7 @@ import {
 	removeGjcTmuxSession,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-sessions";
 import { postmortem } from "@gajae-code/utils";
+import { observeProcessIncarnation } from "../../src/sdk/broker/process-incarnation";
 
 function args(overrides: Partial<Args> = {}): Args {
 	return {
@@ -3703,7 +3704,10 @@ describe("tmux owner isolation launch gate", () => {
 		}
 	});
 
-	it("publishes one generation and propagates its lifecycle metadata to the managed child", () => {
+	it.each([
+		"linux",
+		"darwin",
+	] as const)("publishes one generation and execs the managed owner supervisor as the pane process on %s", platform => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-owner-generation-"));
 		try {
 			const sessionId = "managed-owner-session";
@@ -3722,7 +3726,7 @@ describe("tmux owner isolation launch gate", () => {
 				},
 				argv: ["bun", "cli.ts"],
 				execPath: "/bin/bun",
-				platform: "linux",
+				platform,
 				tty: interactiveTty,
 				tmuxAvailable: true,
 				existingBranchSessionName: null,
@@ -3743,7 +3747,13 @@ describe("tmux owner isolation launch gate", () => {
 			expect(innerCommand).toContain(`GJC_TMUX_OWNER_STATE_DIR='${root}'`);
 			expect(innerCommand).toContain("GJC_TMUX_OWNER_SERVER_KEY='tmux'");
 			expect(innerCommand).not.toContain("managed-private-pkcs8-der-base64");
-			expect(innerCommand).toStartWith("exec env GJC_TMUX_LAUNCHED=1");
+			// Darwin scrubs the malloc environment so the CLI guard never re-execs the
+			// supervisor below the pane PID.
+			expect(innerCommand).toStartWith(
+				platform === "darwin"
+					? "exec env -u MallocStackLogging -u MallocStackLoggingNoCompact GJC_TMUX_LAUNCHED=1"
+					: "exec env GJC_TMUX_LAUNCHED=1",
+			);
 			expect(innerCommand).toMatch(
 				/GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL='http:\/\/127\.0\.0\.1:\d+\/bootstrap\/[0-9a-f-]{36}'/i,
 			);
@@ -3752,14 +3762,239 @@ describe("tmux owner isolation launch gate", () => {
 			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_INCARNATION='[0-9a-f-]{36}'/i);
 			expect(innerCommand).not.toContain("GJC_MANAGED_OWNER_PREDECESSOR_TOKEN");
 			expect(innerCommand).not.toContain("tmux-exit.json");
+			// `exec` keeps the pane PID equal to the supervisor PID that managed close pins.
+			const entry = path.join(root, "cli.ts");
+			// A macOS source launch also refuses Bun's cwd `.env` autoload in both processes.
+			const bun = platform === "darwin" ? `'/bin/bun' '--no-env-file'` : `'/bin/bun'`;
+			expect(innerCommand).toEndWith(
+				` ${bun} '${entry}' '--internal-managed-owner-supervisor' '--' ${bun} '${entry}' 'hello'`,
+			);
+			expect(innerCommand).not.toContain("GJC_MANAGED_OWNER_COMMAND_JSON");
 			expect(
 				calls.some(call => call.includes("@gjc-owner-generation") && call.at(-1) === generation.generation),
 			).toBe(true);
 			expect(calls.some(call => call.includes("@gjc-owner-server-key") && call.at(-1) === "tmux")).toBe(true);
+			// Darwin close needs only the binding identity, so its binding stays opaque.
+			if (platform === "darwin") expect(innerCommand).toContain("GJC_MANAGED_OWNER_REDACT_COMMAND='1'");
+			else expect(innerCommand).not.toContain("GJC_MANAGED_OWNER_REDACT_COMMAND");
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
+
+	const supervisedLaunch = (
+		platform: "linux" | "darwin",
+		cwd: string,
+		rawArgs: string[],
+		env: NodeJS.ProcessEnv,
+		messages: string[] = [],
+	) => {
+		const calls: string[][] = [];
+		const diagnostics: string[] = [];
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages, tmux: true }),
+			rawArgs,
+			cwd,
+			env,
+			argv: ["bun", "cli.ts"],
+			execPath: "/bin/bun",
+			platform,
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			existingBranchSessionName: null,
+			diagnosticWriter: message => diagnostics.push(message),
+			spawnSync: (_command, spawnArgs) => {
+				calls.push(spawnArgs);
+				return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+			},
+		});
+		return { handled, calls, diagnostics, innerCommand: calls.find(call => call[0] === "new-session")?.at(-1) };
+	};
+
+	it.each([
+		"linux",
+		"darwin",
+	] as const)("carries empty and escape-heavy supervised arguments without re-encoding them on %s", platform => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-supervised-argv-"));
+		try {
+			const backslashes = "\\".repeat(8_500);
+			const { innerCommand } = supervisedLaunch(
+				platform,
+				root,
+				["--tmux", "@prompt.txt", "", backslashes],
+				{
+					GJC_COORDINATOR_SESSION_ID: "argv-session",
+					GJC_COORDINATOR_SESSION_STATE_FILE: path.join(root, "runtime-state.json"),
+				},
+				["@prompt.txt", "", backslashes],
+			);
+			expect(innerCommand).toBeString();
+			// The empty argument survives as its own shell word.
+			expect(innerCommand).toEndWith(`'hello' '@prompt.txt' '' '${backslashes}'`.slice("'hello' ".length));
+			// The argv appears once, shell-quoted verbatim: no JSON doubling of backslashes,
+			// so an argument that fit tmux's ~16 KiB command limit before still fits.
+			expect(innerCommand!.split(backslashes).length - 1).toBe(1);
+			expect(innerCommand).not.toContain("\\".repeat(8_501));
+			expect(Buffer.byteLength(innerCommand!)).toBeLessThan(10_000);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses a Linux argv whose recoverable binding would exceed the owner-only read bound before creating a session", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-supervised-size-"));
+		try {
+			// Control characters serialize to six JSON bytes each.
+			const control = "\u0001".repeat(11_000);
+			const { handled, calls, diagnostics } = supervisedLaunch(
+				"linux",
+				root,
+				["--tmux", control],
+				{
+					GJC_COORDINATOR_SESSION_ID: "size-session",
+					GJC_COORDINATOR_SESSION_STATE_FILE: path.join(root, "runtime-state.json"),
+				},
+				[control],
+			);
+			expect(handled).toBe(true);
+			expect(calls.some(call => call[0] === "new-session")).toBe(false);
+			expect(diagnostics.join("\n")).toContain("managed_owner_command_too_large");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"derives supervised lifecycle paths from the resolved anchor of a symlinked .worktrees bucket",
+		() => {
+			const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-worktree-link-")));
+			try {
+				const repo = path.join(root, "repo");
+				const bucket = path.join(root, "bucket");
+				fs.mkdirSync(path.join(bucket, "feature"), { recursive: true });
+				fs.mkdirSync(repo);
+				fs.symlinkSync(bucket, path.join(repo, ".worktrees"));
+				const lexical = path.join(repo, ".worktrees", "feature");
+				const platform = process.platform === "linux" ? "linux" : "darwin";
+				const { innerCommand, diagnostics } = supervisedLaunch(platform, lexical, ["--tmux"], {
+					GJC_COORDINATOR_SESSION_ID: "worktree-session",
+					GJC_SESSION_ID: "worktree-gjc-session",
+					// Exercise the derived state path, not an operator pin.
+					GJC_COORDINATOR_SESSION_STATE_FILE: "",
+				});
+				expect(diagnostics).toEqual([]);
+				expect(innerCommand).toBeString();
+				const canonical = path.join(bucket, "feature");
+				const stateDir = /GJC_TMUX_OWNER_STATE_DIR='([^']+)'/.exec(innerCommand!)?.[1];
+				expect(stateDir, innerCommand).toStartWith(`${canonical}${path.sep}`);
+				const stateFile = /GJC_COORDINATOR_SESSION_STATE_FILE='([^']+)'/.exec(innerCommand!)?.[1];
+				expect(stateFile).toStartWith(`${canonical}${path.sep}`);
+				expect(fs.existsSync(path.join(stateDir!, "worktree-session", "owner-lifecycle", "generation.json"))).toBe(
+					true,
+				);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "linux" || process.platform === "win32").each(["exited", "live"] as const)(
+		"relaunches a pinned macOS root session only after its supervised predecessor exited (%s supervisor)",
+		predecessor => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-darwin-relaunch-"));
+			try {
+				const sessionId = "pinned-root-session";
+				const launch = () => {
+					const calls: string[][] = [];
+					const diagnostics: string[] = [];
+					let serverCreated = false;
+					launchDefaultTmuxIfNeeded({
+						parsed: args({ tmux: true }),
+						rawArgs: ["--tmux"],
+						cwd: root,
+						env: {
+							GJC_COORDINATOR_SESSION_ID: sessionId,
+							GJC_COORDINATOR_SESSION_STATE_FILE: path.join(root, "runtime-state.json"),
+							GJC_TMUX_SESSION: "pinned",
+							GJC_PSMUX_DETECTION: "off",
+							GJC_TMUX_COMMAND: "tmux",
+						},
+						argv: ["bun", "cli.ts"],
+						execPath: "/bin/bun",
+						platform: "darwin",
+						tty: interactiveTty,
+						tmuxAvailable: true,
+						existingBranchSessionName: null,
+						currentBranch: "",
+						diagnosticWriter: message => diagnostics.push(message),
+						ownerIsolationProbe: {
+							readCallerCgroup: () => null,
+							probeServer: () => {
+								if (!serverCreated) {
+									serverCreated = true;
+									return { state: "absent" };
+								}
+								return {
+									state: "safe",
+									pid: 123,
+									startTime: "42",
+									cgroup: { classification: "not_applicable" },
+								};
+							},
+							recordAttempt: () => {},
+						},
+						spawnSync: (_command, spawnArgs) => {
+							calls.push(spawnArgs);
+							return { exitCode: 0, stdout: spawnArgs[0] === "display-message" ? "$0\tpinned" : "$0" };
+						},
+					});
+					return { calls, diagnostics };
+				};
+				const first = launch();
+				expect(first.diagnostics).toEqual([]);
+				const generationFile = path.join(root, sessionId, "owner-lifecycle", "generation.json");
+				const firstGeneration = JSON.parse(fs.readFileSync(generationFile, "utf8")).generation as string;
+				// The supervisor of a normally exited owner leaves its binding and no receipt.
+				const exited = Bun.spawnSync(["/usr/bin/true"]).pid;
+				const live = observeProcessIncarnation(process.pid);
+				if (live.status !== "present") throw new Error("test process is unobservable");
+				const supervisor =
+					predecessor === "exited"
+						? { supervisor_pid: exited, supervisor_start_time: "exited-supervisor" }
+						: { supervisor_pid: process.pid, supervisor_start_time: live.incarnation };
+				fs.writeFileSync(
+					path.join(lifecyclePaths(root, sessionId, firstGeneration).root, "child-token.binding.json"),
+					`${JSON.stringify({
+						schema_version: 3,
+						binding_kind: "opaque",
+						generation: firstGeneration,
+						session_id: sessionId,
+						run_id: "run",
+						endpoint_incarnation: "incarnation",
+						child_token: "token",
+						...supervisor,
+						created_at: new Date().toISOString(),
+					})}\n`,
+					{ mode: 0o600 },
+				);
+				const second = launch();
+				if (predecessor === "live") {
+					// A live supervisor still owns its generation; it is never replaced.
+					expect(second.diagnostics.join("\n")).toContain("managed_owner_predecessor_live");
+					expect(second.calls.some(call => call[0] === "new-session")).toBeFalse();
+					expect(JSON.parse(fs.readFileSync(generationFile, "utf8")).generation).toBe(firstGeneration);
+					return;
+				}
+				expect(second.diagnostics).toEqual([]);
+				const innerCommand = second.calls.find(call => call[0] === "new-session")?.at(-1);
+				expect(innerCommand).toContain("--internal-managed-owner-supervisor");
+				expect(innerCommand).not.toContain("GJC_MANAGED_OWNER_PREDECESSOR_TOKEN");
+				expect(JSON.parse(fs.readFileSync(generationFile, "utf8")).generation).not.toBe(firstGeneration);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
 
 	it.each([
 		"valid",
