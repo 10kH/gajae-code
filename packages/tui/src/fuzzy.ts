@@ -60,37 +60,51 @@ function scoreMatch(queryLower: string, textLower: string): FuzzyMatch {
 		positionScore[i] = i * 0.1 - (isWordBoundary ? 10 : 0);
 	}
 
-	// Runs are at most m long, so k ranges over 0..m.
-	let byRun = new Float64Array((m + 1) * n).fill(Number.POSITIVE_INFINITY);
+	// A run of length k ending at i needs the last k text and query characters to
+	// be equal, so `suffix[i]` (that common-suffix length) bounds the run states
+	// at i. Each layer writes exactly the states 0..suffix[i] that the next layer
+	// reads, so the buffers are never cleared and the work per layer is
+	// O(n + sum of suffix lengths) rather than O(m · n).
+	let byRun = new Float64Array((m + 1) * n);
 	let nextByRun = new Float64Array((m + 1) * n);
 	// `atIndex[i]`: best score over every run length with the current char at i.
-	let atIndex = new Float64Array(n).fill(Number.POSITIVE_INFINITY);
+	let atIndex = new Float64Array(n);
 	let nextAtIndex = new Float64Array(n);
+	let suffix = new Int32Array(n);
+	let nextSuffix = new Int32Array(n);
 	for (let i = 0; i < n; i++) {
+		byRun[i] = Number.POSITIVE_INFINITY;
+		atIndex[i] = Number.POSITIVE_INFINITY;
 		if (textLower[i] !== queryLower[0]) continue;
+		suffix[i] = 1;
+		byRun[n + i] = Number.POSITIVE_INFINITY;
 		if (i === 0) byRun[n] = positionScore[0]! - 5;
 		else byRun[i] = positionScore[i]!;
 		atIndex[i] = Math.min(byRun[i]!, byRun[n + i]!);
 	}
 
 	for (let q = 1; q < m; q++) {
-		nextByRun.fill(Number.POSITIVE_INFINITY);
-		nextAtIndex.fill(Number.POSITIVE_INFINITY);
 		const char = queryLower[q];
-		// After q matched characters a run is at most q + 1 long (index 0 adds one).
-		const maxRun = Math.min(q + 1, m);
+		nextByRun[0] = Number.POSITIVE_INFINITY;
+		nextAtIndex[0] = Number.POSITIVE_INFINITY;
+		nextSuffix[0] = 0;
 		// Smallest `atIndex[p] - 2 * p` over p <= i - 2, for the gap transition.
 		let gapBase = Number.POSITIVE_INFINITY;
 		for (let i = 1; i < n; i++) {
 			if (i >= 2) gapBase = Math.min(gapBase, atIndex[i - 2]! - 2 * (i - 2));
-			if (textLower[i] !== char) continue;
+			if (textLower[i] !== char) {
+				nextByRun[i] = Number.POSITIVE_INFINITY;
+				nextAtIndex[i] = Number.POSITIVE_INFINITY;
+				nextSuffix[i] = 0;
+				continue;
+			}
+			const previousSuffix = suffix[i - 1]!;
+			nextSuffix[i] = previousSuffix + 1;
 			let bestHere = gapBase + 2 * i - 2 + positionScore[i]!;
 			nextByRun[i] = bestHere;
-			for (let k = 0; k < maxRun; k++) {
-				const previous = byRun[k * n + i - 1]!;
-				if (previous === Number.POSITIVE_INFINITY) continue;
+			for (let k = 0; k <= previousSuffix; k++) {
 				const run = k + 1;
-				const score = previous - run * 5 + positionScore[i]!;
+				const score = byRun[k * n + i - 1]! - run * 5 + positionScore[i]!;
 				nextByRun[run * n + i] = score;
 				if (score < bestHere) bestHere = score;
 			}
@@ -98,6 +112,7 @@ function scoreMatch(queryLower: string, textLower: string): FuzzyMatch {
 		}
 		[byRun, nextByRun] = [nextByRun, byRun];
 		[atIndex, nextAtIndex] = [nextAtIndex, atIndex];
+		[suffix, nextSuffix] = [nextSuffix, suffix];
 	}
 
 	let score = Number.POSITIVE_INFINITY;
