@@ -5,7 +5,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Effort } from "../src/model-thinking";
 import { crc32 } from "../src/providers/aws-eventstream";
-import { buildKiroAdditionalModelRequestFields } from "../src/providers/kiro-api-key";
+import { buildKiroAdditionalModelRequestFields, streamKiroApiKey } from "../src/providers/kiro-api-key";
 import { streamKiroCodeWhisperer } from "../src/providers/kiro-codewhisperer";
 import type { AssistantMessage, Context, Model } from "../src/types";
 
@@ -326,9 +326,7 @@ describe("Kiro native reasoning", () => {
 		const assistantHistoryMsg = history?.[1];
 		expect(assistantHistoryMsg?.assistantResponseMessage).toBeDefined();
 		expect(assistantHistoryMsg?.assistantResponseMessage?.content).toContain("result");
-		expect((assistantHistoryMsg?.assistantResponseMessage as any)?.reasoningContent?.signature).toBe(
-			"sig1",
-		);
+		expect((assistantHistoryMsg?.assistantResponseMessage as any)?.reasoningContent?.signature).toBe("sig1");
 	});
 
 	test("prompt prefix is absent when native fields are sent", async () => {
@@ -378,5 +376,211 @@ describe("Kiro native reasoning", () => {
 		// additionalModelRequestFields should be present
 		expect((request as any)?.additionalModelRequestFields).toBeDefined();
 		expect(((request as any)?.additionalModelRequestFields as any)?.thinking?.type).toBe("adaptive");
+	});
+});
+
+function kiroModel(id: string): Model<"kiro-codewhisperer-stream"> {
+	return {
+		id,
+		name: id,
+		api: "kiro-codewhisperer-stream",
+		provider: "kiro",
+		baseUrl: "",
+		reasoning: true,
+		input: ["text"],
+		output: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200_000,
+		maxTokens: 8_192,
+	};
+}
+
+describe("Kiro native reasoning field matrix", () => {
+	const adaptive = (effort: string) => ({
+		thinking: { type: "adaptive", display: "summarized" },
+		output_config: { effort },
+	});
+	test.each([
+		["claude-opus-4.6", Effort.High, adaptive("high")],
+		["claude-opus-4-8", Effort.Medium, adaptive("medium")],
+		["claude-sonnet-5.5", Effort.Low, adaptive("low")],
+		["kimi-k3", Effort.High, adaptive("high")],
+		["claude-opus-4.6", Effort.Minimal, adaptive("low")],
+		["claude-opus-4.6", true, adaptive("medium")],
+		["claude-opus-4.6", false, undefined],
+		["claude-opus-4.5", Effort.High, undefined],
+		["claude-sonnet-4-5", Effort.High, undefined],
+		["gpt-5.6-luna", Effort.High, { reasoning: { effort: "high" } }],
+		["gpt-5-6-terra", Effort.XHigh, { reasoning: { effort: "xhigh" } }],
+		["gpt-5.6-sol", false, { reasoning: { effort: "none" } }],
+		["gpt-5.6-sol", undefined, undefined],
+		["gpt-5.5", Effort.High, undefined],
+		["deepseek-3.2", Effort.High, undefined],
+	] as const)("%s with reasoning %p", (id, reasoning, expected) => {
+		expect(buildKiroAdditionalModelRequestFields(kiroModel(id), reasoning)).toEqual(expected);
+	});
+});
+
+describe("Kiro native reasoning stream lifecycle (OAuth)", () => {
+	test("reasoning -> text -> reasoning opens a new thinking block and closes each once", async () => {
+		const events: Array<{ type: string; index?: number }> = [];
+		(globalThis.fetch as any) = async () =>
+			eventStreamResponse([
+				{ type: "reasoningContentEvent", payload: { text: "A", signature: "sigA" } },
+				{ type: "assistantResponseEvent", payload: { content: "answer" } },
+				{ type: "reasoningContentEvent", payload: { text: "B", signature: "sigB" } },
+			]);
+		let message: AssistantMessage | undefined;
+		for await (const event of streamKiroCodeWhisperer(
+			kiroModel("claude-opus-4.6"),
+			{ messages: [{ role: "user", content: "Test", timestamp: 1 }] },
+			{ apiKey: JSON.stringify({ token: "social-access-token", profileArn: PROFILE_ARN }), reasoning: Effort.High },
+		)) {
+			if (event.type.startsWith("thinking_")) events.push({ type: event.type, index: (event as any).contentIndex });
+			if (event.type === "done") message = event.message;
+		}
+		const thinking = message?.content.filter(b => b.type === "thinking") as any[];
+		expect(thinking.map(b => [b.thinking, b.thinkingSignature])).toEqual([
+			["A", "kiro:signature:sigA"],
+			["B", "kiro:signature:sigB"],
+		]);
+		const starts = events.filter(e => e.type === "thinking_start").map(e => e.index);
+		const ends = events.filter(e => e.type === "thinking_end").map(e => e.index);
+		expect(starts).toHaveLength(2);
+		expect(ends).toEqual(starts);
+	});
+});
+
+async function runApiKey(
+	model: Model<"kiro-codewhisperer-stream">,
+	context: Context,
+	responseFrames: Record<string, unknown>[],
+	reasoning?: Effort | boolean,
+): Promise<{ request: any; message: AssistantMessage }> {
+	let request: any;
+	(globalThis.fetch as any) = async (_input: string | URL | Request, init?: RequestInit) => {
+		request = JSON.parse(String(init?.body));
+		return new Response(responseFrames.map(f => JSON.stringify(f)).join(""), { status: 200 });
+	};
+	let message: AssistantMessage | undefined;
+	for await (const event of streamKiroApiKey(model, context, {
+		apiKey: "ksk_test-secret",
+		region: "us-east-1",
+		reasoning,
+	})) {
+		if (event.type === "done" || event.type === "error") message = (event as any).message ?? (event as any).error;
+	}
+	if (!request || !message) throw new Error("API-key stream produced no request or message");
+	return { request, message };
+}
+
+describe("Kiro native reasoning (API key transport)", () => {
+	test("sends native fields without the prompt prefix", async () => {
+		const { request } = await runApiKey(
+			kiroModel("claude-opus-4.6"),
+			{ systemPrompt: ["sys"], messages: [{ role: "user", content: "Test", timestamp: 1 }] },
+			[{ content: "ok" }],
+			Effort.High,
+		);
+		expect(request.additionalModelRequestFields).toEqual({
+			thinking: { type: "adaptive", display: "summarized" },
+			output_config: { effort: "high" },
+		});
+		expect(JSON.stringify(request)).not.toContain("<thinking_mode>");
+	});
+
+	test("explicit off on GPT sends effort none", async () => {
+		const { request } = await runApiKey(
+			kiroModel("gpt-5.6-sol"),
+			{ messages: [{ role: "user", content: "Test", timestamp: 1 }] },
+			[{ content: "ok" }],
+			false,
+		);
+		expect(request.additionalModelRequestFields).toEqual({ reasoning: { effort: "none" } });
+	});
+
+	test("parses reasoning frames and replays the raw signature on the next turn", async () => {
+		const model = kiroModel("claude-opus-4.6");
+		const { message: first } = await runApiKey(
+			model,
+			{ messages: [{ role: "user", content: "Q1", timestamp: 1 }] },
+			[{ text: "thinking", signature: "sigK" }, { content: "result" }],
+			Effort.High,
+		);
+		const thinking = first.content.find(b => b.type === "thinking") as any;
+		expect(thinking?.thinking).toBe("thinking");
+		expect(thinking?.thinkingSignature).toBe("kiro:signature:sigK");
+
+		const { request } = await runApiKey(
+			model,
+			{
+				messages: [
+					{ role: "user", content: "Q1", timestamp: 1 },
+					first,
+					{ role: "user", content: "Q2", timestamp: 2 },
+				],
+			},
+			[{ content: "ok" }],
+			Effort.High,
+		);
+		const assistant = request.conversationState.history.find((h: any) => h.assistantResponseMessage);
+		expect(assistant.assistantResponseMessage.reasoningContent).toEqual({ signature: "sigK" });
+	});
+});
+
+describe("Kiro reasoning replay decoding (OAuth)", () => {
+	const turn = (signatures: Array<string | undefined>): AssistantMessage =>
+		({
+			role: "assistant",
+			content: [
+				...signatures.map(sig => ({ type: "thinking", thinking: "t", thinkingSignature: sig })),
+				{ type: "text", text: "r" },
+			],
+			api: "kiro-codewhisperer-stream",
+			provider: "kiro",
+			model: "claude-opus-4.6",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 1,
+		}) as unknown as AssistantMessage;
+
+	async function replayed(signatures: Array<string | undefined>): Promise<unknown> {
+		let request: any;
+		(globalThis.fetch as any) = async (_input: string | URL | Request, init?: RequestInit) => {
+			request = JSON.parse(new TextDecoder().decode(init?.body as Uint8Array));
+			return eventStreamResponse([{ type: "assistantResponseEvent", payload: { content: "ok" } }]);
+		};
+		for await (const _ of streamKiroCodeWhisperer(
+			kiroModel("claude-opus-4.6"),
+			{
+				messages: [
+					{ role: "user", content: "Q1", timestamp: 1 },
+					turn(signatures),
+					{ role: "user", content: "Q2", timestamp: 2 },
+				],
+			},
+			{ apiKey: JSON.stringify({ token: "social-access-token", profileArn: PROFILE_ARN }), reasoning: Effort.High },
+		)) {
+		}
+		return request.conversationState.history.find((h: any) => h.assistantResponseMessage).assistantResponseMessage
+			.reasoningContent;
+	}
+
+	test.each([
+		[["kiro:redactedContent:blob"], { redactedContent: "blob" }],
+		[["kiro:signature:"], undefined],
+		[["kiro:unknown:x"], undefined],
+		[["anthropic-native-signature"], undefined],
+		[["kiro:signature:first", "kiro:signature:last"], { signature: "last" }],
+		[["kiro:signature:keep", "kiro:unknown:x"], { signature: "keep" }],
+	] as const)("%p replays %p", async (signatures, expected) => {
+		expect(await replayed([...signatures])).toEqual(expected);
 	});
 });

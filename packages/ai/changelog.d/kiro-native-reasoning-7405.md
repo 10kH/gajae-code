@@ -1,13 +1,7 @@
-### Features
+### Fixed
 
-- Add native reasoning support for Kiro models (Claude Opus/Sonnet 4.6+, GPT 5.6+) via `reasoningContentEvent` parsing and `additionalModelRequestFields` request fields
-- New `buildKiroAdditionalModelRequestFields()` helper generates model-specific reasoning configuration for both API key and OAuth transports
-- Stream parsers in both `kiro-api-key.ts` and `kiro-codewhisperer.ts` now handle `reasoningContentEvent` with text, signature, and redactedContent payloads
-- Thinking signatures are tagged as `kiro:signature:<sig>` or `kiro:redactedContent:<blob>` for provider response tracking
-
-### Tests
-
-- Add test suite in `kiro-native-reasoning.test.ts` covering:
-  - Request field generation for Claude Opus/Sonnet and GPT models
-  - Stream parsing of reasoningContentEvent with text, signature, and redactedContent
-  - Two-turn replay with thinking signature preservation and block lifecycle
+- Kiro (OAuth and `ksk_` API key) now requests native reasoning through `additionalModelRequestFields` instead of a prompt-tag imitation:
+  - Claude Opus/Sonnet 4.6+ and 5.x, plus Kimi K3, get adaptive thinking with `output_config.effort`.
+  - GPT 5.6 gets `reasoning.effort`, and an explicit off sends `effort: "none"`.
+  - Other models keep the prompt fallback (#7405).
+- Kiro streams now parse `reasoningContentEvent` into thinking blocks and replay the returned `signature` or `redactedContent` on later assistant turns (#7405).

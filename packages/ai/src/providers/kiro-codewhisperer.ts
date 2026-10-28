@@ -44,7 +44,14 @@ import {
 	streamKiroApiKey,
 	toKiroModelId,
 } from "./kiro-api-key";
-import { closeReasoningBlock, createReasoningBlockState, parseReasoningContentEventHelper, type ReasoningBlockState } from "./kiro-reasoning-parser";
+import {
+	closeReasoningBlock,
+	createReasoningBlockState,
+	type KiroReasoningContent,
+	kiroReasoningContentForReplay,
+	parseReasoningContentEventHelper,
+	type ReasoningBlockState,
+} from "./kiro-reasoning-parser";
 
 /**
  * Trust assumption: globalThis.fetch is treated as a trusted source for authenticated
@@ -110,6 +117,7 @@ interface WireAssistantMessage {
 	assistantResponseMessage: {
 		content: string;
 		toolUses?: WireToolUse[];
+		reasoningContent?: KiroReasoningContent;
 	};
 }
 
@@ -692,28 +700,13 @@ function convertToWireMessage(
 	// results can reference the toolUseId they answer.
 	const textParts: string[] = [];
 	const toolUses: WireToolUse[] = [];
-	let reasoningSignature: Record<string, string> | undefined;
+	const reasoningContent = kiroReasoningContentForReplay(msg.content);
 	for (const block of msg.content) {
 		if (typeof block === "string") {
 			textParts.push(block);
 		} else if (block.type === "text") {
 			textParts.push(block.text);
 		} else if (block.type === "thinking") {
-			// Decode reasoning signature/redactedContent from tagged values.
-			// Only the last valid tagged block per assistant turn is used.
-			if (block.thinkingSignature) {
-				if (
-					block.thinkingSignature.startsWith("kiro:signature:") &&
-					block.thinkingSignature.length > "kiro:signature:".length
-				) {
-					reasoningSignature = { signature: block.thinkingSignature.slice("kiro:signature:".length) };
-				} else if (
-					block.thinkingSignature.startsWith("kiro:redactedContent:") &&
-					block.thinkingSignature.length > "kiro:redactedContent:".length
-				) {
-					reasoningSignature = { redactedContent: block.thinkingSignature.slice("kiro:redactedContent:".length) };
-				}
-			}
 		} else if (block.type === "toolCall") {
 			toolUses.push({
 				toolUseId: block.id,
@@ -722,15 +715,12 @@ function convertToWireMessage(
 			});
 		}
 	}
-	const resp: any = {
-		content: textParts.join("\n"),
-		...(toolUses.length > 0 ? { toolUses } : {}),
-	};
-	if (reasoningSignature) {
-		resp.reasoningContent = reasoningSignature;
-	}
 	return {
-		assistantResponseMessage: resp,
+		assistantResponseMessage: {
+			content: textParts.join("\n"),
+			...(toolUses.length > 0 ? { toolUses } : {}),
+			...(reasoningContent ? { reasoningContent } : {}),
+		},
 	};
 }
 

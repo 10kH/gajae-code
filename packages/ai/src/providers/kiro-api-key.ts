@@ -31,7 +31,13 @@ import type {
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { withHttpStatus } from "../utils/http-inspector";
 import type { KiroCodeWhispererOptions } from "./kiro-codewhisperer";
-import { closeReasoningBlock, createReasoningBlockState, parseReasoningContentEventHelper, type ReasoningBlockState } from "./kiro-reasoning-parser";
+import {
+	closeReasoningBlock,
+	createReasoningBlockState,
+	kiroReasoningContentForReplay,
+	parseReasoningContentEventHelper,
+	type ReasoningBlockState,
+} from "./kiro-reasoning-parser";
 
 /**
  * Trust assumption: globalThis.fetch is treated as a trusted source for authenticated
@@ -903,9 +909,7 @@ const NATIVE_REASONING_MODELS: Record<string, "thinking_output_config" | "reason
  * Get the native reasoning field type for a model, or undefined if not supported.
  * Uses explicit map to avoid substring-matching issues like '-5' matching '4.5'.
  */
-function getNativeReasoningFieldType(
-	modelId: string,
-): "thinking_output_config" | "reasoning" | undefined {
+function getNativeReasoningFieldType(modelId: string): "thinking_output_config" | "reasoning" | undefined {
 	return NATIVE_REASONING_MODELS[modelId];
 }
 
@@ -913,10 +917,10 @@ function getNativeReasoningFieldType(
  * Build additional model request fields for Kiro native reasoning.
  * Returns undefined when reasoning is not applicable, so buildKiroThinkingPrefix fallback applies.
  * For models that support native reasoning, returns structured request fields instead.
- * - true: use model default effort
- * - false/'none': explicitly disable (GPT only; Claude uses default thinking)
- * - effort name: use that effort
- * - undefined: no native fields, use prompt fallback
+ * - true: medium effort
+ * - false/'none': GPT sends effort "none"; Claude/Kimi send nothing
+ * - minimal: low (Kiro has no minimal)
+ * - undefined: no native fields
  */
 export function buildKiroAdditionalModelRequestFields(
 	model: Model<"kiro-codewhisperer-stream">,
@@ -928,40 +932,23 @@ export function buildKiroAdditionalModelRequestFields(
 	// Unknown model or model without native reasoning: use prompt fallback
 	if (!nativeFieldType) return undefined;
 
-	// Reasoning disabled or not requested: use prompt fallback (or default model behavior)
-	if (!reasoning || reasoning === "none") return undefined;
+	// Explicit off: GPT accepts effort "none"; Claude/Kimi simply omit thinking.
+	if (reasoning === false || reasoning === "none") {
+		return nativeFieldType === "reasoning" ? { reasoning: { effort: "none" } } : undefined;
+	}
+	// Not requested: leave the upstream default in control.
+	if (reasoning === undefined) return undefined;
 
-	// Map reasoning parameter to effort: true -> undefined (uses model default),
-	// string -> pass through or normalize
-	const mapEffort = (val: string | boolean): string | undefined => {
-		if (val === true) return undefined; // Use model default
-		if (val === "minimal") return "low"; // Normalize to Kiro effort names
-		return val as string;
-	};
-
-	const effort = mapEffort(reasoning as string | boolean);
+	// Kiro's effort vocabulary is low|medium|high|xhigh|max.
+	const effort = reasoning === true ? "medium" : reasoning === "minimal" ? "low" : reasoning;
 
 	if (nativeFieldType === "thinking_output_config") {
-		// Claude/Kimi: adaptive thinking with summarized display
 		return {
-			thinking: {
-				type: "adaptive",
-				display: "summarized",
-			},
-			...(effort ? { output_config: { effort } } : {}),
+			thinking: { type: "adaptive", display: "summarized" },
+			output_config: { effort },
 		};
 	}
-
-	if (nativeFieldType === "reasoning") {
-		// GPT: reasoning with effort
-		return {
-			reasoning: {
-				...(effort ? { effort } : {}),
-			},
-		};
-	}
-
-	return undefined;
+	return { reasoning: { effort } };
 }
 
 function buildApiKeyRequest(
@@ -982,27 +969,12 @@ function buildApiKeyRequest(
 		if (msg.role === "assistant") {
 			let content = "";
 			const toolUses: Array<{ name: string; toolUseId: string; input: Record<string, unknown> }> = [];
-			let reasoningContent: Record<string, string> | undefined;
+			const reasoningContent = kiroReasoningContentForReplay(msg.content);
 			for (const block of msg.content) {
 				if (typeof block === "string") content += block;
 				else if (block.type === "text") content += block.text;
 				else if (block.type === "thinking") {
 					content = `<thinking>${block.thinking}</thinking>\n\n${content}`;
-					// Decode reasoning signature/redactedContent from tagged values.
-					// Only the last valid tagged block per assistant turn is used.
-					if (block.thinkingSignature) {
-						if (
-							block.thinkingSignature.startsWith("kiro:signature:") &&
-							block.thinkingSignature.length > "kiro:signature:".length
-						) {
-							reasoningContent = { signature: block.thinkingSignature.slice("kiro:signature:".length) };
-						} else if (
-							block.thinkingSignature.startsWith("kiro:redactedContent:") &&
-							block.thinkingSignature.length > "kiro:redactedContent:".length
-						) {
-							reasoningContent = { redactedContent: block.thinkingSignature.slice("kiro:redactedContent:".length) };
-						}
-					}
 				} else if (block.type === "toolCall") {
 					toolUses.push({
 						name: block.name,
@@ -1011,15 +983,12 @@ function buildApiKeyRequest(
 					});
 				}
 			}
-			const resp: any = {
-				content,
-				...(toolUses.length > 0 ? { toolUses } : {}),
-			};
-			if (reasoningContent) {
-				resp.reasoningContent = reasoningContent;
-			}
 			history.push({
-				assistantResponseMessage: resp,
+				assistantResponseMessage: {
+					content,
+					...(toolUses.length > 0 ? { toolUses } : {}),
+					...(reasoningContent ? { reasoningContent } : {}),
+				},
 			});
 		} else if (msg.role === "user") {
 			let content = extractText(msg);
@@ -1495,9 +1464,9 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						if (!hasTerminalEvent) {
 							// Transition from reasoning to text: close active reasoning block
 							closeReasoningBlock(blocks, output, stream, reasoningState);
-						if (event.data === lastContent) continue;
-						lastContent = event.data;
-						consumeContent(event.data);
+							if (event.data === lastContent) continue;
+							lastContent = event.data;
+							consumeContent(event.data);
 						}
 					} else if (event.type === "toolUse") {
 						if (!hasTerminalEvent) {

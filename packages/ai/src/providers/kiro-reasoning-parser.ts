@@ -10,7 +10,35 @@
 import type { AssistantMessage, ThinkingContent } from "../types";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
 
-type Block = (ThinkingContent & { index?: number }) | (any & { index?: number });
+type Block = { type: string; index?: number };
+
+/** Wire shape Kiro expects on assistantResponseMessage.reasoningContent. */
+export type KiroReasoningContent = { signature: string } | { redactedContent: string };
+
+const SIGNATURE_TAG = "kiro:signature:";
+const REDACTED_TAG = "kiro:redactedContent:";
+
+/**
+ * Decode the Kiro reasoning payload to replay for one assistant turn: the last
+ * thinking block carrying a nonempty Kiro tag wins; other providers' signatures
+ * and unknown tags are ignored.
+ */
+export function kiroReasoningContentForReplay(content: string | readonly unknown[]): KiroReasoningContent | undefined {
+	if (typeof content === "string") return undefined;
+	let result: KiroReasoningContent | undefined;
+	for (const block of content) {
+		if (typeof block !== "object" || block === null) continue;
+		const thinking = block as Partial<ThinkingContent>;
+		if (thinking.type !== "thinking" || !thinking.thinkingSignature) continue;
+		const sig = thinking.thinkingSignature;
+		if (sig.startsWith(SIGNATURE_TAG) && sig.length > SIGNATURE_TAG.length) {
+			result = { signature: sig.slice(SIGNATURE_TAG.length) };
+		} else if (sig.startsWith(REDACTED_TAG) && sig.length > REDACTED_TAG.length) {
+			result = { redactedContent: sig.slice(REDACTED_TAG.length) };
+		}
+	}
+	return result;
+}
 
 interface ReasoningContentEventPayload {
 	text?: string;
@@ -68,7 +96,7 @@ export function parseReasoningContentEventHelper(
 		stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: output });
 	}
 
-	const block = blocks[thinkingIndex] as ThinkingContent & { index?: number };
+	const block = blocks[thinkingIndex] as ThinkingContent;
 
 	// Append text content
 	if (typeof ev.text === "string" && ev.text) {
@@ -84,9 +112,9 @@ export function parseReasoningContentEventHelper(
 	// Set thinkingSignature from the last valid tagged block
 	// Ignore empty tags and unknown tag prefixes
 	if (typeof ev.signature === "string" && ev.signature.length > 0) {
-		block.thinkingSignature = `kiro:signature:${ev.signature}`;
+		block.thinkingSignature = `${SIGNATURE_TAG}${ev.signature}`;
 	} else if (typeof ev.redactedContent === "string" && ev.redactedContent.length > 0) {
-		block.thinkingSignature = `kiro:redactedContent:${ev.redactedContent}`;
+		block.thinkingSignature = `${REDACTED_TAG}${ev.redactedContent}`;
 	}
 }
 
@@ -103,29 +131,16 @@ export function closeReasoningBlock(
 ): void {
 	const thinkingIndex = state.activeThinkingIndex;
 	if (thinkingIndex !== undefined && thinkingIndex < blocks.length) {
-		const block = blocks[thinkingIndex] as ThinkingContent & { index?: number };
+		const block = blocks[thinkingIndex];
 		if (block.type === "thinking") {
 			stream.push({
 				type: "thinking_end",
 				contentIndex: thinkingIndex,
-				content: block.thinking,
+				content: (block as ThinkingContent).thinking,
 				partial: output,
 			});
 		}
 	}
 	// Clear the active block so the next reasoning event starts fresh
 	state.activeThinkingIndex = undefined;
-}
-
-/**
- * Finalize remaining thinking block at stream end.
- * Called once when the stream completes without explicit close.
- */
-export function closeThinkingBlock(
-	blocks: Block[],
-	output: AssistantMessage,
-	stream: AssistantMessageEventStream,
-	state: ReasoningBlockState,
-): void {
-	closeReasoningBlock(blocks, output, stream, state);
 }
