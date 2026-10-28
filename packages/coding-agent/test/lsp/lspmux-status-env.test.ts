@@ -6,7 +6,7 @@ import * as path from "node:path";
 /**
  * `detectLspmux` probes `lspmux status` from a fresh process so the repository
  * `.env` loads the same way a checkout does. The stub records that child's
- * environment. Shell exports are parent environment entries the `.env` does not declare.
+ * environment. Inherited values are entries passed in the parent environment.
  */
 
 const PROBE = path.join(import.meta.dir, "..", "fixtures", "lspmux-status-env-probe.ts");
