@@ -1279,3 +1279,20 @@ blindly re-sent), close mutates only an exactly re-proven substrate, and
 orphaned children converge through ordinary close after
 `sdk.masterOrphanGraceMs`. Task text and master capability are transient
 dispatch inputs and never persist in any durable store, log, or output.
+
+Closing a spawned headless child first sends `session.close` to the exact
+registration-pinned host endpoint, authorized by the Broker lifecycle marker the
+host was launched with and carries in its own index row, then waits up to the
+host cleanup deadline (5 s, on monotonic time) for that exact process to exit.
+Only a refused, unreachable or still-running host is closed through the
+substrate escalation (SIGTERM, then SIGKILL; `TerminateProcess` on Windows). The
+close is proven by the exact process being gone, so a child that already exited
+(for example after a lost acknowledgement) closes without any signal, and an
+identity that is no longer re-proven is never asked or signaled.
+
+On Windows, Broker `session.spawn` (including custom trusted hosts) selects the
+identity-fenced headless substrate before any multiplexer probe, because a
+managed tmux/psmux child cannot pass owner admission there: Windows has no
+owner-only reader for its private child binding. The headless proof file is
+still flushed and exclusively created, but Windows offers no directory-entry
+flush, so that step is skipped as lifecycle storage already does.
