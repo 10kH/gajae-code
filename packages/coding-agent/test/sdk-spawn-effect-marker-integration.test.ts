@@ -277,6 +277,10 @@ for (const release of ["proven", "unproven"] as const) {
 }
 
 const sourceCli = path.resolve(import.meta.dir, "../src/cli.ts");
+// Local-only lane: Dev CI does not build dist/gjc for this shard, so the
+// compiled managed lane is skipped there and runs only after a local build.
+const compiledCli = path.resolve(import.meta.dir, "../dist/gjc");
+const compiledAvailable = await Bun.file(compiledCli).exists();
 
 async function readPublishedLifecycleReady(
 	read: () => Promise<unknown>,
@@ -420,9 +424,10 @@ function linuxOwnerIsolationAvailable(): boolean {
 		}).exitCode === 0
 	);
 }
-// Real managed tmux lanes need managed-owner admission and a cooperative macOS
-// close, which this change does not provide; they run on Linux only.
-const realTmuxAvailable = process.platform === "linux" && Bun.which("tmux") !== null && linuxOwnerIsolationAvailable();
+const realTmuxAvailable =
+	process.platform !== "win32" &&
+	Bun.which("tmux") !== null &&
+	(process.platform !== "linux" || linuxOwnerIsolationAvailable());
 
 test.skipIf(!realTmuxAvailable)(
 	"managed wrong outer cannot register a valid inner CLI or substitute headless",
@@ -730,18 +735,19 @@ async function captureManagedDiagnostics(proof: SpawnSubstrateProof, env: NodeJS
 	return stdout + stderr;
 }
 
-for (const lane of ["headless", "managed-source", "managed-early-failure"] as const) {
+for (const lane of ["headless", "managed-source", "managed-compiled", "managed-early-failure"] as const) {
 	// Windows always selects headless, and the managed lanes need a real tmux pane
 	// with usable owner isolation (see realTmuxAvailable);
 	// the headless lane and the Windows selector test cover those hosts.
-	test.skipIf(lane !== "headless" && !realTmuxAvailable)(
-		`real session.spawn ${lane}: ${lane === "managed-early-failure" ? "injected refusal after observed owner resolution" : "registers before seed delivery"}`,
+	test.skipIf((lane !== "headless" && !realTmuxAvailable) || (lane === "managed-compiled" && !compiledAvailable))(
+		`real session.spawn ${lane}: ${lane === "managed-early-failure" ? "injected refusal after observed owner resolution" : "registers before seed delivery"}${lane === "managed-compiled" ? " (requires packages/coding-agent/dist/gjc)" : ""}`,
 		async () => {
 			const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-real-marker-"));
 			const managed = lane !== "headless";
+			const compiled = lane === "managed-compiled";
 			const earlyFailure = lane === "managed-early-failure";
 			const canary = `OPAQUE-COMMAND-CANARY-${randomUUID()}`;
-			const executable = process.execPath;
+			const executable = compiled ? compiledCli : process.execPath;
 			// Non-elevated Windows cannot create symlinks; run an identical copy
 			// with the executable extension there instead.
 			const alias = path.join(root, process.platform === "win32" ? `${canary}.exe` : canary);
@@ -779,9 +785,11 @@ for (const lane of ["headless", "managed-source", "managed-early-failure"] as co
 				BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0",
 			};
 			// The program prefix only: the managed invocation appends the supervisor flag and
-			// the child argv. Source mode matches the product (`--no-env-file` on macOS).
-			const supervisorArgv =
-				process.platform === "darwin"
+			// the child argv. Source mode matches the product (`--no-env-file` on macOS), and
+			// a compiled binary is its own program.
+			const supervisorArgv = compiled
+				? [compiledCli]
+				: process.platform === "darwin"
 					? [process.execPath, "--no-env-file", sourceCli]
 					: [process.execPath, sourceCli];
 			const provider = createSpawnSubstrateProvider({
@@ -872,7 +880,7 @@ for (const lane of ["headless", "managed-source", "managed-early-failure"] as co
 			});
 			setLifecycleCommandResolverForTest(broker, () => ({
 				file: alias,
-				args: ["run", sourceCli, "sdk", "session-host-internal"],
+				args: compiled ? ["sdk", "session-host-internal"] : ["run", sourceCli, "sdk", "session-host-internal"],
 			}));
 			let spawning: Promise<unknown> | undefined;
 			let passed = false;
@@ -1000,7 +1008,9 @@ for (const lane of ["headless", "managed-source", "managed-early-failure"] as co
 							});
 							const command = await new Response(inspection.stdout).text();
 							expect(await inspection.exited).toBe(0);
-							expect(command).toContain(sourceCli);
+							if (compiled && pid === endpoint.pid)
+								expect(command.includes(alias) || command.includes(compiledCli)).toBe(true);
+							else expect(command).toContain(compiled ? compiledCli : sourceCli);
 							expect(command).toContain(entry);
 						}
 						const parentInspection = Bun.spawn(["ps", "-p", String(endpoint.pid), "-o", "ppid="], {
