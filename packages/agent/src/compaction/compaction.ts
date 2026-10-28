@@ -1030,6 +1030,18 @@ function outboundSummaryText(text: string, convert: ConvertToLlm): string {
 	return text;
 }
 
+/**
+ * Frame a stored previous summary at the model boundary.
+ * Outbound conversion already ran; this text is not clipped.
+ * Fence and conversation closers stay neutralized, and previous-summary closers are too.
+ */
+export function frameOutboundPreviousSummary(text: string): string {
+	const escaped = escapeSummaryFenceClosers(text)
+		.replace(/<\/previous-summary>/gi, "&lt;/previous-summary>")
+		.replace(/<\/previous-summary[ \t\n\r\f]+>/gi, "&lt;/previous-summary>");
+	return `${SUMMARY_FENCE_OPEN}${escaped}${SUMMARY_FENCE_CLOSE}`;
+}
+
 export async function generateSummary(
 	currentMessages: AgentMessage[],
 	model: Model,
@@ -1061,7 +1073,8 @@ export async function generateSummary(
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
 	if (previousSummary) {
 		const outboundPreviousSummary = outboundSummaryText(previousSummary, options?.convertToLlm ?? convertToLlm);
-		promptText += `<previous-summary>\n${outboundPreviousSummary}\n</previous-summary>\n\n`;
+		const framedPreviousSummary = frameOutboundPreviousSummary(outboundPreviousSummary);
+		promptText += `<previous-summary>\n${framedPreviousSummary}\n</previous-summary>\n\n`;
 	}
 	promptText += formatAdditionalContext(options?.extraContext);
 	promptText += basePrompt;
