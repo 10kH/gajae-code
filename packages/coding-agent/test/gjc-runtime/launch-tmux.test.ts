@@ -4329,10 +4329,17 @@ describe("tmux owner isolation launch gate", () => {
 	});
 
 	it.each([
-		{ platform: "linux" as const, pin: (root: string) => `${root}/pins/../runtime-state.json`, refused: true },
-		{ platform: "linux" as const, pin: () => "pins/runtime-state.json", refused: true },
+		{ platform: "linux" as const, pin: (root: string) => `${root}/missing/../runtime-state.json`, refused: true },
+		// Relative to the process cwd, which is where any parent-side write would land.
+		{
+			platform: "linux" as const,
+			pin: (root: string) => `${path.basename(root)}-pin/runtime-state.json`,
+			refused: true,
+		},
+		// The supervisor trims its state-directory environment value, so it would read another directory.
+		{ platform: "linux" as const, pin: (root: string) => `${root}/missing /runtime-state.json`, refused: true },
 		{ platform: "linux" as const, pin: (root: string) => `${root}/.//runtime-state.json`, refused: false },
-		{ platform: "darwin" as const, pin: (root: string) => `${root}/pins/../runtime-state.json`, refused: true },
+		{ platform: "darwin" as const, pin: (root: string) => `${root}/missing/../runtime-state.json`, refused: true },
 		{ platform: "darwin" as const, pin: (root: string) => `${root}/.//runtime-state.json`, refused: false },
 	])("keeps a $platform operator pin verbatim and refuses it before any storage only when its supervisor would (%#)", ({
 		platform,
@@ -4340,13 +4347,25 @@ describe("tmux owner isolation launch gate", () => {
 		refused,
 	}) => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-operator-pin-"));
+		const stateFile = pin(root);
+		const relativeDestination = path.isAbsolute(stateFile) ? undefined : path.resolve(path.dirname(stateFile));
 		try {
-			const stateFile = pin(root);
 			const context = {
 				parsed: args({ messages: ["hello"], tmux: true }),
 				rawArgs: ["--tmux", "hello"],
 				cwd: root,
-				env: { GJC_COORDINATOR_SESSION_ID: "operator-pin", GJC_COORDINATOR_SESSION_STATE_FILE: stateFile },
+				env: {
+					GJC_COORDINATOR_SESSION_ID: "operator-pin",
+					GJC_COORDINATOR_SESSION_STATE_FILE: stateFile,
+					// A signed coordinator launch also stages its sidecar bootstrap while planning.
+					...(refused
+						? {
+								[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]: "true",
+								[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV]: "pkcs8-private-key-material",
+								[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]: "a".repeat(64),
+							}
+						: {}),
+				},
 				argv: ["bun", "cli.ts"],
 				execPath: "/bin/bun",
 				platform,
@@ -4373,12 +4392,14 @@ describe("tmux owner isolation launch gate", () => {
 				);
 				expect(calls.some(call => call[0] === "new-session")).toBe(false);
 				expect(fs.readdirSync(root)).toEqual([]);
+				if (relativeDestination) expect(fs.existsSync(relativeDestination)).toBe(false);
 			} else {
 				expect(diagnostics.join("\n")).not.toContain("gjc_tmux_state_file_pin_unsafe");
 				expect(calls.some(call => call[0] === "new-session")).toBe(true);
 			}
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
+			if (relativeDestination) fs.rmSync(relativeDestination, { recursive: true, force: true });
 		}
 	});
 
