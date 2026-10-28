@@ -14,6 +14,7 @@ import {
 import { assertSafePathComponent } from "./session-layout";
 import { trustedCoordinatorEnv } from "./sidecar-bootstrap-env";
 import {
+	assertManagedOwnerGenerationNotReplaced,
 	installManagedOwnerCooperativeShutdown,
 	lifecyclePaths,
 	parseExactOwnerJson,
@@ -265,6 +266,18 @@ async function admitManagedOwner(): Promise<ManagedOwnerAdmission> {
 		if (!safeChildToken(childToken)) return deny(owner, "exact_child_binding_unavailable");
 		const binding = readCurrentChildBinding(owner.root, childToken);
 		if (isManagedOwnerBinding(binding, { ...owner, token: childToken })) {
+			// A relaunch may have replaced this generation before its supervisor
+			// published the binding; that child would outlive every close path.
+			try {
+				assertManagedOwnerGenerationNotReplaced(owner.stateDir, owner.sessionId, owner.generation);
+			} catch (error) {
+				return deny(
+					owner,
+					error instanceof Error && error.message === "owner_generation_stale"
+						? "owner_generation_stale"
+						: "owner_generation_unverifiable",
+				);
+			}
 			// Darwin: before the CLI, so the supervisor's cooperative relay can never
 			// meet the signal's default action. Without readiness it never relays, and
 			// a cooperative close then fails closed.

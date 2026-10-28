@@ -9,7 +9,13 @@ import {
 	type ManagedOwnerRecoverableBinding,
 } from "@gajae-code/coding-agent/gjc-runtime/managed-owner-binding";
 import { sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-import { lifecyclePaths, readSecureOwnerJson } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
+import {
+	captureOwnerGenerationBaselineSync,
+	lifecyclePaths,
+	readSecureOwnerJson,
+	replaceOwnerGenerationSync,
+	resolveManagedOwnerPredecessorSync,
+} from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const admissionModule = path.join(
@@ -576,6 +582,87 @@ describe.skipIf(process.platform === "win32")("managed owner admission", () => {
 				expect(rejected.admitted).toBe(false);
 				expect(rejected.exitCode).toBe(75);
 			}
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	async function handoffReasons(root: string): Promise<string[]> {
+		const reasons: string[] = [];
+		for (const file of (await fs.readdir(root)).filter(name => name.startsWith("admission-handoff-")).sort())
+			reasons.push((JSON.parse(await fs.readFile(path.join(root, file), "utf8")) as { reason: string }).reason);
+		return reasons;
+	}
+
+	it("refuses a child whose published generation a relaunch replaced before its binding existed", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-admission-replaced-"));
+		try {
+			const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
+			// Launch A publishes its generation; its supervisor pauses before the binding write.
+			replaceOwnerGenerationSync(stateDir, "session-2681", "generation-2681", { state: "absent" });
+			const baselineA = captureOwnerGenerationBaselineSync(stateDir, "session-2681");
+			// Launch B finds no binding of A under the publication lock and replaces A.
+			let predecessorChecked = false;
+			replaceOwnerGenerationSync(stateDir, "session-2681", "generation-relaunch", baselineA, () => {
+				predecessorChecked = true;
+				expect(resolveManagedOwnerPredecessorSync(stateDir, "session-2681", baselineA)).toBeUndefined();
+			});
+			expect(predecessorChecked).toBe(true);
+			// A resumes: its supervisor writes the binding and starts the child.
+			await writeBinding(root, "late-token");
+			const late = await admit(stateDir, "late-token");
+			expect(late).toMatchObject({ admitted: false, exitCode: 75 });
+			expect(late.stderr).toContain("owner_generation_stale");
+			// Off Linux the handoff cannot be persisted through private authority; the
+			// stderr reason above is the record there.
+			expect(await handoffReasons(root)).toEqual(process.platform === "linux" ? ["owner_generation_stale"] : []);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it("admits the current published generation, and a relaunch then sees its binding and refuses", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-admission-current-"));
+		try {
+			const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
+			replaceOwnerGenerationSync(stateDir, "session-2681", "generation-2681", { state: "absent" });
+			const baselineA = captureOwnerGenerationBaselineSync(stateDir, "session-2681");
+			await writeBinding(root, "current-token");
+			expect(await admit(stateDir, "current-token")).toMatchObject({ admitted: true, exitCode: 0 });
+			// The admitted child's supervisor (pid 1 in the fixture) is observed live, so the
+			// relaunch must refuse inside the lock and leave generation A current.
+			expect(() =>
+				replaceOwnerGenerationSync(stateDir, "session-2681", "generation-relaunch", baselineA, () =>
+					resolveManagedOwnerPredecessorSync(stateDir, "session-2681", baselineA, () => ({
+						status: "present",
+						incarnation: "1",
+					})),
+				),
+			).toThrow(
+				process.platform === "linux"
+					? "managed_owner_replacement_evidence_ambiguous"
+					: "managed_owner_predecessor_live",
+			);
+			expect(captureOwnerGenerationBaselineSync(stateDir, "session-2681")).toEqual(baselineA);
+			expect(await admit(stateDir, "current-token")).toMatchObject({ admitted: true, exitCode: 0 });
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses a published generation whose current record cannot be read", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-admission-unverifiable-"));
+		try {
+			const paths = lifecyclePaths(stateDir, "session-2681", "generation-2681");
+			replaceOwnerGenerationSync(stateDir, "session-2681", "generation-2681", { state: "absent" });
+			await writeBinding(paths.root, "orphan-token");
+			await fs.chmod(paths.generationFile, 0o644);
+			const result = await admit(stateDir, "orphan-token");
+			expect(result).toMatchObject({ admitted: false, exitCode: 75 });
+			expect(result.stderr).toContain("owner_generation_unverifiable");
+			expect(await handoffReasons(paths.root)).toEqual(
+				process.platform === "linux" ? ["owner_generation_unverifiable"] : [],
+			);
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}

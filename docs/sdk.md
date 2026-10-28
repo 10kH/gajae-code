@@ -1334,6 +1334,18 @@ Off Linux, a prior generation's child binding without any receipt is ordinary
 history, so relaunching the same pinned session starts fresh; any receipt there
 still fails closed as unavailable recovery evidence.
 
+A relaunch of a pinned session checks its predecessor inside the same
+generation lock that publishes the replacement. A supervised child whose
+generation is already published is admitted only while that generation is
+still current, read under that lock; a child whose generation a relaunch
+replaced first (for example because its supervisor had not yet published the
+binding the relaunch would have found) is blocked with
+`owner_generation_stale`, and an unreadable current generation blocks it with
+`owner_generation_unverifiable`. So a relaunch either sees the live
+predecessor's binding and refuses, or the predecessor's child never runs. A
+child whose generation is not yet published is admitted; its launcher's own
+publication then fails against any replacement and removes the session.
+
 Admission denial does not depend on being able to save a diagnostic. Unsafe or
 unavailable storage never receives a fallback pathname write: the child stays
 blocked with exit 75, and when the durable handoff cannot be persisted through

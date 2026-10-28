@@ -29,6 +29,7 @@ import {
 	persistCoordinatorRuntimeStateFromPostmortem,
 } from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
 import { buildGjcTmuxSessionSlug } from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
+import * as ownerIsolation from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 import {
 	captureOwnerGenerationBaselineSync,
 	isExactScopedBootstrapSuccessReceipt,
@@ -3990,6 +3991,83 @@ describe("tmux owner isolation launch gate", () => {
 				expect(innerCommand).toContain("--internal-managed-owner-supervisor");
 				expect(innerCommand).not.toContain("GJC_MANAGED_OWNER_PREDECESSOR_TOKEN");
 				expect(JSON.parse(fs.readFileSync(generationFile, "utf8")).generation).not.toBe(firstGeneration);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"checks the predecessor of a pinned root relaunch inside the generation publication lock",
+		() => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-relaunch-locked-check-"));
+			try {
+				const launch = () => {
+					const diagnostics: string[] = [];
+					let serverCreated = false;
+					launchDefaultTmuxIfNeeded({
+						parsed: args({ tmux: true }),
+						rawArgs: ["--tmux"],
+						cwd: root,
+						env: {
+							GJC_COORDINATOR_SESSION_ID: "locked-check-session",
+							GJC_COORDINATOR_SESSION_STATE_FILE: path.join(root, "runtime-state.json"),
+							GJC_TMUX_SESSION: "pinned",
+							GJC_PSMUX_DETECTION: "off",
+							GJC_TMUX_COMMAND: "tmux",
+						},
+						argv: ["bun", "cli.ts"],
+						execPath: "/bin/bun",
+						platform: "darwin",
+						tty: interactiveTty,
+						tmuxAvailable: true,
+						existingBranchSessionName: null,
+						currentBranch: "",
+						diagnosticWriter: message => diagnostics.push(message),
+						ownerIsolationProbe: {
+							readCallerCgroup: () => null,
+							probeServer: () => {
+								if (!serverCreated) {
+									serverCreated = true;
+									return { state: "absent" };
+								}
+								return {
+									state: "safe",
+									pid: 123,
+									startTime: "42",
+									cgroup: { classification: "not_applicable" },
+								};
+							},
+							recordAttempt: () => {},
+						},
+						spawnSync: (_command, spawnArgs) => ({
+							exitCode: 0,
+							stdout: spawnArgs[0] === "display-message" ? "$0\tpinned" : "$0",
+						}),
+					});
+					return diagnostics;
+				};
+				expect(launch()).toEqual([]);
+				// A binding published between an unlocked check and the publication lock would
+				// be missed; the publication-time check must run inside replaceOwnerGenerationSync.
+				const replace = ownerIsolation.replaceOwnerGenerationSync;
+				const resolve = ownerIsolation.resolveManagedOwnerPredecessorSync;
+				let insidePublication = false;
+				const checks: boolean[] = [];
+				spyOn(ownerIsolation, "replaceOwnerGenerationSync").mockImplementation((...replaceArgs) => {
+					insidePublication = true;
+					try {
+						return replace(...replaceArgs);
+					} finally {
+						insidePublication = false;
+					}
+				});
+				spyOn(ownerIsolation, "resolveManagedOwnerPredecessorSync").mockImplementation((...resolveArgs) => {
+					checks.push(insidePublication);
+					return resolve(...resolveArgs);
+				});
+				expect(launch()).toEqual([]);
+				expect(checks.at(-1)).toBe(true);
 			} finally {
 				fs.rmSync(root, { recursive: true, force: true });
 			}

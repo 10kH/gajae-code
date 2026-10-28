@@ -1346,12 +1346,17 @@ export function isOwnerGenerationBaselineCurrentSync(
 	}
 }
 
-/** Synchronous publication for managed launch paths, serialized by a SQLite write transaction. */
+/**
+ * Synchronous publication for managed launch paths, serialized by a SQLite write transaction.
+ * `assertReplaceable` runs inside that transaction after the baseline check, so a
+ * predecessor check cannot interleave with a child admission of the generation it replaces.
+ */
 export function replaceOwnerGenerationSync(
 	stateDir: string,
 	sessionId: string,
 	generation: string,
 	expectedBaseline: OwnerGenerationBaseline,
+	assertReplaceable?: () => void,
 ): string {
 	const paths = lifecyclePaths(stateDir, sessionId, generation);
 	const db = acquireSqliteLockSync(paths, 7_000);
@@ -1360,6 +1365,7 @@ export function replaceOwnerGenerationSync(
 	try {
 		if (!isOwnerGenerationBaselineCurrentSync(stateDir, sessionId, expectedBaseline))
 			throw new Error("baseline_generation_changed");
+		assertReplaceable?.();
 		const previous = captureOwnerGenerationBaselineSync(stateDir, sessionId);
 		const published = {
 			schema_version: 1 as const,
@@ -1395,6 +1401,47 @@ export function replaceOwnerGenerationSync(
 			fsSync.unlinkSync(temporaryGeneration);
 		} catch {}
 		db.close();
+	}
+}
+
+/**
+ * Child admission fence. Once a generation is published (its immutable marker
+ * exists), its child is admitted only while that generation is still current,
+ * read under the generation lock that also holds a relaunch's predecessor check
+ * and publication. So either the relaunch saw this child's binding and refused a
+ * live predecessor, or it replaced the generation first and this child is
+ * refused: no admitted child is left behind a generation that close no longer
+ * reaches. A child of a generation not yet published is admitted; its launcher's
+ * publication then fails the baseline check against any replacement and removes
+ * the session.
+ */
+export function assertManagedOwnerGenerationNotReplaced(stateDir: string, sessionId: string, generation: string): void {
+	const paths = lifecyclePaths(stateDir, sessionId, generation);
+	try {
+		fsSync.lstatSync(paths.generationMarkerFile);
+	} catch (error) {
+		if (isCode(error, "ENOENT")) return;
+		throw new Error("owner_generation_unverifiable");
+	}
+	const db = acquireSqliteLockSync(paths, GENERATION_LOCK_WAIT_TIMEOUT_MS, true);
+	if (!db) throw new Error("owner_generation_unverifiable");
+	try {
+		let current: unknown;
+		try {
+			current = readSecureOwnerJson(paths.generationFile);
+		} catch {
+			throw new Error("owner_generation_unverifiable");
+		}
+		if (!isRecord(current) || current.session_id !== sessionId || !nonEmpty(current.generation))
+			throw new Error("owner_generation_unverifiable");
+		if (current.generation !== generation) throw new Error("owner_generation_stale");
+	} finally {
+		try {
+			db.exec("COMMIT");
+		} catch {
+		} finally {
+			db.close();
+		}
 	}
 }
 
