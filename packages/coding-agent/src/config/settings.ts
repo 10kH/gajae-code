@@ -258,6 +258,10 @@ type DurableBatchRevision = {
 	previousRevision: number | undefined;
 	revision: number;
 };
+type DurablePublication = {
+	notificationMutation: boolean;
+	supersededByOverlap: boolean;
+};
 type NotificationValidationState = {
 	malformedConfigRoot: boolean;
 	invalidNotificationGlobal: boolean;
@@ -1626,8 +1630,9 @@ export class Settings implements NotificationSettingsReader {
 		try {
 			const receipt = await commit;
 			await failureRefresh;
-			const appliedNotificationMutation = this.#applyDurableBatch(revisions);
-			this.#recordNotificationValidationBatchApply(notificationValidationGuard, appliedNotificationMutation);
+			const publication = this.#applyDurableBatch(revisions);
+			if (publication.supersededByOverlap) await this.#refreshAfterSupersededPublication();
+			this.#recordNotificationValidationBatchApply(notificationValidationGuard, publication.notificationMutation);
 			return receipt;
 		} catch (error) {
 			for (const entry of revisions) {
@@ -1729,8 +1734,9 @@ export class Settings implements NotificationSettingsReader {
 		try {
 			const receipt = await commit;
 			await failureRefresh;
-			const appliedNotificationMutation = this.#applyDurableBatch(revisions);
-			this.#recordNotificationValidationBatchApply(notificationValidationGuard, appliedNotificationMutation);
+			const publication = this.#applyDurableBatch(revisions);
+			if (publication.supersededByOverlap) await this.#refreshAfterSupersededPublication();
+			this.#recordNotificationValidationBatchApply(notificationValidationGuard, publication.notificationMutation);
 			return receipt;
 		} catch (error) {
 			for (const entry of revisions) {
@@ -6545,7 +6551,7 @@ export class Settings implements NotificationSettingsReader {
 		slot.release();
 	}
 
-	#applyDurableBatch(revisions: readonly DurableBatchRevision[]): boolean {
+	#applyDurableBatch(revisions: readonly DurableBatchRevision[]): DurablePublication {
 		return this.#applyDurablePatches(
 			revisions,
 			revisions.map(entry => entry.patch),
@@ -6575,20 +6581,29 @@ export class Settings implements NotificationSettingsReader {
 		patches: readonly AtomicYamlPatch[],
 		clearStagedMutations: boolean,
 		restoreNotificationState?: NotificationValidationState,
-	): boolean {
+	): DurablePublication {
 		const revisionsByPath = new Map<string, DurableBatchRevision>();
 		for (const entry of revisions) revisionsByPath.set(entry.patch.path, entry);
 		const finalPatches = new Map<string, AtomicYamlPatch>();
 		for (const patch of patches) finalPatches.set(patch.path, patch);
+		// A patch whose own revision is current is the committed value for its path, but a
+		// newer descendant or ancestor revision means the in-memory tree cannot be rebuilt
+		// from the patch alone: the overlapping batch already wrote a different subtree
+		// shape. Publishing the patch here would either drop the newer intent or resurrect
+		// a superseded value, so those paths are skipped and the durable file is re-read
+		// instead of guessing the merged shape.
+		let supersededByOverlap = false;
 		const applicable = [...finalPatches.values()].filter(patch => {
 			const revision = revisionsByPath.get(patch.path);
-			return (
-				revision !== undefined &&
-				this.#pathRevisions.get(patch.path) === revision.revision &&
-				!this.#hasNewerOverlappingRevision(patch.path, revision.revision)
-			);
+			if (revision === undefined) return false;
+			if (this.#pathRevisions.get(patch.path) !== revision.revision) return false;
+			if (this.#hasNewerOverlappingRevision(patch.path, revision.revision)) {
+				supersededByOverlap = true;
+				return false;
+			}
+			return true;
 		});
-		if (applicable.length === 0) return false;
+		if (applicable.length === 0) return { notificationMutation: false, supersededByOverlap };
 
 		const previous = new Map<string, unknown>();
 		for (const patch of applicable) {
@@ -6626,7 +6641,10 @@ export class Settings implements NotificationSettingsReader {
 		this.#revalidateNotificationSettingsAfterMutation(applicable.map(patch => patch.path));
 		if (restoreNotificationState) this.#restoreNotificationValidationState(restoreNotificationState);
 		this.#publishSettingsChanges(previous);
-		return applicable.some(patch => isNotificationSettingsPath(patch.path));
+		return {
+			notificationMutation: applicable.some(patch => isNotificationSettingsPath(patch.path)),
+			supersededByOverlap,
+		};
 	}
 
 	#hasNewerOverlappingRevision(settingPath: string, revision: number): boolean {
@@ -6676,6 +6694,19 @@ export class Settings implements NotificationSettingsReader {
 		await enqueueAtomicYamlOperation(this.#configPath, canonicalPath =>
 			this.#refreshDurableSettingsUnderQueue(canonicalPath),
 		);
+	}
+	/**
+	 * Re-read the durable file after a publication that could not be replayed in memory
+	 * because a newer overlapping batch owns part of the same subtree. The file is the only
+	 * authority for the merged shape; staged local intent is replayed on top by
+	 * {@link #replaceGlobalWithDurable}.
+	 */
+	async #refreshAfterSupersededPublication(): Promise<void> {
+		try {
+			await this.#refreshDurableSettings();
+		} catch (error) {
+			logger.warn("Settings: refresh after superseded atomic batch failed", { error: String(error) });
+		}
 	}
 	#assertDurableConfigWritable(): void {
 		if (this.canWriteDurableConfig()) return;

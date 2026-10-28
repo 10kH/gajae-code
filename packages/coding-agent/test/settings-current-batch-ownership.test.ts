@@ -8,6 +8,7 @@ import {
 	enqueueAtomicYamlOperation,
 	withAtomicYamlConfigTransaction,
 } from "../src/config/atomic-yaml-patch";
+import type { ModelSelectorValue } from "../src/config/model-selector-value";
 import { Settings, type SettingsAtomicPatch } from "../src/config/settings";
 
 const patch: SettingsAtomicPatch[] = [{ path: "temperature", op: "set", value: 0.4 }];
@@ -901,4 +902,29 @@ describe("current-value atomic batch local ownership", () => {
 			}
 		});
 	}
+});
+
+describe("concurrent parent and child atomic batches", () => {
+	it("keeps memory equal to disk when a child batch reserves a newer revision", async () => {
+		const temp = TempDir.createSync("@gjc-concurrent-batch-");
+		const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") });
+		try {
+			await settings.commitAtomicBatch([{ path: "modelRoles", op: "set", value: { default: "old" } }]);
+			const configPath = settings.getGlobalConfigPath();
+			if (!configPath) throw new Error("Expected disk-backed settings");
+			const parent = settings.commitAtomicBatch([
+				{ path: "modelRoles", op: "set", value: { default: "new", image: "img" } },
+			]);
+			const child = settings.commitAtomicBatch([{ path: "modelRoles.custom", op: "set", value: "custom" }]);
+			await Promise.all([parent, child]);
+			const disk = YAML.parse(await Bun.file(configPath).text()) as {
+				modelRoles?: Record<string, ModelSelectorValue>;
+			};
+			expect(disk.modelRoles).toEqual({ default: "new", image: "img", custom: "custom" });
+			expect(settings.getModelRoles()).toEqual(disk.modelRoles ?? {});
+		} finally {
+			await settings.close();
+			temp.removeSync();
+		}
+	});
 });
