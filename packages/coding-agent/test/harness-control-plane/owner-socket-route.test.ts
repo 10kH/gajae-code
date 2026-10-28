@@ -599,6 +599,74 @@ describe("harness owner socket routing", () => {
 	);
 
 	it.skipIf(process.platform === "win32")(
+		"does not route a base-format live lease from another socket dir",
+		async () => {
+			const socketDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			const otherDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			extraDirs.push(socketDir, otherDir);
+			const endpoint = controlSocketPath(root, SID, { GJC_HARNESS_SOCKET_DIR: socketDir });
+			const server = await listen(endpoint, ALLOWED);
+			try {
+				await plantLease(endpoint);
+				const same = await runHarness(["observe", "--session", SID], { GJC_HARNESS_SOCKET_DIR: socketDir });
+				expect(same.raw).toContain(ALLOWED);
+				const before = server.received.length;
+				const other = await runHarness(["observe", "--session", SID], { GJC_HARNESS_SOCKET_DIR: otherDir });
+				expect(other.raw).not.toContain(ALLOWED);
+				expect(server.received.length).toBe(before);
+				await expect(
+					acquireLease(root, SID, {
+						ownerId: "owner-other",
+						pid: process.pid,
+						eventsPath: sessionPaths(root, SID).events,
+						endpoint: {
+							kind: "unix-socket",
+							path: controlSocketPath(root, SID, { GJC_HARNESS_SOCKET_DIR: otherDir }),
+						},
+						ttlMs: 10_000,
+					}),
+				).rejects.toThrow(/lease_held/);
+				expect((await readLease(root, SID))?.ownerId).toBe("owner-planted");
+			} finally {
+				await server.close();
+			}
+		},
+		20_000,
+	);
+
+	it("accepts a private windows access list and rejects one others can write", async () => {
+		const mod = await import("../../src/harness-control-plane/session-lease");
+		const allow = mod.windowsAclGrantsOnlyUser;
+		const listing = [
+			"C:\\Users\\me\\AppData\\Local\\gjc-socknote NT AUTHORITY\\SYSTEM:(I)(OI)(CI)(F)",
+			"                                    BUILTIN\\Administrators:(I)(OI)(CI)(F)",
+			"                                    DESKTOP\\me:(I)(OI)(CI)(F)",
+			"",
+		].join("\n");
+		expect(allow(listing, "me")).toBe(true);
+		expect(allow(`${listing}\n                                    Everyone:(F)\n`, "me")).toBe(false);
+		expect(allow(`${listing}\n                                    BUILTIN\\Users:(W)\n`, "me")).toBe(false);
+		expect(allow(`${listing}\n                                    BUILTIN\\Users:(RX)\n`, "me")).toBe(true);
+		expect(allow("", "me")).toBe(false);
+	});
+
+	it.skipIf(process.platform !== "win32")(
+		"routes observe to a live owner from another socket dir on windows",
+		async () => {
+			const socketDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			const otherDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			extraDirs.push(socketDir, otherDir);
+			await withSocketEnv({ GJC_HARNESS_SOCKET_DIR: socketDir }, async () => {
+				const res = await runHarness(["observe", "--session", SID], { GJC_HARNESS_SOCKET_DIR: otherDir });
+				const body = JSON.parse(res.raw) as { evidence?: { ownerRouted?: boolean } };
+				expect(res.code).toBe(0);
+				expect(body.evidence?.ownerRouted).toBe(true);
+			});
+		},
+		20_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
 		"does not route or take over through a world-writable socket record directory",
 		async () => {
 			await expectUntrustedRecordIgnored((dir, file) => {

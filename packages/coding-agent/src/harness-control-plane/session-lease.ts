@@ -6,6 +6,7 @@
  * be taken over, incrementing `leaseEpoch`, but a stale lease is NEVER permission for
  * destructive recovery (that gate lives in the classifier/recovery layer).
  */
+import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
@@ -154,10 +155,58 @@ function ensureTrustedDir(dir: string): boolean {
 	return recordDirTrusted(dir);
 }
 
+/** True when an icacls listing grants this user write and does not grant write to another principal. */
+export function windowsAclGrantsOnlyUser(text: string, username: string): boolean {
+	const user = username.trim().toLowerCase();
+	if (!user) return false;
+	let userCanWrite = false;
+	let otherCanWrite = false;
+	for (const raw of text.split(/\r?\n/)) {
+		const marker = raw.indexOf(":(");
+		if (marker < 0) continue;
+		let principal = raw.slice(0, marker).trim().toLowerCase();
+		if (principal.includes(":\\") || principal.startsWith("\\\\")) {
+			const parts = principal.split(/\s+/);
+			principal = parts[parts.length - 1] ?? principal;
+		}
+		const short = principal.includes("\\") ? principal.slice(principal.lastIndexOf("\\") + 1) : principal;
+		const rights = raw.slice(marker).toUpperCase();
+		const canWrite = /\((?:[^)]*)\b(?:F|M|W|D|WD|AD|WA|DC|WDAC|WO)\b/.test(rights);
+		const ignored = short === "system" || short === "administrators";
+		if (short === user) {
+			if (canWrite) userCanWrite = true;
+		} else if (canWrite && !ignored) otherCanWrite = true;
+	}
+	return userCanWrite && !otherCanWrite;
+}
+
+const windowsTrust = new Map<string, { ino: number; mtimeMs: number; ok: boolean }>();
+
+function windowsObjectPrivate(target: string): boolean {
+	let st: fsSync.Stats;
+	try {
+		st = fsSync.lstatSync(target);
+	} catch {
+		return false;
+	}
+	const cached = windowsTrust.get(target);
+	if (cached && cached.ino === st.ino && cached.mtimeMs === st.mtimeMs) return cached.ok;
+	let ok = false;
+	try {
+		const listing = execFileSync("icacls", [target], { encoding: "utf8", windowsHide: true, timeout: 3000 });
+		ok = windowsAclGrantsOnlyUser(listing, os.userInfo().username);
+	} catch {
+		ok = false;
+	}
+	windowsTrust.set(target, { ino: st.ino, mtimeMs: st.mtimeMs, ok });
+	return ok;
+}
+
 function recordDirTrusted(dir: string): boolean {
 	try {
 		const st = fsSync.lstatSync(dir);
 		if (st.isSymbolicLink() || !st.isDirectory()) return false;
+		if (process.platform === "win32") return windowsObjectPrivate(dir);
 		const uid = processUid();
 		if (uid === null || st.uid !== uid) return false;
 		if ((st.mode & 0o077) !== 0) return false;
@@ -165,6 +214,14 @@ function recordDirTrusted(dir: string): boolean {
 	} catch {
 		return false;
 	}
+}
+
+function recordFileTrusted(st: fsSync.Stats, file: string): boolean {
+	if (!st.isFile()) return false;
+	if (process.platform === "win32") return windowsObjectPrivate(file);
+	const uid = processUid();
+	if (uid === null || st.uid !== uid) return false;
+	return (st.mode & 0o077) === 0;
 }
 /** In-process seam. Production leaves this unset. A test may swap the store after the directory check. */
 let ownerSocketRecordAfterDirCheck: (() => void) | null = null;
@@ -249,9 +306,7 @@ function readOwnerSocketRecord(root: string, sessionId: string): OwnerSocketReco
 		fd = fsSync.openSync(file, flags);
 		if (!storeIdentityHeld(file, ids)) return null;
 		const st = fsSync.fstatSync(fd);
-		const uid = processUid();
-		if (uid === null || st.uid !== uid || !st.isFile()) return null;
-		if ((st.mode & 0o077) !== 0) return null;
+		if (!recordFileTrusted(st, file)) return null;
 		if (st.size <= 0 || st.size > SOCKET_RECORD_MAX_BYTES) return null;
 		const buf = Buffer.alloc(st.size);
 		if (fsSync.readSync(fd, buf, 0, st.size, 0) !== st.size) return null;
@@ -288,8 +343,7 @@ function writeOwnerSocketRecord(file: string, record: OwnerSocketRecord): void {
 		fd = fsSync.openSync(tmp, flags, 0o600);
 		created = true;
 		const st = fsSync.fstatSync(fd);
-		const uid = processUid();
-		if (uid === null || st.uid !== uid || !st.isFile() || (st.mode & 0o077) !== 0) return;
+		if (!recordFileTrusted(st, tmp)) return;
 		const body = JSON.stringify(record);
 		if (Buffer.byteLength(body) > SOCKET_RECORD_MAX_BYTES) return;
 		if (fsSync.writeSync(fd, body) !== Buffer.byteLength(body)) return;
