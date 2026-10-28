@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
 import * as crypto from "node:crypto";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -639,13 +640,13 @@ describe.skipIf(process.platform === "win32")("managed owner admission", () => {
 				supervisor_start_time: self.incarnation,
 			});
 			expect(await admit(stateDir, "current-token")).toMatchObject({ admitted: true, exitCode: 0 });
-			let observedUnderLock = false;
+			let probesUnderLock = 0;
 			const live = (pid: number) => {
 				const probe = new Database(path.join(root, "owner-locks.sqlite"));
 				try {
 					probe.exec("PRAGMA busy_timeout = 0");
 					expect(() => probe.exec("BEGIN IMMEDIATE")).toThrow();
-					observedUnderLock = true;
+					probesUnderLock += 1;
 				} finally {
 					probe.close();
 				}
@@ -668,16 +669,66 @@ describe.skipIf(process.platform === "win32")("managed owner admission", () => {
 					baseline: baselineA,
 				}),
 			).toThrow(refusal);
-			await expect(replaceOwnerGeneration(stateDir, "session-2681", "generation-async", baselineA)).rejects.toThrow(
-				refusal,
-			);
-			expect(observedUnderLock).toBe(process.platform !== "linux");
+			await expect(
+				replaceOwnerGeneration(stateDir, "session-2681", "generation-async", baselineA, live),
+			).rejects.toThrow(refusal);
+			// One locked observation each for the sync and async publishers off Linux.
+			expect(probesUnderLock).toBe(process.platform === "linux" ? 0 : 2);
 			expect(captureOwnerGenerationBaselineSync(stateDir, "session-2681")).toEqual(baselineA);
 			expect(await admit(stateDir, "current-token")).toMatchObject({ admitted: true, exitCode: 0 });
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
 	});
+
+	// Waits out each publisher's 7 s lock deadline on purpose.
+	it("runs every publisher's predecessor check only after it holds the generation lock", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-admission-lock-order-"));
+		try {
+			const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
+			replaceOwnerGenerationSync(stateDir, "session-2681", "generation-2681", { state: "absent" });
+			const baselineA = captureOwnerGenerationBaselineSync(stateDir, "session-2681");
+			const self = observeProcessIncarnation(process.pid);
+			if (self.status !== "present") throw new Error("test process incarnation unavailable");
+			await writeBinding(root, "current-token", {
+				supervisor_pid: process.pid,
+				supervisor_start_time: self.incarnation,
+			});
+			const refusal =
+				process.platform === "linux"
+					? "managed_owner_replacement_evidence_ambiguous"
+					: "managed_owner_predecessor_live";
+			// Another writer holds the generation lock. A publisher that checked its
+			// predecessor before taking the lock would refuse with the predecessor reason;
+			// one that checks under the lock can only time out on the lock.
+			const holder = new Database(path.join(root, "owner-locks.sqlite"));
+			try {
+				holder.exec("BEGIN IMMEDIATE");
+				expect(() => replaceOwnerGenerationSync(stateDir, "session-2681", "generation-sync", baselineA)).toThrow(
+					"generation_lock_contended",
+				);
+				await expect(
+					replaceOwnerGeneration(stateDir, "session-2681", "generation-async", baselineA),
+				).rejects.toThrow("generation_lock_contended");
+			} finally {
+				holder.exec("ROLLBACK");
+				holder.close();
+			}
+			expect(() => replaceOwnerGenerationSync(stateDir, "session-2681", "generation-sync", baselineA)).toThrow(
+				refusal,
+			);
+			await expect(replaceOwnerGeneration(stateDir, "session-2681", "generation-async", baselineA)).rejects.toThrow(
+				refusal,
+			);
+			expect(captureOwnerGenerationBaselineSync(stateDir, "session-2681")).toEqual(baselineA);
+			for (const generation of ["generation-sync", "generation-async"])
+				expect(fsSync.existsSync(lifecyclePaths(stateDir, "session-2681", generation).generationMarkerFile)).toBe(
+					false,
+				);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	}, 30_000);
 
 	it("refuses a published generation whose current record cannot be read", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-admission-unverifiable-"));
