@@ -1844,6 +1844,62 @@ describe("Broker spawn close and orphan reaper", () => {
 		}
 	});
 
+	it.each([
+		["win32", true],
+		["darwin", false],
+	] as const)("%s Broker spawn persists its authority claim when the journal directory cannot be flushed: launches=%p", async (platform, launches) => {
+		const agentDir = await temp();
+		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
+		const base = provider(probe);
+		let launched = 0;
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				...base,
+				launch: async () => {
+					launched += 1;
+					return await base.launch();
+				},
+			},
+			spawnPromptLayer: promptLayer,
+		});
+		await broker.start();
+		const journalDirectory = path.join(agentDir, "sdk");
+		const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+		const realOpen = fs.open;
+		// Windows refuses a read-only handle on a directory; every other open is real.
+		const open = spyOn(fs, "open").mockImplementation((async (
+			file: Parameters<typeof fs.open>[0],
+			...rest: unknown[]
+		) => {
+			if (path.resolve(String(file)) === journalDirectory)
+				throw Object.assign(new Error(`EPERM: operation not permitted, open '${journalDirectory}'`), {
+					code: "EPERM",
+				});
+			return await (realOpen as (...args: unknown[]) => ReturnType<typeof fs.open>)(file, ...rest);
+		}) as typeof fs.open);
+		try {
+			Object.defineProperty(process, "platform", { configurable: true, value: platform });
+			const response = (await broker.handleRequest("session.spawn", spawnInput(), `journal-${platform}`)) as {
+				ok: boolean;
+			};
+			Object.defineProperty(process, "platform", platformDescriptor!);
+			expect(response.ok).toBe(launches);
+			expect(launched).toBe(launches ? 1 : 0);
+			if (launches) {
+				// The claim is durable: a fresh store reopening the journal sees it.
+				const reopened = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
+				await reopened.open();
+				expect(reopened.claims()).toHaveLength(1);
+			}
+		} finally {
+			if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
+			open.mockRestore();
+			await broker.stop();
+		}
+	});
+
 	it("pins child registration to the launch locator and the dispatch endpoint", async () => {
 		const agentDir = await temp();
 		const seen: { pinned?: { endpointGeneration: number; pid: number } } = {};
