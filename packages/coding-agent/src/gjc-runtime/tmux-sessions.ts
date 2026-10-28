@@ -273,6 +273,11 @@ export async function waitForPinnedProcessExit(
 export interface CreateGjcTmuxSessionOptions {
 	platform?: NodeJS.Platform;
 	launch?: ManagedTmuxLaunchSpec;
+	/**
+	 * @internal Program prefix (executable and entrypoint) of the supervisor in isolated
+	 * managed-launch tests; the supervisor flag is appended as in production.
+	 */
+	supervisorArgvForTest?: readonly string[];
 }
 
 export type CreateOwnerIsolationTestDependencies = {
@@ -871,7 +876,7 @@ export function createGjcTmuxSession(
 	const childEnvironment: Record<string, string> = { ...(launch?.env ?? {}), ...managedEnvironment };
 	const executionEnv = { ...identityEnv, ...managedEnvironment };
 	const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
-	const supervisorArgv = managedOwnerSupervisorArgv(platform);
+	const supervisorArgv = options.supervisorArgvForTest ?? managedOwnerSupervisorArgv(platform);
 	const command =
 		platform === "win32"
 			? buildWindowsPowerShellInnerCommand({

@@ -1473,3 +1473,39 @@ the pane command unsets `MallocStackLogging` and `MallocStackLoggingNoCompact`,
 and a source-mode launch runs Bun with `--no-env-file` (as a compiled binary
 already does), so neither the tmux server environment nor a cwd `.env` can make
 the CLI malloc guard re-exec the supervisor below the pane PID.
+
+Closing a spawned headless child first sends `session.close` to the exact
+registration-pinned host endpoint, authorized by the Broker lifecycle marker the
+host was launched with and carries in its own index row, then waits up to the
+host cleanup deadline (5 s, on monotonic time) for that exact process to exit.
+Only a refused, unreachable or still-running host is closed through the
+substrate escalation (SIGTERM, then SIGKILL; `TerminateProcess` on Windows). The
+close is proven by the exact process being gone, so a child that already exited
+(for example after a lost acknowledgement) closes without any signal, and an
+identity that is no longer re-proven is never asked or signaled.
+
+On Windows, Broker `session.spawn` (including custom trusted hosts) selects the
+identity-fenced headless substrate before any multiplexer probe, because a
+managed tmux/psmux child cannot pass owner admission there: Windows has no
+owner-only reader for its private child binding. The headless proof file is
+still flushed and exclusively created, but Windows offers no directory-entry
+flush, so that step is skipped as lifecycle storage already does.
+
+Substrate supervisor identity and registered SDK-host identity are distinct
+proofs. Before publishing the lifecycle marker, the Broker resolves the actual
+host under the original readiness deadline: the headless process itself, or the
+positively verified direct child of the pinned managed supervisor. Registration
+must match that host's pid and incarnation and the lifecycle request marker.
+The supervisor proof remains separate cleanup authority; an empty process
+observation is not proof of absence, and ambiguous or replaced children are not
+adopted. A generic registration uncertainty is not permission to retry seed
+delivery or discard the Broker claim. The Broker selects a managed multiplexer
+only where that host can be resolved (macOS and Linux tmux); Windows uses the
+headless substrate described above. An
+owner that cannot be resolved fails as `lifecycle_owner_unresolved` once the
+substrate release is proven, and stays `terminal_uncertain` while it is not. A
+substrate that exits on its own while its exact close runs (a host that gave up
+at its readiness cutoff) counts as released once its exact proof reports it
+gone; a live or replaced substrate does not. Editing source or replacing files does not
+update a running Broker; verify a fresh isolated runtime before a separately
+controlled Broker replacement.
