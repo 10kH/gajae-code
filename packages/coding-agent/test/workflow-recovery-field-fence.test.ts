@@ -12,6 +12,22 @@ function innerText(framed: string): string {
 	return framed.slice(OPEN.length, framed.length - CLOSE.length);
 }
 
+/** Raw cap, then full entity escaping. This is the contract the property compares against. */
+function rawClipThenEscape(value: string, maxLength: number): string {
+	const cap = Math.max(0, maxLength);
+	let flat = "";
+	for (let index = 0; index < value.length && flat.length < cap; index++) {
+		const code = value.charCodeAt(index);
+		if (code === 13) {
+			if (value.charCodeAt(index + 1) === 10) index++;
+			flat += " ";
+			continue;
+		}
+		flat += code === 10 ? " " : (value[index] ?? "");
+	}
+	return flat.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 describe("workflow recovery field fence", () => {
 	it("frames a tail-only over-long field after the clip", () => {
 		const max = 240;
@@ -35,7 +51,7 @@ describe("workflow recovery field fence", () => {
 		expect(inner).toContain("&lt;/untrusted-content&gt;");
 		expect(framed).not.toContain("TAIL_ONLY_MARKER");
 		expect(inner.includes("<")).toBe(false);
-		expect(inner.length).toBeLessThanOrEqual(max);
+		expect(inner.length).toBeLessThanOrEqual(max * 5);
 	});
 
 	it("stays bounded for an input twice the cap", () => {
@@ -47,7 +63,15 @@ describe("workflow recovery field fence", () => {
 		expect(Date.now() - started).toBeLessThan(1000);
 		const inner = innerText(framed);
 		expect(inner).toBe("H".repeat(max));
-		expect(framed.length).toBeLessThanOrEqual(OPEN.length + CLOSE.length + max);
+		expect(framed.length).toBeLessThanOrEqual(OPEN.length + CLOSE.length + max * 5);
+	});
+
+	it("keeps raw characters that fit when escaping expands", () => {
+		const max = 240;
+		expect(innerText(fenceClippedCompactionText("&".repeat(49), max))).toBe("&amp;".repeat(49));
+		expect(innerText(fenceClippedCompactionText(`${"a".repeat(239)}&`, max))).toBe(`${"a".repeat(239)}&amp;`);
+		expect(innerText(fenceClippedCompactionText(`${"a".repeat(238)}<Z`, max))).toBe(`${"a".repeat(238)}&lt;Z`);
+		expect(innerText(fenceClippedCompactionText(`${"a".repeat(238)}>Z`, max))).toBe(`${"a".repeat(238)}&gt;Z`);
 	});
 
 	it("property: fenceClippedCompactionText, fc.property seed 680, numRuns 64", () => {
@@ -55,11 +79,13 @@ describe("workflow recovery field fence", () => {
 			fc.property(fc.string({ maxLength: 400 }), fc.integer({ min: 0, max: 240 }), (value, max) => {
 				const framed = fenceClippedCompactionText(value, max);
 				const inner = innerText(framed);
+				expect(inner).toBe(rawClipThenEscape(value, max));
 				expect(inner.includes("<")).toBe(false);
 				expect(inner.includes(">")).toBe(false);
 				expect(inner.includes("\n")).toBe(false);
 				expect(inner.includes("\r")).toBe(false);
-				expect(inner.length).toBeLessThanOrEqual(Math.max(0, max));
+				expect(inner.length).toBeLessThanOrEqual(Math.max(0, max) * 5);
+				expect(framed.length).toBeLessThanOrEqual(OPEN.length + CLOSE.length + Math.max(0, max) * 5);
 				if (max > 0 && value.length <= max && !/[&<>\r\n]/.test(value)) {
 					expect(inner).toBe(value);
 				}

@@ -19,13 +19,9 @@ function clipFlat(value: string, maxLength: number): string {
 	return out;
 }
 
-/** Clip and escape first. The untrusted fence is applied after the cap cut. */
+/** Clip the raw text, then escape. The fence is applied after that cut and the escaped text is not clipped again. */
 export function fenceClippedCompactionText(value: string, maxLength: number): string {
 	const cap = Math.max(0, maxLength);
-	const escaped = clipFlat(value, cap)
-		.replace(/&/g, "&amp;")
-		.replace(/</g, "&lt;")
-		.replace(/>/g, "&gt;")
-		.slice(0, cap);
+	const escaped = clipFlat(value, cap).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 	return `${OPEN}${escaped}${CLOSE}`;
 }
