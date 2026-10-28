@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { execFileSync } from "node:child_process";
 import * as fsSync from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import * as net from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import fc from "fast-check";
-import { RuntimeOwner } from "../../src/harness-control-plane/owner";
+import { RuntimeOwner, resolveOwner } from "../../src/harness-control-plane/owner";
 import { acquireLease, readLease } from "../../src/harness-control-plane/session-lease";
 import type { HarnessSessionTransport } from "../../src/harness-control-plane/session-transport";
 import { controlSocketPath, sessionPaths, writeSessionState } from "../../src/harness-control-plane/storage";
@@ -695,6 +696,163 @@ describe("harness owner socket routing", () => {
 		},
 		20_000,
 	);
+
+	it.skipIf(process.platform === "win32")(
+		"does not block on a fifo socket record",
+		async () => {
+			const file = await recordPath();
+			expect(file).toBeTruthy();
+			const dir = path.dirname(file!);
+			fsSync.mkdirSync(dir, { recursive: true, mode: 0o700 });
+			fsSync.chmodSync(dir, 0o700);
+			execFileSync("mkfifo", [file]);
+			const foreign = path.join(root, "attacker.sock");
+			const server = await listen(foreign, FORGED);
+			const socketDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			extraDirs.push(socketDir);
+			const saved = process.env.GJC_HARNESS_SOCKET_DIR;
+			const owner = new RuntimeOwner({
+				root,
+				sessionId: SID,
+				transport: new IdleTransport(),
+				heartbeatMs: 60_000,
+			});
+			try {
+				await plantLease(foreign);
+				const promptFile = path.join(root, "prompt.txt");
+				await writeFile(promptFile, SECRET, "utf8");
+				const res = await runHarness(["submit", "--session", SID, "--prompt-file", promptFile, "--input", "{}"]);
+				expect(server.received).toHaveLength(0);
+				expect(res.raw).not.toContain(FORGED);
+				fsSync.rmSync(sessionPaths(root, SID).lease, { force: true });
+				fsSync.rmSync(file!, { force: true });
+				process.env.GJC_HARNESS_SOCKET_DIR = socketDir;
+				await owner.start();
+				fsSync.rmSync(file!, { force: true });
+				execFileSync("mkfifo", [file]);
+				await owner.stop();
+			} finally {
+				await server.close();
+				await owner.stop().catch(() => {});
+				fsSync.rmSync(dir, { recursive: true, force: true });
+				if (saved === undefined) delete process.env.GJC_HARNESS_SOCKET_DIR;
+				else process.env.GJC_HARNESS_SOCKET_DIR = saved;
+			}
+		},
+		20_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"does not route through a directory placed at the socket record",
+		async () => {
+			const file = await recordPath();
+			expect(file).toBeTruthy();
+			const dir = path.dirname(file!);
+			fsSync.mkdirSync(dir, { recursive: true, mode: 0o700 });
+			fsSync.chmodSync(dir, 0o700);
+			fsSync.mkdirSync(file!, { mode: 0o700 });
+			const foreign = path.join(root, "attacker.sock");
+			const server = await listen(foreign, FORGED);
+			try {
+				await plantLease(foreign);
+				const promptFile = path.join(root, "prompt.txt");
+				await writeFile(promptFile, SECRET, "utf8");
+				const res = await runHarness(["submit", "--session", SID, "--prompt-file", promptFile, "--input", "{}"]);
+				expect(server.received).toHaveLength(0);
+				expect(res.raw).not.toContain(FORGED);
+			} finally {
+				await server.close();
+				fsSync.rmSync(dir, { recursive: true, force: true });
+			}
+		},
+		20_000,
+	);
+
+	it.skipIf(process.platform === "win32" || !canSymlink)(
+		"rejects a socket record when its directory is replaced before open",
+		async () => {
+			const mod = await import("../../src/harness-control-plane/session-lease");
+			const file = await recordPath();
+			expect(file).toBeTruthy();
+			const dir = path.dirname(file!);
+			fsSync.mkdirSync(dir, { recursive: true, mode: 0o700 });
+			fsSync.chmodSync(dir, 0o700);
+			const swapped = await mkdtemp(path.join(tmpdir(), "hsn-"));
+			extraDirs.push(swapped);
+			fsSync.chmodSync(swapped, 0o700);
+			const foreign = path.join(root, "attacker.sock");
+			const sentinel = path.join(root, "swap-sentinel.txt");
+			fsSync.writeFileSync(sentinel, "keep", { mode: 0o600 });
+			fsSync.writeFileSync(path.join(swapped, "record.json"), forgedRecord(foreign), { mode: 0o600 });
+			fsSync.symlinkSync(sentinel, path.join(swapped, `record.json.tmp-${process.pid}`));
+			const server = await listen(foreign, FORGED);
+			const socketDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			extraDirs.push(socketDir);
+			const saved = process.env.GJC_HARNESS_SOCKET_DIR;
+			process.env.GJC_HARNESS_SOCKET_DIR = socketDir;
+			mod.setOwnerSocketRecordAfterDirCheck(() => {
+				fsSync.rmSync(dir, { recursive: true, force: true });
+				fsSync.symlinkSync(swapped, dir);
+			});
+			const owner = new RuntimeOwner({
+				root,
+				sessionId: SID,
+				transport: new IdleTransport(),
+				heartbeatMs: 60_000,
+			});
+			try {
+				await plantLease(foreign);
+				expect((await resolveOwner(root, SID)).socketPath).toBeNull();
+				expect(fsSync.readFileSync(sentinel, "utf8")).toBe("keep");
+				fsSync.rmSync(sessionPaths(root, SID).lease, { force: true });
+				fsSync.rmSync(dir, { force: true });
+				fsSync.mkdirSync(dir, { mode: 0o700 });
+				await owner.start();
+				expect(fsSync.readFileSync(sentinel, "utf8")).toBe("keep");
+				expect((await readLease(root, SID))?.ownerId).toBe(owner.ownerId);
+			} finally {
+				mod.setOwnerSocketRecordAfterDirCheck(null);
+				await owner.stop().catch(() => {});
+				fsSync.rmSync(dir, { recursive: true, force: true });
+				await server.close();
+				if (saved === undefined) delete process.env.GJC_HARNESS_SOCKET_DIR;
+				else process.env.GJC_HARNESS_SOCKET_DIR = saved;
+			}
+		},
+		20_000,
+	);
+
+	it("property owner socket record text", async () => {
+		const mod = await import("../../src/harness-control-plane/session-lease");
+		const parse = mod.recordFromText;
+		expect(typeof parse).toBe("function");
+		const token = fc.string({ minLength: 1, maxLength: 40 }).filter(value => value.length > 0);
+		const nonce = fc
+			.array(fc.integer({ min: 0, max: 15 }), { minLength: 64, maxLength: 64 })
+			.map(digits => digits.map(digit => digit.toString(16)).join(""));
+		fc.assert(
+			fc.property(
+				fc.record({
+					socketPath: token,
+					pid: fc.integer({ min: 1, max: 1_000_000 }),
+					ownerId: token,
+					leaseEpoch: fc.integer({ min: 0, max: 10_000 }),
+					nonce,
+				}),
+				fc.string(),
+				(row, junk) => {
+					const text = JSON.stringify(row);
+					expect(parse(text)).toEqual(row);
+					expect(parse(`x${junk}`)).toBeNull();
+					expect(parse(`${text}}`)).toBeNull();
+					expect(parse(JSON.stringify({ ...row, pid: String(row.pid) }))).toBeNull();
+					expect(parse(JSON.stringify({ ...row, nonce: "ab" }))).toBeNull();
+					return true;
+				},
+			),
+			{ seed: 618, numRuns: 64 },
+		);
+	});
 
 	it("property owner socket lexical identity", async () => {
 		const mod = await import("../../src/harness-control-plane/session-lease");

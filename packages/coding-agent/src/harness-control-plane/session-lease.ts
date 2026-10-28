@@ -166,12 +166,51 @@ function recordDirTrusted(dir: string): boolean {
 		return false;
 	}
 }
-function recordStoreTrusted(file: string): boolean {
-	const dir = path.dirname(file);
-	return recordDirTrusted(path.dirname(dir)) && recordDirTrusted(dir);
+/** In-process seam. Production leaves this unset. A test may swap the store after the directory check. */
+let ownerSocketRecordAfterDirCheck: (() => void) | null = null;
+
+export function setOwnerSocketRecordAfterDirCheck(hook: (() => void) | null): void {
+	ownerSocketRecordAfterDirCheck = hook;
 }
 
-function recordFromText(text: string): OwnerSocketRecord | null {
+interface DirIdentity {
+	dev: number;
+	ino: number;
+}
+
+function trustedDirIdentity(dir: string): DirIdentity | null {
+	if (!recordDirTrusted(dir)) return null;
+	try {
+		const st = fsSync.lstatSync(dir);
+		return { dev: st.dev, ino: st.ino };
+	} catch {
+		return null;
+	}
+}
+
+function sameDirIdentity(dir: string, identity: DirIdentity): boolean {
+	try {
+		const st = fsSync.lstatSync(dir);
+		return !st.isSymbolicLink() && st.isDirectory() && st.dev === identity.dev && st.ino === identity.ino;
+	} catch {
+		return false;
+	}
+}
+
+function storeIdentities(file: string): { parent: DirIdentity; dir: DirIdentity } | null {
+	const dir = path.dirname(file);
+	const parent = trustedDirIdentity(path.dirname(dir));
+	const leaf = trustedDirIdentity(dir);
+	if (!parent || !leaf) return null;
+	return { parent, dir: leaf };
+}
+
+function storeIdentityHeld(file: string, ids: { parent: DirIdentity; dir: DirIdentity }): boolean {
+	const dir = path.dirname(file);
+	return sameDirIdentity(path.dirname(dir), ids.parent) && sameDirIdentity(dir, ids.dir);
+}
+
+export function recordFromText(text: string): OwnerSocketRecord | null {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(text);
@@ -195,10 +234,20 @@ function recordFromText(text: string): OwnerSocketRecord | null {
 }
 function readOwnerSocketRecord(root: string, sessionId: string): OwnerSocketRecord | null {
 	const file = ownerSocketRecordPath(root, sessionId);
-	if (!file || !recordStoreTrusted(file)) return null;
+	if (!file) return null;
+	const ids = storeIdentities(file);
+	if (!ids) return null;
+	try {
+		ownerSocketRecordAfterDirCheck?.();
+	} catch {
+		return null;
+	}
+	if (!storeIdentityHeld(file, ids)) return null;
 	let fd: number | undefined;
 	try {
-		fd = fsSync.openSync(file, fsSync.constants.O_RDONLY | noFollowFlag());
+		const flags = fsSync.constants.O_RDONLY | noFollowFlag() | (fsSync.constants.O_NONBLOCK ?? 0);
+		fd = fsSync.openSync(file, flags);
+		if (!storeIdentityHeld(file, ids)) return null;
 		const st = fsSync.fstatSync(fd);
 		const uid = processUid();
 		if (uid === null || st.uid !== uid || !st.isFile()) return null;
@@ -223,6 +272,14 @@ function readOwnerSocketRecord(root: string, sessionId: string): OwnerSocketReco
 function writeOwnerSocketRecord(file: string, record: OwnerSocketRecord): void {
 	const dir = path.dirname(file);
 	if (!ensureTrustedDir(path.dirname(dir)) || !ensureTrustedDir(dir)) return;
+	const ids = storeIdentities(file);
+	if (!ids) return;
+	try {
+		ownerSocketRecordAfterDirCheck?.();
+	} catch {
+		return;
+	}
+	if (!storeIdentityHeld(file, ids)) return;
 	const tmp = `${file}.tmp-${process.pid}`;
 	const flags = fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY | noFollowFlag();
 	let fd: number | undefined;
@@ -238,6 +295,7 @@ function writeOwnerSocketRecord(file: string, record: OwnerSocketRecord): void {
 		if (fsSync.writeSync(fd, body) !== Buffer.byteLength(body)) return;
 		fsSync.closeSync(fd);
 		fd = undefined;
+		if (!storeIdentityHeld(file, ids)) return;
 		fsSync.renameSync(tmp, file);
 		created = false;
 	} catch {
