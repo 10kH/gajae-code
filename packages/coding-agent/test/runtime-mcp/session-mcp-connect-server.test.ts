@@ -218,6 +218,30 @@ describe("MCPManager.connectSessionServer", () => {
 		expect(JSON.stringify(result?.content)).toContain("foo-bar ok");
 	}, 20_000);
 
+	test("a held tool is published once the owning server disconnects", async () => {
+		const { base, log } = makeDir();
+		const manager = newManager(base);
+		await manager.connectSessionServer("foo-bar", fakeConfig(log, "foo-bar", ["--tools", "grown"]), source);
+		const [name] = toolsOf(manager, "foo-bar");
+		await manager.connectSessionServer("foo.bar", fakeConfig(log, "foo.bar", ["--tools", "grown"]), source);
+		expect(toolsOf(manager, "foo.bar")).toEqual([]);
+
+		await manager.disconnectServer("foo-bar");
+		expect(toolsOf(manager, "foo.bar")).toEqual([name]);
+		const result = await manager
+			.getTools()
+			.find(tool => tool.name === name)
+			?.execute("promoted-call", {}, undefined, {} as never);
+		expect(JSON.stringify(result?.content)).toContain("foo.bar ok");
+
+		// A disconnected server's held tools are dropped and never promoted later.
+		await manager.connectSessionServer("foo-bar", fakeConfig(log, "foo-bar", ["--tools", "grown"]), source);
+		expect(toolsOf(manager, "foo-bar")).toEqual([]);
+		await manager.disconnectServer("foo-bar");
+		await manager.disconnectServer("foo.bar");
+		expect(manager.getTools()).toEqual([]);
+	}, 20_000);
+
 	test("rejects invalid configs and frozen connection sets without spawning", async () => {
 		const { base, log } = makeDir();
 		const manager = newManager(base);

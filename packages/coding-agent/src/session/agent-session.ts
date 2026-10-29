@@ -4193,6 +4193,8 @@ export class AgentSession {
 	#exactMcpRetirementCompletion: Promise<void> | undefined;
 	readonly #sessionMcpControlPort: SessionMcpControlPort | undefined;
 	#sessionMcpOverrides = new Map<string, "connected" | "disconnected">();
+	/** MCP tool names skipped because a non-MCP tool already holds them. */
+	#mcpToolNamesHeldByOtherTools = new Set<string>();
 	#startupTurnBarrier: Promise<void> | undefined;
 	#startupTurnBarrierPending = false;
 	#pendingPythonMessages: Array<{
@@ -6784,6 +6786,23 @@ export class AgentSession {
 		await replacement;
 	}
 
+	/**
+	 * True when `tool` is an MCP tool whose name is already registered by a non-MCP tool
+	 * (for example an extension tool named `mcp__foo_bar`). The existing tool is kept so
+	 * later calls are never redirected to an MCP endpoint; the conflict is logged.
+	 */
+	#isMcpToolNameHeldByOtherTool(tool: CustomTool): boolean {
+		if (!isMCPBridgeTool(tool)) return false;
+		const existing = this.#toolRegistry.get(tool.name);
+		if (!existing || isMCPBridgeTool(existing)) return false;
+		this.#mcpToolNamesHeldByOtherTools.add(tool.name);
+		logger.warn("Skipping MCP tool whose name is already registered by another tool", {
+			tool: tool.name,
+			serverName: tool.mcpServerName,
+		});
+		return true;
+	}
+
 	/** Swap named custom tools and restore authoritative MCP selections as late tools arrive. */
 	async replaceNamedCustomTools(
 		previousNames: readonly string[],
@@ -6806,10 +6825,15 @@ export class AgentSession {
 		const previous = new Set(previousNames);
 		const inactiveNewToolNames = new Set(options?.inactiveNewToolNames ?? []);
 		const previousActive = this.getActiveToolNames();
-		for (const name of previous) this.#toolRegistry.delete(name);
+		for (const name of previous) {
+			// The registry still holds the non-MCP tool that kept this name; do not remove it.
+			if (this.#mcpToolNamesHeldByOtherTools.delete(name)) continue;
+			this.#toolRegistry.delete(name);
+		}
 		const getCustomToolContext = () => this.#getCustomToolContext();
 		const added: string[] = [];
 		for (const customTool of omitPluginMcpNameShadows(nextTools)) {
+			if (this.#isMcpToolNameHeldByOtherTool(customTool)) continue;
 			const wrapped = CustomToolAdapter.wrap(customTool, getCustomToolContext) as AgentTool;
 			const finalTool = (
 				this.#extensionRunner ? new ExtensionToolWrapper(wrapped, this.#extensionRunner) : wrapped
@@ -13869,6 +13893,7 @@ export class AgentSession {
 		});
 
 		for (const customTool of omitPluginMcpNameShadows(mcpTools)) {
+			if (this.#isMcpToolNameHeldByOtherTool(customTool)) continue;
 			const wrapped = CustomToolAdapter.wrap(customTool, getCustomToolContext) as AgentTool;
 			const finalTool = (
 				this.#extensionRunner ? new ExtensionToolWrapper(wrapped, this.#extensionRunner) : wrapped

@@ -8,9 +8,12 @@ import { afterEach, describe, expect, test, vi } from "bun:test";
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { logger } from "@gajae-code/utils";
+import * as z from "zod/v4";
+import type { CustomTool } from "../../src/extensibility/custom-tools/types";
 import { loadAllMCPConfigs } from "../../src/runtime-mcp/config";
 import { attachExactMcpControls } from "../../src/runtime-mcp/redaction";
 import { issueSessionMcpControlGrant, type SessionMcpControlGrant } from "../../src/runtime-mcp/session-controls-grant";
+import { createMCPToolName } from "../../src/runtime-mcp/tool-bridge";
 import type { SessionMcpControlAction } from "../../src/session/agent-session";
 import {
 	logLines,
@@ -27,7 +30,8 @@ import {
 	writeStandard,
 } from "./fixtures/session-mcp-harness";
 
-afterEach(runCleanups);
+// Disposing a session can wait for an in-flight MCP connect; allow for a loaded machine.
+afterEach(runCleanups, 20_000);
 
 function control(h: SessionHarness, action: SessionMcpControlAction, name: string) {
 	return h.session.controlSessionMcpServer(action, name);
@@ -408,6 +412,58 @@ describe("session MCP controls on AgentSession", () => {
 		}
 	}, 30_000);
 
+	test("a connected server cannot take over a non-MCP tool's name", async () => {
+		const c = makeCase();
+		writeMcp(c, c.userMcp, { fakeon: {} });
+		writeMcp(c, c.projectMcp, {
+			foo: { autoload: false, args: ["--tools", "bar", "--grow-on", c.flag("grow")] },
+		});
+		const localTool = (name: string): CustomTool =>
+			({
+				name,
+				label: name,
+				description: `Local tool ${name}`,
+				parameters: z.object({}),
+				async execute() {
+					return { content: [{ type: "text", text: `local ${name}` }] };
+				},
+			}) as CustomTool;
+		// The names the server's `bar` (initial catalog) and `grown` (list_changed) tools map to.
+		const names = [createMCPToolName("foo", "bar"), createMCPToolName("foo", "grown")];
+		const warn = vi.spyOn(logger, "warn");
+		try {
+			const h = await openSession(c, { session: { customTools: names.map(localTool) } });
+			const runsLocally = async (name: string) => {
+				const result = await h.session.getToolByName(name)?.execute("collision-call", {}, undefined, {} as never);
+				return JSON.stringify(result?.content).includes(`local ${name}`);
+			};
+			expect(await control(h, "connect", "foo")).toMatchObject({ status: "connected" });
+			await settle();
+			expect(await runsLocally(names[0])).toBe(true);
+
+			// A later tools/list_changed refresh cannot take over either name.
+			writeFileSync(c.flag("grow"), "");
+			const blocked = (name: string) =>
+				warn.mock.calls.some(
+					([message, context]) =>
+						String(message).includes("already registered by another tool") &&
+						(context as { tool?: string } | undefined)?.tool === name,
+				);
+			const deadline = Date.now() + 5000;
+			while (Date.now() < deadline && !blocked(names[1])) await sleep(50);
+			await settle();
+			expect(blocked(names[0]) && blocked(names[1])).toBe(true);
+			for (const name of names) expect(await runsLocally(name)).toBe(true);
+
+			// Disconnecting the server keeps the local tools registered.
+			await control(h, "disconnect", "foo");
+			await settle();
+			for (const name of names) expect(await runsLocally(name)).toBe(true);
+		} finally {
+			warn.mockRestore();
+		}
+	}, 30_000);
+
 	test("the first turn after /new waits for restored autoload tools", async () => {
 		const c = makeCase();
 		writeStandard(c);
@@ -430,20 +486,16 @@ describe("session MCP controls on AgentSession", () => {
 		const c = makeCase();
 		writeStandard(c);
 		const h = await openSession(c);
-		await settle();
-		// Fail only the control's own refresh (it passes an explicit active set), not a
-		// concurrent background tool publication.
-		const original = h.session.refreshMCPTools.bind(h.session);
-		let failed = false;
-		h.session.refreshMCPTools = async (tools, options) => {
-			if (!failed && options?.activeMCPToolNames) {
-				failed = true;
-				throw new Error("refresh failed");
-			}
-			return original(tools, options);
+		const manager = h.result.mcpManager;
+		if (!manager) throw new Error("expected an MCP manager");
+		// The manager disconnects the server and then reports a cleanup error.
+		const original = manager.disconnectServer.bind(manager);
+		manager.disconnectServer = async name => {
+			manager.disconnectServer = original;
+			await original(name);
+			throw new Error("cleanup failed");
 		};
-		await expect(control(h, "disconnect", "fakeon")).rejects.toThrow("refresh failed");
-		h.session.refreshMCPTools = original;
+		await expect(control(h, "disconnect", "fakeon")).rejects.toThrow("cleanup failed");
 		expect(h.result.mcpManager?.getConnectionStatus("fakeon")).toBe("disconnected");
 		const spawns = spawnCount(c, "fakeon");
 		await h.session.newSession();

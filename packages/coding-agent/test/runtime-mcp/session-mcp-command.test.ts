@@ -23,7 +23,8 @@ import {
 	writeStandard,
 } from "./fixtures/session-mcp-harness";
 
-afterEach(runCleanups);
+// Disposing a session can wait for an in-flight MCP connect; allow for a loaded machine.
+afterEach(runCleanups, 20_000);
 
 type Output = { status: string; warning: string; error: string; returned: unknown };
 

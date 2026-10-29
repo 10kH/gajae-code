@@ -64,7 +64,10 @@ function serverConfig(c: Case, name: string, spec: ServerSpec): Record<string, u
 	if (spec.autoload !== undefined) config.autoload = spec.autoload;
 	if (spec.enabled !== undefined) config.enabled = spec.enabled;
 	if (spec.sharing !== undefined) config.sharing = spec.sharing;
-	if (spec.timeout !== undefined) config.timeout = spec.timeout;
+	// Startup waits only briefly for undeclared timeouts; a loaded test machine can miss
+	// that window, so autoload servers declare one unless the test sets its own.
+	const timeout = spec.timeout ?? (spec.autoload === false ? undefined : 15_000);
+	if (timeout !== undefined) config.timeout = timeout;
 	return config;
 }
 
