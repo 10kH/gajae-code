@@ -312,7 +312,7 @@ describe("imageGenTool", () => {
 			run: (params: ImageGenParams) => imageGenTool.execute("call-codex", params, undefined, ctx),
 		};
 	}
-	it("posts Codex image-only models to the generations route", async () => {
+	it("posts bundled Codex gpt-image-* models to the generations route", async () => {
 		const { captured, run } = setupCodexImageGen(
 			"gpt-image-2",
 			["image"],
@@ -326,7 +326,10 @@ describe("imageGenTool", () => {
 				),
 		);
 		const result = await run({ subject: "a circle" });
-		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+		const imagePaths = result.details?.imagePaths ?? [];
+		generatedImagePaths.push(...imagePaths);
+		expect(imagePaths).toHaveLength(1);
+		expect((await fs.readFile(imagePaths[0])).toString()).toBe("fake-webp");
 		const { requestUrl, requestBody } = captured;
 		expect(requestUrl).toBe("https://chatgpt.com/backend-api/codex/images/generations");
 		expect(requestBody).toMatchObject({ model: "gpt-image-2", n: 1, quality: "auto", output_format: "webp" });
@@ -338,7 +341,7 @@ describe("imageGenTool", () => {
 		output: Model["output"],
 		baseUrl: string,
 		input?: { data: string; mime_type: string }[],
-	): Promise<{ requestUrl?: string; requestBody?: unknown }> {
+	): Promise<{ fetchCalls: number; requestUrl?: string; requestBody?: unknown }> {
 		const { captured, run } = setupCodexImageGen(
 			id,
 			output,
@@ -354,7 +357,7 @@ describe("imageGenTool", () => {
 		["/codex", "https://chatgpt.com/backend-api/codex"],
 		["/codex/responses", "https://chatgpt.com/backend-api/codex/responses/"],
 	])("Codex base URL ending in %s", (_suffix, baseUrl) => {
-		it("posts gpt-image-* models to a single /codex/images/generations route", async () => {
+		it("posts bundled gpt-image-* models to a single /codex/images/generations route", async () => {
 			expect((await codexRequestFor("gpt-image-2", ["image"], baseUrl)).requestUrl).toBe(
 				"https://chatgpt.com/backend-api/codex/images/generations",
 			);
@@ -370,26 +373,15 @@ describe("imageGenTool", () => {
 		[
 			"a query string",
 			"https://proxy.example/backend-api/?trace=1",
-			"https://proxy.example/backend-api/codex/images/generations?trace=1",
 			"https://proxy.example/backend-api/codex/responses?trace=1",
 		],
 		[
 			"a fragment",
 			"https://proxy.example/backend-api/codex#section/codex",
-			"https://proxy.example/backend-api/codex/images/generations",
 			"https://proxy.example/backend-api/codex/responses",
 		],
-		[
-			"a hostname ending in codex",
-			"http://codex/",
-			"http://codex/codex/images/generations",
-			"http://codex/codex/responses",
-		],
-	])("Codex base URL with %s", (_label, baseUrl, generationsUrl, responsesUrl) => {
-		it("normalizes the generations route on the pathname", async () => {
-			expect((await codexRequestFor("gpt-image-2", ["image"], baseUrl)).requestUrl).toBe(generationsUrl);
-		});
-
+		["a hostname ending in codex", "http://codex/", "http://codex/codex/responses"],
+	])("Codex base URL with %s", (_label, baseUrl, responsesUrl) => {
 		it("normalizes the responses route on the pathname", async () => {
 			expect((await codexRequestFor("gpt-5.5", ["text", "image"], baseUrl)).requestUrl).toBe(responsesUrl);
 		});
@@ -403,7 +395,23 @@ describe("imageGenTool", () => {
 		expect(requestBody).toHaveProperty("tools");
 		expect(requestBody).toHaveProperty("input");
 	});
-	it("rejects image edits for Codex image-only models before fetch", async () => {
+	describe.each(["gpt-image-custom", "gpt-image-2"])("custom Codex model %s with a custom base URL", id => {
+		it.each([
+			["generations", undefined],
+			["edits", [{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" }]],
+		])("keeps %s on /codex/responses with the hosted image_generation tool", async (_label, input) => {
+			const captured = await codexRequestFor(id, ["image"], "https://proxy.example/backend-api", input);
+			expect(captured.fetchCalls).toBe(1);
+			expect(captured.requestUrl).toBe("https://proxy.example/backend-api/codex/responses");
+			expect(captured.requestBody).toMatchObject({
+				model: id,
+				tools: [{ type: "image_generation" }],
+				tool_choice: { type: "image_generation" },
+			});
+			expect(captured.requestBody).toHaveProperty("input");
+		});
+	});
+	it("rejects image edits for bundled Codex gpt-image-* models before fetch", async () => {
 		const { captured, run } = setupCodexImageGen("gpt-image-2", ["image"], "", () => new Response());
 		await expect(
 			run({

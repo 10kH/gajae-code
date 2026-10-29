@@ -4,7 +4,7 @@ import * as https from "node:https";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getEnvApiKey, type Model } from "@gajae-code/ai/core";
+import { getBundledModel, getEnvApiKey, type Model } from "@gajae-code/ai/core";
 import {
 	CODEX_BASE_URL,
 	getCodexAccountId,
@@ -1248,14 +1248,17 @@ function createOpenAIInlineImage(data: string): InlineImageData {
 	const mimeType = parseImageMetadata(bytes)?.mimeType ?? OPENAI_IMAGE_MIME_TYPE;
 	return { data, mimeType };
 }
-/**
- * Selects the standalone `/codex/images/generations` route by affirmative model identity only.
- * Output modalities do not prove Images API support: other image-only Codex models keep using
- * the hosted `image_generation` tool on `/codex/responses`, including edits.
- */
-function isCodexImagesApiModel(model: Model): boolean {
-	if (model.api !== "openai-codex-responses" && model.provider !== "openai-codex") return false;
-	return model.id.toLowerCase().startsWith("gpt-image-");
+/** Bundled openai-codex gpt-image-* models on the bundled Codex endpoint. A custom model keeps /codex/responses. */
+function getCodexImagesUrl(model: Model, authCredentialType?: "api_key" | "oauth"): string | undefined {
+	const bundled = getBundledModel("openai-codex", model.id);
+	if (!bundled?.id.startsWith("gpt-image-")) return undefined;
+	if (model.provider !== bundled.provider || model.api !== bundled.api) return undefined;
+	const url = getCodexRouteUrl(getOpenAIBaseUrl(model, authCredentialType), URL_PATHS.CODEX_IMAGES_GENERATIONS);
+	const bundledUrl = getCodexRouteUrl(
+		getOpenAIBaseUrl(bundled, authCredentialType),
+		URL_PATHS.CODEX_IMAGES_GENERATIONS,
+	);
+	return url === bundledUrl ? url : undefined;
 }
 function buildCodexImagesRequest(model: Model, promptText: string, params: ImageGenParams): CodexImagesRequest {
 	const size = resolveOpenAIImageSize(params.aspect_ratio, params.image_size);
@@ -1337,12 +1340,7 @@ export function getOpenAIImageBaseUrlForTest(model: Model, authCredentialType?: 
 	return getOpenAIBaseUrl(model, authCredentialType);
 }
 
-/**
- * Builds a Codex route URL from a configured base URL. Normalization runs on the parsed pathname
- * only: a trailing `/codex` or `/codex/responses` path segment is stripped before `route` is
- * appended, so the route appears exactly once. The query string is preserved; a fragment is
- * dropped because it is never sent to the server and must not end up inside the path.
- */
+/** Normalizes on the parsed pathname so the route appears once; the fragment is never sent, so it is dropped. */
 function getCodexRouteUrl(baseUrl: string, route: string): string {
 	let url: URL;
 	try {
@@ -1454,7 +1452,8 @@ async function generateOpenAIHostedImage(
 	options?: { authCredentialType?: "api_key" | "oauth" },
 ): Promise<OpenAIHostedImageResult> {
 	const promptText = assemblePrompt(params);
-	const useImagesApi = isCodexImagesApiModel(model);
+	const imagesUrl = getCodexImagesUrl(model, options?.authCredentialType);
+	const useImagesApi = imagesUrl !== undefined;
 	if (useImagesApi && inputImages.length > 0) {
 		throw new Error("Codex image edits are not supported on this route.");
 	}
@@ -1463,9 +1462,7 @@ async function generateOpenAIHostedImage(
 		? buildCodexImagesRequest(model, promptText, params)
 		: buildOpenAIHostedImageRequest(model, promptText, params, inputImages, stream);
 	const response = await fetchImageProvider(
-		useImagesApi
-			? getCodexRouteUrl(getOpenAIBaseUrl(model, options?.authCredentialType), URL_PATHS.CODEX_IMAGES_GENERATIONS)
-			: getOpenAIResponsesUrl(model, options?.authCredentialType),
+		imagesUrl ?? getOpenAIResponsesUrl(model, options?.authCredentialType),
 		{
 			method: "POST",
 			headers: buildOpenAIImageHeaders(model, apiKey, sessionId),
@@ -1474,12 +1471,14 @@ async function generateOpenAIHostedImage(
 		},
 		apiKey,
 	);
+
 	if (!response.ok) {
 		const errorText = await readProviderResponseText(response, apiKey, signal);
 		throw new Error(
 			`OpenAI image request failed (${response.status}): ${getOpenAIResponseErrorMessage(errorText, apiKey)}`,
 		);
 	}
+
 	if (useImagesApi) {
 		const rawText = await readProviderResponseText(response, apiKey, signal);
 		const data = parseProviderJson<CodexImagesResponse>(rawText, apiKey);
@@ -1489,6 +1488,7 @@ async function generateOpenAIHostedImage(
 	if (stream || contentType.includes("text/event-stream")) {
 		return redactOpenAIHostedImageResult(await parseOpenAIHostedImageSse(response, signal, apiKey), apiKey);
 	}
+
 	const rawText = await readProviderResponseText(response, apiKey, signal);
 	const data = parseProviderJson<OpenAIHostedImageResponse>(rawText, apiKey);
 	return redactOpenAIHostedImageResult(collectOpenAIHostedImageResult(data), apiKey);
