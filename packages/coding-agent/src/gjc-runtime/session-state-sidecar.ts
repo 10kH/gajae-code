@@ -10,6 +10,7 @@ import {
 	renameNoReplacePath,
 } from "@gajae-code/natives";
 import { normalizePathForComparison, postmortem } from "@gajae-code/utils";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { withFileLock } from "../config/file-lock";
 import {
 	type CoordinatorAtomicWriteOptions,
@@ -1696,7 +1697,12 @@ function worktreeBaselineDirtyFromEnvOrMarker(): boolean | null {
 function observedRecoverableWorktreeChanges(cwd: string): boolean {
 	if (!cwd.trim()) return false;
 	try {
-		const proc = Bun.spawnSync(["git", "status", "--porcelain"], { cwd, stdout: "pipe", stderr: "pipe" });
+		const proc = Bun.spawnSync(["git", "status", "--porcelain"], {
+			env: projectSafeSpawnEnv(),
+			cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
 		return proc.exitCode === 0 && proc.stdout.byteLength > 0;
 	} catch {
 		return false;
