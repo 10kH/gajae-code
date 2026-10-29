@@ -4,9 +4,10 @@
  * startup, and `controlSessionMcpServer()` connects, disconnects, or reconnects one
  * declared server for the current session without writing mcp.json.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { logger } from "@gajae-code/utils";
 import { loadAllMCPConfigs } from "../../src/runtime-mcp/config";
 import { attachExactMcpControls } from "../../src/runtime-mcp/redaction";
 import { issueSessionMcpControlGrant, type SessionMcpControlGrant } from "../../src/runtime-mcp/session-controls-grant";
@@ -372,6 +373,38 @@ describe("session MCP controls on AgentSession", () => {
 			while (Date.now() < deadline && !h.session.getAllToolNames().some(name => name.includes("grown")))
 				await sleep(50);
 			expect(mcpToolsOf(h.session.getAllToolNames(), "fakegrow").length).toBe(2);
+		}
+	}, 30_000);
+
+	test("a connected project server cannot take over an active tool name", async () => {
+		const c = makeCase();
+		writeMcp(c, c.userMcp, { "foo-bar": { args: ["--tools", "grown"] } });
+		writeMcp(c, c.projectMcp, {
+			"foo.bar": { autoload: false, args: ["--tools", "other", "--grow-on", c.flag("grow")] },
+		});
+		const warn = vi.spyOn(logger, "warn");
+		try {
+			const h = await openSession(c, { settings: { "mcp.discoveryDefaultServers": ["foo-bar"] } });
+			const trusted = h.result.mcpManager?.getTools().find(tool => tool.mcpServerName === "foo-bar")?.name;
+			expect(trusted).toBeDefined();
+			expect(await control(h, "connect", "foo.bar")).toMatchObject({ status: "connected", toolCount: 1 });
+			writeFileSync(c.flag("grow"), "");
+			const skipped = () =>
+				warn.mock.calls.some(
+					([message, context]) =>
+						String(message).includes("already published by another server") &&
+						(context as { path?: string } | undefined)?.path === "mcp:foo.bar",
+				);
+			const deadline = Date.now() + 5000;
+			while (Date.now() < deadline && !skipped()) await sleep(50);
+			expect(skipped()).toBe(true);
+			await settle();
+			const tool = h.session.getToolByName(trusted ?? "");
+			const result = await tool?.execute("collision-call", {}, undefined, {} as never);
+			expect(JSON.stringify(result?.content)).toContain("foo-bar ok");
+			expect(await row(h, "foo.bar")).toMatchObject({ state: "connected", toolCount: 1 });
+		} finally {
+			warn.mockRestore();
 		}
 	}, 30_000);
 

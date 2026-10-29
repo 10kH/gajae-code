@@ -1,7 +1,8 @@
 // Minimal stdio MCP server used by the session MCP connect tests.
 // It logs `spawn <name> <pid>` / `exit <name> <pid>` so tests can count real processes.
 // Flags: --name <n> --log <file> [--delay-init ms] [--delay-if-exists <file> ms] [--fail] [--fail-if-exists <file>]
-//        [--grow-on <file>]: once <file> exists, list a second tool and send tools/list_changed.
+//        [--tools a,b]: tool names to list (default: echo)
+//        [--grow-on <file>]: once <file> exists, also list `grown` and send tools/list_changed.
 import { appendFileSync, existsSync } from "node:fs";
 
 const argv = process.argv.slice(2);
@@ -32,6 +33,7 @@ const delayIfExists =
 const send = (message: unknown) => process.stdout.write(`${JSON.stringify(message)}\n`);
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+const baseTools = (flag("--tools") ?? "echo").split(",");
 const growOn = flag("--grow-on");
 if (growOn) {
 	const timer = setInterval(() => {
@@ -68,7 +70,7 @@ async function handle(message: { id?: number | string; method?: string; params?:
 			send({
 				jsonrpc: "2.0",
 				id: message.id,
-				result: { tools: growOn && existsSync(growOn) ? [tool("echo"), tool("grown")] : [tool("echo")] },
+				result: { tools: [...baseTools, ...(growOn && existsSync(growOn) ? ["grown"] : [])].map(tool) },
 			});
 			return;
 		case "tools/call":

@@ -1725,7 +1725,23 @@ export class MCPManager {
 		const publishedTools = this.#tools.filter(
 			tool => !((tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name),
 		);
-		if (!this.#suppressedServers.has(name)) publishedTools.push(...tools);
+		if (!this.#suppressedServers.has(name)) {
+			// Tool names are normalized per server (`foo-bar` and `foo.bar` both map to
+			// `mcp__foo_bar_*`). A server joining or refreshing a live catalog must never
+			// replace another server's tool under the same name: keep the existing tool.
+			const publishedNames = new Set(publishedTools.map(tool => tool.name));
+			for (const tool of tools) {
+				if (publishedNames.has(tool.name)) {
+					logger.warn("Skipping MCP tool whose name is already published by another server", {
+						path: `mcp:${name}`,
+						tool: tool.name,
+					});
+					continue;
+				}
+				publishedNames.add(tool.name);
+				publishedTools.push(tool);
+			}
+		}
 		// Stable sort by name so reconnect order does not perturb the array.
 		// See `sortMCPToolsByName` for the cache-stability rationale.
 		sortMCPToolsByName(publishedTools);
