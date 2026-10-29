@@ -347,8 +347,7 @@ async function admitManagedOwner(): Promise<ManagedOwnerAdmission> {
 	const predecessorToken = process.env[MANAGED_OWNER_PREDECESSOR_TOKEN_ENV]?.trim();
 	if (childToken && !predecessorKeys.some(key => process.env[key] !== undefined)) {
 		if (typeof natives.readOwnerOnlyFile !== "function") {
-			handoffNotPersisted();
-			return { kind: "blocked" };
+			return deny(owner, "native_owned_file_reader_unavailable");
 		}
 		if (!safeChildToken(childToken)) return deny(owner, "exact_child_binding_unavailable");
 		const binding = readCurrentChildBinding(owner.root, childToken);
