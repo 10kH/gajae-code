@@ -165,6 +165,7 @@ import {
 import { createMCPFormInputHandler } from "../runtime-mcp/elicitation";
 import { type MCPLoadResult, omitUnapprovedProjectStdio } from "../runtime-mcp/manager";
 import { omitPluginMcpNameShadows, retainPluginMcpMandatoryNames } from "../runtime-mcp/plugin-mcp-name-filter";
+import { isIssuedSessionMcpControlGrant, type SessionMcpControlGrant } from "../runtime-mcp/session-controls-grant";
 import { MCP_STARTUP_WAIT_GRACE_MS } from "../runtime-mcp/startup-policy";
 import type { MCPServerConfig } from "../runtime-mcp/types";
 import {
@@ -597,8 +598,11 @@ export interface CreateAgentSessionOptions {
 	 * @internal CLI-only startup optimization; SDK callers retain synchronous loading by default.
 	 */
 	deferMcpConfigStartup?: boolean;
-	/** @internal Enables session-local MCP controls for root interactive CLI sessions only. */
-	sessionMcpControls?: boolean;
+	/**
+	 * @internal Session-local MCP controls for the root interactive CLI session.
+	 * Only a token minted by the CLI entry point is honored; any other value is ignored.
+	 */
+	sessionMcpControlGrant?: SessionMcpControlGrant;
 	/** Process-local master authority. Never persist or pass to lifecycle children. */
 	masterModeContext?: MasterModeContext;
 	/**
@@ -2737,6 +2741,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let sessionMcpStartupSettled = true;
 		let sessionMcpRestoreFlight: Promise<void> | undefined;
 		let sessionMcpRestoreCancelled = false;
+		/** Settles once queued owned-manager tool publications have been applied to the session. */
+		let settleOwnedMcpToolSync: () => Promise<void> = () => Promise.resolve();
 		const notificationDebounceTimers = new Map<string, Timer>();
 		const installMcpInputHandler = (manager: MCPManager): void => {
 			manager.setInputRequestHandler(
@@ -2835,8 +2841,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						Object.keys(loaded.configs).filter(name => !pluginNames.has(name)),
 					);
 					for (const name of conventionalCacheServerNames) ownedConventionalMcpServerNames.add(name);
-					publishOwnedMcpTools = Object.keys(mergedConfigs).length > 0;
-					if (Object.keys(mergedConfigs).length > 0 || (sessionMcpGrant && pluginNames.size === 0)) {
+					// A granted session keeps an owned manager with no autoload servers so
+					// servers connected later still publish their tool-list changes.
+					publishOwnedMcpTools =
+						Object.keys(mergedConfigs).length > 0 || (sessionMcpGrant && pluginNames.size === 0);
+					if (publishOwnedMcpTools) {
 						nextManager = new MCPManager(
 							to,
 							conventionalCacheServerNames.size > 0 ? await getOwnedMcpToolCache() : null,
@@ -3909,7 +3918,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 				const pluginNames = new Set(Object.keys(configs));
 				const grant =
-					options.sessionMcpControls === true &&
+					isIssuedSessionMcpControlGrant(options.sessionMcpControlGrant) &&
 					options.deferMcpConfigStartup === true &&
 					options.enableMcpAutoload !== false &&
 					options.mcpManager === undefined &&
@@ -3977,8 +3986,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						mcpManager = owned;
 						ownsMcpManager = true;
 					} else if (Object.keys(mergedConfigs).length === 0) {
+						// Granted session with only autoload:false servers: keep an empty owned
+						// manager and publish servers connected later through the tool sync.
 						mcpManager = owned;
 						ownsMcpManager = true;
+						pluginMcpManagerServers.set(owned, new Set());
+						conventionalMcpManagerServers.set(owned, new Set());
+						publishOwnedMcpTools = true;
 					} else {
 						await connectOwnedConventionalMcp(
 							owned,
@@ -5550,8 +5564,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			return servers;
 		};
-		const restoreSessionMcpAutoload = (names: readonly string[]): void => {
-			if (names.length === 0 || sessionMcpRestoreFlight) return;
+		// Resolves after reconnecting the named autoload servers and publishing their tools.
+		const restoreSessionMcpAutoload = (names: readonly string[]): Promise<void> => {
+			if (sessionMcpRestoreFlight) return sessionMcpRestoreFlight;
+			if (names.length === 0) return Promise.resolve();
 			const generation = sessionMcpLedgerGeneration;
 			let flight: Promise<void> | undefined;
 			flight = (async () => {
@@ -5575,6 +5591,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							}
 						}),
 					);
+					// Each connect queued a tool publication; wait for it to land.
+					await settleOwnedMcpToolSync();
 				} catch (error) {
 					logger.warn("Failed to restore session MCP autoload", { error: safeErrorForLog(error) });
 				} finally {
@@ -5583,6 +5601,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			})();
 			sessionMcpRestoreFlight = flight;
 			void flight.catch(() => {});
+			return flight;
 		};
 		const sessionMcpControlPort: SessionMcpControlPort | undefined = sessionMcpGrant
 			? {
@@ -6074,6 +6093,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					});
 				return ownedMcpToolsSync;
 			};
+			settleOwnedMcpToolSync = () => ownedMcpToolsSync;
 			session.registerToolSessionCleanup(async () => {
 				acceptingOwnedMcpTools = false;
 				await ownedMcpToolsSync;
