@@ -5758,8 +5758,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							.getBranch()
 							.some(
 								entry =>
-									entry.type === "message" &&
-									(entry.message as { customType?: string }).customType === MASTER_PEER_SNAPSHOT_CUSTOM_TYPE,
+									entry.type === "custom_message" && entry.customType === MASTER_PEER_SNAPSHOT_CUSTOM_TYPE,
 							),
 					onError: error =>
 						logger.debug("master peer snapshot injection failed", { error: safeErrorForLog(error) }),
