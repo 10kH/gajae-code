@@ -36,9 +36,12 @@ const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
 const MANAGED_OWNER_GENERATION_ENV = "GJC_TMUX_OWNER_GENERATION";
 const MANAGED_OWNER_INCARNATION_ENV = "GJC_MANAGED_OWNER_INCARNATION";
 const MANAGED_OWNER_LAUNCH_BASELINE_ENV = "GJC_MANAGED_OWNER_LAUNCH_BASELINE";
+const MANAGED_OWNER_REDACT_COMMAND_ENV = "GJC_MANAGED_OWNER_REDACT_COMMAND";
 const MANAGED_OWNER_RUN_ID_ENV = "GJC_MANAGED_OWNER_RUN_ID";
 const MANAGED_OWNER_SESSION_ID_ENV = "GJC_COORDINATOR_SESSION_ID";
 const MANAGED_OWNER_STATE_DIR_ENV = "GJC_TMUX_OWNER_STATE_DIR";
+const MANAGED_OWNER_SERVER_KEY_ENV = "GJC_TMUX_OWNER_SERVER_KEY";
+const TMUX_LAUNCHED_ENV = "GJC_TMUX_LAUNCHED";
 export const MANAGED_OWNER_PREDECESSOR_TOKEN_ENV = "GJC_MANAGED_OWNER_PREDECESSOR_TOKEN";
 export const MANAGED_OWNER_PREDECESSOR_GENERATION_ENV = "GJC_MANAGED_OWNER_PREDECESSOR_GENERATION";
 export const MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV = "GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID";
@@ -92,6 +95,44 @@ const predecessorKeys = [
 	MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV,
 	MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV,
 ];
+/**
+ * Owner context a launcher passes with the child token. The supervisor refuses to
+ * spawn without the state dir, session id, generation, run id and incarnation, and
+ * its child inherits them, so a supervised child never lacks all of these.
+ */
+const ownerContextKeys = [
+	MANAGED_OWNER_STATE_DIR_ENV,
+	MANAGED_OWNER_SESSION_ID_ENV,
+	MANAGED_OWNER_GENERATION_ENV,
+	MANAGED_OWNER_RUN_ID_ENV,
+	MANAGED_OWNER_INCARNATION_ENV,
+	MANAGED_OWNER_LAUNCH_BASELINE_ENV,
+	MANAGED_OWNER_TRANSCRIPT_PATH_ENV,
+	MANAGED_OWNER_REDACT_COMMAND_ENV,
+	MANAGED_OWNER_SERVER_KEY_ENV,
+	TMUX_LAUNCHED_ENV,
+	...predecessorKeys,
+];
+
+/** Same bound as other early project-dotenv readers; FIFOs, devices and larger files are incomplete. */
+const PROJECT_DOTENV_MAX_FILE_BYTES = 64 * 1024;
+
+/**
+ * A child token that only a project dotenv supplied: its value is the static
+ * declaration and no other owner context exists. Equality alone is not proof of
+ * origin (a real token can be copied into `.env`), so any owner context keeps the
+ * full admission path and its fail-closed refusal. Owner context is checked from the
+ * environment first, so a supervised child never reads project files here; the
+ * bounded read refuses a FIFO or oversized layer instead of blocking on it.
+ */
+function projectOnlyChildToken(env: NodeJS.ProcessEnv, cwd: string): boolean {
+	const raw = env[MANAGED_OWNER_CHILD_TOKEN_ENV];
+	if (raw === undefined || ownerContextKeys.some(name => env[name] !== undefined)) return false;
+	const snapshot = projectEnvSnapshot(cwd, { maxFileBytes: PROJECT_DOTENV_MAX_FILE_BYTES });
+	if (snapshot.incomplete) return false;
+	const key = canonicalEnvKey(MANAGED_OWNER_CHILD_TOKEN_ENV);
+	return !snapshot.dynamic.has(key) && snapshot.values[key] === raw;
+}
 
 export interface ManagedOwnerRecoveryContext {
 	root: string;
@@ -293,6 +334,13 @@ export async function admitManagedOwnerBeforeCli(): Promise<ManagedOwnerAdmissio
 	}
 }
 async function admitManagedOwner(): Promise<ManagedOwnerAdmission> {
+	if (projectOnlyChildToken(process.env, process.cwd())) {
+		// Ordinary CLI in a repository whose dotenv names the token. Dropping it keeps
+		// later gates, and processes spawned with an explicit environment, from reading
+		// it as owner context. Bun's default spawn environment is fixed at startup.
+		delete process.env[MANAGED_OWNER_CHILD_TOKEN_ENV];
+		return { kind: "fresh" };
+	}
 	const owner = ownerEnvironment();
 	if (!owner) return { kind: "fresh" };
 	const childToken = process.env[MANAGED_OWNER_CHILD_TOKEN_ENV]?.trim();
