@@ -146,7 +146,8 @@ describe("issue #5374: session identity on the bash tool-env path", () => {
 		process.env.GJC_MASTER_OWNER_SESSION_ID = "outer-master";
 		try {
 			const result = await new BashTool(createSession("nested-session")).execute("call", {
-				command: '[ -n "$GJC_MASTER_OWNER_SESSION_ID" ] && printf "owner=%s" "$GJC_MASTER_OWNER_SESSION_ID" || printf "owner=<unset>"',
+				command:
+					'[ -n "$GJC_MASTER_OWNER_SESSION_ID" ] && printf "owner=%s" "$GJC_MASTER_OWNER_SESSION_ID" || printf "owner=<unset>"',
 			});
 			expect(textOf(result)).toContain("owner=<unset>");
 			const master = await new BashTool(createSession("master-owner", "master-owner")).execute("call", {
