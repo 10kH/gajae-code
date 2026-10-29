@@ -513,6 +513,106 @@ try { await runManagedOwnerSupervisor(${supervisorArgs}); process.exitCode = 22;
 		}
 	});
 
+	it("keeps a child supervised after it copies its genuine token or whole tuple into the project .env", async () => {
+		for (const names of [
+			["GJC_MANAGED_OWNER_CHILD_TOKEN"],
+			[
+				"GJC_MANAGED_OWNER_CHILD_TOKEN",
+				"GJC_TMUX_OWNER_STATE_DIR",
+				"GJC_COORDINATOR_SESSION_ID",
+				"GJC_TMUX_OWNER_GENERATION",
+				"GJC_MANAGED_OWNER_RUN_ID",
+				"GJC_MANAGED_OWNER_INCARNATION",
+				"GJC_MANAGED_OWNER_LAUNCH_BASELINE",
+			],
+		]) {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-dotenv-reflect-"));
+			try {
+				const workspace = path.join(stateDir, "workspace");
+				await fs.mkdir(workspace);
+				// Equality with a dotenv value is not provenance: the inherited owner context
+				// still selects exact binding verification instead of an ordinary fresh start.
+				const command = [
+					process.execPath,
+					"-e",
+					`import { writeFileSync } from "node:fs"; import { admitManagedOwnerBeforeCli } from ${JSON.stringify(admissionModule)};
+writeFileSync(".env", ${JSON.stringify(names)}.map(name => name + "=" + process.env[name]).join("\\n") + "\\n");
+if ((await admitManagedOwnerBeforeCli()).kind !== "supervised") process.exit(20);
+if (!process.env.GJC_MANAGED_OWNER_CHILD_TOKEN) process.exit(21);`,
+				];
+				const result = await runSupervisor(stateDir, command, {}, { cwd: workspace });
+				expect(result.exitCode, `${names.length} names: ${result.stderr}`).toBe(0);
+				const dotenv = await fs.readFile(path.join(workspace, ".env"), "utf8");
+				expect(dotenv).toMatch(/^GJC_MANAGED_OWNER_CHILD_TOKEN=[0-9a-f-]{36}$/m);
+			} finally {
+				await fs.rm(stateDir, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("never reads project dotenv layers during supervised admission", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-dotenv-fifo-"));
+		const workspace = path.join(stateDir, "workspace");
+		const fifo = path.join(workspace, ".env");
+		const ready = path.join(stateDir, "ready");
+		let supervisor: ReturnType<typeof startSupervisor> | undefined;
+		let output: Promise<[string, string]> | undefined;
+		// The child inherits the supervisor's stdout and stderr, so both streams end
+		// only once the supervisor and its child have exited. No pid is signalled.
+		const stopAll = async (): Promise<boolean> => {
+			supervisor?.kill("SIGKILL");
+			if (!output) return true;
+			let closed = false;
+			void output.then(() => {
+				closed = true;
+			});
+			const giveUpAt = Date.now() + 15_000;
+			while (!closed && Date.now() < giveUpAt) {
+				// Release a child blocked opening the FIFO so its own exit timer can run.
+				try {
+					fsSync.closeSync(fsSync.openSync(fifo, fsSync.constants.O_WRONLY | fsSync.constants.O_NONBLOCK));
+				} catch {}
+				await Bun.sleep(100);
+			}
+			return closed;
+		};
+		try {
+			await fs.mkdir(workspace);
+			// A FIFO blocks any unbounded read; admission must decide from its inherited context.
+			// The exit timer is armed before the admission module loads.
+			const command = [
+				process.execPath,
+				"-e",
+				`setTimeout(() => process.exit(91), 10_000);
+const { writeFileSync } = await import("node:fs");
+const { admitManagedOwnerBeforeCli } = await import(${JSON.stringify(admissionModule)});
+if (Bun.spawnSync(["mkfifo", ".env"]).exitCode !== 0) process.exit(19);
+writeFileSync(${JSON.stringify(ready)}, "ready");
+if ((await admitManagedOwnerBeforeCli()).kind !== "supervised") process.exit(20);
+process.exit(0);`,
+			];
+			supervisor = startSupervisor(stateDir, command, {}, { cwd: workspace });
+			output = Promise.all([new Response(supervisor.stdout).text(), new Response(supervisor.stderr).text()]);
+			let supervisorExited = false;
+			void supervisor.exited.then(() => {
+				supervisorExited = true;
+			});
+			// Readiness is written just before admission, so import time is not timed.
+			const readyBy = Date.now() + 15_000;
+			while (!fsSync.existsSync(ready) && !supervisorExited && Date.now() < readyBy) await Bun.sleep(20);
+			expect(fsSync.existsSync(ready)).toBe(true);
+			// The supervisor exits only after its child, so this bounds the child's admission.
+			const blocked =
+				(await Promise.race([supervisor.exited, Bun.sleep(3_000).then(() => "timeout" as const)])) === "timeout";
+			const exitCode = blocked ? null : await supervisor.exited;
+			expect(await stopAll()).toBe(true);
+			expect({ blocked, exitCode }, (await output)[1]).toEqual({ blocked: false, exitCode: 0 });
+		} finally {
+			await stopAll();
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	}, 45_000);
+
 	it("records SIGABRT through the missing native child reference path", async () => {
 		if (process.platform !== "linux") return;
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
