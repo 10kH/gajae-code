@@ -2923,8 +2923,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 				mcpManager = nextManager;
 				ownsMcpManager = Boolean(nextManager);
+				// The outgoing cwd's tools retire below, so a target MCP tool takes over their names.
 				await session.refreshMCPTools((nextManager?.getTools() ?? []) as CustomTool[], {
 					mandatoryMCPToolNames: pluginMcpToolNames,
+					retiringToolNames: previousCwdCapturing,
 				});
 			}
 			cwdCapturingToolNames.length = 0;

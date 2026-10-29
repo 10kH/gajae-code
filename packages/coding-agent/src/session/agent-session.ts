@@ -6790,17 +6790,32 @@ export class AgentSession {
 	 * True when `tool` is an MCP tool whose name is already registered by a non-MCP tool
 	 * (for example an extension tool named `mcp__foo_bar`). The existing tool is kept so
 	 * later calls are never redirected to an MCP endpoint; the conflict is logged.
+	 * A tool in `retiring` is being removed by the same update, so the MCP tool replaces it.
 	 */
-	#isMcpToolNameHeldByOtherTool(tool: CustomTool): boolean {
+	#isMcpToolNameHeldByOtherTool(tool: CustomTool, retiring?: ReadonlyMap<string, AgentTool>): boolean {
 		if (!isMCPBridgeTool(tool)) return false;
 		const existing = this.#toolRegistry.get(tool.name);
 		if (!existing || isMCPBridgeTool(existing)) return false;
+		if (retiring?.get(tool.name) === existing) {
+			this.#mcpToolNamesHeldByOtherTools.delete(tool.name);
+			return false;
+		}
 		this.#mcpToolNamesHeldByOtherTools.add(tool.name);
 		logger.warn("Skipping MCP tool whose name is already registered by another tool", {
 			tool: tool.name,
 			serverName: tool.mcpServerName,
 		});
 		return true;
+	}
+
+	/** Current non-MCP registry entries for the names an update is retiring. */
+	#retiringNonMcpTools(names: readonly string[] | undefined): Map<string, AgentTool> {
+		const retiring = new Map<string, AgentTool>();
+		for (const name of names ?? []) {
+			const tool = this.#toolRegistry.get(name);
+			if (tool && !isMCPBridgeTool(tool)) retiring.set(name, tool);
+		}
+		return retiring;
 	}
 
 	/** Swap named custom tools and restore authoritative MCP selections as late tools arrive. */
@@ -13868,9 +13883,12 @@ export class AgentSession {
 			activeMCPToolNames?: string[];
 			mandatoryMCPToolNames?: string[];
 			persistMCPSelection?: boolean;
+			/** Non-MCP tools the caller is replacing; an incoming MCP tool may take over their names. */
+			retiringToolNames?: readonly string[];
 		} = {},
 	): Promise<void> {
 		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
+		const retiring = this.#retiringNonMcpTools(options.retiringToolNames);
 		const existingNames = Array.from(this.#toolRegistry.keys());
 		for (const name of existingNames) {
 			const tool = this.#toolRegistry.get(name);
@@ -13893,7 +13911,7 @@ export class AgentSession {
 		});
 
 		for (const customTool of omitPluginMcpNameShadows(mcpTools)) {
-			if (this.#isMcpToolNameHeldByOtherTool(customTool)) continue;
+			if (this.#isMcpToolNameHeldByOtherTool(customTool, retiring)) continue;
 			const wrapped = CustomToolAdapter.wrap(customTool, getCustomToolContext) as AgentTool;
 			const finalTool = (
 				this.#extensionRunner ? new ExtensionToolWrapper(wrapped, this.#extensionRunner) : wrapped
