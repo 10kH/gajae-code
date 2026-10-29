@@ -3476,6 +3476,9 @@ export class AcpAgent implements Agent {
 				// its exact endpoint (`reused`) or relaunches it, so only this error falls through.
 				if (!(error instanceof RouterAttachmentMissingError)) throw error;
 				this.#assertSessionEpoch(id, epoch);
+				logger.warn(
+					`ACP session ${id} is broker-live without a Router attachment; retrying through session.resume.`,
+				);
 			}
 		}
 
