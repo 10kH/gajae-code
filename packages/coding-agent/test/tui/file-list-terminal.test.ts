@@ -140,6 +140,78 @@ test("a carriage return inside a file name does not rewind the label", () => {
 	expect(overwritten).not.toContain("\r");
 });
 
+// Applicable input budget for one untrusted label, and twice that size.
+// Painted column width is not this budget: renderResult clips the row, and the
+// size bound is the unclipped renderFileList string.
+const LABEL_INPUT_BUDGET = 64 * 1024;
+const DOUBLE_LABEL_INPUT = 2 * LABEL_INPUT_BUDGET;
+const LABEL_TIME_BUDGET_MS = 1_000;
+const LABEL_RENDER_SLACK = 1_024;
+const CONTROL_RENDER_CAP = 2_000;
+const PAINTED_WIDTH = 16;
+
+type LabelShape = "newlines" | "osc" | "osc-open" | "dcs" | "dcs-open";
+
+function hostileLabel(shape: LabelShape, size: number): string {
+	if (shape === "newlines") return "k\n".repeat(size / 2);
+	const prefix = shape === "osc" || shape === "osc-open" ? "keep\x1b]52;c;" : "keep\x1bP";
+	const suffix = shape === "osc" ? "\x07tail" : shape === "dcs" ? "\x1b\\tail" : "";
+	return prefix + "A".repeat(size - prefix.length - suffix.length) + suffix;
+}
+
+function expectNoAttackControls(rendered: string): void {
+	expect(rendered).not.toContain("\x1b]52;");
+	expect(rendered).not.toContain("\x1bP");
+	expect(rendered).not.toContain("\u009d");
+}
+
+test("renderResult and renderFileList bound path and meta at 2x the label input budget", () => {
+	expect(DOUBLE_LABEL_INPUT).toBe(2 * LABEL_INPUT_BUDGET);
+	expect(LABEL_INPUT_BUDGET).toBeGreaterThan(PAINTED_WIDTH);
+	expect(CONTROL_RENDER_CAP).toBeLessThan(LABEL_INPUT_BUDGET);
+	const shapes: LabelShape[] = ["newlines", "osc", "osc-open", "dcs", "dcs-open"];
+	for (const shape of shapes) {
+		for (const size of [LABEL_INPUT_BUDGET, DOUBLE_LABEL_INPUT]) {
+			const input = hostileLabel(shape, size);
+			expect(input.length).toBeGreaterThanOrEqual(size);
+			expect(input.length).toBeGreaterThan(PAINTED_WIDTH);
+
+			const findStarted = performance.now();
+			const found = renderFind(input, PAINTED_WIDTH);
+			expect(performance.now() - findStarted).toBeLessThan(LABEL_TIME_BUDGET_MS);
+			expectNoAttackControls(found);
+
+			const pathStarted = performance.now();
+			const pathRendered = renderList(input, "2 KB");
+			expect(performance.now() - pathStarted).toBeLessThan(LABEL_TIME_BUDGET_MS);
+			expectNoAttackControls(pathRendered);
+			expect(pathRendered).toContain("2 KB");
+
+			const metaStarted = performance.now();
+			const metaRendered = renderList("src/notes.txt", input);
+			expect(performance.now() - metaStarted).toBeLessThan(LABEL_TIME_BUDGET_MS);
+			expectNoAttackControls(metaRendered);
+			expect(metaRendered).toContain("src/notes.txt");
+
+			if (shape === "newlines") {
+				expect(pathRendered.split("\n").length).toBe(1);
+				expect(metaRendered.split("\n").length).toBe(1);
+				expect(pathRendered.length).toBeLessThanOrEqual(input.length + LABEL_RENDER_SLACK);
+				expect(metaRendered.length).toBeLessThanOrEqual(input.length + LABEL_RENDER_SLACK);
+				expect(pathRendered.length).toBeGreaterThan(PAINTED_WIDTH);
+				expect(pathRendered).toContain("k k");
+			} else {
+				expect(pathRendered.length).toBeLessThan(CONTROL_RENDER_CAP);
+				expect(metaRendered.length).toBeLessThan(CONTROL_RENDER_CAP);
+				expect(pathRendered).not.toContain("AAAA");
+				expect(metaRendered).not.toContain("AAAA");
+				expect(found).not.toContain("AAAA");
+				expect(pathRendered).toContain("keep");
+			}
+		}
+	}
+});
+
 test("property: injected terminal controls are absent from find file names, fc.property seed 62921, numRuns 64", () => {
 	const mark = fc.stringMatching(/^[A-Za-z]{6,12}$/);
 	const wrapper = fc.constantFrom(
