@@ -12,7 +12,6 @@ import { observeProcessIncarnation, type ProcessIncarnationObservation } from ".
 import {
 	managedDirectoryRoot,
 	managedSecurityFailureClassification,
-	prepareManagedDirectoryRoot,
 	publishManagedFileNoReplace,
 } from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTime, readLinuxProcStartTimeSync } from "./linux-proc";
@@ -28,6 +27,7 @@ import {
 	MANAGED_OWNER_RUN_ID_ENV,
 	managedOwnerSupervisorInvocation,
 } from "./managed-owner-supervisor";
+import { prepareOwnerLifecycleRootSync } from "./owner-lifecycle-root";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
 import { GJC_DIR, GJC_SESSION_PREFIX, tmuxRuntimeSessionPath } from "./session-layout";
 import {
@@ -846,17 +846,12 @@ export function createGjcTmuxSession(
 	const stateDir = (platform === "win32" ? path.win32 : path).dirname(stateFile);
 	const generation = crypto.randomUUID();
 	if (launch) {
-		const lifecycleRoot = lifecyclePaths(stateDir, sessionId, generation).root;
-		if (fsSync.existsSync(lifecycleRoot) && !verifyOwnerOnlyPathSecurity(lifecycleRoot, "directory").ok)
-			throw new Error("gjc_tmux_managed_storage_unsafe");
 		try {
-			prepareManagedDirectoryRoot(lifecycleRoot);
+			prepareOwnerLifecycleRootSync(lifecyclePaths(stateDir, sessionId, generation).root);
 		} catch {
 			// Preparation refuses a linked or unsafe component without naming it.
 			throw new Error("gjc_tmux_managed_storage_unsafe");
 		}
-		if (!verifyOwnerOnlyPathSecurity(lifecycleRoot, "directory").ok)
-			throw new Error("gjc_tmux_managed_storage_unsafe");
 	}
 	// Captured before the session exists: its child is admitted only while this stays current.
 	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);

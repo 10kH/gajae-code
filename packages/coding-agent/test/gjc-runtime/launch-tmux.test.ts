@@ -60,6 +60,25 @@ type SpawnSyncResult = Bun.SyncSubprocess<"pipe", "pipe">;
 const launchTestRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-launch-tests-"));
 let launchStateSequence = 0;
 const NATIVE_SESSION_ID = "$0";
+/** Every entry below `directory` with its type, mode and file bytes, for unchanged-tree checks. */
+function treeSnapshot(directory: string): string[] {
+	const entries: string[] = [];
+	const visit = (current: string) => {
+		for (const name of fs.readdirSync(current).sort()) {
+			const entry = path.join(current, name);
+			const stat = fs.lstatSync(entry);
+			const relative = path.relative(directory, entry);
+			const mode = (stat.mode & 0o7777).toString(8);
+			if (stat.isDirectory()) {
+				entries.push(`dir ${relative} ${mode}`);
+				visit(entry);
+			} else entries.push(`file ${relative} ${mode} ${fs.readFileSync(entry, "utf8")}`);
+		}
+	};
+	entries.push(`root ${(fs.lstatSync(directory).mode & 0o7777).toString(8)}`);
+	visit(directory);
+	return entries;
+}
 const nativeTmux = process.platform === "win32" ? null : Bun.which("tmux");
 
 function safeAbsentOwnerIsolationProbe(
@@ -4292,15 +4311,30 @@ describe("tmux owner isolation launch gate", () => {
 		},
 	);
 
-	it.skipIf(process.platform === "win32")("refuses a root launch whose private state tail is a symlink", () => {
+	it.skipIf(process.platform === "win32").each([
+		["the private state tail links to an empty directory", "tail", false],
+		["the private state tail links to a directory that holds the session", "tail", true],
+		["the session directory links to an empty directory", "session", false],
+		["the session directory links to a nonempty directory", "session", true],
+	] as const)("refuses a root launch when %s, without writing through the link", (_label, link, populated) => {
 		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-tail-link-")));
 		try {
 			const cwd = path.join(root, "workspace");
 			const outside = path.join(root, "outside");
 			fs.mkdirSync(outside, { mode: 0o700 });
 			const stateFile = tmuxRuntimeSessionPath(cwd, "tail-gjc-session", buildGjcTmuxSessionSlug("gjc_tail"));
-			fs.mkdirSync(path.dirname(path.dirname(stateFile)), { recursive: true, mode: 0o700 });
-			fs.symlinkSync(outside, path.dirname(stateFile));
+			const stateDir = path.dirname(stateFile);
+			if (link === "tail") {
+				fs.mkdirSync(path.dirname(stateDir), { recursive: true, mode: 0o700 });
+				fs.symlinkSync(outside, stateDir);
+				// The directory the lifecycle root would be created in, reached through the link.
+				if (populated) fs.mkdirSync(path.join(outside, "tail-session"), { mode: 0o700 });
+			} else {
+				fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+				fs.symlinkSync(outside, path.join(stateDir, "tail-session"));
+			}
+			if (populated) fs.writeFileSync(path.join(outside, "sentinel"), "kept");
+			const before = treeSnapshot(outside);
 			const calls: string[][] = [];
 			const diagnostics: string[] = [];
 			launchDefaultTmuxIfNeeded({
@@ -4327,7 +4361,7 @@ describe("tmux owner isolation launch gate", () => {
 			});
 			expect(calls.some(call => call[0] === "new-session")).toBe(false);
 			expect(diagnostics.join("\n")).toContain("managed_owner_storage_unsafe");
-			expect(fs.readdirSync(outside)).toEqual([]);
+			expect(treeSnapshot(outside)).toEqual(before);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
