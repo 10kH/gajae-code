@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Settings } from "../../../src/config/settings";
+import { issueSessionMcpControlGrant } from "../../../src/runtime-mcp/session-controls-grant";
 import { type CreateAgentSessionOptions, createAgentSession } from "../../../src/sdk/session";
 
 const fakeServer = join(import.meta.dir, "session-mcp-fake-server.ts");
@@ -156,7 +157,7 @@ export async function openSession(
 		promptTemplates: [],
 		slashCommands: [],
 		hasUI: false,
-		sessionMcpControls: true,
+		sessionMcpControlGrant: issueSessionMcpControlGrant(),
 		deferMcpConfigStartup: true,
 		...(options.session ?? {}),
 	});

@@ -2806,7 +2806,8 @@ export interface SessionMcpControlPort {
 	getFailedServers(): ReadonlySet<string>;
 	markFailed(name: string): void;
 	clearFailed(name: string): void;
-	restoreAutoload(names: readonly string[]): void;
+	/** Reconnect autoload servers in the background; settles after their tools are published. */
+	restoreAutoload(names: readonly string[]): Promise<void>;
 }
 export interface SessionMcpStatusSnapshot {
 	readonly available: boolean;
@@ -12553,6 +12554,10 @@ export class AgentSession {
 							.filter(tool => tool.mcpServerName === name)
 							.map(tool => tool.name),
 					);
+					const recordDisconnected = (): void => {
+						if (server?.autoload) this.#sessionMcpOverrides.set(name, "disconnected");
+						else this.#sessionMcpOverrides.delete(name);
+					};
 					try {
 						await manager.disconnectServer(name);
 						await this.refreshMCPTools(manager.getTools(), {
@@ -12562,11 +12567,13 @@ export class AgentSession {
 						});
 					} catch (error) {
 						await this.refreshMCPTools(manager.getTools(), { persistMCPSelection: false }).catch(() => {});
+						// The disconnect may have taken effect before the error; record it so a
+						// later /new or session switch still restores an autoload server.
+						if (manager.getConnectionStatus(name) === "disconnected") recordDisconnected();
 						throw error;
 					}
 					this.#commitSessionTransition();
-					if (server?.autoload) this.#sessionMcpOverrides.set(name, "disconnected");
-					else this.#sessionMcpOverrides.delete(name);
+					recordDisconnected();
 					port.clearFailed(name);
 					return { action, name, status: "disconnected", toolCount: 0 };
 				}
@@ -12622,7 +12629,8 @@ export class AgentSession {
 					port.clearFailed(name);
 				}
 				await this.refreshMCPTools(manager.getTools(), { persistMCPSelection: false }).catch(() => {});
-				port.restoreAutoload(restore);
+				// The replacement session's first turn waits for the restored tools.
+				if (restore.length > 0) this.extendStartupTurnBarrier(port.restoreAutoload(restore));
 			},
 			abort: async () => {},
 		};

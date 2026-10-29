@@ -125,6 +125,13 @@ const SESSION_MCP_SUBCOMMANDS: SubcommandDef[] = [
 	{ name: "reconnect", description: "Reconnect one server", usage: "<name>" },
 ];
 
+/**
+ * Server names come from repository-controlled mcp.json files and are inserted into the
+ * editor and rendered by the select list. Offer only names that match the mcp.json
+ * schema's name pattern, so terminal control bytes never reach the completion UI.
+ */
+const COMPLETABLE_MCP_SERVER_NAME = /^[A-Za-z0-9_.-]{1,100}$/;
+
 /** Builtin command whose argument completions may resolve asynchronously from session state. */
 export type SessionBuiltinSlashCommand = BuiltinSlashCommand & {
 	getArgumentCompletions?: (prefix: string) => AutocompleteItem[] | null | Promise<AutocompleteItem[] | null>;
@@ -151,7 +158,7 @@ function getSessionMcpSlashCommands(
 							? candidates.connected
 							: candidates.reconnectable;
 				return list
-					.filter(server => server.name.startsWith(match[2]))
+					.filter(server => COMPLETABLE_MCP_SERVER_NAME.test(server.name) && server.name.startsWith(match[2]))
 					.map(server => ({
 						value: `${match[1]} ${server.name}`,
 						label: server.name,

@@ -9,6 +9,7 @@ import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadAllMCPConfigs } from "../../src/runtime-mcp/config";
 import { attachExactMcpControls } from "../../src/runtime-mcp/redaction";
+import { issueSessionMcpControlGrant, type SessionMcpControlGrant } from "../../src/runtime-mcp/session-controls-grant";
 import type { SessionMcpControlAction } from "../../src/session/agent-session";
 import {
 	logLines,
@@ -355,12 +356,79 @@ describe("session MCP controls on AgentSession", () => {
 		await settle();
 		expect(spawnCount(c, "fakefailauto")).toBe(spawns);
 	}, 30_000);
+
+	test("servers connected by the session publish later tool-list changes", async () => {
+		// With and without autoload servers: the empty-start manager must publish too.
+		for (const withAutoload of [false, true]) {
+			const c = makeCase();
+			writeMcp(c, c.userMcp, {
+				...(withAutoload ? { fakeon: {} } : {}),
+				fakegrow: { autoload: false, args: ["--grow-on", c.flag("grow")] },
+			});
+			const h = await openSession(c);
+			expect(await control(h, "connect", "fakegrow")).toMatchObject({ status: "connected", toolCount: 1 });
+			writeFileSync(c.flag("grow"), "");
+			const deadline = Date.now() + 5000;
+			while (Date.now() < deadline && !h.session.getAllToolNames().some(name => name.includes("grown")))
+				await sleep(50);
+			expect(mcpToolsOf(h.session.getAllToolNames(), "fakegrow").length).toBe(2);
+		}
+	}, 30_000);
+
+	test("the first turn after /new waits for restored autoload tools", async () => {
+		const c = makeCase();
+		writeStandard(c);
+		const h = await openSession(c);
+		await control(h, "disconnect", "fakeon");
+		const barriers: Promise<void>[] = [];
+		const extend = h.session.extendStartupTurnBarrier.bind(h.session);
+		h.session.extendStartupTurnBarrier = barrier => {
+			barriers.push(barrier);
+			extend(barrier);
+		};
+		await h.session.newSession();
+		expect(barriers).toHaveLength(1);
+		await barriers[0];
+		// No polling: the barrier settles only after the restored tools are published.
+		expect(mcpToolsOf(h.session.getActiveToolNames(), "fakeon").length).toBe(1);
+	}, 30_000);
+
+	test("a disconnect that fails after taking effect is still restored by /new", async () => {
+		const c = makeCase();
+		writeStandard(c);
+		const h = await openSession(c);
+		await settle();
+		// Fail only the control's own refresh (it passes an explicit active set), not a
+		// concurrent background tool publication.
+		const original = h.session.refreshMCPTools.bind(h.session);
+		let failed = false;
+		h.session.refreshMCPTools = async (tools, options) => {
+			if (!failed && options?.activeMCPToolNames) {
+				failed = true;
+				throw new Error("refresh failed");
+			}
+			return original(tools, options);
+		};
+		await expect(control(h, "disconnect", "fakeon")).rejects.toThrow("refresh failed");
+		h.session.refreshMCPTools = original;
+		expect(h.result.mcpManager?.getConnectionStatus("fakeon")).toBe("disconnected");
+		const spawns = spawnCount(c, "fakeon");
+		await h.session.newSession();
+		const deadline = Date.now() + 5000;
+		while (Date.now() < deadline && h.result.mcpManager?.getConnectionStatus("fakeon") !== "connected")
+			await sleep(50);
+		expect(h.result.mcpManager?.getConnectionStatus("fakeon")).toBe("connected");
+		expect(spawnCount(c, "fakeon")).toBe(spawns + 1);
+	}, 30_000);
 });
 
 describe("session MCP control grant", () => {
-	test("is withheld unless the session is a deferred root session without --mcp-config", async () => {
+	test("is withheld without a CLI-minted grant or outside a deferred root session", async () => {
+		// An SDK caller cannot forge the grant: only tokens minted by issueSessionMcpControlGrant count.
+		const forged = Object.freeze({ grantSource: "root-interactive-cli" }) as SessionMcpControlGrant;
 		for (const session of [
-			{ sessionMcpControls: false },
+			{ sessionMcpControlGrant: undefined },
+			{ sessionMcpControlGrant: forged },
 			{ deferMcpConfigStartup: false },
 			{ enableMcpAutoload: false },
 		]) {
@@ -375,11 +443,11 @@ describe("session MCP control grant", () => {
 	}, 60_000);
 
 	test("exact --mcp-config sessions keep only their exact controls", async () => {
-		for (const sessionMcpControls of [false, true]) {
+		for (const sessionMcpControlGrant of [undefined, issueSessionMcpControlGrant()]) {
 			const c = makeCase();
 			const exact = join(c.base, "exact.json");
 			writeMcp(c, exact, { fakeexact: {} });
-			const h = await openSession(c, { session: { mcpConfigPath: exact, sessionMcpControls } });
+			const h = await openSession(c, { session: { mcpConfigPath: exact, sessionMcpControlGrant } });
 			attachExactMcpControls(h.session, { grantSource: "root-interactive-exact-config", configPath: exact });
 			expect(h.session.hasExactMcpControls).toBe(true);
 			expect(h.session.hasSessionMcpControls).toBe(false);

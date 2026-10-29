@@ -10,6 +10,7 @@ import { join } from "node:path";
 import type { AutocompleteItem } from "@gajae-code/tui";
 import { getBuiltinSlashCommandsForSession } from "../../src/extensibility/slash-commands";
 import { attachExactMcpControls } from "../../src/runtime-mcp/redaction";
+import { issueSessionMcpControlGrant } from "../../src/runtime-mcp/session-controls-grant";
 import { type BuiltinSlashCommandRuntime, lookupBuiltinSlashCommand } from "../../src/slash-commands/builtin-registry";
 import {
 	type Case,
@@ -182,11 +183,29 @@ describe("/mcp in sessions with session MCP controls", () => {
 	}, 30_000);
 });
 
+describe("/mcp completion with untrusted server names", () => {
+	test("names outside the mcp.json name pattern are never offered", async () => {
+		const c = makeCase();
+		const hostile = "evil\u001b[2J\u001b]0;spoof\u0007";
+		writeMcp(c, c.userMcp, { fakeon: {} });
+		writeMcp(c, c.projectMcp, { fakeoff: { autoload: false }, [hostile]: { autoload: false } });
+		const h = await openSession(c);
+		const status = await h.session.getSessionMcpStatusSnapshot();
+		expect(status?.servers.some(server => server.name === hostile)).toBe(true);
+		const offered = await completions(h, "connect ");
+		expect(offered.map(item => item.label)).toEqual(["fakeoff"]);
+		for (const item of [...offered, ...(await completions(h, "connect e"))]) {
+			expect(`${item.value}${item.label}${item.description ?? ""}`).not.toMatch(/[\u0000-\u001f\u007f]/);
+		}
+		expect((await runMcp(h, "status")).status).not.toContain("\u001b");
+	}, 30_000);
+});
+
 describe("/mcp outside the session MCP control capability", () => {
 	test("sessions without the grant keep the pristine namespace", async () => {
 		const c = makeCase();
 		writeStandard(c);
-		const h = await openSession(c, { session: { sessionMcpControls: false } });
+		const h = await openSession(c, { session: { sessionMcpControlGrant: undefined } });
 		expect(getBuiltinSlashCommandsForSession(false, h.session).some(item => item.name === "mcp")).toBe(false);
 		expect(getBuiltinSlashCommandsForSession(false).some(item => item.name === "mcp")).toBe(false);
 		expect((await runMcp(h, "status")).returned).toEqual({ prompt: "/mcp status" });
@@ -196,11 +215,11 @@ describe("/mcp outside the session MCP control capability", () => {
 
 	test("exact --mcp-config sessions keep the native /mcp surface", async () => {
 		const outputs: string[] = [];
-		for (const sessionMcpControls of [false, true]) {
+		for (const sessionMcpControlGrant of [undefined, issueSessionMcpControlGrant()]) {
 			const c = makeCase();
 			const exact = join(c.base, "exact.json");
 			writeMcp(c, exact, { fakeexact: {} });
-			const h = await openSession(c, { session: { mcpConfigPath: exact, sessionMcpControls } });
+			const h = await openSession(c, { session: { mcpConfigPath: exact, sessionMcpControlGrant } });
 			attachExactMcpControls(h.session, { grantSource: "root-interactive-exact-config", configPath: exact });
 			const command = getBuiltinSlashCommandsForSession(true, h.session).find(item => item.name === "mcp");
 			const subcommands = (command?.subcommands ?? []).map(item => item.name).join(",");
