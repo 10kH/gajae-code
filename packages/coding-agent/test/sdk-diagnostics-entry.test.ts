@@ -812,10 +812,18 @@ describe("sdk diagnostics public entry (B1)", () => {
 		// result proves nothing -- the earlier stale-addon receipt recorded
 		// fsMutations=[] only because the addon import failed first, which is NOT
 		// evidence that the admission write was avoided.
+		// After PR #7399, durableHandoff uses the native addon (not Node.js fs functions),
+		// so we check for native activation and verify the handoff file was actually created.
 		const baseline = await runEntry(["sdk", "diagnostics", "--help"], { mode: "ordinary", env: ownerEnv });
-		const attemptedOwnerWrites = baseline.trap.fsMutations.filter(entry => entry.includes(ownerStateDir));
-		expect(attemptedOwnerWrites.length).toBeGreaterThan(0);
-		expect(baseline.trap.fsMutations.join("\n")).toContain("mkdir");
+		// The ordinary path should activate the native addon when attempting the durable handoff write.
+		expect(baseline.trap.nativeActivations).toBeGreaterThan(0);
+		// Verify the handoff file was actually created (use a fresh check).
+		const handoffFiles = (await fs.readdir(ownerStateDir)).filter(f => f.startsWith("admission-handoff-"));
+		expect(handoffFiles.length).toBeGreaterThan(0);
+		// Clean up the handoff file so the later assertion passes.
+		for (const file of handoffFiles) {
+			await fs.unlink(path.join(ownerStateDir, file));
+		}
 
 		// Fixed path: the actual bin entry and the exported runCli render help with no
 		// mutation anywhere, and the owner state root stays empty.
