@@ -88,6 +88,25 @@ const spawnArgv = (value: unknown): string[] => {
 	return Array.isArray(cmd) ? (cmd as string[]) : [];
 };
 const fixtureDirectories: string[] = [];
+/** Every entry below `directory` with its type, mode and file bytes, for unchanged-tree checks. */
+function treeSnapshot(directory: string): string[] {
+	const entries: string[] = [];
+	const visit = (current: string) => {
+		for (const name of fsSync.readdirSync(current).sort()) {
+			const entry = path.join(current, name);
+			const stat = fsSync.lstatSync(entry);
+			const relative = path.relative(directory, entry);
+			const mode = (stat.mode & 0o7777).toString(8);
+			if (stat.isDirectory()) {
+				entries.push(`dir ${relative} ${mode}`);
+				visit(entry);
+			} else entries.push(`file ${relative} ${mode} ${fsSync.readFileSync(entry, "utf8")}`);
+		}
+	};
+	entries.push(`root ${(fsSync.lstatSync(directory).mode & 0o7777).toString(8)}`);
+	visit(directory);
+	return entries;
+}
 function argv(command: string[] | { cmd: string[] }): string[] {
 	return Array.isArray(command) ? command : command.cmd;
 }
@@ -1094,38 +1113,49 @@ describe("GJC tmux session management", () => {
 		},
 	);
 
-	it.skipIf(process.platform === "win32")(
-		"refuses a Broker launch whose private state tail is a symlink",
-		async () => {
-			const root = fsSync.realpathSync(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-tail-link-")));
-			fixtureDirectories.push(root);
-			const cwd = path.join(root, "workspace");
-			const outside = path.join(root, "outside");
-			await fs.mkdir(outside, { mode: 0o700 });
-			const stateFile = tmuxRuntimeSessionPath(cwd, "broker-child", buildGjcTmuxSessionSlug("broker-child"));
-			await fs.mkdir(path.dirname(path.dirname(stateFile)), { recursive: true, mode: 0o700 });
-			// Link the private tail itself to a separate owner-only directory.
-			await fs.symlink(outside, path.dirname(stateFile));
-			let reachedIsolation = false;
-			__setCreateOwnerIsolationForTests({
-				execute: () => {
-					reachedIsolation = true;
-					return { ok: false, code: "scope_bootstrap_failed", diagnostic: "test-stop" };
+	it.skipIf(process.platform === "win32").each([
+		["the private state tail links to an empty directory", "tail", false],
+		["the private state tail links to a directory that holds the session", "tail", true],
+		["the session directory links to an empty directory", "session", false],
+		["the session directory links to a nonempty directory", "session", true],
+	] as const)("refuses a Broker launch when %s, without writing through the link", async (_label, link, populated) => {
+		const root = fsSync.realpathSync(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-tail-link-")));
+		fixtureDirectories.push(root);
+		const cwd = path.join(root, "workspace");
+		const outside = path.join(root, "outside");
+		await fs.mkdir(outside, { mode: 0o700 });
+		const stateFile = tmuxRuntimeSessionPath(cwd, "broker-child", buildGjcTmuxSessionSlug("broker-child"));
+		const stateDir = path.dirname(stateFile);
+		if (link === "tail") {
+			await fs.mkdir(path.dirname(stateDir), { recursive: true, mode: 0o700 });
+			await fs.symlink(outside, stateDir);
+			// The directory the lifecycle root would be created in, reached through the link.
+			if (populated) await fs.mkdir(path.join(outside, "broker-child"), { mode: 0o700 });
+		} else {
+			await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
+			await fs.symlink(outside, path.join(stateDir, "broker-child"));
+		}
+		if (populated) await fs.writeFile(path.join(outside, "sentinel"), "kept");
+		const before = treeSnapshot(outside);
+		let reachedIsolation = false;
+		__setCreateOwnerIsolationForTests({
+			execute: () => {
+				reachedIsolation = true;
+				return { ok: false, code: "scope_bootstrap_failed", diagnostic: "test-stop" };
+			},
+		});
+		expect(() =>
+			createGjcTmuxSession(
+				{ GJC_TMUX_COMMAND: "tmux" },
+				{
+					platform: process.platform === "linux" ? "linux" : "darwin",
+					launch: { childSessionId: "broker-child", cwd, argv: ["child-command"] },
 				},
-			});
-			expect(() =>
-				createGjcTmuxSession(
-					{ GJC_TMUX_COMMAND: "tmux" },
-					{
-						platform: process.platform === "linux" ? "linux" : "darwin",
-						launch: { childSessionId: "broker-child", cwd, argv: ["child-command"] },
-					},
-				),
-			).toThrow("gjc_tmux_managed_storage_unsafe");
-			expect(reachedIsolation).toBe(false);
-			expect(fsSync.readdirSync(outside)).toEqual([]);
-		},
-	);
+			),
+		).toThrow("gjc_tmux_managed_storage_unsafe");
+		expect(reachedIsolation).toBe(false);
+		expect(treeSnapshot(outside)).toEqual(before);
+	});
 
 	it("rejects a managed launch on Windows before any lifecycle storage or owner isolation", () => {
 		const root = fsSync.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-win32-"));
