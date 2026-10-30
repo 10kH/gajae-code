@@ -428,6 +428,68 @@ describe("harness owner socket routing", () => {
 		20_000,
 	);
 
+	it.skipIf(process.platform === "win32" || !canSymlink)(
+		"routes observe through the socket record when the user sets a symlinked socket dir",
+		async () => {
+			const socketDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
+			const holder = await mkdtemp(path.join(tmpdir(), "hsl-"));
+			extraDirs.push(socketDir, holder);
+			const linked = path.join(holder, "s");
+			fsSync.symlinkSync(socketDir, linked);
+			const storage = (await import("../../src/harness-control-plane/storage")) as {
+				controlSocketPathFor?: (sessionRoot: string, sessionId: string, env: NodeJS.ProcessEnv) => string | null;
+			};
+			await withSocketEnv({ GJC_HARNESS_SOCKET_DIR: linked }, async () => {
+				// Lookup rejects the symlinked base, so only the lease-bound record can route this owner.
+				if (storage.controlSocketPathFor) {
+					expect(storage.controlSocketPathFor(root, SID, { GJC_HARNESS_SOCKET_DIR: linked })).toBeNull();
+				}
+				const res = await runHarness(["observe", "--session", SID], { GJC_HARNESS_SOCKET_DIR: linked });
+				const body = JSON.parse(res.raw) as { evidence?: { ownerRouted?: boolean } };
+				expect(res.code).toBe(0);
+				expect(body.evidence?.ownerRouted).toBe(true);
+			});
+			expect(fsSync.lstatSync(linked).isSymbolicLink()).toBe(true);
+		},
+		20_000,
+	);
+
+	it.skipIf(process.platform === "win32" || !canSymlink)(
+		"routes the same owner when only one side spells the state root through a symlink",
+		async () => {
+			const holder = await mkdtemp(path.join(tmpdir(), "hsl-"));
+			extraDirs.push(holder);
+			const linked = path.join(holder, "root");
+			fsSync.symlinkSync(root, linked);
+			const real = fsSync.realpathSync(root);
+			for (const [ownerRoot, lookupRoot] of [
+				[linked, real],
+				[real, linked],
+				[root, root],
+			]) {
+				const owner = new RuntimeOwner({
+					root: ownerRoot,
+					sessionId: SID,
+					transport: new IdleTransport(),
+					heartbeatMs: 60_000,
+				});
+				await owner.start();
+				try {
+					const resolved = await resolveOwner(lookupRoot, SID);
+					expect(resolved.live).toBe(true);
+					expect(resolved.socketPath).not.toBeNull();
+					const res = await runHarness(["observe", "--session", SID], { GJC_HARNESS_STATE_ROOT: lookupRoot });
+					const body = JSON.parse(res.raw) as { evidence?: { ownerRouted?: boolean } };
+					expect(res.code).toBe(0);
+					expect(body.evidence?.ownerRouted).toBe(true);
+				} finally {
+					await owner.stop();
+				}
+			}
+		},
+		40_000,
+	);
+
 	it.skipIf(process.platform === "win32")(
 		"routes observe to a live owner when the command temp dir differs",
 		async () => {
@@ -599,7 +661,7 @@ describe("harness owner socket routing", () => {
 	);
 
 	it.skipIf(process.platform === "win32")(
-		"does not route a base-format live lease from another socket dir",
+		"keeps the trust boundary for a record-less lease from another socket dir",
 		async () => {
 			const socketDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
 			const otherDir = await mkdtemp(path.join(tmpdir(), "hsd-"));
@@ -614,7 +676,8 @@ describe("harness owner socket routing", () => {
 				const other = await runHarness(["observe", "--session", SID], { GJC_HARNESS_SOCKET_DIR: otherDir });
 				expect(other.raw).not.toContain(ALLOWED);
 				expect(server.received.length).toBe(before);
-				// Documented result: a read-only observation that reports no reachable owner.
+				// Intentional boundary (Known limits): without a lease-bound record the command cannot prove
+				// the endpoint is the owner's private socket, so it does not dial it and reports no owner.
 				const body = JSON.parse(other.raw) as {
 					state?: { ownerLive?: boolean };
 					evidence?: { readOnly?: boolean; ownerRouted?: boolean };

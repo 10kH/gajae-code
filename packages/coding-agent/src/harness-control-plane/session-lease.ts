@@ -12,7 +12,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isFileLockAcquireTimeout, withFileLock } from "../config/file-lock";
 
-import { controlSocketPath, sessionPaths } from "./storage";
+import { controlSocketPath, controlSocketPathFor, sessionPaths, stableRootKey } from "./storage";
 
 export interface SessionLease {
 	ownerId: string;
@@ -138,7 +138,10 @@ function ownerSocketRecordRoot(): string | null {
 export function ownerSocketRecordPath(root: string, sessionId: string): string | null {
 	const base = ownerSocketRecordRoot();
 	if (!base) return null;
-	const digest = createHash("sha256").update(`${root}\0${sessionId}`).digest("hex").slice(0, 24);
+	const digest = createHash("sha256")
+		.update(`${stableRootKey(root)}\0${sessionId}`)
+		.digest("hex")
+		.slice(0, 24);
 	return path.join(base, digest, "record.json");
 }
 
@@ -328,8 +331,8 @@ function trustedOwnerSocket(
 	lease: SessionLease | null,
 ): string | null {
 	try {
-		const computed = controlSocketPath(root, sessionId);
-		if (ownerSocketPathsMatch(endpointPath, computed)) return computed;
+		const computed = controlSocketPathFor(root, sessionId);
+		if (computed && ownerSocketPathsMatch(endpointPath, computed)) return computed;
 	} catch {
 		/* A matching record can still name the owner socket. */
 	}

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { FileLockAcquireError, FileLockTestHooks, withFileLock } from "../../src/config/file-lock";
@@ -491,5 +492,78 @@ describe("SessionLease", () => {
 
 	it("isOwnerAlive returns false for an obviously dead pid", () => {
 		expect(isOwnerAlive(2_147_483_646)).toBe(false);
+	});
+});
+
+describe("owner socket lookup under a configured temp dir", () => {
+	const tempDirs: string[] = [];
+
+	afterEach(async () => {
+		await Promise.all(tempDirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })));
+	});
+
+	async function shortTempDir(): Promise<string> {
+		const dir = await mkdtemp(path.join(tmpdir(), "hlt-"));
+		tempDirs.push(dir);
+		return dir;
+	}
+
+	function computedSocket(tempRoot: string): string {
+		const digest = createHash("sha256").update(`${root}\0${SID}`).digest("hex").slice(0, 16);
+		return path.join(tempRoot, `gjch${process.getuid?.()}`, `c-${digest}.sock`);
+	}
+
+	async function resolveWithTmpdir(tempRoot: string, endpointPath: string) {
+		const lease = {
+			ownerId: "owner-a",
+			sessionId: SID,
+			pid: process.pid,
+			leaseTokenHash: "ab".repeat(32),
+			endpoint: { kind: "unix-socket", path: endpointPath },
+			eventsPath: "e",
+			heartbeatAt: new Date().toISOString(),
+			expiresAt: new Date(Date.now() + 60_000).toISOString(),
+			leaseEpoch: 1,
+			writer: { ownerId: "owner-a", leaseEpoch: 1 },
+		};
+		await mkdir(path.dirname(sessionPaths(root, SID).lease), { recursive: true });
+		await writeFile(sessionPaths(root, SID).lease, `${JSON.stringify(lease)}\n`, "utf8");
+		const saved = { TMPDIR: process.env.TMPDIR, GJC_HARNESS_SOCKET_DIR: process.env.GJC_HARNESS_SOCKET_DIR };
+		process.env.TMPDIR = tempRoot;
+		delete process.env.GJC_HARNESS_SOCKET_DIR;
+		try {
+			return await resolveOwner(root, SID);
+		} finally {
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	}
+
+	it.skipIf(process.platform === "win32")(
+		"does not chmod or trust a symlinked socket directory during lookup",
+		async () => {
+			const tempRoot = await shortTempDir();
+			const target = await shortTempDir();
+			await chmod(target, 0o755);
+			await symlink(target, path.join(tempRoot, `gjch${process.getuid?.()}`));
+			const owner = await resolveWithTmpdir(tempRoot, computedSocket(tempRoot));
+			expect(owner.live).toBe(true);
+			expect(owner.socketPath).toBeNull();
+			expect((await stat(target)).mode & 0o777).toBe(0o755);
+			expect(await readdir(target)).toEqual([]);
+		},
+	);
+
+	it.skipIf(process.platform === "win32")("still routes to a private socket directory", async () => {
+		const tempRoot = await shortTempDir();
+		const base = path.join(tempRoot, `gjch${process.getuid?.()}`);
+		await mkdir(base, { mode: 0o700 });
+		await chmod(base, 0o700);
+		const socketPath = computedSocket(tempRoot);
+		const owner = await resolveWithTmpdir(tempRoot, socketPath);
+		expect(owner.socketPath).toBe(socketPath);
+		expect(await readdir(base)).toEqual([]);
 	});
 });
