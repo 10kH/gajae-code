@@ -87,9 +87,17 @@ function publishReady(phase: WriterInput["phase"], markerPath: string, dev: bigi
 		fs.renameSync(tempReady, input.ready);
 	} finally {
 		if (fd !== undefined) {
-			try { fs.closeSync(fd); } catch { /* ignore */ }
+			try {
+				fs.closeSync(fd);
+			} catch {
+				/* ignore */
+			}
 		}
-		try { fs.unlinkSync(tempReady); } catch { /* ignore */ }
+		try {
+			fs.unlinkSync(tempReady);
+		} catch {
+			/* ignore */
+		}
 	}
 }
 
