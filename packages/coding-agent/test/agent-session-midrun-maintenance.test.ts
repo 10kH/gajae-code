@@ -481,13 +481,28 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		expect(getLatestCompactionEntry(session.sessionManager.getBranch())).toBeNull();
 	});
 
+	it("sends the unchanged context on a window below the ceiling when nothing is compactable and it fits", async () => {
+		// A 272k window sits below the 300k ceiling, so the default threshold is the
+		// window minus its 15% reserve (231,200). 240k crosses it and still fits the
+		// window with the configured reserve.
+		session = await buildSession({
+			contextWindow: 272_000,
+			shortCircuit: true,
+			settings: { "compaction.thresholdTokens": -1 },
+		});
+		await seedUncompactableConversation(session, 240_000);
+		const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
+		expect(outcome).toBe("not-needed");
+		expect(getLatestCompactionEntry(session.sessionManager.getBranch())).toBeNull();
+	});
+
 	it("still fails when nothing is compactable and the context no longer fits the window", async () => {
 		session = await buildSession({
 			contextWindow: 340_000,
 			shortCircuit: true,
 			settings: { "compaction.thresholdTokens": -1 },
 		});
-		await seedUncompactableConversation(session, 320_000);
+		await seedUncompactableConversation(session, 330_000);
 		const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
 		expect(outcome).toBe("failed");
 		expect(getLatestCompactionEntry(session.sessionManager.getBranch())).toBeNull();
