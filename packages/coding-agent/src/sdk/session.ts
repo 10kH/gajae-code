@@ -166,7 +166,6 @@ import { createMCPFormInputHandler } from "../runtime-mcp/elicitation";
 import { type MCPLoadResult, omitUnapprovedProjectStdio } from "../runtime-mcp/manager";
 import { omitPluginMcpNameShadows, retainPluginMcpMandatoryNames } from "../runtime-mcp/plugin-mcp-name-filter";
 import { isIssuedSessionMcpControlGrant, type SessionMcpControlGrant } from "../runtime-mcp/session-controls-grant";
-import { MCP_STARTUP_WAIT_GRACE_MS } from "../runtime-mcp/startup-policy";
 import type { MCPServerConfig } from "../runtime-mcp/types";
 import {
 	getNotificationConfig,
@@ -3975,8 +3974,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							? Math.max(maximum, timeout)
 							: maximum;
 					}, 0);
-					const maxPluginMcpStartupWaitMs =
-						maxPluginMcpTimeoutMs > 0 ? maxPluginMcpTimeoutMs + MCP_STARTUP_WAIT_GRACE_MS : undefined;
+					const maxPluginMcpStartupWaitMs = maxPluginMcpTimeoutMs > 0 ? maxPluginMcpTimeoutMs : undefined;
 					const owned = new MCPManager(
 						cwd,
 						conventionalCacheServerNames.size > 0 ? await getOwnedMcpToolCache() : null,
