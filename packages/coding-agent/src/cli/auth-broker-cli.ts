@@ -170,6 +170,10 @@ async function runServe(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 		storage,
 		bind,
 		bearerTokens: [token],
+		readBearerTokens: async () => {
+			const latest = await readToken();
+			return latest ? [latest] : [];
+		},
 		version: VERSION,
 	});
 	logger.info("auth-broker listening", { url: handle.url });
