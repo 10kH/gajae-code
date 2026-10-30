@@ -28,6 +28,7 @@ import { isAuthenticated, type ModelRegistry } from "../config/model-registry";
 import { type ModelRoleSettings, resolveModelRoleValue } from "../config/model-resolver";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import imageGenDescription from "../prompts/tools/image-gen.md" with { type: "text" };
+import { escapeUntrustedContent, wrapUntrustedContent } from "../session/messages";
 import { isPrivateOrSpecialAddress, validatePublicHttpUrl } from "../web/insane/url-guard";
 import { resolveReadPath } from "./path-utils";
 
@@ -51,7 +52,7 @@ function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-export function redactImageProviderText(value: unknown, activeApiKey?: string): string {
+export function redactImageProviderText(value: unknown, activeApiKey?: string, cap = true): string {
 	let text = typeof value === "string" ? value : value === undefined || value === null ? "" : String(value);
 	const key = activeApiKey?.trim();
 	if (key) {
@@ -100,7 +101,45 @@ export function redactImageProviderText(value: unknown, activeApiKey?: string): 
 		)
 		.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, REDACTED_PROVIDER_SECRET)
 		.replace(/\b[A-Za-z0-9+/_-]{40,}={0,2}\b/g, REDACTED_PROVIDER_SECRET);
-	return text.length > MAX_PROVIDER_TEXT_LENGTH ? `${text.slice(0, MAX_PROVIDER_TEXT_LENGTH - 1)}…` : text;
+	if (!cap || text.length <= MAX_PROVIDER_TEXT_LENGTH) return text;
+	return `${text.slice(0, MAX_PROVIDER_TEXT_LENGTH - 1)}…`;
+}
+
+export type ImageProviderProseCut = "tail" | "both";
+
+/** Cut already-redacted prose. Callers fence the result; this function does not. */
+export function cutImageProviderProse(text: string, direction: ImageProviderProseCut): string {
+	if (text.length <= MAX_PROVIDER_TEXT_LENGTH) return text;
+	const budget = MAX_PROVIDER_TEXT_LENGTH - 1;
+	if (direction === "tail") return `…${text.slice(-budget)}`;
+	const headLen = Math.floor(budget / 2);
+	return `${text.slice(0, headLen)}…${text.slice(-(budget - headLen))}`;
+}
+
+/** Redact, then cut, then fence. The fence is never part of the cut. */
+export function frameImageProviderModelText(
+	raw: string | undefined,
+	apiKey?: string,
+	direction: ImageProviderProseCut = "both",
+): string | undefined {
+	if (!raw) return undefined;
+	const trimmed = redactImageProviderText(raw, apiKey, false).trim();
+	if (!trimmed) return undefined;
+	// Escape before the cut so a closer cannot grow the kept window past the cap.
+	return wrapUntrustedContent(cutImageProviderProse(escapeUntrustedContent(trimmed), direction));
+}
+
+function providerProseForResult(raw: string | undefined, apiKey?: string): { details?: string; framed?: string } {
+	if (!raw) return {};
+	const redacted = redactImageProviderText(raw, apiKey, false);
+	if (!redacted) return {};
+	const details =
+		redacted.length > MAX_PROVIDER_TEXT_LENGTH ? `${redacted.slice(0, MAX_PROVIDER_TEXT_LENGTH - 1)}…` : redacted;
+	return { details, framed: frameImageProviderModelText(raw, apiKey, "both") };
+}
+
+function prefixWithFramedProse(prefix: string, framedProse: string | undefined): string {
+	return framedProse ? `${prefix}\n\n${framedProse}` : prefix;
 }
 
 function tryParseProviderJson<T>(rawText: string): T | undefined {
@@ -405,7 +444,7 @@ interface OpenAIHostedImageResult {
 function redactOpenAIHostedImageResult(result: OpenAIHostedImageResult, activeApiKey: string): OpenAIHostedImageResult {
 	return {
 		...result,
-		responseText: result.responseText ? redactImageProviderText(result.responseText, activeApiKey) : undefined,
+		responseText: result.responseText ? redactImageProviderText(result.responseText, activeApiKey, false) : undefined,
 		revisedPrompt: result.revisedPrompt ? redactImageProviderText(result.revisedPrompt, activeApiKey) : undefined,
 	};
 }
@@ -1093,16 +1132,14 @@ function buildResponseSummary(
 	provider: ImageProvider,
 	model: string,
 	imagePaths: string[],
-	responseText: string | undefined,
+	framedProse: string | undefined,
 ): string {
 	const lines = [`Provider: ${provider}`, `Model: ${model}`, `Generated ${imagePaths.length} image(s):`];
 	for (const p of imagePaths) {
 		lines.push(`  ${p}`);
 	}
-	if (responseText) {
-		lines.push("", responseText.trim());
-	}
-	return lines.join("\n");
+	if (!framedProse) return lines.join("\n");
+	return `${lines.join("\n")}\n\n${framedProse}`;
 }
 
 function collectResponseText(parts: GeminiPart[]): string | undefined {
@@ -1542,17 +1579,17 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 					{ authCredentialType: apiKey.authCredentialType },
 				);
 
+				const prose = providerProseForResult(parsed.responseText, apiKey.apiKey);
 				if (parsed.images.length === 0) {
-					const messageText = parsed.responseText ? `\n\n${parsed.responseText}` : "";
 					return {
-						content: [{ type: "text", text: `No image data returned.${messageText}` }],
+						content: [{ type: "text", text: prefixWithFramedProse("No image data returned.", prose.framed) }],
 						details: {
 							provider,
 							model,
 							imageCount: 0,
 							imagePaths: [],
 							images: [],
-							responseText: parsed.responseText,
+							responseText: prose.details,
 							revisedPrompt: parsed.revisedPrompt,
 							usage: parsed.usage,
 						},
@@ -1562,16 +1599,14 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				const imagePaths = await saveImagesToTemp(parsed.images);
 
 				return {
-					content: [
-						{ type: "text", text: buildResponseSummary(provider, model, imagePaths, parsed.responseText) },
-					],
+					content: [{ type: "text", text: buildResponseSummary(provider, model, imagePaths, prose.framed) }],
 					details: {
 						provider,
 						model,
 						imageCount: parsed.images.length,
 						imagePaths,
 						images: parsed.images,
-						responseText: parsed.responseText,
+						responseText: prose.details,
 						revisedPrompt: parsed.revisedPrompt,
 						usage: parsed.usage,
 					},
@@ -1623,20 +1658,21 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				}
 
 				const parsed = await parseAntigravitySseForImage(response, requestSignal, apiKey.apiKey);
-				const responseText =
-					parsed.text.length > 0 ? redactImageProviderText(parsed.text.join(" "), apiKey.apiKey) : undefined;
+				const prose = providerProseForResult(
+					parsed.text.length > 0 ? parsed.text.join(" ") : undefined,
+					apiKey.apiKey,
+				);
 
 				if (parsed.images.length === 0) {
-					const messageText = responseText ? `\n\n${responseText}` : "";
 					return {
-						content: [{ type: "text", text: `No image data returned.${messageText}` }],
+						content: [{ type: "text", text: prefixWithFramedProse("No image data returned.", prose.framed) }],
 						details: {
 							provider,
 							model,
 							imageCount: 0,
 							imagePaths: [],
 							images: [],
-							responseText,
+							responseText: prose.details,
 							usage: parsed.usage,
 						},
 					};
@@ -1645,14 +1681,14 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				const imagePaths = await saveImagesToTemp(parsed.images);
 
 				return {
-					content: [{ type: "text", text: buildResponseSummary(provider, model, imagePaths, responseText) }],
+					content: [{ type: "text", text: buildResponseSummary(provider, model, imagePaths, prose.framed) }],
 					details: {
 						provider,
 						model,
 						imageCount: parsed.images.length,
 						imagePaths,
 						images: parsed.images,
-						responseText,
+						responseText: prose.details,
 						usage: parsed.usage,
 					},
 				};
@@ -1698,8 +1734,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 
 				const data = parseProviderJson<OpenRouterResponse>(rawText, apiKey.apiKey);
 				const message = data.choices?.[0]?.message;
-				const rawResponseText = collectOpenRouterResponseText(message);
-				const responseText = rawResponseText ? redactImageProviderText(rawResponseText, apiKey.apiKey) : undefined;
+				const prose = providerProseForResult(collectOpenRouterResponseText(message), apiKey.apiKey);
 				const imageUrls = extractOpenRouterImageUrls(message);
 				const inlineImages: InlineImageData[] = [];
 				for (const imageUrl of imageUrls) {
@@ -1707,16 +1742,15 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				}
 
 				if (inlineImages.length === 0) {
-					const messageText = responseText ? `\n\n${responseText}` : "";
 					return {
-						content: [{ type: "text", text: `No image data returned.${messageText}` }],
+						content: [{ type: "text", text: prefixWithFramedProse("No image data returned.", prose.framed) }],
 						details: {
 							provider,
 							model: resolvedModel,
 							imageCount: 0,
 							imagePaths: [],
 							images: [],
-							responseText,
+							responseText: prose.details,
 						},
 					};
 				}
@@ -1725,7 +1759,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 
 				return {
 					content: [
-						{ type: "text", text: buildResponseSummary(provider, resolvedModel, imagePaths, responseText) },
+						{ type: "text", text: buildResponseSummary(provider, resolvedModel, imagePaths, prose.framed) },
 					],
 					details: {
 						provider,
@@ -1733,7 +1767,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 						imageCount: inlineImages.length,
 						imagePaths,
 						images: inlineImages,
-						responseText,
+						responseText: prose.details,
 					},
 				};
 			}
@@ -1777,7 +1811,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				}
 
 				const { imageUrls, responseText: rawResponseText } = collectAlibabaImageResult(data);
-				const responseText = rawResponseText ? redactImageProviderText(rawResponseText, apiKey.apiKey) : undefined;
+				const prose = providerProseForResult(rawResponseText, apiKey.apiKey);
 				// Result URLs are short-lived OSS-signed URLs (24h); download immediately.
 				const inlineImages: InlineImageData[] = [];
 				for (const imageUrl of imageUrls) {
@@ -1785,16 +1819,15 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				}
 
 				if (inlineImages.length === 0) {
-					const messageText = responseText ? `\n\n${responseText}` : "";
 					return {
-						content: [{ type: "text", text: `No image data returned.${messageText}` }],
+						content: [{ type: "text", text: prefixWithFramedProse("No image data returned.", prose.framed) }],
 						details: {
 							provider,
 							model,
 							imageCount: 0,
 							imagePaths: [],
 							images: [],
-							responseText,
+							responseText: prose.details,
 						},
 					};
 				}
@@ -1802,14 +1835,14 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				const imagePaths = await saveImagesToTemp(inlineImages);
 
 				return {
-					content: [{ type: "text", text: buildResponseSummary(provider, model, imagePaths, responseText) }],
+					content: [{ type: "text", text: buildResponseSummary(provider, model, imagePaths, prose.framed) }],
 					details: {
 						provider,
 						model,
 						imageCount: inlineImages.length,
 						imagePaths,
 						images: inlineImages,
-						responseText,
+						responseText: prose.details,
 					},
 				};
 			}
@@ -1864,8 +1897,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 
 			const data = parseProviderJson<GeminiGenerateContentResponse>(rawText, apiKey.apiKey);
 			const responseParts = combineParts(data);
-			const rawResponseText = collectResponseText(responseParts);
-			const responseText = rawResponseText ? redactImageProviderText(rawResponseText, apiKey.apiKey) : undefined;
+			const prose = providerProseForResult(collectResponseText(responseParts), apiKey.apiKey);
 			const inlineImages = collectInlineImages(responseParts);
 
 			if (inlineImages.length === 0) {
@@ -1873,14 +1905,14 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 					? `Blocked: ${redactImageProviderText(data.promptFeedback.blockReason, apiKey.apiKey)}`
 					: "No image data returned.";
 				return {
-					content: [{ type: "text", text: `${blocked}${responseText ? `\n\n${responseText}` : ""}` }],
+					content: [{ type: "text", text: prefixWithFramedProse(blocked, prose.framed) }],
 					details: {
 						provider,
 						model,
 						imageCount: 0,
 						imagePaths: [],
 						images: [],
-						responseText,
+						responseText: prose.details,
 						promptFeedback: redactGeminiPromptFeedback(data.promptFeedback, apiKey.apiKey),
 						usage: data.usageMetadata,
 					},
@@ -1890,14 +1922,14 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 			const imagePaths = await saveImagesToTemp(inlineImages);
 
 			return {
-				content: [{ type: "text", text: buildResponseSummary(provider, model, imagePaths, responseText) }],
+				content: [{ type: "text", text: buildResponseSummary(provider, model, imagePaths, prose.framed) }],
 				details: {
 					provider,
 					model,
 					imageCount: inlineImages.length,
 					imagePaths,
 					images: inlineImages,
-					responseText,
+					responseText: prose.details,
 					promptFeedback: redactGeminiPromptFeedback(data.promptFeedback, apiKey.apiKey),
 					usage: data.usageMetadata,
 				},
