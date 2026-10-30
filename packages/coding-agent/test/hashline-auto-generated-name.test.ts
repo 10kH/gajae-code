@@ -28,6 +28,22 @@ function hashlineReplace(file: string, current: string, next: string): string {
 	return `§${file}\n≔${anchor}..${anchor}\n${next}\n`;
 }
 
+function symlinkCreationAllowed(): boolean {
+	const probe = fs.mkdtempSync(path.join(os.tmpdir(), "hashline-symlink-probe-"));
+	try {
+		fs.symlinkSync("target", path.join(probe, "link"));
+		return true;
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException).code;
+		if (code === "EPERM" || code === "EACCES") return false;
+		throw err;
+	} finally {
+		fs.rmSync(probe, { recursive: true, force: true });
+	}
+}
+
+const symlinkAllowed = symlinkCreationAllowed();
+
 let tempDir: string;
 
 beforeEach(async () => {
@@ -280,3 +296,56 @@ it("still allows a later section after that path's generated header was replaced
 	expect(await Bun.file(plainPath).text()).toContain("AAA");
 	expect(await Bun.file(notesPath).text()).toContain("changed");
 });
+
+it.skipIf(!symlinkAllowed)(
+	"still allows a handwritten symlink name that points at a generated file; skipped when symlink creation returns EPERM",
+	async () => {
+		const targetPath = await writeFixture("widget.gen.ts", "keep\n");
+		const linkPath = path.join(tempDir, "notes.ts");
+		await fs.promises.symlink("widget.gen.ts", linkPath);
+		const tool = new EditTool(makeSession(tempDir, true), "hashline");
+		const result = await tool.execute("hashline-link-gen-target", {
+			input: hashlineReplace("notes.ts", "keep", "changed"),
+		});
+
+		expect(result.isError).toBeUndefined();
+		expect(await Bun.file(targetPath).text()).toBe("changed\n");
+		expect(await Bun.file(linkPath).text()).toBe("changed\n");
+	},
+);
+
+it.skipIf(!symlinkAllowed)(
+	"still allows a handwritten symlink name that points at a handwritten file; skipped when symlink creation returns EPERM",
+	async () => {
+		const targetPath = await writeFixture("notes.ts", "keep\n");
+		const linkPath = path.join(tempDir, "alias.ts");
+		await fs.promises.symlink("notes.ts", linkPath);
+		const tool = new EditTool(makeSession(tempDir, true), "hashline");
+		const result = await tool.execute("hashline-link-hand-target", {
+			input: hashlineReplace("alias.ts", "keep", "changed"),
+		});
+
+		expect(result.isError).toBeUndefined();
+		expect(await Bun.file(targetPath).text()).toBe("changed\n");
+		expect(await Bun.file(linkPath).text()).toBe("changed\n");
+	},
+);
+
+it.skipIf(!symlinkAllowed)(
+	"refuses a generated symlink name that points at a handwritten file; skipped when symlink creation returns EPERM",
+	async () => {
+		const targetPath = await writeFixture("notes.ts", "keep\n");
+		const linkPath = path.join(tempDir, "widget.gen.ts");
+		await fs.promises.symlink("notes.ts", linkPath);
+		const tool = new EditTool(makeSession(tempDir, true), "hashline");
+
+		await expect(
+			tool.execute("hashline-link-gen-name", {
+				input: hashlineReplace("widget.gen.ts", "keep", "changed"),
+			}),
+		).rejects.toThrow(/Cannot modify auto-generated file/);
+
+		expect(await Bun.file(targetPath).text()).toBe("keep\n");
+		expect(await Bun.file(linkPath).text()).toBe("keep\n");
+	},
+);

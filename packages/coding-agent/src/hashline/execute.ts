@@ -372,7 +372,7 @@ export async function executeHashlineSingle(
 	};
 }
 
-/** Apply the filename patterns to every section before the first write. */
+/** Apply the filename patterns to every section before the first write. Lexical basename only. */
 function assertHashlineSectionNamesEditable(
 	options: ExecuteHashlineSingleOptions,
 	sections: HashlineInputSection[],
