@@ -6368,7 +6368,7 @@ export class AgentSession {
 		this.#mandatoryMCPToolNames = new Set(
 			(config.mandatoryMCPToolNames ?? [])
 				.map(name => name.toLowerCase())
-				.filter(name => this.#toolRegistry.has(name)),
+				.filter(name => this.#isRegisteredMcpTool(name)),
 		);
 		this.#constructorMCPToolSelection =
 			config.initialMCPToolSelectionIsExplicit === true
@@ -6785,6 +6785,18 @@ export class AgentSession {
 		await replacement;
 	}
 
+	/** A mandatory MCP name counts only while an MCP tool is the registered object for it. */
+	#isRegisteredMcpTool(name: string): boolean {
+		const tool = this.#toolRegistry.get(name);
+		return tool !== undefined && isMCPBridgeTool(tool);
+	}
+
+	/** True when a non-MCP tool owns `name`; a mandatory MCP name must never activate it. */
+	#isNameHeldByNonMcpTool(name: string): boolean {
+		const tool = this.#toolRegistry.get(name);
+		return tool !== undefined && !isMCPBridgeTool(tool);
+	}
+
 	/**
 	 * True when `tool` is an MCP tool whose name is already registered by a non-MCP tool
 	 * (for example an extension tool named `mcp__foo_bar`). The existing tool is kept so
@@ -6857,8 +6869,8 @@ export class AgentSession {
 		);
 		this.#mandatoryMCPToolNames = new Set(
 			options?.mandatoryMCPToolNames !== undefined
-				? retainedMandatory.filter(name => this.#toolRegistry.has(name))
-				: retainedMandatory,
+				? retainedMandatory.filter(name => this.#isRegisteredMcpTool(name))
+				: retainedMandatory.filter(name => !this.#isNameHeldByNonMcpTool(name)),
 		);
 		if (options?.defaultSelectedConventionalMCPToolNames !== undefined) {
 			this.#defaultSelectedConventionalMCPToolNames = new Set(options.defaultSelectedConventionalMCPToolNames);
@@ -13924,8 +13936,8 @@ export class AgentSession {
 		);
 		this.#mandatoryMCPToolNames = new Set(
 			options.mandatoryMCPToolNames !== undefined
-				? retainedMandatory.filter(name => this.#toolRegistry.has(name))
-				: retainedMandatory,
+				? retainedMandatory.filter(name => this.#isRegisteredMcpTool(name))
+				: retainedMandatory.filter(name => !this.#isNameHeldByNonMcpTool(name)),
 		);
 		this.#pruneSelectedMCPToolNames();
 		const hasPersistedMCPToolSelection = this.buildDisplaySessionContext().hasPersistedMCPToolSelection;

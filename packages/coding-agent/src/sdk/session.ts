@@ -2806,7 +2806,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const declarations = await getGjcPluginToolDeclarations(to);
 				const pluginToolResult = await loadAlwaysOnPluginTools({
 					cwd: to,
-					reservedToolNames: session.getAllToolNames().filter(name => !previousCwdCapturing.includes(name)),
+					// A captured name is free only while the outgoing cwd still owns its registry entry:
+					// its MCP tool or the exact plugin object. Any other owner keeps the name reserved.
+					reservedToolNames: session.getAllToolNames().filter(name => {
+						if (!previousCwdCapturing.includes(name)) return true;
+						const tool = session?.getToolByName(name);
+						return tool !== undefined && !isMCPBridgeTool(tool) && cwdPluginToolEntries.get(name) !== tool;
+					}),
 					declarations,
 				});
 				nextCustomTools.push(...pluginToolResult.tools);
