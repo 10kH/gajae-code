@@ -956,6 +956,62 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		}
 	}, 30_000);
 
+	for (const owner of ["SDK custom tool", "extension tool"] as const) {
+		it(`keeps an ${owner} when the target cwd's plugin claims its name`, async () => {
+			const sourceCwd = path.join(projectDir, "move-source");
+			const targetCwd = path.join(sourceCwd, "move-target");
+			await fs.promises.mkdir(path.join(sourceCwd, ".gjc"), { recursive: true });
+			await fs.promises.mkdir(path.join(targetCwd, ".gjc"), { recursive: true });
+			// The source MCP catalog advertises the live tool's name, so the name is cwd-captured.
+			await fs.promises.writeFile(path.join(sourceCwd, ".gjc", "mcp.json"), demoMcpConfig);
+			await installMcpNamedPluginTool(targetCwd);
+			const liveTool = {
+				name: "mcp__autoload_hello",
+				label: "Live hello",
+				description: "Live hello",
+				parameters: z.object({}),
+				async execute() {
+					return { content: [{ type: "text" as const, text: "LIVE_OWNER_TOOL" }] };
+				},
+			};
+
+			const originalProcessCwd = process.cwd();
+			const sessionManager = SessionManager.create(
+				sourceCwd,
+				SessionManager.managedDestination(sourceCwd, projectDir),
+			);
+			// Deferred startup publishes the source MCP catalog after the live tool is registered.
+			const { session, startDeferredMcpConfig } = await createAgentSession({
+				...isolatedSessionOptions(),
+				cwd: sourceCwd,
+				sessionManager,
+				toolNames: ["move_session"],
+				deferMcpConfigStartup: true,
+				...(owner === "SDK custom tool"
+					? { customTools: [liveTool as CustomTool] }
+					: { extensions: [api => api.registerTool(liveTool)] }),
+				settings: Settings.isolated({ "mcp.discoveryDeferAutoload": false, "mcp.enableProjectConfig": true }),
+			});
+			try {
+				await startDeferredMcpConfig!();
+				const before = session.getToolByName("mcp__autoload_hello");
+				expect(before && isMCPBridgeTool(before)).toBe(false);
+				expect(session.getActiveToolNames()).toContain("mcp__autoload_hello");
+
+				await session.getToolByName("move_session")!.execute("move-onto-plugin", { path: "move-target" });
+
+				const after = session.getToolByName("mcp__autoload_hello");
+				expect(after).toBe(before);
+				expect(session.getActiveToolNames()).toContain("mcp__autoload_hello");
+				const result = await after!.execute("call-live-owner", {} as never);
+				expect(JSON.stringify(result.content)).toContain("LIVE_OWNER_TOOL");
+			} finally {
+				await session.dispose();
+				process.chdir(originalProcessCwd);
+			}
+		}, 30_000);
+	}
+
 	it("keeps a same-named plugin tool that the target cwd also provides", async () => {
 		const sourceCwd = path.join(projectDir, "move-source");
 		const targetCwd = path.join(sourceCwd, "move-target");
@@ -985,6 +1041,47 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			process.chdir(originalProcessCwd);
 		}
 	}, 30_000);
+
+	it("never activates an inactive non-MCP tool through a mandatory MCP name", async () => {
+		const name = "mcp__domain_docs_lookup";
+		const extensionTool = {
+			name,
+			label: "Extension lookup",
+			description: "Extension lookup",
+			parameters: z.object({}),
+			async execute() {
+				return { content: [{ type: "text" as const, text: "EXTENSION_LOOKUP" }] };
+			},
+		};
+		// A plugin-bundle MCP tool that advertises the same name and is mandatory.
+		const pluginMcpTool = {
+			...extensionTool,
+			label: "Plugin MCP lookup",
+			mcpServerName: "domain_docs",
+			mcpToolName: "lookup",
+			gjcPluginBundle: true,
+		} as CustomTool;
+		const { session } = await createAgentSession({
+			...isolatedSessionOptions(),
+			extensions: [api => api.registerTool(extensionTool)],
+		});
+		try {
+			const owner = session.getToolByName(name);
+			expect(owner && isMCPBridgeTool(owner)).toBe(false);
+			await session.setActiveToolsByName(session.getActiveToolNames().filter(active => active !== name));
+			expect(session.getActiveToolNames()).not.toContain(name);
+
+			await session.refreshMCPTools([pluginMcpTool], { mandatoryMCPToolNames: [name] });
+			expect(session.getToolByName(name)).toBe(owner);
+			expect(session.getActiveToolNames()).not.toContain(name);
+
+			await session.replaceNamedCustomTools([], [pluginMcpTool], { mandatoryMCPToolNames: [name] });
+			expect(session.getToolByName(name)).toBe(owner);
+			expect(session.getActiveToolNames()).not.toContain(name);
+		} finally {
+			await session.dispose();
+		}
+	});
 
 	it("retains a declared-timeout MCP manager and publishes tools after background connection", async () => {
 		await runMCPCommand({
