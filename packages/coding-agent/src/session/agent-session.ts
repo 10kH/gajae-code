@@ -11859,6 +11859,22 @@ export class AgentSession {
 		return this.agent.state.isStreaming || this.#livePromptsInFlight() > 0;
 	}
 
+	/**
+	 * Whether `waitForIdle()` would block right now: a streaming turn, a retry or
+	 * TTSR resume, post-prompt work (idle-flush deliveries, auto-continuations), or
+	 * pending session settlement. Unlike `isStreaming`, this stays true in the gap
+	 * after a turn ends while a scheduled background delivery is still pending.
+	 */
+	get isAwaitingIdle(): boolean {
+		return (
+			this.isStreaming ||
+			this.#retryPromise !== undefined ||
+			this.#ttsrResumePromise !== undefined ||
+			this.#postPromptTasks.size > 0 ||
+			this.#isSessionSettlementPending()
+		);
+	}
+
 	/** Wait until streaming and session settlement work are fully settled. */
 	/**
 	 * Wait until streaming and session settlement work are fully settled.

@@ -1702,12 +1702,12 @@ export class SelectorController {
 							return;
 						}
 						if (selection.kind === "profile") {
-							// Activation waits for the running turn to go idle before it takes the
+							// Activation waits for the session to go idle before it takes the
 							// selection admission. Close the selector first so Enter is not a
-							// silent no-op that leaves the menu mounted until the turn ends.
+							// silent no-op that leaves the menu mounted until the session settles.
 							done();
-							if (this.ctx.session.isStreaming) {
-								this.ctx.showStatus("Model profile change queued until the current turn finishes.");
+							if (this.ctx.session.isAwaitingIdle) {
+								this.ctx.showStatus("Model profile change queued until the agent is idle.");
 							}
 							this.ctx.ui.requestRender();
 							await this.#applyModelProfile(selection.profileName, selection.setDefault);

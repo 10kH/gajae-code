@@ -11,9 +11,9 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import { TempDir } from "@gajae-code/utils";
 
 // The /model selector closes before a queued profile activation and announces the
-// queue from `session.isStreaming`. These tests pin the real session contract that
-// decision relies on: the flag is set for the whole turn, and control mutations do
-// not run until the turn is over.
+// queue from `session.isAwaitingIdle`. These tests pin the real session contract that
+// decision relies on: the flag is set whenever `waitForIdle()` would block (a running
+// turn or post-prompt work), and control mutations do not run until it clears.
 function assistantMessage(): AssistantMessage {
 	return {
 		role: "assistant",
@@ -82,11 +82,12 @@ describe("AgentSession control mutation during a running turn", () => {
 		const activePrompt = session.prompt("active work");
 		await turn.started;
 		expect(session.isStreaming).toBe(true);
+		expect(session.isAwaitingIdle).toBe(true);
 
 		let bodyRan = false;
 		const mutation = session.withSdkControlMutation(async () => {
 			bodyRan = true;
-			return session.isStreaming;
+			return session.isAwaitingIdle;
 		});
 		for (let i = 0; i < 20; i++) await Promise.resolve();
 		expect(bodyRan).toBe(false);
@@ -97,9 +98,32 @@ describe("AgentSession control mutation during a running turn", () => {
 		expect(bodyRan).toBe(true);
 	});
 
-	it("is not streaming when idle, so an idle pick shows no queued notice", async () => {
+	it("is not awaiting idle when idle, so an idle pick shows no queued notice", async () => {
 		expect(session.isStreaming).toBe(false);
+		expect(session.isAwaitingIdle).toBe(false);
 		expect(await session.withSdkControlMutation(async () => "ran")).toBe("ran");
+	});
+
+	it("reports awaiting idle for post-prompt work after the turn stops streaming", async () => {
+		// Mirrors an idle-flush delivery queued after the foreground prompt settles:
+		// `isStreaming` is false, but `waitForIdle()` still blocks on the task.
+		const delivery = Promise.withResolvers<void>();
+		session.trackPostPromptTaskForTests(delivery.promise);
+		expect(session.isStreaming).toBe(false);
+		expect(session.hasPostPromptWork).toBe(true);
+		expect(session.isAwaitingIdle).toBe(true);
+
+		let bodyRan = false;
+		const mutation = session.withSdkControlMutation(async () => {
+			bodyRan = true;
+		});
+		for (let i = 0; i < 20; i++) await Promise.resolve();
+		expect(bodyRan).toBe(false);
+
+		delivery.resolve();
+		await mutation;
+		expect(bodyRan).toBe(true);
+		expect(session.isAwaitingIdle).toBe(false);
 	});
 
 	it("runs mutations queued behind one turn in submission order", async () => {
