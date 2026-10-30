@@ -1017,15 +1017,22 @@ function compactEvents(events: SessionIndexEvent[], policy: ResolvedRetentionPol
 }
 
 /**
- * Adds the indexSeq of every complete audit row in [start, end) to `seqs` and
- * returns the bytes consumed; a torn trailing row is left for a later read.
+ * Adds the indexSeq of every audit row in [start, end) to `seqs` and returns the
+ * bytes through the last newline (`complete`) and the bytes after it (`tail`).
+ * Callers hold the index lock, so a tail is left by a crashed write, never one in
+ * flight; it is parsed too, so a record that lost only its newline still dedupes.
  */
-async function readAuditedSeqs(file: string, start: number, end: number, seqs: Set<number>): Promise<number> {
+async function readAuditedSeqs(
+	file: string,
+	start: number,
+	end: number,
+	seqs: Set<number>,
+): Promise<{ complete: number; tail: number }> {
 	let h: fs.FileHandle;
 	try {
 		h = await fs.open(file, "r");
 	} catch (error) {
-		if (isEnoent(error)) return 0;
+		if (isEnoent(error)) return { complete: 0, tail: 0 };
 		throw error;
 	}
 	try {
@@ -1037,7 +1044,7 @@ async function readAuditedSeqs(file: string, start: number, end: number, seqs: S
 			read += bytesRead;
 		}
 		const complete = data.subarray(0, read).lastIndexOf(0x0a) + 1;
-		for (const line of data.subarray(0, complete).toString("utf8").split("\n")) {
+		for (const line of data.subarray(0, read).toString("utf8").split("\n")) {
 			if (!line) continue;
 			try {
 				const record = JSON.parse(line) as Partial<SessionIndexAuditRecord>;
@@ -1046,7 +1053,7 @@ async function readAuditedSeqs(file: string, start: number, end: number, seqs: S
 				// Best-effort dedupe seed; a corrupt audit row never blocks the index.
 			}
 		}
-		return complete;
+		return { complete, tail: read - complete };
 	} finally {
 		await h.close();
 	}
@@ -1574,12 +1581,17 @@ export class SessionIndex {
 				? seeded
 				: { seqs: new Set<number>(), ino: stat.ino, offset: 0 };
 		this.#audited = audited;
+		let tail = 0;
 		if (stat.size > audited.offset) {
-			audited.offset += await readAuditedSeqs(file, audited.offset, stat.size, audited.seqs);
+			const read = await readAuditedSeqs(file, audited.offset, stat.size, audited.seqs);
+			audited.offset += read.complete;
+			tail = read.tail;
 		}
 		const pending = candidates.filter(record => !audited.seqs.has(record.indexSeq));
 		if (pending.length === 0) return;
-		await appendSync(file, pending.map(record => JSON.stringify(record)).join("\n"));
+		const rows = pending.map(record => JSON.stringify(record)).join("\n");
+		// Start a new line after a crashed write's tail, so these rows never join it.
+		await appendSync(file, tail > 0 ? `\n${rows}` : rows);
 		for (const record of pending) audited.seqs.add(record.indexSeq);
 		// Nothing else appends while the lock is held, so the file now ends at this write.
 		const written = await statIndexFile(file);

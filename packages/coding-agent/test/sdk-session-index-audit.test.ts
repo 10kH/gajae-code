@@ -41,6 +41,22 @@ async function auditedSeqCounts(file: string): Promise<Record<number, number>> {
 	return counts;
 }
 
+/** Like auditedSeqCounts, but keeps the lines that are not JSON instead of throwing on them. */
+async function auditLines(file: string): Promise<{ counts: Record<number, number>; malformed: string[] }> {
+	const counts: Record<number, number> = {};
+	const malformed: string[] = [];
+	for (const line of (await fs.readFile(file, "utf8")).split("\n")) {
+		if (!line) continue;
+		try {
+			const seq = (JSON.parse(line) as { indexSeq: number }).indexSeq;
+			counts[seq] = (counts[seq] ?? 0) + 1;
+		} catch {
+			malformed.push(line);
+		}
+	}
+	return { counts, malformed };
+}
+
 describe("session index rejection audit", () => {
 	it("does not re-archive a rejection another reader already archived", async () => {
 		const { dir, logPath, auditPath } = await fixture("gjc-index-audit-longlived-");
@@ -89,5 +105,28 @@ describe("session index rejection audit", () => {
 		await new SessionIndex(dir, { auditRotateBytes: 4096 }).open();
 		await longLived.refresh();
 		expect(await auditedSeqCounts(auditPath)).toEqual({ 1: 1, 2: 1 });
+	});
+
+	it("starts a new line after a torn final row instead of joining it", async () => {
+		const { dir, logPath, auditPath } = await fixture("gjc-index-audit-torn-");
+		await fs.writeFile(logPath, legacyRow(dir, 1));
+		// A write that crashed mid-row leaves a tail without its newline.
+		const torn = JSON.stringify({ indexSeq: 7, code: "rejected_legacy_locator" }).slice(0, 20);
+		await fs.writeFile(auditPath, `${JSON.stringify({ indexSeq: 5 })}\n${torn}`);
+		const longLived = await new SessionIndex(dir).open();
+		await fs.appendFile(logPath, legacyRow(dir, 2));
+		await (await new SessionIndex(dir).open()).refresh();
+		await longLived.refresh();
+		expect(await auditLines(auditPath)).toEqual({ counts: { 1: 1, 2: 1, 5: 1 }, malformed: [torn] });
+	});
+
+	it("dedupes a final row that lost only its newline", async () => {
+		const { dir, logPath, auditPath } = await fixture("gjc-index-audit-unterminated-");
+		await fs.writeFile(logPath, legacyRow(dir, 1));
+		await fs.writeFile(auditPath, JSON.stringify({ indexSeq: 1 }));
+		await new SessionIndex(dir).open();
+		await fs.appendFile(logPath, legacyRow(dir, 2));
+		await new SessionIndex(dir).open();
+		expect(await auditLines(auditPath)).toEqual({ counts: { 1: 1, 2: 1 }, malformed: [] });
 	});
 });
