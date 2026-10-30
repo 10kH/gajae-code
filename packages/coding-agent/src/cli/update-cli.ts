@@ -934,6 +934,41 @@ async function repointActivationRecordToRetryCandidate(
 	}
 }
 
+function activationRecordMatchesCandidate(
+	record: ActivationRecordV1,
+	options: BinaryReplacementOptions,
+	staged: { readonly identity: FileIdentity } | undefined,
+): boolean {
+	const digest = options.candidate?.sha256.toLowerCase() ?? staged?.identity.sha256;
+	return (
+		(digest === undefined || record.candidate.digest === digest) &&
+		record.candidate.version === options.expectedVersion &&
+		(!options.candidate ||
+			(record.candidate.ref === options.candidate.ref && record.candidate.channel === options.candidate.channel))
+	);
+}
+
+/**
+ * True only for a `staged`/`pending_activation` record whose live target is
+ * still byte- and identity-exact to the recorded baseline (or still absent for
+ * a fresh install), so no promotion ever reached the installed binary.
+ */
+function isSupersedablePrePromotionRecord(
+	record: ActivationRecordV1,
+	targetPath: string,
+	current: { readonly identity: FileIdentity } | undefined,
+): boolean {
+	if (record.phase !== "staged" && record.phase !== "pending_activation") return false;
+	if (path.resolve(record.targetPath) !== targetPath) return false;
+	if (!record.baseline.exists) return current === undefined;
+	return (
+		current !== undefined &&
+		record.targetIdentity !== undefined &&
+		sameFileIdentity(record.targetIdentity, current.identity) &&
+		current.identity.sha256 === record.baseline.digest
+	);
+}
+
 /**
  * Atomically replace the installed binary and roll back if version verification fails.
  */
@@ -957,8 +992,17 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		throw new Error("installation_original_target_changed");
 	const existing = await readActivationRecord(targetPath);
 	if (existing.status === "malformed" || existing.status === "foreign") throw new Error("activation_record_untrusted");
+	// A pre-promotion record for a different candidate never mutated the install:
+	// its live target is still the recorded baseline. Pinning it would refuse every
+	// later release with activation_transaction_requires_reconciliation (#6096), so
+	// let a fresh transaction supersede it. Anything past promotion stays pinned.
+	const supersedable =
+		existing.status === "valid" &&
+		!activationRecordMatchesCandidate(existing.record, options, undefined) &&
+		isSupersedablePrePromotionRecord(existing.record, targetPath, current);
 	const resumePinned =
 		existing.status === "valid" &&
+		!supersedable &&
 		existing.record.phase !== "verified" &&
 		existing.record.phase !== "rolled_back" &&
 		options.candidate !== undefined;
@@ -983,14 +1027,13 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	let record: ActivationRecordV1;
 	let recordIdentity: FileIdentity;
 	let redundantStage: { readonly path: string; readonly identity: FileIdentity } | undefined;
-	if (existing.status === "valid" && existing.record.phase !== "verified" && existing.record.phase !== "rolled_back") {
-		if (
-			existing.record.candidate.digest !== (options.candidate?.sha256.toLowerCase() ?? staged?.identity.sha256) ||
-			existing.record.candidate.version !== options.expectedVersion ||
-			(options.candidate &&
-				(existing.record.candidate.ref !== options.candidate.ref ||
-					existing.record.candidate.channel !== options.candidate.channel))
-		)
+	if (
+		existing.status === "valid" &&
+		!supersedable &&
+		existing.record.phase !== "verified" &&
+		existing.record.phase !== "rolled_back"
+	) {
+		if (!activationRecordMatchesCandidate(existing.record, options, staged))
 			throw new Error("activation_transaction_requires_reconciliation");
 		const currentStagingPath = path.resolve(options.tempPath);
 		const recordedStagingPath = path.resolve(existing.record.stagingPath);
