@@ -30,16 +30,17 @@ function hashlineReplace(file: string, current: string, next: string): string {
 
 function symlinkCreationAllowed(): boolean {
 	const probe = fs.mkdtempSync(path.join(os.tmpdir(), "hashline-symlink-probe-"));
+	let allowed = true;
 	try {
 		fs.symlinkSync("target", path.join(probe, "link"));
-		return true;
 	} catch (err) {
 		const code = (err as NodeJS.ErrnoException).code;
-		if (code === "EPERM" || code === "EACCES") return false;
-		throw err;
+		if (code !== "EPERM" && code !== "EACCES") throw err;
+		allowed = false;
 	} finally {
 		fs.rmSync(probe, { recursive: true, force: true });
 	}
+	return allowed;
 }
 
 const symlinkAllowed = symlinkCreationAllowed();
