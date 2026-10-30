@@ -2,12 +2,17 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Agent } from "@gajae-code/agent-core";
+import type { Model } from "@gajae-code/ai";
 import { CombinedAutocompleteProvider } from "@gajae-code/tui/autocomplete";
 import fc from "fast-check";
 import type { CustomizeDoctorReport } from "../src/cli/customize-doctor";
 import { renderCustomizeDoctorText, runCustomizeDoctor } from "../src/cli/customize-doctor";
 import { Settings } from "../src/config/settings";
+import type { LoadedCustomCommand } from "../src/extensibility/custom-commands/types";
 import { loadSlashCommands } from "../src/extensibility/slash-commands";
+import { AgentSession } from "../src/session/agent-session";
+import { SessionManager } from "../src/session/session-manager";
 
 const tempRoots: string[] = [];
 const TERMINAL_CONTROLS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/;
@@ -20,6 +25,31 @@ async function makeRepo(): Promise<string> {
 	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "slash-cmd-"));
 	tempRoots.push(dir);
 	return dir;
+}
+
+function displayModel(): Model<"openai-responses"> {
+	return {
+		id: "mock",
+		name: "mock",
+		api: "openai-responses",
+		provider: "openai",
+		baseUrl: "https://example.invalid",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 8192,
+		maxTokens: 2048,
+	};
+}
+
+function loadedCommand(name: string, description: string, source: LoadedCustomCommand["source"]): LoadedCustomCommand {
+	const commandPath = source === "bundled" ? `mcp:${name}` : `user/${name}.ts`;
+	return {
+		path: commandPath,
+		resolvedPath: commandPath,
+		source,
+		command: { name, description, execute: () => "" },
+	};
 }
 
 async function writeCommand(cwd: string, relativePath: string, content: string): Promise<void> {
@@ -668,5 +698,62 @@ describe.serial("slash command display", () => {
 		expect(byName.get("hookplain")).toBe("Run the plain hook.");
 		expect(byName.get("customplain")).toBe("Run the plain custom command.");
 		expect(byName.get("custom") ?? "").toContain("\u001b]52;c;YQ==\u0007");
+	});
+
+	it("joins mcp prompt metadata into customCommands without the file-command filter", async () => {
+		const cwd = await makeRepo();
+		const marker = "mcp-join-file-marker";
+		await writeCommand(
+			cwd,
+			path.join(".gjc", "commands", "shipmcp.md"),
+			["---", 'description: "ship \\u001b]52;c;YQ==\\u0007 the file command"', "---", marker, ""].join("\n"),
+		);
+		const fileCommands = (await loadSlashCommands({ cwd })).filter(command => command.content.includes(marker));
+		expect(fileCommands).toHaveLength(1);
+		const fileCommand = fileCommands[0];
+		if (fileCommand === undefined) throw new Error("expected the loaded file command");
+		expect(fileCommand.description.includes("\u001b")).toBe(false);
+
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: { model: displayModel(), systemPrompt: ["initial"], tools: [], messages: [] },
+			}),
+			sessionManager: SessionManager.inMemory(cwd),
+			settings: Settings.isolated({}),
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
+			customCommands: [loadedCommand("customplain", "Run the plain custom command.", "user")],
+		});
+		try {
+			session.setMCPPromptCommands([
+				loadedCommand("server:review", "hello\u001b]52;c;YQ==\u0007", "bundled"),
+				loadedCommand("notes:summarize", "Summarize the notes.", "bundled"),
+			]);
+			const merged = session.customCommands;
+			expect(merged.map(item => item.command.name)).toEqual(["customplain", "server:review", "notes:summarize"]);
+			expect(merged.map(item => item.source)).toEqual(["user", "bundled", "bundled"]);
+			expect(merged[1]?.path).toBe("mcp:server:review");
+			expect(merged[2]?.command.description).toBe("Summarize the notes.");
+
+			const customSlash = merged.map(loaded => ({
+				name: loaded.command.name,
+				description: `${loaded.command.description} (${loaded.source})`,
+			}));
+			const provider = new CombinedAutocompleteProvider(
+				[...customSlash, { name: fileCommand.name, description: fileCommand.description }],
+				cwd,
+			);
+			const suggestions = await provider.getSuggestions(["/"], 0, 1);
+			const byName = new Map((suggestions?.items ?? []).map(item => [item.label, item.description ?? ""]));
+
+			expect(byName.get("shipmcp") ?? "").toContain("the file command");
+			expect((byName.get("shipmcp") ?? "").includes("\u001b")).toBe(false);
+			expect(byName.get("server:review")).toBe("hello\u001b]52;c;YQ==\u0007 (bundled)");
+			expect(byName.get("notes:summarize")).toBe("Summarize the notes. (bundled)");
+			expect(byName.get("customplain")).toBe("Run the plain custom command. (user)");
+		} finally {
+			await session.dispose();
+		}
 	});
 });
