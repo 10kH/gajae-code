@@ -2730,6 +2730,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			return ownedMcpToolCache;
 		};
 		const cwdCapturingToolNames: string[] = [];
+		// Registry entries installed by the cwd's always-on plugin tools. On a cwd rescope a
+		// target MCP tool may replace exactly these objects, never another owner of the name.
+		const cwdPluginToolNames: string[] = [];
+		const cwdPluginToolEntries = new Map<string, AgentTool>();
+		const recordCwdPluginToolEntries = (): void => {
+			cwdPluginToolEntries.clear();
+			for (const name of cwdPluginToolNames) {
+				const tool = session?.getToolByName(name);
+				if (tool && !isMCPBridgeTool(tool)) cwdPluginToolEntries.set(name, tool);
+			}
+		};
 		const ownedConventionalMcpServerNames = new Set<string>();
 		const cachedConventionalMcpServerNames = new Set<string>();
 		let ownedMcpManagerToolNames: string[] = [];
@@ -2789,6 +2800,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			await session.refreshGjcSubskillTools();
 			const previousCwdCapturing = [...cwdCapturingToolNames];
 			const nextCwdCapturing: string[] = [];
+			const nextPluginToolNames: string[] = [];
 			const nextCustomTools: CustomTool[] = [];
 			try {
 				const declarations = await getGjcPluginToolDeclarations(to);
@@ -2799,6 +2811,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				});
 				nextCustomTools.push(...pluginToolResult.tools);
 				nextCwdCapturing.push(...pluginToolResult.tools.map(tool => tool.name));
+				nextPluginToolNames.push(...pluginToolResult.tools.map(tool => tool.name));
 			} catch (error) {
 				logger.warn("Failed to reload always-on plugin tools after session rescope", {
 					error: error instanceof Error ? error.message : String(error),
@@ -2923,10 +2936,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 				mcpManager = nextManager;
 				ownsMcpManager = Boolean(nextManager);
-				// The outgoing cwd's tools retire below, so a target MCP tool takes over their names.
+				// The outgoing cwd's plugin tools retire below, so a target MCP tool replaces them.
 				await session.refreshMCPTools((nextManager?.getTools() ?? []) as CustomTool[], {
 					mandatoryMCPToolNames: pluginMcpToolNames,
-					retiringToolNames: previousCwdCapturing,
+					retiringTools: cwdPluginToolEntries,
 				});
 			}
 			cwdCapturingToolNames.length = 0;
@@ -2938,8 +2951,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					mandatoryMCPToolNames: pluginMcpToolNames,
 					defaultSelectedConventionalMCPToolNames: deferConventionalMcpAutoload ? [] : conventionalMcpToolNames,
 					inactiveNewToolNames: deferConventionalMcpAutoload ? conventionalMcpToolNames : undefined,
+					retiringTools: cwdPluginToolEntries,
 				},
 			);
+			cwdPluginToolNames.length = 0;
+			cwdPluginToolNames.push(...nextPluginToolNames);
+			recordCwdPluginToolEntries();
 			wireOwnedMcpToolSync();
 		};
 
@@ -3612,6 +3629,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (pluginToolResult.tools.length > 0) {
 				customTools.push(...pluginToolResult.tools);
 				cwdCapturingToolNames.push(...pluginToolResult.tools.map(tool => tool.name));
+				cwdPluginToolNames.push(...pluginToolResult.tools.map(tool => tool.name));
 			}
 			for (const q of pluginToolResult.quarantine) {
 				gjcFindings.add({
@@ -5745,6 +5763,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				recoveredSessionDefault.activeIndex,
 				recoveredSessionDefault.skips,
 			);
+		recordCwdPluginToolEntries();
 		session.configWarnings.push(...contextFileWarnings);
 		// Determined once, here, where settings are already available. Keep the
 		// durable warning for interactive and print consumers; ACP delivery is

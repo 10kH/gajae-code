@@ -14,8 +14,10 @@ import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDbPath, getAgentDir, logger, setAgentDir } from "@gajae-code/utils";
+import { z } from "zod/v4";
 import { safeRm } from "../../../scripts/safe-cleanup";
 import { runMCPCommand } from "../src/cli/mcp-cli";
+import type { CustomTool } from "../src/extensibility/custom-tools/types";
 import { installGjcBundle } from "../src/extensibility/gjc-plugins";
 import {
 	DeferredMCPTool,
@@ -876,6 +878,78 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			const after = session.getToolByName("mcp__autoload_hello");
 			expect(after && isMCPBridgeTool(after)).toBe(true);
 			expect(session.getActiveToolNames()).toContain("mcp__autoload_hello");
+		} finally {
+			await session.dispose();
+			process.chdir(originalProcessCwd);
+		}
+	}, 30_000);
+
+	it("removes a plugin tool of the cwd it leaves when the target has no tool of that name", async () => {
+		const sourceCwd = path.join(projectDir, "move-source");
+		const targetCwd = path.join(sourceCwd, "move-target");
+		await fs.promises.mkdir(path.join(targetCwd, ".gjc"), { recursive: true });
+		await installMcpNamedPluginTool(sourceCwd);
+
+		const originalProcessCwd = process.cwd();
+		const sessionManager = SessionManager.create(sourceCwd, SessionManager.managedDestination(sourceCwd, projectDir));
+		const { session } = await createAgentSession({
+			...isolatedSessionOptions(),
+			cwd: sourceCwd,
+			sessionManager,
+			toolNames: ["move_session"],
+			settings: Settings.isolated({ "mcp.discoveryDeferAutoload": false, "mcp.enableProjectConfig": true }),
+		});
+		try {
+			expect(session.getToolByName("mcp__autoload_hello")).toBeDefined();
+
+			await session.getToolByName("move_session")!.execute("move-off-plugin", { path: "move-target" });
+
+			expect(session.getToolByName("mcp__autoload_hello")).toBeUndefined();
+		} finally {
+			await session.dispose();
+			process.chdir(originalProcessCwd);
+		}
+	}, 30_000);
+
+	it("keeps an SDK custom tool that shares a name with the source and target MCP catalogs", async () => {
+		const sourceCwd = path.join(projectDir, "move-source");
+		const targetCwd = path.join(sourceCwd, "move-target");
+		await fs.promises.mkdir(path.join(sourceCwd, ".gjc"), { recursive: true });
+		await fs.promises.mkdir(path.join(targetCwd, ".gjc"), { recursive: true });
+		await fs.promises.writeFile(path.join(sourceCwd, ".gjc", "mcp.json"), demoMcpConfig);
+		await fs.promises.writeFile(path.join(targetCwd, ".gjc", "mcp.json"), demoMcpConfig);
+		const sdkTool = {
+			name: "mcp__autoload_hello",
+			label: "SDK hello",
+			description: "SDK hello",
+			parameters: z.object({}),
+			async execute() {
+				return { content: [{ type: "text", text: "LIVE_SDK_TOOL" }] };
+			},
+		} as CustomTool;
+
+		const originalProcessCwd = process.cwd();
+		const sessionManager = SessionManager.create(sourceCwd, SessionManager.managedDestination(sourceCwd, projectDir));
+		const { session } = await createAgentSession({
+			...isolatedSessionOptions(),
+			cwd: sourceCwd,
+			sessionManager,
+			toolNames: ["move_session"],
+			customTools: [sdkTool],
+			settings: Settings.isolated({ "mcp.discoveryDeferAutoload": false, "mcp.enableProjectConfig": true }),
+		});
+		try {
+			const before = session.getToolByName("mcp__autoload_hello");
+			expect(before && isMCPBridgeTool(before)).toBe(false);
+			expect(JSON.stringify((await before!.execute("sdk-before", {} as never)).content)).toContain("LIVE_SDK_TOOL");
+			expect(session.getActiveToolNames()).toContain("mcp__autoload_hello");
+
+			await session.getToolByName("move_session")!.execute("move-past-sdk-tool", { path: "move-target" });
+
+			const after = session.getToolByName("mcp__autoload_hello");
+			expect(after).toBe(before);
+			expect(session.getActiveToolNames()).toContain("mcp__autoload_hello");
+			expect(JSON.stringify((await after!.execute("sdk-after", {} as never)).content)).toContain("LIVE_SDK_TOOL");
 		} finally {
 			await session.dispose();
 			process.chdir(originalProcessCwd);
