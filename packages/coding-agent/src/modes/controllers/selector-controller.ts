@@ -1702,8 +1702,15 @@ export class SelectorController {
 							return;
 						}
 						if (selection.kind === "profile") {
-							await this.#applyModelProfile(selection.profileName, selection.setDefault);
+							// Activation waits for the running turn to go idle before it takes the
+							// selection admission. Close the selector first so Enter is not a
+							// silent no-op that leaves the menu mounted until the turn ends.
 							done();
+							if (this.ctx.session.isStreaming) {
+								this.ctx.showStatus("Model profile change queued until the current turn finishes.");
+							}
+							this.ctx.ui.requestRender();
+							await this.#applyModelProfile(selection.profileName, selection.setDefault);
 							this.ctx.ui.requestRender();
 							return;
 						}

@@ -891,7 +891,111 @@ describe("model selector profiles", () => {
 		expect(settings.get("task.agentModelOverrides")).toMatchObject({ executor: "provider-a/alternate" });
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
 		expect(ctx.showStatus).toHaveBeenCalledWith("Model profile: Profile Alpha");
+		expect(ctx.showStatus).not.toHaveBeenCalledWith("Model profile change queued until the current turn finishes.");
 		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
+	});
+
+	test("profile selection during a running turn closes the selector before activation settles", async () => {
+		const { ctx, session } = createControllerContext();
+		const idle = Promise.withResolvers<void>();
+		Object.assign(session, {
+			isStreaming: true,
+			async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+				await idle.promise;
+				return body();
+			},
+		});
+		const controller = new SelectorController(ctx as never);
+		controller.showModelSelector();
+		const selector = ctx.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
+		await Bun.sleep(10);
+		installTestTheme();
+
+		const selection = selector.__testSelectProfile("profile-a", false);
+		await Bun.sleep(0);
+		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
+		expect(ctx.showStatus).toHaveBeenCalledWith("Model profile change queued until the current turn finishes.");
+		expect(session.setModelTemporaryCalls).toEqual([]);
+
+		idle.resolve();
+		await selection;
+		expect(session.model).toBe(defaultModel);
+		expect(ctx.showStatus).toHaveBeenCalledWith("Model profile: Profile Alpha");
+		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
+	});
+
+	test("queued profile activation failure is reported after the selector closes", async () => {
+		const { ctx, settings, session } = createControllerContext({ missingCredentials: true });
+		const idle = Promise.withResolvers<void>();
+		Object.assign(session, {
+			isStreaming: true,
+			async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+				await idle.promise;
+				return body();
+			},
+		});
+		const controller = new SelectorController(ctx as never);
+		controller.showModelSelector();
+		const selector = ctx.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
+		await Bun.sleep(10);
+		installTestTheme();
+
+		const selection = selector.__testSelectProfile("profile-a", false);
+		await Bun.sleep(0);
+		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
+		expect(ctx.showError).not.toHaveBeenCalled();
+
+		idle.resolve();
+		await selection;
+		expect(ctx.showError).toHaveBeenCalledWith(
+			'Model profile "Profile Alpha" requires credentials for: provider-a. Run /login and configure the missing provider(s), then retry.',
+		);
+		expect(session.model).toBe(alternateModel);
+		expect(settings.get("modelProfile.default")).toBe("old-profile");
+		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
+	});
+
+	test("two profile picks queued behind one turn apply in selection order", async () => {
+		const { ctx, session } = createControllerContext();
+		const idle = Promise.withResolvers<void>();
+		let tail = Promise.resolve();
+		Object.assign(session, {
+			isStreaming: true,
+			// Mirrors the real session: wait for idle, then serialize through FIFO admission.
+			async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+				await idle.promise;
+				const run = tail.then(body);
+				tail = run.then(
+					() => undefined,
+					() => undefined,
+				);
+				return run;
+			},
+		});
+		const controller = new SelectorController(ctx as never);
+
+		controller.showModelSelector();
+		const first = ctx.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
+		await Bun.sleep(10);
+		installTestTheme();
+		const firstSelection = first.__testSelectProfile("profile-a", false);
+		await Bun.sleep(0);
+
+		// The closed selector lets the user reopen /model and pick again before the turn ends.
+		controller.showModelSelector();
+		const second = ctx.editorContainer.addChild.mock.calls[1]?.[0] as ModelSelectorComponent;
+		await Bun.sleep(10);
+		installTestTheme();
+		const secondSelection = second.__testSelectProfile("codex-eco", false);
+		await Bun.sleep(0);
+		expect(ctx.restoreComposer).toHaveBeenCalledTimes(2);
+		expect(session.setModelTemporaryCalls).toEqual([]);
+
+		idle.resolve();
+		await Promise.all([firstSelection, secondSelection]);
+		expect(session.setModelTemporaryCalls.map(call => call.model)).toEqual([defaultModel, providerBDefault]);
+		expect(session.model).toBe(providerBDefault);
+		expect(ctx.showError).not.toHaveBeenCalled();
 	});
 
 	test("Set as default persists and flushes modelProfile.default", async () => {
