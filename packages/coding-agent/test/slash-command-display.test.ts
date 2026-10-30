@@ -458,6 +458,40 @@ describe.serial("slash command display", () => {
 		);
 	});
 
+	it("keeps a plain doctor surface title and summary label", () => {
+		const plain = commandReport("ship", "/work/ship.md", "Stored plainly.");
+		plain.surfaces[0]!.displayName = "Custom Surfaces";
+		const text = renderCustomizeDoctorText(plain);
+		expect(text).toContain("Custom Surfaces (command)");
+		expect(text).toContain("stored-only: 1");
+	});
+
+	it("strips terminal controls from a doctor surface title and summary label", () => {
+		const osc = commandReport("ship", "/work/ship.md", "Stored plainly.");
+		osc.surfaces[0]!.displayName = "Commands\u001b]52;c;YQ==\u0007";
+		const oscText = renderCustomizeDoctorText(osc);
+		expect(oscText.includes("\u001b")).toBe(false);
+		expect(oscText.includes("\u0007")).toBe(false);
+		expect(oscText).toContain("Commands (command)");
+		expect(oscText).not.toContain("YQ==");
+
+		const csi = commandReport("ship", "/work/ship.md", "Stored plainly.");
+		csi.surfaces[0]!.kind = "hook";
+		csi.surfaces[0]!.displayName = "Hooks\u001b[2K";
+		const csiText = renderCustomizeDoctorText(csi);
+		expect(csiText.includes("\u001b")).toBe(false);
+		expect(csiText).toContain("Hooks (hook)");
+		expect(csiText).not.toContain("[2K");
+
+		const summary = commandReport("ship", "/work/ship.md", "Stored plainly.");
+		summary.summary = { "loaded\u001b]8;;https://attacker.example\u0007": 1, "stored-only": 2 };
+		const summaryText = renderCustomizeDoctorText(summary);
+		expect(summaryText.includes("\u001b")).toBe(false);
+		expect(summaryText).toContain("loaded: 1");
+		expect(summaryText).toContain("stored-only: 2");
+		expect(summaryText).not.toContain("attacker.example");
+	});
+
 	it("does not print a discovered command name's terminal controls", async () => {
 		const cwd = await makeRepo();
 		const oscName = "reviewzz\u001b]0;injected-title-7f3a\u0007";

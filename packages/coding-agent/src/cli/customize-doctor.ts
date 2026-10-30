@@ -1670,8 +1670,9 @@ function formatShadowedBy(item: CustomizeDoctorItem): string {
 }
 
 // Discovery text is untrusted. Strip terminal controls at this boundary, with
-// no preview cut before it. The structured report keeps the original name so
-// session load matching still compares that discovery name.
+// no preview cut before it. Surface titles and summary labels use the same
+// helper. The structured report keeps the original name so session load
+// matching still compares that discovery name.
 function doctorDisplay(text: string): string {
 	return sanitizeDisplayLine(text);
 }
@@ -1718,7 +1719,7 @@ export function renderCustomizeDoctorText(report: CustomizeDoctorReport): string
 	}
 
 	for (const surface of report.surfaces) {
-		lines.push(`${surface.displayName} (${surface.kind}) — ${surface.items.length} discovered`);
+		lines.push(`${doctorDisplay(surface.displayName)} (${surface.kind}) — ${surface.items.length} discovered`);
 		for (const warning of surface.warnings ?? []) lines.push(`  warning: ${doctorDisplay(warning)}`);
 		for (const p of surface.precedence) {
 			lines.push(
@@ -1767,7 +1768,7 @@ export function renderCustomizeDoctorText(report: CustomizeDoctorReport): string
 	}
 
 	const summaryLine = Object.entries(report.summary)
-		.map(([status, count]) => `${status}: ${count}`)
+		.map(([status, count]) => `${doctorDisplay(status)}: ${count}`)
 		.join(", ");
 	lines.push(`Summary — ${summaryLine || "nothing discovered"}`);
 	if (report.warnings.length > 0) {
