@@ -1095,7 +1095,7 @@ export class EventController {
 			this.ctx.showWarning(lastAssistant?.errorMessage ? TEXTLESS_INCOMPLETE_WARNING : TEXTLESS_LENGTH_WARNING);
 		}
 		this.sendCompletionNotification();
-		this.ctx.promptSuggestion?.onAgentEnd();
+		this.ctx.promptSuggestion?.onAgentEnd(event.stopReason);
 	}
 
 	async #handleAutoCompactionStart(
