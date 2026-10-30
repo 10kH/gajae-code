@@ -63,7 +63,11 @@ if (op === "notify") {
 	// directly. A stand-in script runs node and exits; GJC then waits for a CDP
 	// endpoint that never appears, so the probe aborts once node has run.
 	const exe = `${cwd}/browser-stand-in.sh`;
-	await Bun.write(exe, `#!/bin/sh\nexec "${node}" -e 0\n`);
+	// A GTK browser would load the modules these variables name; record whether any arrived.
+	await Bun.write(
+		exe,
+		`#!/bin/sh\n[ -n "$GTK_MODULES$GTK3_MODULES$GTK_PATH" ] && echo gtk >> "${cwd}/preload-ran"\nexec "${node}" -e 0\n`,
+	);
 	await fs.chmod(exe, 0o755);
 	const userDataDir = `${cwd}/user-data`;
 	await fs.mkdir(userDataDir);

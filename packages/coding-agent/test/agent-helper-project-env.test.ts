@@ -81,4 +81,25 @@ describe.skipIf(process.platform === "win32" || !Bun.which("node"))("session hel
 			expect(await runProbe(target, op, true, { NODE_OPTIONS: `--require=${target.preload}` })).toBe(true);
 		}, 30_000);
 	}
+
+	// Linux Chrome/Chromium are GTK programs: GTK loads `GTK_MODULES`/`GTK3_MODULES`
+	// from `GTK_PATH`. The browser stand-in records whether any of them reached it.
+	for (const op of ["app-path", "chrome-profile"] as const) {
+		for (const noEnvFile of [false, true]) {
+			it(`does not hand project GTK module variables to the ${op} browser (${noEnvFile ? "--no-env-file" : "autoload"})`, async () => {
+				const target = project();
+				fs.writeFileSync(
+					path.join(target.cwd, ".env"),
+					`GTK_MODULES=planted\nGTK3_MODULES=planted\nGTK_PATH=${target.cwd}\n`,
+				);
+				expect(await runProbe(target, op, noEnvFile)).toBe(false);
+			}, 30_000);
+		}
+
+		it(`keeps an operator-exported GTK_MODULES for the ${op} browser`, async () => {
+			const target = project();
+			fs.writeFileSync(path.join(target.cwd, ".env"), "GTK_MODULES=planted\n");
+			expect(await runProbe(target, op, true, { GTK_MODULES: "operator" })).toBe(true);
+		}, 30_000);
+	}
 });
