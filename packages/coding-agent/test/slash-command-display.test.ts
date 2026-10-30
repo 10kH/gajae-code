@@ -756,4 +756,51 @@ describe.serial("slash command display", () => {
 			await session.dispose();
 		}
 	});
+
+	it("keeps plain mcp prompt text beside a plain file command", async () => {
+		const cwd = await makeRepo();
+		const marker = "mcp-plain-file-marker";
+		await writeCommand(
+			cwd,
+			path.join(".gjc", "commands", "ship-plain.md"),
+			["---", 'description: "  Ship the notes.  "', "---", marker, ""].join("\n"),
+		);
+		const fileCommand = (await loadSlashCommands({ cwd })).find(command => command.content.includes(marker));
+		expect(fileCommand).toMatchObject({ name: "ship-plain", description: "Ship the notes." });
+		if (fileCommand === undefined) throw new Error("expected the loaded file command");
+
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: { model: displayModel(), systemPrompt: ["initial"], tools: [], messages: [] },
+			}),
+			sessionManager: SessionManager.inMemory(cwd),
+			settings: Settings.isolated({}),
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
+			customCommands: [loadedCommand("customplain", "Run the plain custom command.", "user")],
+		});
+		try {
+			session.setMCPPromptCommands([
+				loadedCommand("server:review", "hello\u001b]52;c;YQ==\u0007", "bundled"),
+				loadedCommand("notes:summarize", "Summarize the notes.", "bundled"),
+			]);
+			const customSlash = session.customCommands.map(loaded => ({
+				name: loaded.command.name,
+				description: `${loaded.command.description} (${loaded.source})`,
+			}));
+			const provider = new CombinedAutocompleteProvider(
+				[...customSlash, { name: fileCommand.name, description: fileCommand.description }],
+				cwd,
+			);
+			const suggestions = await provider.getSuggestions(["/"], 0, 1);
+			const byName = new Map((suggestions?.items ?? []).map(item => [item.label, item.description ?? ""]));
+			expect(byName.get("ship-plain")).toBe("Ship the notes.");
+			expect(byName.get("notes:summarize")).toBe("Summarize the notes. (bundled)");
+			expect(byName.get("server:review")).toBe("hello\u001b]52;c;YQ==\u0007 (bundled)");
+			expect(byName.get("customplain")).toBe("Run the plain custom command. (user)");
+		} finally {
+			await session.dispose();
+		}
+	});
 });
