@@ -891,7 +891,7 @@ describe("model selector profiles", () => {
 		expect(settings.get("task.agentModelOverrides")).toMatchObject({ executor: "provider-a/alternate" });
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
 		expect(ctx.showStatus).toHaveBeenCalledWith("Model profile: Profile Alpha");
-		expect(ctx.showStatus).not.toHaveBeenCalledWith("Model profile change queued until the current turn finishes.");
+		expect(ctx.showStatus).not.toHaveBeenCalledWith("Model profile change queued until the agent is idle.");
 		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
 	});
 
@@ -899,7 +899,7 @@ describe("model selector profiles", () => {
 		const { ctx, session } = createControllerContext();
 		const idle = Promise.withResolvers<void>();
 		Object.assign(session, {
-			isStreaming: true,
+			isAwaitingIdle: true,
 			async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
 				await idle.promise;
 				return body();
@@ -914,7 +914,7 @@ describe("model selector profiles", () => {
 		const selection = selector.__testSelectProfile("profile-a", false);
 		await Bun.sleep(0);
 		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
-		expect(ctx.showStatus).toHaveBeenCalledWith("Model profile change queued until the current turn finishes.");
+		expect(ctx.showStatus).toHaveBeenCalledWith("Model profile change queued until the agent is idle.");
 		expect(session.setModelTemporaryCalls).toEqual([]);
 
 		idle.resolve();
@@ -924,11 +924,39 @@ describe("model selector profiles", () => {
 		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
 	});
 
+	test("post-prompt work without a streaming turn still shows the queued notice", async () => {
+		const { ctx, session } = createControllerContext();
+		const idle = Promise.withResolvers<void>();
+		// The turn has stopped streaming, but an idle-flush delivery is still pending.
+		Object.assign(session, {
+			isStreaming: false,
+			isAwaitingIdle: true,
+			async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+				await idle.promise;
+				return body();
+			},
+		});
+		const controller = new SelectorController(ctx as never);
+		controller.showModelSelector();
+		const selector = ctx.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
+		await Bun.sleep(10);
+		installTestTheme();
+
+		const selection = selector.__testSelectProfile("profile-a", false);
+		await Bun.sleep(0);
+		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
+		expect(ctx.showStatus).toHaveBeenCalledWith("Model profile change queued until the agent is idle.");
+
+		idle.resolve();
+		await selection;
+		expect(ctx.showStatus).toHaveBeenCalledWith("Model profile: Profile Alpha");
+	});
+
 	test("queued profile activation failure is reported after the selector closes", async () => {
 		const { ctx, settings, session } = createControllerContext({ missingCredentials: true });
 		const idle = Promise.withResolvers<void>();
 		Object.assign(session, {
-			isStreaming: true,
+			isAwaitingIdle: true,
 			async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
 				await idle.promise;
 				return body();
@@ -955,12 +983,77 @@ describe("model selector profiles", () => {
 		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
 	});
 
+	test("admission refused while queued (session closing) surfaces an error after the selector closes", async () => {
+		const { ctx, settings, session } = createControllerContext();
+		const idle = Promise.withResolvers<void>();
+		let bodyRan = false;
+		Object.assign(session, {
+			isAwaitingIdle: true,
+			// The real session throws a busy error when admission closes during the wait.
+			async withSdkControlMutation<T>(_body: () => Promise<T>): Promise<T> {
+				await idle.promise;
+				throw Object.assign(new Error("Session is closing."), { code: "busy" });
+			},
+		});
+		const originalBody = session.setModelTemporary.bind(session);
+		session.setModelTemporary = (async (...args: Parameters<typeof originalBody>) => {
+			bodyRan = true;
+			return originalBody(...args);
+		}) as typeof session.setModelTemporary;
+		const controller = new SelectorController(ctx as never);
+		controller.showModelSelector();
+		const selector = ctx.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
+		await Bun.sleep(10);
+		installTestTheme();
+
+		const selection = selector.__testSelectProfile("profile-a", false);
+		await Bun.sleep(0);
+		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
+		expect(ctx.showStatus).toHaveBeenCalledWith("Model profile change queued until the agent is idle.");
+
+		idle.resolve();
+		await selection;
+		expect(ctx.showError).toHaveBeenCalledWith("Session is closing.");
+		expect(ctx.showStatus).not.toHaveBeenCalledWith("Model profile: Profile Alpha");
+		expect(bodyRan).toBe(false);
+		expect(session.model).toBe(alternateModel);
+		expect(settings.get("modelProfile.default")).toBe("old-profile");
+		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
+	});
+
+	test("queued notice is shown before activation is requested", async () => {
+		const { ctx, session } = createControllerContext();
+		const order: string[] = [];
+		ctx.showStatus.mockImplementation((message: string) => {
+			order.push(`status:${message}`);
+		});
+		Object.assign(session, {
+			isAwaitingIdle: true,
+			async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+				order.push("mutation");
+				return body();
+			},
+		});
+		ctx.restoreComposer.mockImplementation(() => {
+			order.push("close");
+		});
+		const controller = new SelectorController(ctx as never);
+		await selectFirstProfile(controller);
+
+		expect(order.slice(0, 3)).toEqual([
+			"close",
+			"status:Model profile change queued until the agent is idle.",
+			"mutation",
+		]);
+		expect(order.at(-1)).toBe("status:Model profile: Profile Alpha");
+	});
+
 	test("two profile picks queued behind one turn apply in selection order", async () => {
 		const { ctx, session } = createControllerContext();
 		const idle = Promise.withResolvers<void>();
 		let tail = Promise.resolve();
 		Object.assign(session, {
-			isStreaming: true,
+			isAwaitingIdle: true,
 			// Mirrors the real session: wait for idle, then serialize through FIFO admission.
 			async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
 				await idle.promise;
